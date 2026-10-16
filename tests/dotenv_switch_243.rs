@@ -170,7 +170,8 @@ fn probe_child() {
             format!("range={}", r.is_ok())
         }
         #[cfg(feature = "backend-azure")]
-        "azure_account_url" => s3dlio::azure_client::resolve_azure_account_url("acct"),
+        "azure_account_url" => s3dlio::azure_client::resolve_azure_account_url("acct")
+            .unwrap_or_else(|e| format!("error: {e}")),
         #[cfg(feature = "arrow-backend")]
         "arrow_get" => {
             use s3dlio::object_store::ObjectStore;

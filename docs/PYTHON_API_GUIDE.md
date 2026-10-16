@@ -487,9 +487,13 @@ await s3dlio.put_many_async(items)
 
 ```python
 uris = ["s3://bucket/file1", "s3://bucket/file2", "s3://bucket/file3"]
-results = s3dlio.get_many(uris, workers=64)
+results = s3dlio.get_many(uris, max_in_flight=64)
 
-# Async version
+# az:// and gs:// work too (all URIs in one call must use the same scheme)
+results = s3dlio.get_many(["az://myaccount/container/a.bin", "az://myaccount/container/b.bin"])
+results = s3dlio.get_many(["gs://bucket/a.bin", "gs://bucket/b.bin"])
+
+# Async version (s3:// only: get_many_async() and get_many_stats() read through the S3 client)
 results = await s3dlio.get_many_async(uris)
 
 # O_DIRECT reads — bypass page cache (v0.9.95: now correctly uses O_DIRECT)
@@ -559,11 +563,29 @@ gcloud auth application-default login
 ```
 
 **Azure Blob Storage:**
+
+The storage account comes from the URI (`az://account/container/key`). Set
+`S3DLIO_AZURE_CREDENTIAL` to choose the credential (default `auto`): `workload-identity`, `client-secret`,
+`client-certificate` (needs a build with the cargo feature `azure-client-certificate`), `managed-identity`,
+`cli` (`az login` / `azd auth login`; the `az` / `azd` executable must be on `PATH`), `sas`, or `none`.
+`auto` is a fallback chain over workload identity, client secret, client certificate, managed identity and `cli`
+(members whose variables are not set are skipped; one that fails to give a token falls through to the next). Credentials
+are created once per process, so rotating a secret needs a restart. A bearer-token mode needs an `https` endpoint. Account keys (Shared Key) and
+connection strings are **not** supported (the Azure SDK s3dlio is built on, `azure_storage_blob` 1.0, signs
+only with bearer tokens or a SAS). The full table of modes and the variables each reads is in
+[Environment_Variables.md](Environment_Variables.md#azure-blob-storage-configuration).
 ```python
 import os
-os.environ['AZURE_STORAGE_ACCOUNT'] = 'myaccount'
-os.environ['AZURE_STORAGE_KEY'] = 'mykey'
-# Optional custom endpoint:
+# Service principal (the same variables the Azure SDKs use):
+os.environ['AZURE_TENANT_ID'] = '<tenant>'
+os.environ['AZURE_CLIENT_ID'] = '<app id>'
+os.environ['AZURE_CLIENT_SECRET'] = '<secret>'          # auto -> client-secret
+# Managed identity on an Azure VM / App Service / AKS node:
+#   os.environ['S3DLIO_AZURE_CREDENTIAL'] = 'managed-identity'
+# SAS token:
+#   os.environ['S3DLIO_AZURE_CREDENTIAL'] = 'sas'
+#   os.environ['S3DLIO_AZURE_SAS_TOKEN'] = 'sv=...&sig=...'
+# Optional custom endpoint. Azurite (http://) needs no credential:
 os.environ['AZURE_STORAGE_ENDPOINT'] = 'http://127.0.0.1:10000'  # Azurite
 ```
 
@@ -978,7 +1000,7 @@ with ThreadPoolExecutor(max_workers=16) as pool:
 
 ```python
 uris = s3dlio.list("s3://bucket/dataset/")
-s3dlio.get_many_stats(uris, concurrency=100)
+s3dlio.get_many_stats(uris, max_in_flight=100)
 
 # Subsequent gets use cached sizes (2.5x faster)
 for uri in uris:
@@ -1210,8 +1232,8 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `put_many_async(items)` | Async batch upload | Coroutine |
 | `get(uri)` | Download object | BytesView |
 | `get_range(uri, offset, length=None)` | Server-side range request | BytesView |
-| `get_many(uris, workers)` | Parallel download | List[BytesView] |
-| `get_many_async(uris)` | Async parallel download | Coroutine |
+| `get_many(uris, max_in_flight=64)` | Parallel download (s3://, az://, gs://, file://, direct://) | List[(uri, BytesView)] |
+| `get_many_async(uris, max_in_flight=64)` | Async parallel download (s3:// only) | Coroutine |
 | `list(uri, recursive=False, pattern=None)` | List objects | List[str] |
 | `stat(uri)` | Get metadata | dict |
 | `stat_async(uri)` | Async metadata | Coroutine |

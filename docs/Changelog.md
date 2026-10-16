@@ -109,6 +109,167 @@
   of backoff between them (`S3DLIO_MAX_RETRY_ATTEMPTS`), on top of the SDK's own attempts, before the
   error is returned; it used to fail after the SDK's attempts alone.
 
+### Added
+
+- **Azure credential modes: managed identity, service principal, workload identity and SAS (#253).**
+  The Azure backend used only the `az`/`azd` developer login, so it could not authenticate on Azure VMs, AKS pods or
+  in CI. `S3DLIO_AZURE_CREDENTIAL` now selects `auto` (default), `cli`, `managed-identity`, `client-secret`,
+  `client-certificate`, `workload-identity`, `sas` or `none` (case-insensitive; an unknown value is an error listing
+  the valid ones). **BEHAVIOUR CHANGE: the default is now `auto`, a fallback chain.** Before, every Azure
+  request used `az`/`azd` only and the `AZURE_*` service-principal variables were ignored. `auto` now tries, in
+  order, workload identity (`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`), client secret
+  (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`), client certificate (`AZURE_CLIENT_CERTIFICATE_PATH`),
+  managed identity (`IDENTITY_ENDPOINT`/`MSI_ENDPOINT` set, or the instance metadata service identifies an Azure VM),
+  then `az`/`azd`, skips members whose variables are not set, falls through a member that cannot produce a token (for
+  example a VM with no assigned identity goes on to `az`), uses the first that works for the rest of the process, and
+  lists every member tried and why if none works. The Azure metadata probe runs on the blocking pool with an overall
+  bound of under 0.5 s; a negative ("not Azure") result is cached for 30 s, a positive result is not separately
+  cached by the probe helper (the winning credential is what is cached). Set `S3DLIO_AZURE_CREDENTIAL=cli` for the old behaviour.
+  Credentials are created once per mode and kept for the life of the process: a rotated secret, certificate or
+  token file needs a restart.
+  `AZURE_AUTHORITY_HOST` (https only) is honoured by the SDK for the Entra ID modes. `sas` appends
+  `S3DLIO_AZURE_SAS_TOKEN` to every request URL (the SDK keeps the query on GET, HEAD, PUT, DELETE and LIST; tested).
+  Each credential is created once per process and shared by the cached per-account client (#242 follow-up), so the SDK
+  caches and refreshes tokens; only the `cli` mode runs a process, per token request. A 401/403 and a failed token request
+  name the mode (`Azure credential mode <m>: ...`); the SAS token is removed from messages. A bearer-token mode on an
+  `http` endpoint is refused with a message saying it needs https (use `sas`/`none` for Azurite); `auto` on `http` sends no
+  credential, as before. The `client-certificate` mode needs the new cargo feature `azure-client-certificate` (it links
+  OpenSSL, so it is not in `full-backends` or the default wheel) and a PKCS#12 `.pfx` with an RSA key; without the
+  feature the mode reports that. Shared Key (account key) is still not supported: `azure_storage_blob` 1.0 cannot sign with
+  it. Tested end to end against local fake Entra ID, App Service managed-identity and Blob services (HTTPS with a throwaway
+  CA): managed identity, client secret, `auto`, workload identity, client certificate and SAS, including one token
+  request per credential for many blob requests. Not tested: real Azure, the real instance-metadata address (the SDK
+  hard-codes it; the probe is tested against a local stand-in), and a real AKS federated token. The `auto` metadata probe
+  checks for an Azure instance document: an earlier draft accepted any connection to 169.254.169.254, which on a Google
+  Cloud VM selected managed identity and made an Azure test wait about 400 s.
+
+### Fixed
+
+- **Container listing could send credentials to another host (#253 review, security).** `list-buckets az://...`
+  and Python `list_containers` put the raw text after `az://` into a host name, so `az://attacker.example#` built a
+  request to attacker.example carrying the bearer token or SAS. Every place that turns an account into a URL now
+  goes through one check: 3-24 lowercase letters and digits (upper case is accepted and lowercased, as host names
+  are case-insensitive), or with a custom endpoint any name free of `/ ? # @ \ %`, whitespace and control
+  characters. `%` is refused outright, so `%2e%2e` and `%2f` cannot smuggle a dot segment or a slash. Nothing is
+  sent and no credential is built for a refused name. `resolve_azure_account_url` now returns a `Result`, and
+  `is_azure_blob_host` ignores case.
+- **SAS material no longer survives in error text (#253 review).** The SDK re-sorts and re-encodes the query on
+  operations that set query pairs (list, container operations, block staging and commit), and transport errors print
+  the whole request URL, so replacing the exact token text missed them. Error text now loses the query of every URL in
+  it, every SAS parameter value (`sig`, `se`, `sp`, `skoid`, ...), and each value of the configured token as written,
+  decoded, encoded and double-encoded. `AzureRequestError` has a redacting `Debug`, and `redact_url` also strips
+  userinfo.
+- **`auto` no longer waits out the SDK's retry schedule on a VM without an identity (#253 review).** The managed
+  identity attempt in `auto` has a deadline (`S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`, default 5000 ms; the SDK retries a
+  404/410/5xx from the metadata service for about 72 s), after which `auto` moves on to `az`/`azd`; the same deadline applies when a managed identity that already won stalls
+  on a later token refresh, after which the chain is run again with the managed identity left to the end (a stall
+  costs one deadline when another member works; a lone managed identity still gets its second try); a request forgets the
+  winner only if it is still the one it used, which protects a newer winner of a different mode (a re-installed winner of
+  the same mode is the same credential object and can still be cleared once by a late failure, costing one extra chain
+  run). Only managed identity has its own deadline: the HTTPS modes rely on the SDK's 20 s connect and
+  60 s read timeouts, and `az`/`azd` has none in `azure_identity` 1.0.0. A "not Azure"
+  answer from the metadata probe is cached for 30 s (a failing chain no longer probes twice per request); a cached
+  `auto` winner that starts failing makes that request run the chain again, so a working member further down is found
+  without a restart; a configured service principal that fails before `auto` falls through is logged at `warn`. The
+  client-certificate file is read and parsed on the blocking pool at the first token request, not on a runtime worker.
+- **`S3DLIO_REQUIRE_FULL_BACKENDS` (test and release validation only).** `python/tests/test_full_backend_azure_gcs.py`
+  fails, instead of skipping, when the wheel lacks the Azure/GCS backends and this variable is set to anything other than
+  empty, `0`, `false`, `no` or `off` (unknown values fail too). Not read by the library; see `docs/Environment_Variables.md`.
+- **Deleting an `az://` object that is already gone succeeds again (#253 review).** Wrapping Azure errors to
+  name the credential mode and hide a SAS token turned them into plain text, so the delete contract no longer
+  recognised `BlobNotFound` and `delete`/`delete -r` failed for a blob that was already missing (or vanished
+  between the listing and its delete). Errors now keep the typed SDK error inside, and batch deletes treat a
+  missing blob as deleted.
+- **Azure hardening (#253 review).** An `az://` account name must be 3-24 lowercase letters and digits (with a
+  custom endpoint such as Azurite the rule is relaxed, but `/ ? # @ \`, whitespace and control characters are
+  never accepted), checked before any request or credential use, so `az://attacker.example#/c/k` cannot redirect a
+  request or a bearer token. A SAS token is refused over plain `http` to anything but `localhost`/loopback.
+  Endpoint and account URLs in log lines and error messages are shown without their query string, and
+  `list_account_containers` errors name the credential mode like blob operations.
+- **GCS gRPC full reads cannot abort on an absurd size (#255 follow-up).** The gRPC receive buffer is reserved
+  with `try_reserve` and falls back to growth instead of aborting if the reservation fails.
+- **`get_many()` on `az://` and `gs://` URIs no longer fails for every key (#242).** The function
+  stripped the scheme and container/bucket and handed the Azure and GCS stores only a bare object
+  key, but those stores read the account/container/bucket from the full URI, so every read errored
+  while the same URI worked with `get()`. Each read is now given the full URI. Further changes to the
+  same call, found in review:
+  - A failed batch no longer leaves reads running. The call waits for the reads already in flight
+    and returns the first error as `GET <uri>: <cause>`; reads that had not started are skipped
+    (the S3 reader also drains before returning, but it does not skip). Previously it returned at
+    once and the other downloads, and for Azure the `az` token processes, kept running.
+  - The stores come from the process-wide store cache (#204) and the calls write op-log rows like
+    `get()` does (#174). Before, each URI built a new store and no row was written.
+  - A URI that names no object (`az://acct/container`, `gs://bucket/`) is refused before any read
+    starts: `Cannot GET: no key specified in URI`.
+  - A read task that panics is reported as `GET <uri>: the read task failed: ...`, with its URI.
+  - `get_many` of `file://`/`direct://` already passed full URIs and is unchanged. `get_many_async()` and
+    `get_many_stats()` still send every URI through the S3-only reader and refuse non-S3 URIs.
+  Covered by unit tests with a fake store and, for Azure, a Python test against a local fake Blob
+  endpoint; there is no local stand-in for GCS, so `gs://` is covered by the unit tests only.
+- **Azure: one HTTP client per account URL instead of one per operation (#242 review).** Every
+  `get`/`stat`/`get_range` built a new Azure service client, with a new connection pool, TLS state and
+  an empty bearer-token cache. Clients are now cached per account URL (at most 64) and reused, so
+  connections and the SDK's token cache are shared. `list_account_containers` no longer attaches a
+  credential to an `http://` endpoint (the SDK refused it with "must use https"). Not measured against
+  live Azure (no network access in the test runs); the unit tests count client constructions.
+  Limit: a cached client keeps its bearer token until it nears expiry (about an hour), so after
+  `az login` as a different identity a running process keeps using the old one until the token
+  refreshes or the process restarts. When more than 64 accounts are used an arbitrary cached client is evicted
+  (it is rebuilt, with a new token request, on next use).
+- **GCS HTTP and Azure GETs no longer grow their receive buffer by doubling (#252).** The GCS HTTP read
+  started a 1 MiB buffer and let it double, so an object over 1 MiB was copied again at each growth step
+  (an 8 MiB body: 3 growths); the Azure reads used the SDK's `collect()`, which also grows chunk by chunk.
+  Both now receive into one buffer sized from the object size in the response (GCS, clamped to the requested
+  range) or the length the Azure response announces (`Content-Range`/`Content-Length`), the size hint, or the
+  requested range (an Azure range reserves at most 128 MiB up front). If the server sends more than announced
+  the buffer still grows. The result is **one copy inside s3dlio after the SDK delivers the data**; it does not
+  remove copies the SDK makes itself (Azure partitioned downloads, used above 32 MiB, buffer each partition
+  first). A test counts buffer growth. Throughput was not measured.
+- **GCS gRPC range reads reserve the range, not the object (#255).** The gRPC read sized its buffer to the
+  whole object even for a range read, so a 1 MiB range of a multi-TiB object tried to reserve the object, and a
+  negative size from the server wrapped through `as usize`. The buffer and the read timeout are now sized to
+  the bytes the read returns (clamped to the object); a negative size is 0 and the buffer grows as data
+  arrives. Full reads are unchanged. Tested on the sizing function only (no GCS service offline).
+- **Azure: a stale cached size can no longer turn a download into one request per byte (#242 review).**
+  `AzureObjectStore` caches the size a `HEAD` reports for 60 s. A blob cached as 0 or 1 byte and then
+  enlarged made the sequential download plan one-byte ranges (the SDK keeps the caller's partition size and
+  learns the real length only from the first response), roughly a million serial requests for 1 MiB. Now:
+  the partition size is never below 32 MiB whatever the hint says; the default mode (`Auto` with the Azure
+  SDK engine) and `azure-sdk` make **no `HEAD` at all** (one request for a blob up to 32 MiB; the buffer is
+  sized from the response); the s3dlio RangeEngine, which plans its ranges from the size, uses a cached size
+  without a `HEAD` but guarded: its last range asks for one byte more than planned, so a blob that grew (an
+  over read) or shrank (a short read or a range error) makes the engine fail, and the read is retried once
+  with a size from a fresh `HEAD` (an unchanged blob costs no `HEAD`; before this guard every RangeEngine read
+  started with one); `put`/`put_multipart` forget the written object's cached size and
+  `delete`/`delete_batch`/`delete_prefix` forget exactly the deleted objects' (never the whole cache), under one
+  canonical `az://account/container/key` / `gs://bucket/object` key (Azure and GCS); an Azure range read reserves
+  the response's `Content-Length` and asks for its whole range in one request (an open-ended range uses the 32 MiB
+  default partition, not the SDK's 4 MiB). Tested against a fake Blob service that refuses after 300 requests.
+  Cache growth is bounded separately by the #241 size-cache fix, which this builds on (`ObjectSizeCache` gained
+  `invalidate` and `invalidate_many`).
+- **Azure: the documentation no longer tells you to authenticate with `AZURE_STORAGE_KEY` (#239).** (The service-principal, managed-identity and SAS modes this entry says were missing were added afterwards, see #253 above.)
+  The docs (`PYTHON_API_GUIDE.md`, `Environment_Variables.md`, `CLI_GUIDE.md`) said an Azure account key,
+  `AZURE_STORAGE_ACCOUNT`, or the service-principal variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
+  `AZURE_TENANT_ID`) authenticate s3dlio to Azure. None of them is read: s3dlio uses the Azure developer-tool
+  credential (`az login`, then `azd auth login`) for `https` endpoints and sends no credential to `http`
+  endpoints such as Azurite; the account always comes from the `az://account/container/key` URI. Account-key
+  (Shared Key) authentication was **not** implemented: the Azure SDK in use (`azure_storage_blob` 1.0.0,
+  `azure_core` 1.1.0, `azure_identity` 1.0.0) can only sign requests with bearer tokens, and signing requests
+  by hand was deliberately not done. The docs now state exactly this. Behaviour is unchanged.
+  The same wrong instructions (`AZURE_STORAGE_ACCOUNT_NAME` / `AZURE_STORAGE_ACCOUNT_KEY`, `AZURE_STORAGE_KEY`,
+  `AZURE_CLIENT_*`, `AZURE_TENANT_ID`, and `az://container/...` URIs without an account) were also removed from
+  `S3TORCHCONNECTOR_MIGRATION.md`, `integration/DLIO_BENCHMARK_INTEGRATION.md`, `testing/BACKEND-TESTING.md`,
+  `integrations/dlio/README.md`, `examples/python/oplog_example.py`, `python/tests/manual_cloud_backend_test.py`
+  and the docstrings of `s3dlio.integrations.dlio.*` and `s3dlio.compat.s3torchconnector` (those Python modules
+  only described the variables; they never read them, so their behaviour is unchanged). `tests/test_op_log_all_backends.sh`
+  no longer requires the unused `AZURE_STORAGE_ACCESS_KEY` to run its Azure step; it needs only `AZURE_STORAGE_ACCOUNT`
+  (used to build the `az://` URI) and an `az login` session; its Azure step now removes any old log first and
+  fails when `s3-cli` fails, instead of printing a message and continuing. Examples that wrote `az://container/...`
+  without the account now write `az://account/container/...` (also in `MULTI_ENDPOINT_GUIDE.md`, the CLI help and the
+  `put_bytes` docstring). `PYTHON_API_GUIDE.md` now lists `max_in_flight` (not `workers`/`concurrency`) for
+  `get_many`/`get_many_stats`, says that `get_many` works on `az://` and `gs://`, and says the `az`/`azd` executable
+  must be on `PATH`.
+
 - **The object size cache no longer grows without bound (#241).** The process-global size cache (and
   the per-store size caches) never removed anything: an expired entry was treated as a miss but left in
   memory, and nothing called the cleanup routine, so a long-running process that touched many distinct

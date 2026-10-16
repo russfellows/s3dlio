@@ -15,13 +15,10 @@ For S3 (s3://):
     # For MinIO/Ceph: export AWS_ENDPOINT_URL="http://localhost:9000"
 
 For Azure Blob (az://):
-    # Option 1: Azure CLI login
+    # Sign in with the Azure CLI (or: azd auth login), or select a mode with
+    # S3DLIO_AZURE_CREDENTIAL: managed-identity, client-secret (AZURE_TENANT_ID / AZURE_CLIENT_ID /
+    # AZURE_CLIENT_SECRET), workload-identity, sas (S3DLIO_AZURE_SAS_TOKEN). Account keys are not read.
     az login
-    
-    # Option 2: Service Principal (set these env vars)
-    export AZURE_TENANT_ID="your-tenant"
-    export AZURE_CLIENT_ID="your-client"
-    export AZURE_CLIENT_SECRET="your-secret"
 
 For GCS (gs://):
     export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
@@ -32,7 +29,7 @@ USAGE:
     python manual_cloud_backend_test.py s3://your-bucket/test-prefix/
     
     # Test Azure backend
-    python manual_cloud_backend_test.py az://your-container/test-prefix/
+    python manual_cloud_backend_test.py az://your-account/your-container/test-prefix/
     
     # Test GCS backend
     python manual_cloud_backend_test.py gs://your-bucket/test-prefix/

@@ -522,8 +522,13 @@ s3-cli --op-log sorted.tsv.zst ls -r s3://bucket/
 ### Azure Configuration
 | Variable | Description |
 |----------|-------------|
-| `AZURE_STORAGE_ACCOUNT` | Storage account name |
 | `AZURE_STORAGE_ENDPOINT` | Custom endpoint (Azurite, etc.) |
+| `S3DLIO_AZURE_CREDENTIAL` | `auto` (default), `cli`, `managed-identity`, `client-secret`, `client-certificate`, `workload-identity`, `sas`, `none` |
+| `S3DLIO_AZURE_SAS_TOKEN` | SAS token for `sas` mode |
+
+The account comes from the URI (`az://account/container/key`). Credentials: see
+`Environment_Variables.md` (Azure Blob Storage Configuration) for the modes and the variables each reads;
+`az login` / `azd auth login` is the `cli` mode.
 
 ### GCS Configuration
 | Variable | Description |

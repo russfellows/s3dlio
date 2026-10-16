@@ -237,7 +237,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 s3dlio provides unified storage operations across all backends with consistent URI patterns:
 
 - **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations (5+ GB/s reads, 2.5+ GB/s writes) with built-in concurrent range GETs (on by default)
-- **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with **RangeEngine** (30-50% faster for large blobs)
+- **☁️ Azure Blob Storage**: `az://account/container/prefix/` - Complete Azure integration with **RangeEngine** (concurrent ranges for large blobs; speed-ups are unmeasured). Authentication: managed identity, workload identity, service principal (secret or certificate), SAS, or `az login`, selected with `S3DLIO_AZURE_CREDENTIAL` (default `auto`; see [Environment Variables](docs/Environment_Variables.md#azure-blob-storage-configuration)). Shared Key (account key) is not supported.
 - **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - Production ready with **RangeEngine** and full ObjectStore integration
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations with **RangeEngine** support
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance with **RangeEngine**
@@ -251,8 +251,8 @@ Concurrent range downloads hide network latency by parallelizing HTTP range requ
 - ✅ **Amazon S3**: Concurrent range splitting enabled by default via `S3DLIO_ENABLE_RANGE_OPTIMIZATION` (default: on). Uses `get_object_concurrent_range_async()` — fires parallel `GetObject(Range: bytes=N-M)` requests via the AWS SDK with lock-free chunk assembly. Controlled by `S3DLIO_RANGE_THRESHOLD_MB` (default: 32 MiB) and `S3DLIO_RANGE_CONCURRENCY` (default: auto-scaled). Disable with `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0`.
 
 **Mechanism 2 — RangeEngine (per-store config flag, must enable explicitly)**
-- ✅ **Azure Blob Storage**: 30-50% faster for large files (`enable_range_engine: true` in `AzureConfig`)
-- ✅ **Google Cloud Storage**: 30-50% faster for large files (`enable_range_engine: true` in `GcsConfig`)
+- ✅ **Azure Blob Storage**: concurrent range downloads for large files (`enable_range_engine: true` in `AzureConfig`); the speed-up has not been measured
+- ✅ **Google Cloud Storage**: concurrent range downloads for large files (`enable_range_engine: true` in `GcsConfig`); the speed-up has not been measured
 - ⚠️ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
 - ⚠️ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
 
@@ -541,7 +541,7 @@ import s3dlio
 
 # Works with any s3dlio URI — just change the prefix:
 #   "s3://bucket/train/"           Amazon S3 / MinIO / Ceph
-#   "az://container/train/"        Azure Blob Storage
+#   "az://account/container/train/"  Azure Blob Storage
 #   "gs://bucket/train/"           Google Cloud Storage
 #   "file:///mnt/data/train/"      Local filesystem
 #   "direct:///mnt/nvme/train/"    Local O_DIRECT (bypass page cache)

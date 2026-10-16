@@ -532,18 +532,70 @@ When a URI's first segment is a server (an explicit `host:port`, see above), s3d
 
 ## Azure Blob Storage Configuration
 
+**Authentication.** The storage account is taken from the URI (`az://account/container/key`).
+`S3DLIO_AZURE_CREDENTIAL` selects how s3dlio authenticates (case-insensitive; an unknown value is an
+error that lists the valid ones):
+
+| Value | What is used | Variables read |
+|-------|--------------|----------------|
+| `auto` (default) | A fallback chain, like the Azure SDKs' `DefaultAzureCredential`: tries workload identity, client secret, client certificate, managed identity, then `cli`, in that order, and uses the first that yields a token. Never picks `sas` or `none`. On an `http` endpoint (Azurite) `auto` sends no credential. | see below |
+| `workload-identity` | AKS / Entra workload identity (federated token) | `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` |
+| `client-secret` | Service principal with a secret | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` |
+| `client-certificate` | Service principal with a certificate: a PKCS#12 (`.pfx`) file with an RSA key. **Only in builds with the cargo feature `azure-client-certificate`** (it links OpenSSL; not in `full-backends` or the default wheel) | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE_PATH`, optional `AZURE_CLIENT_CERTIFICATE_PASSWORD`, optional `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN` (read by the SDK) |
+| `managed-identity` | Azure VM (instance metadata service), App Service, Arc, Functions managed identity | optional `AZURE_CLIENT_ID` (a user-assigned identity); the SDK reads `IDENTITY_ENDPOINT`, `IDENTITY_HEADER`, `IMDS_ENDPOINT`, `MSI_ENDPOINT`, `MSI_SECRET` |
+| `cli` | `az login`, then `azd auth login` (the `az` / `azd` executable must be on `PATH`; it is run for every token request) | none |
+| `sas` | No bearer token; `S3DLIO_AZURE_SAS_TOKEN` is appended to every request URL (works over `http` and `https`) | `S3DLIO_AZURE_SAS_TOKEN` |
+| `none` | No credential (anonymous access, Azurite) | none |
+
+**How `auto` works.** At the first token request it goes down the chain and skips every member whose variables
+are not set: `workload-identity` needs `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`;
+`client-secret` needs `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_SECRET`; `client-certificate` needs
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_CERTIFICATE_PATH`; `managed-identity` applies when
+`IDENTITY_ENDPOINT` or `MSI_ENDPOINT` is set, or when the instance metadata service at 169.254.169.254:80 answers
+`GET /metadata/instance` with an Azure instance document (Google Cloud and AWS VMs answer that address too and are not
+taken for Azure); `cli` always applies. A member that fails to produce a token (an identity not assigned to the VM, a
+rejected secret, `az` not installed) is passed over and the next is tried. The member that works is remembered for the
+process, but not trusted blindly: if it later fails to produce a token, the chain is run again for that request, so a
+working member further down is found without a restart (the member that just failed is left to the end of that request's
+re-run: asked again only if nothing else works). If none works the error lists each member tried and why. A
+configured service principal (workload identity, client secret, client certificate) that fails is logged at `warn`
+level before `auto` moves on. The managed-identity attempt has its own deadline, `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`
+(default 5000): the SDK retries a 404/410/5xx from the instance metadata service with back-off for about 72 s, which
+is too long to wait before trying `az`. The same deadline applies when a managed identity that already won stalls on a
+later token refresh (the chain is then run again with the managed identity left to the end, so a stall costs one deadline
+when another member works, and a lone managed identity still gets its second try). A request forgets the winner only if it
+is still the one that request used, which protects a newer winner of a different mode; a re-installed winner of the same
+mode is the same credential object, so a late failure can still clear it once, costing one extra chain run. **Only managed identity has a deadline of its own.** The other members are bounded by what the Azure SDK
+does: workload identity, client secret and client certificate make HTTPS requests with the SDK's 20 s connect and 60 s
+read timeouts (per request, retries not counted), while `az`/`azd` is a subprocess that `azure_identity` 1.0.0 waits for
+with no timeout at all, so a hung `az` hangs the token request. The metadata probe runs off the async runtime's workers and is bounded: at
+most 250 ms to connect plus one 250 ms deadline to read the answer (under 0.5 s). It runs only when nothing else
+decides the managed-identity question, and a "not Azure" answer is believed for 30 s, so a failing chain does not
+probe on every request. **Changed in this release:** before, the default was `az`/`azd` only and the
+`AZURE_*` service-principal variables were ignored; with `auto` they are now honoured, and a host that is on Azure
+tries its managed identity before `az`. Set `S3DLIO_AZURE_CREDENTIAL=cli` for the old behaviour.
+
+`AZURE_AUTHORITY_HOST` (default `https://login.microsoftonline.com`; it must be `https`) is read by the SDK for
+`client-secret`, `client-certificate` and `workload-identity`. Each credential is created once per process and shared
+for the life of the process, so the SDK caches and refreshes its tokens; a rotated secret, certificate or federated
+token file is not picked up until the process restarts. The bearer token itself is cached by each cached per-account
+client (at most 64) until it nears expiry. Only `cli` runs a process (per token request, not per object). A request
+rejected with 401 or 403 and a failed token request both name the credential mode in the error.
+A bearer-token mode needs an `https` endpoint (the SDK refuses a token over `http`); use `sas` or `none` for an
+`http` endpoint. The SAS token is never logged and is removed from error messages. Not read: `AZURE_STORAGE_ACCOUNT`,
+`AZURE_STORAGE_KEY` and connection strings. Account-key (Shared Key) authentication is **not supported**: the Azure SDK in
+use (`azure_storage_blob` 1.0 / `azure_core` 1.1) can only sign requests with bearer tokens or use a SAS.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AZURE_STORAGE_ACCOUNT` | (unset) | Azure storage account name |
-| `AZURE_STORAGE_KEY` | (unset) | Azure storage account key |
-| `AZURE_CLIENT_ID` | (unset) | Azure AD client ID (for service principal auth) |
-| `AZURE_CLIENT_SECRET` | (unset) | Azure AD client secret |
-| `AZURE_TENANT_ID` | (unset) | Azure AD tenant ID |
+| `S3DLIO_AZURE_CREDENTIAL` | `auto` | Credential mode (above) |
+| `S3DLIO_AZURE_SAS_TOKEN` | (unset) | SAS token for `sas` mode |
+| `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS` | `5000` | In `auto`, how long to wait for a managed-identity token (first attempt, or the refresh of a managed identity that already won) before trying the next member |
 | `AZURE_STORAGE_ENDPOINT` | (unset) | **Custom Azure endpoint** (e.g., `http://localhost:10000` for Azurite) |
 | `AZURE_BLOB_ENDPOINT_URL` | (unset) | Alternative for `AZURE_STORAGE_ENDPOINT` |
 | `S3DLIO_AZURE_DOWNLOAD_MODE` | `auto` | Download strategy: `auto`, `azure-sdk`, `s3dlio`, or `sequential` |
 | `S3DLIO_AZURE_CONCURRENT_ENGINE` | `azure-sdk` | Concurrent engine selected by `auto`: `azure-sdk` or `s3dlio` |
-| `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB` | `32` | Object size at which `auto` enables its concurrent engine |
+| `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB` | `32` | Object size at which `auto` switches from one stream to the concurrent engine. In the default mode (`auto` with the `azure-sdk` engine) no size is looked up: every blob is read with the SDK's managed download, which is one request up to the partition size (`S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB`) and concurrent above it, so the threshold only matters with `S3DLIO_AZURE_CONCURRENT_ENGINE=s3dlio` (or the legacy `enable_range_engine`), where it is compared with a `HEAD` size |
 | `S3DLIO_AZURE_DOWNLOAD_CONCURRENCY` | `16` | Parallel requests used by Azure SDK managed downloads |
 | `S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB` | `32` | Partition size used by Azure SDK managed downloads |
 
@@ -587,6 +639,12 @@ sai3-bench util ls gs://testbucket/
 export GCS_ENDPOINT_URL=http://localhost:9002
 sai3-bench util ls gs://testbucket/
 ```
+
+## Test and Release-Validation Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_REQUIRE_FULL_BACKENDS` | (unset) | Read by `python/tests/test_full_backend_azure_gcs.py` only (not by the library). Unset or empty: the file is skipped on a wheel built without the Azure/GCS backends. `1`, `true`, `yes` or `on` (case-insensitive): a missing backend **fails** every test, so an all-skipped run cannot pass for a release gate. `0`, `false`, `no` or `off`: skip, explicitly. Any other value is also a failure (a mistyped flag must not turn into a silent skip). Set it for any run meant to exercise `./build_pyo3.sh full`, and check the run's pass count too. |
 
 ## Usage Examples
 

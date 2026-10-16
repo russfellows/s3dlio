@@ -31,6 +31,23 @@ pub const DEFAULT_AZURE_DOWNLOAD_PART_SIZE: usize = 32 * 1024 * 1024;
 /// Default Azure SDK managed-download concurrency.
 pub const DEFAULT_AZURE_DOWNLOAD_CONCURRENCY: usize = 16;
 
+/// Smallest partition size a sequential Azure download plans its requests with (32 MiB).
+///
+/// A cached object size is only a hint, and may be stale. The SDK splits a download into
+/// partitions of the size it is given, so a stale 0- or 1-byte hint turned a re-read of a blob
+/// that had grown to 1 MiB into about a million one-byte requests. The partition size is
+/// therefore never smaller than this, whatever the hint says.
+pub const AZURE_MIN_DOWNLOAD_PARTITION_SIZE: usize = 32 * 1024 * 1024;
+
+/// Largest buffer an Azure range read reserves up front (128 MiB), however long a range the
+/// caller asked for. The buffer still grows if the server sends more, so this only bounds what
+/// a caller-chosen length (`get_range(.., Some(1 << 40))` to mean "to the end") can reserve.
+pub const AZURE_RANGE_PRESIZE_MAX: u64 = 128 * 1024 * 1024;
+
+/// Most Azure service clients (one per account URL) kept for reuse; see
+/// `azure_client::AzureBlob::with_default_credential_from_url`.
+pub const AZURE_SERVICE_CLIENT_CACHE_MAX: usize = 64;
+
 /// Selects `auto`, `azure-sdk`, `s3dlio`, or `sequential` Azure downloads.
 pub const ENV_AZURE_DOWNLOAD_MODE: &str = "S3DLIO_AZURE_DOWNLOAD_MODE";
 
@@ -833,6 +850,44 @@ pub const ENV_AZURE_STORAGE_ENDPOINT: &str = "AZURE_STORAGE_ENDPOINT";
 /// Alternative environment variable for custom Azure Blob Storage endpoint
 /// Example: AZURE_BLOB_ENDPOINT_URL=http://localhost:10000
 pub const ENV_AZURE_BLOB_ENDPOINT_URL: &str = "AZURE_BLOB_ENDPOINT_URL";
+
+// =============================================================================
+// Azure credential selection (issue #253)
+// =============================================================================
+
+/// Selects the Azure credential: auto | cli | managed-identity | client-secret |
+/// client-certificate | workload-identity | sas | none (case-insensitive).
+pub const ENV_AZURE_CREDENTIAL: &str = "S3DLIO_AZURE_CREDENTIAL";
+/// The SAS token appended to every Azure request URL in `sas` mode (leading `?` optional).
+pub const ENV_AZURE_SAS_TOKEN: &str = "S3DLIO_AZURE_SAS_TOKEN";
+/// Standard Azure identity variables s3dlio reads (see docs/Environment_Variables.md).
+pub const ENV_AZURE_CLIENT_ID: &str = "AZURE_CLIENT_ID";
+pub const ENV_AZURE_TENANT_ID: &str = "AZURE_TENANT_ID";
+pub const ENV_AZURE_CLIENT_SECRET: &str = "AZURE_CLIENT_SECRET";
+pub const ENV_AZURE_CLIENT_CERTIFICATE_PATH: &str = "AZURE_CLIENT_CERTIFICATE_PATH";
+pub const ENV_AZURE_CLIENT_CERTIFICATE_PASSWORD: &str = "AZURE_CLIENT_CERTIFICATE_PASSWORD";
+pub const ENV_AZURE_FEDERATED_TOKEN_FILE: &str = "AZURE_FEDERATED_TOKEN_FILE";
+/// Set by Azure App Service / Arc / Functions hosts that offer a managed-identity endpoint.
+pub const ENV_AZURE_IDENTITY_ENDPOINT: &str = "IDENTITY_ENDPOINT";
+/// Set by Azure ML / Cloud Shell hosts that offer a managed-identity endpoint.
+pub const ENV_AZURE_MSI_ENDPOINT: &str = "MSI_ENDPOINT";
+
+/// How long `auto` waits for the Azure instance metadata service (169.254.169.254:80) when it
+/// asks whether this is an Azure VM: this long to connect, then this long (one overall
+/// deadline) to read the answer, so a probe takes at most twice this (0.5 s). On a VM the
+/// answer is immediate; elsewhere the connection fails or times out. The probe runs on the
+/// blocking pool, and only when no other chain member decides first.
+pub const AZURE_IMDS_PROBE_TIMEOUT_MS: u64 = 250;
+
+/// How long a "the metadata service does not look like Azure" answer is believed, in seconds, so
+/// a failing `auto` chain does not probe again on every request.
+pub const AZURE_IMDS_NEGATIVE_CACHE_SECS: u64 = 30;
+
+/// Deadline for `auto`'s managed-identity attempt, in milliseconds (the SDK's own retry schedule
+/// for a metadata service that answers 404/410/5xx is about 72 s). Override with
+/// `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`.
+pub const DEFAULT_AZURE_AUTO_MI_TIMEOUT_MS: u64 = 5000;
+pub const ENV_AZURE_AUTO_MI_TIMEOUT_MS: &str = "S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS";
 
 // =============================================================================
 // GCS gRPC Read Timeout / Progress Constants

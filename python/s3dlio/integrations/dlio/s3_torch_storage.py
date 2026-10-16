@@ -60,7 +60,9 @@ class S3PyTorchConnectorStorage(S3Storage):
         AWS_ENDPOINT_URL (for MinIO, Ceph, etc.)
 
     Azure (az://):
-        AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCOUNT_KEY
+        S3DLIO_AZURE_CREDENTIAL selects the credential (default auto: service principal, managed
+        identity or `az login`); the account comes from the az://account/container/path URI
+        (account-key variables are not read).
         AZURE_STORAGE_ENDPOINT (optional)
 
     GCS (gs://):
@@ -255,7 +257,7 @@ class S3PyTorchConnectorStorage(S3Storage):
         S3DLIO_MULTIPART_MAX_IN_FLIGHT, S3DLIO_DISABLE_MULTIPART).
 
         Args:
-            id: Full URI (e.g., s3://bucket/key, az://container/blob, file:///path)
+            id: Full URI (e.g., s3://bucket/key, az://account/container/blob, file:///path)
             data: bytes or BytesIO object
             offset: Not supported (full object write only)
             length: Not supported (full object write only)
@@ -304,7 +306,7 @@ class S3PyTorchConnectorStorage(S3Storage):
         Read data from storage.
 
         Args:
-            id: Full URI (e.g., s3://bucket/key, az://container/blob, file:///path)
+            id: Full URI (e.g., s3://bucket/key, az://account/container/blob, file:///path)
             data: Ignored (buffer not needed with s3dlio)
             offset: Start byte offset (optional)
             length: Number of bytes to read (optional)

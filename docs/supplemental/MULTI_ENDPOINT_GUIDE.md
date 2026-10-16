@@ -411,8 +411,8 @@ s3://bucket2/dataset
 s3://bucket3/dataset
 
 # Comments and blank lines are ignored
-az://container1/data
-az://container2/data
+az://myaccount/container1/data
+az://myaccount/container2/data
 ```
 
 Load in Rust:
@@ -497,7 +497,7 @@ vec![
 // ❌ BAD: Mixed schemes (will fail validation)
 vec![
     "s3://bucket1/data",
-    "az://container/data",  // Different scheme!
+    "az://myaccount/container/data",  // Different scheme!
     "file:///local/data",   // Different scheme!
 ]
 ```

@@ -60,6 +60,8 @@ use pyo3::prelude::*;
 pub(crate) mod delete_batch_plan; // pure URI-grouping helpers for delete_batch (#179)
 pub mod delete_contract; // delete contract A shared by s3-cli and the Python API (#210, #167, #212)
 pub mod object_store;
+#[cfg(any(feature = "backend-azure", feature = "backend-gcs", test))]
+pub(crate) mod read_buffer; // streamed-GET destination buffer, sized once (#252)
 pub(crate) mod redirect_client; // HTTP 307 redirect following (for AIStore compatibility)
 pub mod retry; // v0.9.108+ Phase 4: shared retry helper for body-transfer failures
 pub mod s3_client;
@@ -74,6 +76,8 @@ pub mod object_store_arrow;
 
 #[cfg(feature = "backend-azure")]
 pub mod azure_client;
+#[cfg(feature = "backend-azure")]
+pub mod azure_credential; // Azure credential selection (#253)
 pub mod checkpoint;
 pub mod data_gen;
 pub mod data_gen_alt; // Alternative data generation with ChaCha20

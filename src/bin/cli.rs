@@ -343,7 +343,7 @@ enum Command {
         /// One or more local files, directories, glob patterns ('*','?'), or regex patterns
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        /// Destination URI (s3://bucket/, az://container/, gs://bucket/, file:///path/, direct:///path/) **ending with '/'**
+        /// Destination URI (s3://bucket/, az://account/container/, gs://bucket/, file:///path/, direct:///path/) **ending with '/'**
         dest: String,
         /// Maximum parallel uploads (default 32, max 4096).
         /// Accepts human suffixes: k=1,000  m=1,000,000 (e.g. 32, 64, 256).

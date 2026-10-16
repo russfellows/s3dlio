@@ -24,7 +24,7 @@ use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
 use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::list_containers::list_containers as list_containers_rs;
 use crate::object_store::{
-    store_for_uri, store_for_uri_with_logger, store_routing_endpoint_for_uri,
+    get_many_with_stores, store_for_uri_with_logger, store_routing_endpoint_for_uri,
 };
 use crate::s3_client::run_on_global_rt;
 use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger, op_log_stats};
@@ -248,6 +248,26 @@ fn get_or_create_store(
         ),
         None => store,
     })
+}
+
+/// `get_many` for `az://` and `gs://`: read every URI through `get_many_with_stores`, with the
+/// stores taken from the process-wide cache ([`get_or_create_store`], issue #204: one store,
+/// and so one Azure/GCS client and connection pool, per [`StoreKey`]) and, when `logger` is
+/// `Some`, wrapped to write op-log rows exactly as `get()` does (issue #174).
+///
+/// `logger` is the caller's snapshot of `global_logger()`, taken on the calling thread
+/// BEFORE `submit_io` like every other entry point (#173/#174). The factory below runs on
+/// global-runtime workers, so it must never reach `run_on_global_rt`: `get_or_create_store`
+/// does that only for host-form `s3://` URIs, which are not az/gs.
+async fn get_many_cached_stores(
+    uris: Vec<String>,
+    max_in_flight: usize,
+    logger: Option<crate::s3_logger::Logger>,
+) -> anyhow::Result<Vec<(String, Bytes)>> {
+    get_many_with_stores(uris, max_in_flight, move |uri| {
+        get_or_create_store(uri, logger.clone())
+    })
+    .await
 }
 
 /// Submit async work to the global runtime (io_uring pattern).
@@ -1454,7 +1474,7 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 /// s3dlio.put_bytes("file:///tmp/test.bin", b"hello world")
 ///
 /// # Put bytes to Azure
-/// s3dlio.put_bytes("az://container/blob.bin", b"hello world")
+/// s3dlio.put_bytes("az://myaccount/container/blob.bin", b"hello world")
 ///
 /// # Put bytearray or any buffer-like object
 /// data = bytearray(b"hello world")
@@ -1930,54 +1950,11 @@ pub fn get_many(
                     .collect())
             }
             Scheme::Azure | Scheme::Gcs => {
-                // Use store_for_uri for Azure and GCS
-                // Submit to global runtime (io_uring pattern — never calls block_on)
-                let uris_clone = uris.clone();
-                let res = submit_io(async move {
-                    let sem = Arc::new(Semaphore::new(max_in_flight));
-                    let mut futs = FuturesUnordered::new();
-
-                    for uri in uris_clone.iter().cloned() {
-                        let sem = Arc::clone(&sem);
-                        futs.push(tokio::spawn(async move {
-                            let _permit = sem.acquire_owned().await.unwrap();
-
-                            // Use store_for_uri to get appropriate backend
-                            let store = store_for_uri(&uri)?;
-
-                            // Extract the key from the URI
-                            let key = if let Some(idx) = uri.find("://") {
-                                if let Some(slash_idx) = uri[idx + 3..].find('/') {
-                                    &uri[idx + 3 + slash_idx + 1..]
-                                } else {
-                                    ""
-                                }
-                            } else {
-                                &uri
-                            };
-
-                            if key.is_empty() {
-                                anyhow::bail!("Cannot GET: no key specified in URI: {}", uri);
-                            }
-
-                            let bytes = store.get(key).await?;
-                            Ok::<_, anyhow::Error>((uri, bytes))
-                        }));
-                    }
-
-                    let mut out = Vec::new();
-                    while let Some(res) = futs.next().await {
-                        let (uri, bytes) = res
-                            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
-                            .map_err(|e| anyhow::anyhow!("Get error: {}", e))?;
-                        out.push((uri, bytes));
-                    }
-
-                    // Maintain input order
-                    out.sort_by_key(|(u, _)| uris_clone.iter().position(|x| x == u).unwrap());
-                    Ok::<_, anyhow::Error>(out)
-                })?;
-
+                // Every Azure/GCS store's `get` takes the FULL object URI (#242), so each read
+                // is handed the URI as written. Submit to global runtime (io_uring pattern —
+                // never calls block_on).
+                let logger = global_logger();
+                let res = submit_io(get_many_cached_stores(uris.clone(), max_in_flight, logger))?;
                 Ok(res
                     .into_iter()
                     .map(|(u, b)| (u, PyBytesView::new(b)))
@@ -3857,6 +3834,48 @@ mod store_cache_logger_tests {
             assert_eq!(accepted(&first), 1, "the first logger is not used again");
         });
     }
+
+    /// Issue #242 review: `get_many` on az:// / gs:// must write op-log rows like `get()`
+    /// does. The helper is scheme-agnostic, so the test reads `file://` objects through it
+    /// (Azure and GCS need a service); the az/gs arm of `get_many` calls this same helper
+    /// (see `get_many_routes_remote_schemes_through_the_cached_store_helper`).
+    #[test]
+    fn get_many_remote_helper_writes_op_log_rows_and_reuses_the_cached_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Logger::new(dir.path().join("rows.tsv.zst").to_str().unwrap()).unwrap();
+        let uris: Vec<String> = (0..6)
+            .map(|i| {
+                let f = dir.path().join(format!("obj{i}.bin"));
+                std::fs::write(&f, format!("data{i}")).unwrap();
+                format!("file://{}", f.display())
+            })
+            .collect();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let got = rt
+            .block_on(get_many_cached_stores(uris.clone(), 3, Some(log.clone())))
+            .unwrap();
+        assert_eq!(got.len(), uris.len());
+        assert_eq!(
+            log.stats().accepted,
+            uris.len() as u64,
+            "RED: get_many wrote no op-log row per object"
+        );
+
+        // Every URI under one store key is served by the SAME cached store (not a store built
+        // per URI), whether or not another test warmed the key first.
+        let first = get_or_create_store(&uris[0], None).unwrap();
+        for uri in &uris[1..] {
+            let other = get_or_create_store(uri, None).unwrap();
+            assert!(
+                Arc::ptr_eq(&first, &other),
+                "RED: {uri} got a different store from the cache than {}",
+                uris[0]
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4067,6 +4086,27 @@ mod issue204_store_cache_tests {
         );
     }
 
+    /// `get_many` itself must route az:// / gs:// through the cached-store helper, with the
+    /// op-log logger snapshot taken on the caller thread before `submit_io` (#173/#174).
+    #[test]
+    fn get_many_routes_remote_schemes_through_the_cached_store_helper() {
+        let body = entry_point_source("get_many");
+        assert!(
+            !body.contains("store_for_uri(") && !body.contains("store_for_uri_with_logger("),
+            "RED: get_many builds a store per URI with the factory"
+        );
+        let logger = body
+            .find("global_logger()")
+            .expect("RED: get_many never takes the op-log logger snapshot");
+        let helper = body
+            .find("get_many_cached_stores(")
+            .expect("RED: get_many does not call get_many_cached_stores");
+        assert!(
+            logger < helper,
+            "RED: the logger snapshot must be taken before get_many_cached_stores is called"
+        );
+    }
+
     /// Source of the entry point `name`: from its `fn` line to the closing brace at
     /// column 0.
     fn entry_point_source(name: &str) -> String {
@@ -4092,6 +4132,8 @@ mod issue204_store_cache_tests {
             "put_bytes_async",
             "mkdir_async",
             "put_many_async",
+            // `get_many` for az:// / gs:// goes through this helper (#242 review).
+            "get_many_cached_stores",
         ] {
             let body = entry_point_source(name);
             assert!(
