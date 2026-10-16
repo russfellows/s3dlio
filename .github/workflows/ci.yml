@@ -102,10 +102,12 @@ jobs:
           done
           zstd --version
 
+      # Same feature set as the PyPI wheels (.github/workflows/publish-pypi.yml):
+      # S3 + Azure + file/direct. GCS is not in the PyPI build (git dependencies).
       - name: Build (Python)
         run: |
           pip install maturin
-          maturin build --release --out dist --features extension-module
+          maturin build --release --out dist --features extension-module,backend-azure
           pip install dist/*.whl
       
       - name: Test (Python - Basic)
@@ -117,6 +119,19 @@ jobs:
         run: |
           python -c "import s3dlio; data = s3dlio.generate_data(1024*1024); view = memoryview(data); print(f'✓ Zero-copy memoryview: {len(view)} bytes')"
           python -c "import s3dlio; buf = bytearray(1024); n = s3dlio.generate_into_buffer(buf); print(f'✓ Zero-copy write: {n} bytes')"
+
+      # The Azure backend is in the wheel built above (as in the PyPI wheels), so a
+      # wheel without it must FAIL here, not skip: S3DLIO_REQUIRE_FULL_BACKENDS=1.
+      # The one GCS test in the file is deselected (GCS is not in this wheel). The
+      # tests talk to a local fake Blob service; no Azure account or network is used.
+      # NOTE: written without being able to run GitHub Actions.
+      - name: Test (Python - Azure backend)
+        env:
+          S3DLIO_REQUIRE_FULL_BACKENDS: "1"
+        run: |
+          pip install pytest
+          python -m pytest -q -rs python/tests/test_full_backend_azure_gcs.py \
+            --deselect python/tests/test_full_backend_azure_gcs.py::test_gcs_backend_is_compiled_in_and_get_many_refuses_bad_batches_before_any_request
 
       # Op-log Python tests against the wheel built and installed above (the
       # wheel is the artifact that exercises the PyO3 boundary: init/finalize,

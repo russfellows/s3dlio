@@ -706,6 +706,17 @@ Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `A
   `expect_err`. No behaviour change. (The integration tests under `tests/` use native-backend APIs and
   do not compile under `--no-default-features --features arrow-backend`; that is unchanged.)
 
+### Changed (packaging)
+
+- **The wheels published to PyPI now include the Azure backend.** Earlier wheels carried S3, file
+  and direct only, so `az://` failed with "Azure backend is not enabled" unless you built from
+  source. The PyPI wheels (and a source build of the sdist) now carry S3, Azure, file and direct.
+  GCS is still not in the PyPI wheels (its client uses git dependencies); build it with
+  `./build_pyo3.sh full`. `./build_pyo3.sh` (default) now matches the PyPI set; the new `slim`
+  profile keeps the old S3-only build. CI builds the same feature set and runs the Azure tests of
+  `python/tests/test_full_backend_azure_gcs.py` against that wheel, failing (not skipping) if
+  Azure is missing.
+
 ### Changed (API)
 
 - `memory::AlignedBuf::new(len, align)` now returns `Result<AlignedBuf, AlignedAllocError>` instead of

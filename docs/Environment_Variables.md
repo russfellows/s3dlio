@@ -709,7 +709,7 @@ sai3-bench util ls gs://testbucket/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3DLIO_REQUIRE_FULL_BACKENDS` | (unset) | Read by `python/tests/test_full_backend_azure_gcs.py` only (not by the library). Unset or empty: the file is skipped on a wheel built without the Azure/GCS backends. `1`, `true`, `yes` or `on` (case-insensitive): a missing backend **fails** every test, so an all-skipped run cannot pass for a release gate. `0`, `false`, `no` or `off`: skip, explicitly. Any other value is also a failure (a mistyped flag must not turn into a silent skip). Set it for any run meant to exercise `./build_pyo3.sh full`, and check the run's pass count too. |
+| `S3DLIO_REQUIRE_FULL_BACKENDS` | (unset) | Read by `python/tests/test_full_backend_azure_gcs.py` only (not by the library). Unset or empty: the Azure tests are skipped on a wheel built without the Azure backend (and the GCS test on one without GCS). `1`, `true`, `yes` or `on` (case-insensitive): a missing backend **fails** every test, so an all-skipped run cannot pass for a release gate. `0`, `false`, `no` or `off`: skip, explicitly. Any other value is also a failure (a mistyped flag must not turn into a silent skip). Set it for any run meant to exercise a wheel with Azure (the PyPI/`./build_pyo3.sh` default wheel: the Azure tests need only Azure; the one GCS test needs `./build_pyo3.sh full` and is deselected otherwise), and check the run's pass count too. |
 
 ## Usage Examples
 

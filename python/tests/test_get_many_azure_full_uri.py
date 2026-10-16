@@ -9,7 +9,7 @@ HTTP server on 127.0.0.1 that plays the part of Blob storage (an ``http``
 endpoint is used without credentials).  The server records every request path,
 so the test can check that the requests went to ``/<account>/<container>/<key>``.
 
-The wheel must be built with the Azure backend (``./build_pyo3.sh full``); the
+The wheel must be built with the Azure backend (``./build_pyo3.sh`` default or ``full``); the
 test is skipped on a wheel without it.  GCS has no equivalent local stand-in
 (its client needs Google credentials), so ``gs://`` is covered only by the Rust
 unit tests of ``object_store::get_many_with_stores``.

@@ -25,20 +25,21 @@ all = ["torch>=2.0.0", "jax>=0.4.0", "jaxlib>=0.4.0", "tensorflow>=2.16.0"]
 # ── Optional Rust-feature extras ─────────────────────────────────────────────
 # NOTE: Pre-built wheels from PyPI do NOT include these features.
 # To install with these features you must build from source (see README).
-# NOTE (maintainers): default published wheel is S3-focused; full backends are
-# source-build-only for now via `--features extension-module,full-backends`.
+# NOTE (maintainers): the published wheel carries S3 + Azure (`extension-module,backend-azure`);
+# GCS is source-build-only via `--features extension-module,full-backends`. maturin uses
+# [tool.maturin] features below only when no `--features` is on its command line.
 # The Python dependencies below are listed for clarity; the Rust features are
 # enabled by setting the MATURIN_PEP517_ARGS environment variable.
 #
 # Quick how-to (requires libhdf5-dev / libhwloc-dev system packages):
 #   uv pip install "s3dlio[hdf5]"  --no-binary s3dlio \
-#       --config-settings "cargo-extra-args=--features hdf5,extension-module"
+#       --config-settings "cargo-extra-args=--features hdf5,extension-module,backend-azure"
 #
 #   uv pip install "s3dlio[numa,hdf5]" --no-binary s3dlio \
-#       --config-settings "cargo-extra-args=--features numa,hdf5,extension-module"
+#       --config-settings "cargo-extra-args=--features numa,hdf5,extension-module,backend-azure"
 #
 # Or via environment variable:
-#   MATURIN_PEP517_ARGS="--features numa,hdf5,extension-module" \
+#   MATURIN_PEP517_ARGS="--features numa,hdf5,extension-module,backend-azure" \
 #       uv pip install "s3dlio[numa,hdf5]" --no-binary s3dlio
 hdf5 = ["h5py>=3.0.0"]  # HDF5 read support; native HDF5 gen needs --features hdf5 (libhdf5-dev)
 numa = []               # NUMA topology; needs --features numa (libhwloc-dev)
@@ -59,7 +60,7 @@ build-backend = "maturin"
 module-name   = "s3dlio._pymod"   # put the .so inside the s3dlio package
 python-source = "python"
 python-packages = ["s3dlio"]      # <-- NOTE the key name
-features = ["extension-module"]    # ensure extension-module feature is enabled
+features = ["extension-module", "backend-azure"]  # extension-module is required; backend-azure so sdist/source installs match the PyPI wheel (S3 + Azure)
 
 [tool.uv.workspace]
 members = ["python3.12"]

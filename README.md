@@ -46,8 +46,8 @@ pip install s3dlio
 
 - If using `uv` package manager + `uv` virtual environment: `uv pip install s3dlio`.
 - If using standard `pip` without `uv`: `pip install s3dlio`.
-- The default published wheel is now S3-focused (Azure Blob and GCS are excluded).
-- If you want full backends (S3 + Azure Blob + GCS), build from source with:
+- The PyPI wheels include S3, Azure Blob, file and direct. GCS is not in them (it needs git dependencies).
+- If you also want GCS (S3 + Azure Blob + GCS), build from source with `./build_pyo3.sh full`, or:
 
 ```bash
 # uv workflow:
@@ -57,9 +57,7 @@ uv pip install s3dlio --no-binary s3dlio --config-settings "cargo-extra-args=--f
 pip install s3dlio --no-binary s3dlio --config-settings "cargo-extra-args=--features extension-module,full-backends"
 ```
 
-You can still add a separate package name (for example `s3dlio-full`) later if you want a dedicated prebuilt full wheel distribution.
-
-> Maintainer note: for PyPI uploads, publish the default (`./build_pyo3.sh`) wheel unless intentionally releasing a separate distribution. `full-backends` is currently source-build only via the command above.
+> Maintainer note: the PyPI workflow builds with `--features extension-module,backend-azure`; `./build_pyo3.sh` (default) builds the same backend set. maturin ignores the `features` in `pyproject.toml` whenever `--features` is given on the command line, so keep the two in step. `full-backends` (GCS) is source-build only.
 
 ### Building from Source (Rust)
 
@@ -198,13 +196,14 @@ cargo test
 
 Rust backend feature profiles:
 
-- Default build (`cargo build --release`): S3-focused default backend set.
+- Default build (`cargo build --release`): S3-focused default backend set (Azure needs `--features backend-azure`; the PyPI wheels add it).
 - GCS-enabled build (`--features backend-gcs`): enables GCS in addition to default set.
 - Full cloud build (`--features full-backends`): enables AWS + Azure + GCS.
 
 Python wheel build profiles via `build_pyo3.sh`:
 
-- `default` or `slim`: AWS + file/direct; excludes Azure and GCS.
+- `default`: AWS + Azure + file/direct (the PyPI wheel's backend set); excludes GCS.
+- `slim`: AWS + file/direct only; excludes Azure and GCS.
 - `full`: AWS + Azure + GCS + file/direct.
 - Positional and named forms are equivalent:
     - `./build_pyo3.sh full`

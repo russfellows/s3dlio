@@ -95,7 +95,8 @@ Also update `docs/Changelog.md` in the same commit as the version bump.
   for this repo.
 - Example:
   ```bash
-  ./build_pyo3.sh          # AWS + file/direct backends (default/slim)
+  ./build_pyo3.sh          # AWS + Azure + file/direct (same as the PyPI wheels)
+  ./build_pyo3.sh slim     # AWS + file/direct only
   ./build_pyo3.sh full     # + Azure + GCS
   uv run pytest tests/...  # run Python tests against the built wheel
   ```

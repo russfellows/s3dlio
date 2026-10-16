@@ -1,5 +1,7 @@
-"""Release validation for the full-backend wheel (``./build_pyo3.sh full``): the Azure and GCS
-code paths that can run offline, through the real Python boundary.
+"""Release validation for the Azure (PyPI / ``./build_pyo3.sh``) and full-backend
+(``./build_pyo3.sh full``) wheels: the Azure and GCS code paths that can run offline, through the
+real Python boundary. The Azure tests need only the Azure backend; the one GCS test needs both
+(CI and PyPI wheels carry Azure but not GCS, and deselect that test).
 
 ``az://`` runs against a local fake Blob service (``AZURE_STORAGE_ENDPOINT`` on 127.0.0.1, http,
 so no credential is involved): put, get, range get, stat, list, delete and ``get_many``, with the
@@ -174,7 +176,21 @@ def _backend_absent(reason):
     pytest.skip(reason)
 
 
+def _require_azure():
+    """Skip (or fail under S3DLIO_REQUIRE_FULL_BACKENDS) unless the Azure backend is compiled in.
+
+    The PyPI wheels and the CI wheel carry Azure but not GCS, so the Azure tests must not
+    depend on the GCS probe in ``_require_backends``.
+    """
+    try:
+        s3dlio.stat(f"az://{ACCOUNT}/{CONTAINER}/backend-probe")
+    except Exception as e:  # noqa: BLE001
+        if "not enabled" in str(e):
+            _backend_absent("wheel was built without the Azure backend")
+
+
 def _require_backends():
+    """Require BOTH the GCS and the Azure backends (a ``./build_pyo3.sh full`` wheel)."""
     try:
         s3dlio.mkdir(
             "gs://bucket-for-backend-probe/dir"
@@ -183,11 +199,7 @@ def _require_backends():
         if "not enabled" in str(e):
             _backend_absent("wheel was built without the GCS backend")
         raise
-    try:
-        s3dlio.stat(f"az://{ACCOUNT}/{CONTAINER}/backend-probe")
-    except Exception as e:  # noqa: BLE001
-        if "not enabled" in str(e):
-            _backend_absent("wheel was built without the Azure backend")
+    _require_azure()
 
 
 def uri(key):
@@ -199,7 +211,7 @@ def payload(n, seed=1):
 
 
 def test_azure_put_get_range_stat_list_delete_round_trip(fake):
-    _require_backends()
+    _require_azure()
     small, big = payload(1000), payload(3 * 1024 * 1024 + 17, 7)
     s3dlio.put_bytes(uri("dir/small.bin"), small)
     s3dlio.put_bytes(uri("dir/big.bin"), big)
@@ -218,7 +230,7 @@ def test_azure_put_get_range_stat_list_delete_round_trip(fake):
 
 
 def test_azure_get_many_makes_one_get_per_blob_and_no_head(fake):
-    _require_backends()
+    _require_azure()
     keys = [f"many/o{i}.bin" for i in range(8)]
     for i, k in enumerate(keys):
         s3dlio.put_bytes(uri(k), payload(2000 + i, i))
@@ -236,7 +248,7 @@ def test_azure_get_many_makes_one_get_per_blob_and_no_head(fake):
 def test_azure_overwritten_blob_is_read_correctly_with_few_requests(fake):
     """The stale-size scenario from the Blue review, through the wheel: a blob read at one
     byte, then replaced by a 1.5 MiB one, must come back whole in a handful of requests."""
-    _require_backends()
+    _require_azure()
     s3dlio.put_bytes(uri("grow.bin"), b"x")
     assert bytes(s3dlio.get(uri("grow.bin"))) == b"x"
     big = payload(1_500_000, 3)
@@ -255,7 +267,7 @@ def test_azure_overwritten_blob_is_read_correctly_with_few_requests(fake):
 
 
 def test_azure_get_many_error_names_the_failing_uri_and_stops_the_batch(fake):
-    _require_backends()
+    _require_azure()
     s3dlio.put_bytes(uri("ok.bin"), b"ok")
     missing = uri("missing/none.bin")
     with pytest.raises(RuntimeError) as info:
@@ -281,7 +293,7 @@ def test_gcs_backend_is_compiled_in_and_get_many_refuses_bad_batches_before_any_
 
 def test_azure_deleting_a_missing_blob_succeeds_and_recursive_delete_works(fake):
     """The idempotent-delete contract through the wheel (the typed BlobNotFound must survive)."""
-    _require_backends()
+    _require_azure()
     s3dlio.delete(uri("never/existed.bin"))  # no error
     for i in range(3):
         s3dlio.put_bytes(uri(f"tree/o{i}.bin"), payload(100 + i, i))
@@ -295,7 +307,7 @@ def test_azure_deleting_a_missing_blob_succeeds_and_recursive_delete_works(fake)
 def test_azure_list_containers_refuses_malformed_accounts_before_any_request(
     fake, monkeypatch
 ):
-    _require_backends()  # (this probe itself makes a request to the fake)
+    _require_azure()  # (this probe itself makes a request to the fake)
     fake.requests.clear()
     monkeypatch.delenv("AZURE_STORAGE_ENDPOINT")  # the strict, host-name rule
     # A bearer-token mode with no variables: if a credential were built, the error would be about
@@ -312,7 +324,7 @@ def test_azure_list_containers_refuses_malformed_accounts_before_any_request(
 
 
 def test_azure_malformed_account_names_are_refused_before_any_request(fake):
-    _require_backends()
+    _require_azure()
     fake.requests.clear()
     for bad in ("az://attacker.example#/c/k", "az://a?b/c/k", "az://acct@evil/c/k"):
         with pytest.raises(RuntimeError, match="invalid Azure account"):
