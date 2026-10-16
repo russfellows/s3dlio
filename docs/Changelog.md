@@ -33,7 +33,7 @@ Added and Fixed):
   generated TFRecord files now carry CRC-32C. Checksums stored by earlier releases must be recomputed.
 - **The `direct://` bounce-pool default is 4 pairs x 16 MiB per NUMA node (was 1 pair x 64 MiB).**
   Same memory budget; provisional, from a model and not a hardware measurement.
-- **Python checkpoint checksums (final review F2).** Streamed shards now keep their checksum into the
+- **Python checkpoint checksums.** Streamed shards now keep their checksum into the
   manifest, and `load_latest_manifest()` returns it. `read_shard_by_rank`,
   `PyCheckpointStore.load_latest()` and `s3dlio.load_checkpoint(uri)` validate against it and raise
   on a mismatch, and `finalize_distributed_checkpoint` refuses a malformed checksum string.
@@ -75,7 +75,7 @@ Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `A
   needs a race-free environment loads the file (or sets the real environment) at the very start of the
   process, and forked children inherit the parent's resolved policy. `import s3dlio` now imports the native module first, outside any `try`, so if it fails the caller sees that error instead of PyO3's "initialized once" message from a second attempt. `s3-cli` prints a
   warning on stderr when `S3DLIO_LOAD_DOTENV` names a file it cannot read. Documented in the README and
-  `docs/Environment_Variables.md`. Review round 7: the file is now also loaded before the
+  `docs/Environment_Variables.md`. The file is also loaded before the
   independently public entry points that read or change a setting, not only before the S3 client
   wrapper. Calling `set_s3_endpoint_override` first no longer lets an `AWS_ENDPOINT_URL_S3` that only
   the file defines override the endpoint you just set; `build_smithy_http_client` /
@@ -179,7 +179,7 @@ Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `A
   feature the mode reports that. Shared Key (account key) is still not supported: `azure_storage_blob` 1.0 cannot sign with
   it. Tested end to end against local fake Entra ID, App Service managed-identity and Blob services (HTTPS with a throwaway
   CA): managed identity, client secret, `auto`, workload identity, client certificate and SAS, including one token
-  request per credential for many blob requests. Not tested: real Azure, the real instance-metadata address (the SDK
+  request per credential for many blob requests. Tested against real Azure Blob only with the `cli` and `auto` (CLI) credentials. Not tested: managed identity on a real Azure host, the real instance-metadata address (the SDK
   hard-codes it; the probe is tested against a local stand-in), and a real AKS federated token. The `auto` metadata probe
   checks for an Azure instance document: an earlier draft accepted any connection to 169.254.169.254, which on a Google
   Cloud VM selected managed identity and made an Azure test wait about 400 s.
@@ -195,9 +195,9 @@ Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `A
   against 0.79 s on `file://`), and a GET read it 4 KiB per `read()`. A page-aligned source buffer is now
   written straight from the caller's memory in one `write` (split only at Linux's 2 GiB per-call limit); any
   other source is copied once through a warm, reused, page-aligned bounce buffer from a process-wide pool, one
-  ping-pong pair per NUMA node shared by PUTs and GETs (the copy of chunk k+1 overlaps the write of chunk k;
-  64 MiB buffers by default, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` 4..=64, `..._PAIRS_PER_NODE`, `..._WHEN_BUSY`;
-  the POOLED bounce memory is `nodes x pairs x 2 x size`; that bound covers the pooled path only, see round 7 and
+  ping-pong pairs per NUMA node shared by PUTs and GETs (the copy of chunk k+1 overlaps the write of chunk k;
+  16 MiB buffers and 4 pairs per node by default (see the bounce-pool default entry), `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` 4..=64, `..._PAIRS_PER_NODE`, `..._WHEN_BUSY`;
+  the POOLED bounce memory is `nodes x pairs x 2 x size`; that bound covers the pooled path only, see
   `docs/Environment_Variables.md`). A GET returns
   page-aligned memory: by default it reads straight into one fresh aligned buffer, so a `direct://` GET followed
   by a `direct://` PUT needs no bounce copy of the body for objects of at least `min_io_size` (only the final
@@ -244,7 +244,7 @@ Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `A
   for the GIL, and never inferred from `PyGILState_Check`). `put_bytes` waits after the store returned;
   the awaitable of `put_bytes_async(borrow=True)` is a `Future` that never reaches a terminal state
   (result, error or cancellation) until then under the supported consumer operations (`await`, `cancel`,
-  `Task.cancel`, `asyncio.timeout`, `wait_for`; see the round-7 entries). Forcing completion with
+  `Task.cancel`, `asyncio.timeout`, `wait_for`; see the borrowed-put entries). Forcing completion with
   `set_result` / `set_exception` (or the base-class methods) is unsupported and is not covered. So reusing the buffer after `CancelledError`
   is safe (cancelling waits for a running native write to finish). `put_bytes` waits at most 30 s and then raises
   `ExportStillReferencedError`; the awaitable warns at each missed deadline and keeps waiting
@@ -257,7 +257,7 @@ Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `A
   conversion as `put_bytes()`: any C-contiguous buffer of any item type is read in place, with NO copy made by
   the Python layer and the GIL RELEASED; the export is released before the call returns. `write_owned_bytes()` is
   now the same as `write_chunk()` (a behaviour change: it used to snapshot; `copy=True` restores that, see the
-  round-7 entry). `MultipartUploadWriter.write()` borrows the buffer the same way and copies it
+  borrowed-writer entry). `MultipartUploadWriter.write()` borrows the buffer the same way and copies it
   once, with the GIL released, into its part buffers (parts are uploaded asynchronously and outlive the call, so
   a borrowed Python buffer cannot be handed to them). The same contract as `put_bytes()` applies: do not modify
   the buffer from another thread during the call (a data race). **Not changed:** the legacy community GCS client
@@ -362,7 +362,7 @@ Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `A
   the terminal state until the barrier is satisfied. (2) The guard is built before the put is spawned, and every
   error path of `put_bytes_async` releases the export before raising. (3) A barrier timeout of the blocking `put_bytes` raises
   `s3dlio.ExportStillReferencedError` (new; `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`, default 30 s, not signal
-  interruptible) instead of succeeding (the async awaitable no longer raises it: see round 7). (4) The async barrier never attaches to Python by itself (the result
+  interruptible) instead of succeeding (the async awaitable no longer raises it; it stays pending and warns instead). (4) The async barrier never attaches to Python by itself (the result
   delivery, inside the interpreter-exit gate of #192, releases the export); after interpreter shutdown began a
   `put_bytes` that holds the GIL still releases its export. (5) A `direct://` PUT cancelled while it waits for
   bounce buffers leaves the previous object intact: the target is created/truncated only after the buffers are
@@ -610,7 +610,7 @@ Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `A
   now records a compressing writer's shard under its stored name (`...bin.zst`); it used to look for
   the name without the extension and fail.
 
-- **Python checkpoints kept no checksum (final review F2).** A streamed shard's writer computes a
+- **Python checkpoints kept no checksum.** A streamed shard's writer computes a
   `crc32c:` of the logical bytes, but the Python layer dropped it at every step: the dict returned by
   `CheckpointStream.finalize()` had no `checksum`, `finalize_distributed_checkpoint` wrote
   `"checksum": null` into the manifest (even when the caller supplied one), `load_latest_manifest()`
@@ -642,7 +642,7 @@ Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `A
   `plain.bin.zst`); the exceptions are keys already ending in `.zst` (above) and, for `file://`, a name
   ending in a dot (`a.`), which is now `a..zst`, the same as `direct://` and the manifest.
 
-- **The Python `CheckpointStream.finalize` result names the stored shard (R10b).** With a compressing
+- **The Python `CheckpointStream.finalize` result names the stored shard.** With a compressing
   store (`PyCheckpointStore(uri, compression_level=N)`) the streaming writer stores `rank-N.bin.zst`,
   but `finalize` statted and returned the un-suffixed `rank-N.bin`, so it failed after a successful
   write or described an older uncompressed object left at that name. It now records the stored name
@@ -741,14 +741,14 @@ statements; this list only points at them.
 - **Azure.** Shared Key (account key) authentication is still not supported; credentials are created
   once per process (a rotated secret needs a restart); a cached client keeps its bearer token until it
   nears expiry and at most 64 account clients are cached; an unguarded read trusts one `HEAD` (no ETag
-  or `If-Match`) and `AzureBlob::stat` reads a `HEAD` without `Content-Length` as size 0; real Azure,
-  the real instance-metadata address and a real AKS token were not tested; `client-certificate` needs
+  or `If-Match`) and `AzureBlob::stat` reads a `HEAD` without `Content-Length` as size 0; managed identity on a real Azure host,
+  the real instance-metadata address and a real AKS token were not tested (real Azure Blob was tested with the CLI credential); `client-certificate` needs
   the `azure-client-certificate` feature.
 - **GCS.** The legacy community GCS client (`gcs-community`) still copies the payload once per PUT
   (#254); `get_many_async()` and `get_many_stats()` still refuse non-S3 URIs; the `gs://` paths of
   `get_many` and the gRPC range sizing are covered by unit tests only, and the GET receive-buffer
   change (#252) was not measured for throughput.
-- **Checkpoint compressed-shard naming (R10b).** With compression on, the keys `a` and `a.zst` both
+- **Checkpoint compressed-shard naming.** With compression on, the keys `a` and `a.zst` both
   store `a.zst`; with compression off, a key ending in `.zst` stores raw bytes under that name and the
   checkpoint `Reader` cannot read it back.
 - **Arrow backend.** `delete` / `delete_prefix` do not work on endpoints without `DeleteObjects` (GCS
