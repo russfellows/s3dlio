@@ -9,9 +9,10 @@ built (proving the GCS backend is compiled in) and ``get_many`` refuses bad batc
 request. By default the whole file is skipped on a wheel built without the backends, so it can
 sit beside the slim-wheel tests.
 
-``S3DLIO_REQUIRE_FULL_BACKENDS=1`` (also ``true``/``yes``/``on``) turns that skip into a failure:
-set it in every release or CI run that is meant to exercise the full-backend wheel, where an
-all-skipped file would otherwise pass without proving anything. Check the run's pass count too.
+``S3DLIO_REQUIRE_FULL_BACKENDS=1`` (any non-empty value other than ``0``/``false``/``no``/``off``,
+so a mistyped value fails too) turns that skip into a failure: set it in every release or CI run
+that is meant to exercise the full-backend wheel, where an all-skipped file would otherwise pass
+without proving anything. Check the run's pass count too. See docs/Environment_Variables.md.
 """
 
 import os
@@ -156,15 +157,20 @@ def fake(monkeypatch):
 REQUIRE_FULL_BACKENDS_ENV = "S3DLIO_REQUIRE_FULL_BACKENDS"
 
 
+_EXPLICIT_OFF = ("", "0", "false", "no", "off")
+
+
 def _backend_absent(reason):
-    """Skip, or fail when the run is declared to need the full-backend wheel."""
-    if os.environ.get(REQUIRE_FULL_BACKENDS_ENV, "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        pytest.fail(f"{REQUIRE_FULL_BACKENDS_ENV} is set but {reason}", pytrace=False)
+    """Skip, or fail when the run is declared to need the full-backend wheel.
+
+    Unset, empty or an explicit off value (0/false/no/off) skips; any other value fails, so a
+    mistyped flag cannot turn an all-skipped run into a pass.
+    """
+    value = os.environ.get(REQUIRE_FULL_BACKENDS_ENV, "").strip().lower()
+    if value not in _EXPLICIT_OFF:
+        pytest.fail(
+            f"{REQUIRE_FULL_BACKENDS_ENV}={value!r} is set but {reason}", pytrace=False
+        )
     pytest.skip(reason)
 
 
@@ -312,3 +318,25 @@ def test_azure_malformed_account_names_are_refused_before_any_request(fake):
         with pytest.raises(RuntimeError, match="invalid Azure account"):
             s3dlio.get(bad)
     assert fake.requests == []
+
+
+# The strict flag itself: a mistyped value must not turn into a silent skip.
+@pytest.mark.parametrize(
+    "value", ["1", "true", "YES", " on ", "enabled", "y", "2", "tru"]
+)
+def test_require_flag_fails_when_set_to_anything_but_an_explicit_off(
+    monkeypatch, value
+):
+    monkeypatch.setenv(REQUIRE_FULL_BACKENDS_ENV, value)
+    with pytest.raises(pytest.fail.Exception):
+        _backend_absent("backend missing")
+
+
+@pytest.mark.parametrize("value", [None, "", "  ", "0", "false", "No", "OFF"])
+def test_require_flag_skips_when_unset_empty_or_explicitly_off(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv(REQUIRE_FULL_BACKENDS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(REQUIRE_FULL_BACKENDS_ENV, value)
+    with pytest.raises(pytest.skip.Exception):
+        _backend_absent("backend missing")
