@@ -253,8 +253,13 @@ type CredentialSource =
 ///
 /// The winner is kept for the life of the process, but not trusted blindly: if the cached winner
 /// later fails to produce a token (a revoked secret, `az` logged out, or a managed identity that
-/// stalls past its deadline), the chain is run once more for that request, so a working member
-/// further down is found without a restart; only if the whole chain fails is the request an error. (The members' own credentials are still built once
+/// stalls past its deadline), the chain is run once more for that request, without asking the
+/// member that just failed a second time, so a working member further down is found without a
+/// restart; only if the whole chain fails is the request an error. Only the managed-identity
+/// member has a deadline of its own (`S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`); the others are bounded
+/// only by what the Azure SDK does: the HTTP-based ones (workload identity, client secret,
+/// client certificate) by its 20 s connect and 60 s read timeouts per request, `az`/`azd` by
+/// nothing (azure_identity 1.0.0 waits for the subprocess with no timeout). (The members' own credentials are still built once
 /// per process: a rotated secret, certificate or token file needs a restart; see
 /// [`credential_for`].)
 struct AutoCredential {
@@ -319,6 +324,32 @@ impl AutoCredential {
         Some(std::time::Duration::from_millis(ms))
     }
 
+    /// One token request to `credential` (the `mode` member), under that mode's deadline if it
+    /// has one. Used for the first attempt of a member and for a cached winner alike, so the two
+    /// cannot drift apart. A request that outlives its deadline is dropped and is an error.
+    async fn token_within_deadline(
+        &self,
+        mode: CredentialMode,
+        credential: &Arc<dyn TokenCredential>,
+        scopes: &[&str],
+        options: &Option<TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        let attempt = credential.get_token(scopes, options.clone());
+        match self.member_deadline(mode) {
+            Some(limit) => match tokio::time::timeout(limit, attempt).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(azure_core::Error::with_message(
+                    azure_core::error::ErrorKind::Credential,
+                    format!(
+                        "no token within {} ms ({ENV_AZURE_AUTO_MI_TIMEOUT_MS}); the identity endpoint did not answer in time, or kept retrying a 404/5xx",
+                        limit.as_millis()
+                    ),
+                )),
+            },
+            None => attempt.await,
+        }
+    }
+
     async fn try_member(
         &self,
         mode: CredentialMode,
@@ -335,24 +366,10 @@ impl AutoCredential {
                 return self.member_failed(mode, format!("construction panicked: {e}"), tried)
             }
         };
-        let attempt = credential.get_token(scopes, options.clone());
-        let outcome = match self.member_deadline(mode) {
-            Some(limit) => match tokio::time::timeout(limit, attempt).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    let ms = limit.as_millis();
-                    return self.member_failed(
-                        mode,
-                        format!(
-                            "no token within {ms} ms ({ENV_AZURE_AUTO_MI_TIMEOUT_MS}); the identity endpoint did not answer in time, or kept retrying a 404/5xx"
-                        ),
-                        tried,
-                    );
-                }
-            },
-            None => attempt.await,
-        };
-        match outcome {
+        match self
+            .token_within_deadline(mode, &credential, scopes, options)
+            .await
+        {
             Ok(token) => {
                 info!("Azure credential mode auto: using {mode}");
                 *self.winner.lock().unwrap_or_else(|e| e.into_inner()) = Some((mode, credential));
@@ -417,16 +434,22 @@ impl AutoCredential {
         azure
     }
 
-    /// Run the chain; the first member that yields a token wins and is remembered.
+    /// Run the chain; the first member that yields a token wins and is remembered. `skip` is a
+    /// member that has just failed (or stalled) for this very request as the cached winner: it is
+    /// not asked a second time, so a stalled managed identity costs one deadline, not two.
     async fn run_chain(
         &self,
         scopes: &[&str],
         options: &Option<TokenRequestOptions<'_>>,
+        skip: Option<CredentialMode>,
     ) -> std::result::Result<AccessToken, Vec<String>> {
         let env: &(dyn Fn(&str) -> Option<String> + Send + Sync) = &*self.env;
         let mut tried: Vec<String> = Vec::new();
         let mut managed_identity_tried = false;
         for mode in AUTO_CHAIN {
+            if skip == Some(mode) {
+                continue;
+            }
             let applies = if mode == CredentialMode::ManagedIdentity {
                 auto_member_configured(mode, env) || self.imds_says_azure().await
             } else {
@@ -442,7 +465,10 @@ impl AutoCredential {
         }
         // Nothing worked and the metadata service did not look like Azure when asked: ask again
         // if that answer has gone stale (the service can come up late on a fresh VM).
-        if !managed_identity_tried && self.imds_says_azure().await {
+        if !managed_identity_tried
+            && skip != Some(CredentialMode::ManagedIdentity)
+            && self.imds_says_azure().await
+        {
             if let Some(token) = self
                 .try_member(CredentialMode::ManagedIdentity, scopes, options, &mut tried)
                 .await
@@ -462,33 +488,33 @@ impl TokenCredential for AutoCredential {
         options: Option<TokenRequestOptions<'_>>,
     ) -> azure_core::Result<AccessToken> {
         let mut earlier: Option<String> = None;
+        let mut skip: Option<CredentialMode> = None;
         if let Some((mode, credential)) = self.winner() {
             // The same deadline as the first attempt: a managed identity that won once and then
             // stalls on a refresh must not wait out the SDK's retry schedule before the chain.
-            let attempt = credential.get_token(scopes, options.clone());
-            let outcome = match self.member_deadline(mode) {
-                Some(limit) => match tokio::time::timeout(limit, attempt).await {
-                    Ok(outcome) => outcome,
-                    Err(_) => Err(azure_core::Error::with_message(
-                        azure_core::error::ErrorKind::Credential,
-                        format!(
-                            "no token within {} ms ({ENV_AZURE_AUTO_MI_TIMEOUT_MS})",
-                            limit.as_millis()
-                        ),
-                    )),
-                },
-                None => attempt.await,
-            };
-            match outcome {
+            match self
+                .token_within_deadline(mode, &credential, scopes, &options)
+                .await
+            {
                 Ok(token) => return Ok(token),
                 Err(e) => {
                     warn!("Azure credential mode auto: the credential in use ({mode}) failed ({e}); trying the chain again");
-                    *self.winner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    // Forget it only if it is still the winner this request used: another request
+                    // may already have replaced it, and that newer winner is not ours to clear.
+                    let mut slot = self.winner.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot
+                        .as_ref()
+                        .is_some_and(|(_, c)| Arc::ptr_eq(c, &credential))
+                    {
+                        *slot = None;
+                    }
+                    drop(slot);
                     earlier = Some(format!("{mode} (previously working): {e}"));
+                    skip = Some(mode);
                 }
             }
         }
-        match self.run_chain(scopes, &options).await {
+        match self.run_chain(scopes, &options, skip).await {
             Ok(token) => Ok(token),
             Err(mut tried) => {
                 if let Some(first) = earlier {
@@ -1267,13 +1293,91 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+        // One deadline, not two: the chain did not wait on the managed identity again.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
         // The stalled winner was dropped: later requests go straight to the CLI.
         auto.get_token(&["s"], Option::None).await.unwrap();
         assert_eq!(
             called(&calls, ManagedIdentity),
-            3,
-            "first win + the stalled refresh + the chain's own (bounded) attempt, then no more"
+            2,
+            "first win + the stalled refresh; the re-run chain skips the mode that just stalled, then no more"
         );
+    }
+
+    /// A cached credential whose first call waits at a gate and then fails; later calls fail at
+    /// once. It stands for a winner that several requests hold at the same moment.
+    #[derive(Debug)]
+    struct GatedFailure {
+        calls: std::sync::atomic::AtomicUsize,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenCredential for GatedFailure {
+        async fn get_token(
+            &self,
+            _scopes: &[&str],
+            _options: Option<TokenRequestOptions<'_>>,
+        ) -> azure_core::Result<AccessToken> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.gate.notified().await;
+            }
+            Err(azure_core::Error::with_message(
+                azure_core::error::ErrorKind::Credential,
+                "revoked",
+            ))
+        }
+    }
+
+    // Two requests hold the same winner W. A's failure clears W and its chain installs W2; B's
+    // later failure must not wipe W2: it clears only the winner it actually used.
+    #[tokio::test]
+    async fn a_late_failure_does_not_clear_a_newer_winner() {
+        use CredentialMode::{Cli, ClientSecret};
+        let (auto, _calls) = scripted_auto_with(
+            vec![],
+            Arc::default(),
+            vec![],
+            std::time::Duration::from_secs(30),
+            // The CLI answers once (A's chain), then fails (so B's chain ends in an error).
+            vec![(Cli, Ok("cli-token"))],
+            |_| (std::time::Duration::ZERO, 1),
+        );
+        let auto = Arc::new(auto);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let w = Arc::new(GatedFailure {
+            calls: Default::default(),
+            gate: Arc::clone(&gate),
+        });
+        let w_dyn: Arc<dyn TokenCredential> = w.clone();
+        *auto.winner.lock().unwrap() = Some((ClientSecret, w_dyn));
+
+        // B reads W and waits inside it.
+        let b = tokio::spawn({
+            let auto = Arc::clone(&auto);
+            async move { auto.get_token(&["s"], Option::None).await.map(|_| ()) }
+        });
+        while w.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // A reads W too, fails at once, and its chain installs the CLI as the new winner.
+        let a = auto.get_token(&["s"], Option::None).await.unwrap();
+        assert_eq!(a.token.secret(), "cli-token");
+        let (mode, w2) = auto.winner().expect("A installed a new winner");
+        assert_eq!(mode, Cli);
+
+        // B's W now fails. Its chain also fails (the CLI is out of good calls): B is an error.
+        gate.notify_one();
+        assert!(b.await.unwrap().is_err());
+        let (mode_after, w2_after) = auto
+            .winner()
+            .expect("RED: B's late failure wiped the newer winner");
+        assert_eq!(mode_after, Cli);
+        assert!(Arc::ptr_eq(&w2, &w2_after), "the newer winner is untouched");
     }
 
     // If the cached winner later fails, the chain is run again for that request.
@@ -1315,8 +1419,8 @@ mod tests {
         auto.get_token(&["s"], Option::None).await.unwrap();
         assert_eq!(
             called(&calls, ClientSecret),
-            4,
-            "asked once more by the re-run (the failing call + the chain), not by later requests"
+            3,
+            "the two good calls and the failing one; the re-run chain skips the mode that just failed, and later requests do not ask it"
         );
     }
 
