@@ -36,7 +36,8 @@ Set `S3DLIO_LOAD_DOTENV=1` (or a path) to keep that behaviour.
   parent process, or set by the application before s3dlio ran) is **never overridden** by the file.
   The file only provides the variables that are missing.
 - *When* the file is read: once per process, at the first of these, which is before s3dlio reads any
-  setting (so `S3DLIO_RT_THREADS`, `S3DLIO_OPLOG_*`, `S3DLIO_ENABLE_RANGE_OPTIMIZATION`,
+  setting (so `S3DLIO_RT_THREADS`, the writer-side `S3DLIO_OPLOG_*` settings (the op-log reader's
+  `S3DLIO_OPLOG_READ_*` are not covered, see the recorded limits below), `S3DLIO_ENABLE_RANGE_OPTIMIZATION`,
   `S3DLIO_RANGE_THRESHOLD_MB`, `AWS_ENDPOINT_URL`, `AWS_REGION` ... all see the file's values):
 
   | Program | The file is read at |

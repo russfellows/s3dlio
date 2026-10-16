@@ -607,8 +607,8 @@ fn timeout_and_retry_helpers_first_call_see_the_file() {
 #[test]
 fn effective_thread_budget_first_call_sees_the_file() {
     // Called first and alone: no other helper has applied the policy before it.
-    let p = first_call("r9-budget-first", "budget_first", "S3DLIO_RT_THREADS=5\n");
-    assert_eq!(p.client, "budget=5", "{p:?}");
+    let p = first_call("r9-budget-first", "budget_first", "S3DLIO_RT_THREADS=11\n");
+    assert_eq!(p.client, "budget=11", "{p:?}");
 }
 
 #[test]
@@ -680,9 +680,9 @@ fn thread_budget_helpers_first_call_see_the_file() {
     let p = first_call(
         "r9-budget-rt",
         "thread_budget",
-        "S3DLIO_RT_THREADS=5\nWORLD_SIZE=3\n",
+        "S3DLIO_RT_THREADS=11\nWORLD_SIZE=3\n",
     );
-    assert_eq!(p.client, "world=3 budget=5", "{p:?}");
+    assert_eq!(p.client, "world=3 budget=11", "{p:?}");
     // The MPI-aware budget on its own: a world size above any CPU count gives 1.
     let p = first_call("r9-budget-aware", "aware_budget", "WORLD_SIZE=100000\n");
     assert_eq!(p.client, "aware=1", "{p:?}");
