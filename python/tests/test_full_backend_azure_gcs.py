@@ -6,9 +6,15 @@ so no credential is involved): put, get, range get, stat, list, delete and ``get
 requests the fake saw checked. ``gs://`` has no offline stand-in (its client needs Google
 credentials and a bucket-layout RPC), so only what does not touch the network runs: the store is
 built (proving the GCS backend is compiled in) and ``get_many`` refuses bad batches before any
-request. The whole file is skipped on a wheel built without the backends.
+request. By default the whole file is skipped on a wheel built without the backends, so it can
+sit beside the slim-wheel tests.
+
+``S3DLIO_REQUIRE_FULL_BACKENDS=1`` (also ``true``/``yes``/``on``) turns that skip into a failure:
+set it in every release or CI run that is meant to exercise the full-backend wheel, where an
+all-skipped file would otherwise pass without proving anything. Check the run's pass count too.
 """
 
+import os
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -147,6 +153,21 @@ def fake(monkeypatch):
         thread.join(timeout=10)
 
 
+REQUIRE_FULL_BACKENDS_ENV = "S3DLIO_REQUIRE_FULL_BACKENDS"
+
+
+def _backend_absent(reason):
+    """Skip, or fail when the run is declared to need the full-backend wheel."""
+    if os.environ.get(REQUIRE_FULL_BACKENDS_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        pytest.fail(f"{REQUIRE_FULL_BACKENDS_ENV} is set but {reason}", pytrace=False)
+    pytest.skip(reason)
+
+
 def _require_backends():
     try:
         s3dlio.mkdir(
@@ -154,13 +175,13 @@ def _require_backends():
         )  # a no-op that still builds the store
     except Exception as e:
         if "not enabled" in str(e):
-            pytest.skip("wheel was built without the GCS backend")
+            _backend_absent("wheel was built without the GCS backend")
         raise
     try:
         s3dlio.stat(f"az://{ACCOUNT}/{CONTAINER}/backend-probe")
     except Exception as e:  # noqa: BLE001
         if "not enabled" in str(e):
-            pytest.skip("wheel was built without the Azure backend")
+            _backend_absent("wheel was built without the Azure backend")
 
 
 def uri(key):
