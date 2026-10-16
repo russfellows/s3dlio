@@ -67,7 +67,8 @@
   other source is copied once through a warm, reused, page-aligned bounce buffer from a process-wide pool, one
   ping-pong pair per NUMA node shared by PUTs and GETs (the copy of chunk k+1 overlaps the write of chunk k;
   64 MiB buffers by default, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` 4..=64, `..._PAIRS_PER_NODE`, `..._WHEN_BUSY`;
-  total bounce memory is `nodes x pairs x 2 x size`, see `docs/Environment_Variables.md`). A GET returns
+  the POOLED bounce memory is `nodes x pairs x 2 x size`; that bound covers the pooled path only, see round 7 and
+  `docs/Environment_Variables.md`). A GET returns
   page-aligned memory: by default it reads straight into one fresh aligned buffer, so a `direct://` GET followed
   by a `direct://` PUT needs no bounce copy of the body for objects of at least `min_io_size` (only the final
   zero-padded 4 KiB block is bounced); `S3DLIO_DIRECT_IO_GET_MODE=pooled` reads through the pool instead.
@@ -125,6 +126,17 @@
   only a *private-allocation permit* (`BufferPool::acquire_private`, `capacity` of them, separate from the pooled
   permits, released when the read ends) and allocates its own buffer, so oversized reads are bounded in number but
   cannot starve reads that fit. New `BufferPool::buffer_len()`, `acquire_private()`, `private_available()`.
+- **Round-7 (5/6): the bounce-memory bound is stated for the pooled path only, and the implicit fallback is counted
+  (R6).** Earlier text called `nodes x pairs x 2 x size` the cap on all bounce memory and said nothing but the opt-in
+  `fallback` policy allocates beyond the pool. That was too strong: when a node's pool cannot be created or cannot
+  give the requested alignment, a `direct://` PUT (and a `get_into` read) still succeeds - **availability first** -
+  with a private per-call bounce buffer of up to one bounce size, uncounted and outside the cap. Those implicit
+  allocations are now counted in `direct_bounce::bounce_stats()` (new `implicit_fallbacks` per direction,
+  `implicit_fallback_bytes`, and the causes `pool_unavailable` / `alignment_mismatches`), the first is logged, and
+  every "hard cap" statement (module docs, `docs/Environment_Variables.md`, constants, test comments) is narrowed to
+  the pooled path, with the allocations outside it listed (opt-in `fallback` buffers, implicit buffers, aligned-PUT
+  tail block, default-mode GET destination, unaligned streaming-writer staging). `bounce_stats()` is no longer
+  hidden from the docs.
 - **Round-6 edges of the borrowed-buffer barrier.** `GuardedFuture.cancel()` returns `False` once the put is
   already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
   the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really

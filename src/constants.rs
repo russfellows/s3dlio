@@ -30,9 +30,10 @@ pub const BYTES_PER_MIB: usize = 1024 * 1024;
 /// ping-pong pairs so the copy of chunk `k+1` overlaps the I/O of chunk `k`.
 ///
 /// Why 64 MiB at most: the I/O is large enough that per-syscall cost is noise, while a pair
-/// (2 buffers) per node keeps the total bounce memory small and bounded:
+/// (2 buffers) per node keeps the POOLED bounce memory small and bounded:
 /// `nodes x pairs x 2 x size` (default: 128 MiB per NUMA node), shared by every in-flight
-/// request in both directions. Override with [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`], clamped to
+/// request in both directions. (Pooled path only: private buffers made when the pool cannot serve
+/// a request, or by the opt-in `fallback` policy, are outside it; see `direct_bounce.rs`.) Override with [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`], clamped to
 /// [`MIN_DIRECT_IO_BOUNCE_SIZE_MB`]..=[`MAX_DIRECT_IO_BOUNCE_SIZE_MB`].
 pub const DEFAULT_DIRECT_IO_BOUNCE_SIZE: usize = 64 * BYTES_PER_MIB;
 
@@ -61,7 +62,7 @@ pub const ENV_DIRECT_IO_BOUNCE_PAIRS: &str = "S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_
 /// Environment variable choosing what a request does when every pair of its node is in use:
 /// `wait` (default; strict FIFO across PUTs and GETs, so neither direction starves the other)
 /// or `fallback` (use a private buffer of one bounce size for this request: no pipelining, extra
-/// memory bounded by one buffer per concurrent request beyond the pool).
+/// memory of one buffer per concurrent request beyond the pool, counted in `bounce_stats()`).
 pub const ENV_DIRECT_IO_BOUNCE_WHEN_BUSY: &str = "S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY";
 
 /// Environment variable choosing how a `direct://` GET reads: `direct` (default for now) reads

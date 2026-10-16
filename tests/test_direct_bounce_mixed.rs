@@ -6,7 +6,7 @@
 // The shared direct:// bounce pool under MIXED traffic: GETs and PUTs draw ping-pong pairs from
 // the same per-node pool (one pair, small buffers, so every request is many chunks and they
 // really contend). Checks: content is intact in both directions, both directions were served by
-// the pool, nothing deadlocks, and the memory cap is exactly nodes x pairs x 2 x size.
+// the pool, nothing deadlocks, and the POOLED memory cap is exactly nodes x pairs x 2 x size.
 
 #[path = "common/odirect.rs"]
 mod odirect;

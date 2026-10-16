@@ -136,21 +136,32 @@ buffers, the result of a `direct://` GET) is written straight from the caller's 
 * **Ping-pong pairs.** A request leases one pair (2 buffers) for its whole duration. PUT: chunk `k+1` is copied
   into one buffer while chunk `k` is written from the other, then they swap (the write runs on a helper thread).
   GET: chunk `k+1` is read into one buffer while chunk `k` is copied out of the other into the destination.
-* **Bounded memory.** Total bounce memory is exactly **`nodes x pairs x 2 x size`** (default: 2 x 64 MiB = 128 MiB
-  per NUMA node, in total, for ALL requests in both directions). That is the global cap.
+* **Bounded POOLED memory.** The pool buffers total exactly **`nodes x pairs x 2 x size`** (default: 2 x 64 MiB =
+  128 MiB per NUMA node) for ALL requests in both directions, and every buffer a request leases comes from there.
+  That bound covers the pooled path only; see "Outside the pooled bound" below.
 * **When every pair of the node is in use** the request either **waits** (default) in strict FIFO order shared by
   PUTs and GETs, so neither direction can starve the other, or, with `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY=fallback`,
   uses a private buffer of one bounce size for this request (serial copy-then-I/O, no pipelining; extra memory is
-  bounded by one buffer per concurrent request beyond the pool).
+  one buffer per concurrent request beyond the pool, counted in `BounceStats::fallback_live_bytes`).
 * A transfer of at most one buffer leases ONE buffer; a larger one leases two, ATOMICALLY (all or none, in
   strict FIFO order: no request ever holds one buffer while waiting for another, so mixed traffic cannot
   deadlock). Leases are RAII and are owned by the blocking closure that does the I/O: a cancelled request
   can never return a buffer to the pool while a blocking write or read still uses it, and a request that is
   still WAITING when it is cancelled gives up before any I/O starts.
-* **Hard bound.** With the default `wait` policy the bytes of pool buffers leased at any instant never exceed the
-  cap (`nodes x pairs x 2 x size`); `BounceStats::peak_leased_bytes` records the peak at every lease, so a test can
-  prove it independent of throughput. (`fallback` deliberately allocates beyond the cap and counts those bytes
-  separately; the zero-padded 4 KiB tail block of a page-aligned PUT is one page per concurrent PUT.)
+* **Bound of the pooled path.** With the default `wait` policy the bytes of pool buffers leased at any instant never
+  exceed the cap (`nodes x pairs x 2 x size`); `BounceStats::peak_leased_bytes` records the peak at every lease, so a
+  test can prove it independent of throughput. This says nothing about the allocations below.
+* **Availability first when the pool cannot serve a request.** If a node's pool cannot be created (out of memory;
+  retried every 30 s) or cannot give the requested alignment, the transfer does NOT fail: it takes a private per-call
+  bounce buffer of up to one bounce size. Those allocations are outside the cap. They are counted
+  (`direct_bounce::bounce_stats()`: `implicit_fallbacks` per direction, `implicit_fallback_bytes`, and the cause in
+  `pool_unavailable` / `alignment_mismatches`) and the first one is logged; their number is bounded only by the number
+  of concurrent requests.
+* **Outside the pooled bound, by design:** the opt-in `fallback` buffers and the implicit ones above (each counted
+  separately), the zero-padded 4 KiB tail block of a page-aligned PUT (one page per concurrent PUT), the object-sized
+  aligned destination a default-mode (`direct`) GET returns, and the up-to-64 MiB staging buffer of every unaligned
+  `direct://` streaming writer. Do not read `peak_leased_bytes <= bounce_memory_cap()` as a bound on the process's
+  direct-I/O memory.
 * A GET can instead read straight into one fresh page-aligned buffer of the object's size (zero copies, but fresh
   page faults on every call): `S3DLIO_DIRECT_IO_GET_MODE=direct`, the current default. `pooled` sends GETs through
   the pool (warm buffers, one copy into the destination). Which is faster depends on load; the default stays

@@ -25,23 +25,35 @@
 //!     B; then the buffers swap. The write runs on a helper thread, the copy on the caller's.
 //!   * GET: chunk `k+1` is read into buffer A by the helper thread while chunk `k` is copied out
 //!     of buffer B into the destination; then they swap.
-//! * **Bounded memory.** Total bounce memory is exactly `nodes x pairs x 2 x size` (default
-//!   128 MiB per node) for ALL requests in both directions: that is the global cap.
+//! * **Bounded POOLED memory.** The pool buffers themselves total exactly `nodes x pairs x 2 x
+//!   size` (default 128 MiB per node): every buffer a request leases comes from there, so the bytes
+//!   LEASED at any instant never exceed [`bounce_memory_cap`] under the default `wait` policy.
+//!   That bound covers the pooled path only. Other direct-I/O memory is outside it (see below).
 //! * **Busy policy** (`S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY`): when every pair of the node is
 //!   leased, `wait` (default) queues the request in strict FIFO order shared by PUTs and GETs, so
 //!   neither direction can starve the other; `fallback` instead gives the request a private
-//!   buffer of one bounce size (serial copy-then-I/O, no pipelining; extra memory is bounded by
-//!   one buffer per concurrent request beyond the pool). Both are counted in [`bounce_stats`].
+//!   buffer of one bounce size (serial copy-then-I/O, no pipelining; extra memory is one buffer
+//!   per concurrent request beyond the pool, counted in [`BounceStats::fallback_live_bytes`]).
 //! * **Small objects** lease ONE buffer (not a pair) of the same pool; a transfer of more than
-//!   one buffer leases two atomically. Nothing but the (opt-in) `fallback` policy allocates
-//!   bounce memory beyond the pool, and the page-sized zero-padded tail block of an aligned PUT
-//!   (one 4 KiB buffer per concurrent aligned PUT).
+//!   one buffer leases two atomically.
+//! * **Availability first when the pool cannot serve a request.** If a node's pool cannot be
+//!   created (out of memory; retried every 30 s) or cannot satisfy the requested alignment, the
+//!   transfer is NOT failed: it takes a private per-call bounce buffer of up to one bounce size.
+//!   Those implicit allocations are not covered by the cap. Each one is counted
+//!   ([`BounceStats::implicit_fallbacks`], [`BounceStats::implicit_fallback_bytes`], with the
+//!   cause in [`BounceStats::pool_unavailable`] / [`BounceStats::alignment_mismatches`]) and the
+//!   first one is logged. Their number is bounded only by the number of concurrent requests.
+//! * **Outside the pooled bound, by design:** the opt-in `fallback` buffers and the implicit
+//!   ones above, the page-sized zero-padded tail block of an aligned PUT (one 4 KiB buffer per
+//!   concurrent aligned PUT), the object-sized destination a default-mode GET returns, and the
+//!   64 MiB staging of every unaligned streaming writer.
 //! * **Leases are RAII and owned by the blocking closure that does the I/O**: a cancelled
 //!   future can never return a buffer to the pool while a blocking write or read still uses it.
 //!   Buffers are acquired all-or-nothing in strict FIFO order (no hold-one/wait-for-one
 //!   deadlock); a waiting request polls its cancel flag and abandons the wait before any I/O.
-//! * The hard bound is observable: [`BounceStats::peak_leased_bytes`] is updated at the moment
-//!   of every lease and never exceeds [`bounce_memory_cap`] with the default `wait` policy.
+//! * The POOLED bound is observable: [`BounceStats::peak_leased_bytes`] is updated at the moment
+//!   of every lease and never exceeds [`bounce_memory_cap`] with the default `wait` policy. It
+//!   says nothing about the allocations listed above as outside the pooled bound.
 //! * The GET destination is a raw pointer, so the same code fills the buffer a GET returns (a
 //!   fresh page-aligned allocation) or, later, a buffer supplied by the caller (`get_into`),
 //!   which may be unaligned.
@@ -203,6 +215,11 @@ struct Counters {
     peak_fallback_bytes: AtomicU64,
     /// Waits abandoned because the request was cancelled.
     cancelled_waits: AtomicU64,
+    /// Implicit per-call bounce allocations (pool unavailable / alignment mismatch), by direction.
+    implicit_fallbacks: [AtomicU64; 2],
+    implicit_fallback_bytes: AtomicU64,
+    pool_unavailable: AtomicU64,
+    alignment_mismatches: AtomicU64,
 }
 
 static COUNTERS: Counters = Counters {
@@ -217,6 +234,10 @@ static COUNTERS: Counters = Counters {
     fallback_live_bytes: AtomicU64::new(0),
     peak_fallback_bytes: AtomicU64::new(0),
     cancelled_waits: AtomicU64::new(0),
+    implicit_fallbacks: [AtomicU64::new(0), AtomicU64::new(0)],
+    implicit_fallback_bytes: AtomicU64::new(0),
+    pool_unavailable: AtomicU64::new(0),
+    alignment_mismatches: AtomicU64::new(0),
 };
 
 fn add_gauge(live: &AtomicU64, peak: &AtomicU64, n: u64) {
@@ -252,10 +273,20 @@ pub struct BounceStats {
     pub peak_fallback_bytes: u64,
     /// Waits for a buffer abandoned because the request was cancelled.
     pub cancelled_waits: u64,
+    /// IMPLICIT private bounce allocations made because the pool could not serve the request
+    /// (availability first), per direction `[put, get]`, cumulative. They are outside the pooled
+    /// cap, are not in `fallback_live_bytes`, and are not the opt-in `fallback` policy.
+    pub implicit_fallbacks: [u64; 2],
+    /// Cumulative bytes allocated by those implicit private bounce buffers.
+    pub implicit_fallback_bytes: u64,
+    /// Transfers for which no pooled (or busy-fallback) buffer could be provided: the node's pool
+    /// could not be created, or the fallback buffer could not be allocated.
+    pub pool_unavailable: u64,
+    /// Transfers whose alignment the pool's buffers cannot satisfy.
+    pub alignment_mismatches: u64,
 }
 
 /// Current pool statistics.
-#[doc(hidden)]
 pub fn bounce_stats() -> BounceStats {
     let l = |a: &[AtomicU64; 2]| [a[0].load(Ordering::Relaxed), a[1].load(Ordering::Relaxed)];
     BounceStats {
@@ -270,12 +301,38 @@ pub fn bounce_stats() -> BounceStats {
         fallback_live_bytes: COUNTERS.fallback_live_bytes.load(Ordering::Relaxed),
         peak_fallback_bytes: COUNTERS.peak_fallback_bytes.load(Ordering::Relaxed),
         cancelled_waits: COUNTERS.cancelled_waits.load(Ordering::Relaxed),
+        implicit_fallbacks: l(&COUNTERS.implicit_fallbacks),
+        implicit_fallback_bytes: COUNTERS.implicit_fallback_bytes.load(Ordering::Relaxed),
+        pool_unavailable: COUNTERS.pool_unavailable.load(Ordering::Relaxed),
+        alignment_mismatches: COUNTERS.alignment_mismatches.load(Ordering::Relaxed),
     }
 }
 
-/// The global cap on bounce memory in bytes: `nodes x pairs x 2 x size`, shared by every
+/// Record one IMPLICIT private bounce allocation of `bytes` (the pool could not serve the
+/// request). Counted always; the first one of the process is logged.
+pub(crate) fn note_implicit_bounce(dir: Direction, bytes: usize) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    COUNTERS.implicit_fallbacks[dir.idx()].fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .implicit_fallback_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "s3dlio: a direct:// transfer used a private per-call bounce buffer of {bytes} bytes \
+             because the shared bounce pool could not serve it (pool not creatable, or an \
+             alignment it cannot satisfy). The transfer proceeds (availability first) but this \
+             memory is NOT covered by the pooled cap; further occurrences are only counted \
+             (see direct_bounce::bounce_stats())"
+        );
+    }
+}
+
+/// The cap on POOLED bounce memory in bytes: `nodes x pairs x 2 x size`, shared by every
 /// `direct://` request in both directions (pools are created lazily, so the memory actually held
-/// is the part of this that has been used).
+/// is the part of this that has been used). It bounds the buffers the pool leases, nothing else:
+/// the opt-in `fallback` buffers, the implicit per-call buffers made when the pool cannot serve a
+/// request ([`BounceStats::implicit_fallbacks`]), aligned-PUT tail blocks, GET destinations and
+/// streaming-writer staging are outside it.
 #[doc(hidden)]
 pub fn bounce_memory_cap() -> usize {
     let cfg = config();
@@ -817,6 +874,10 @@ impl Slot {
 /// The pool of the node the calling thread runs on, creating it on first use. `None` when it
 /// could not be created (the caller then uses a private buffer).
 fn pool_for_current_node() -> Option<&'static NodePool> {
+    #[cfg(test)]
+    if test_seam::pool_unavailable() {
+        return None; // injected: as if the node's pool could not be created
+    }
     static POOLS: OnceLock<Vec<Slot>> = OnceLock::new();
     let topo = topology();
     let pools = POOLS.get_or_init(|| (0..topo.nodes()).map(|_| Slot::new()).collect());
@@ -827,6 +888,36 @@ fn pool_for_current_node() -> Option<&'static NodePool> {
         let align = DEFAULT_PAGE_SIZE.max(crate::file_store_direct::system_page_size());
         NodePool::create(topo, idx, cfg, align)
     })
+}
+
+/// Test seam: make the CALLING THREAD see no usable pool, as after a failed pool creation.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NO_POOL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn pool_unavailable() -> bool {
+        NO_POOL.with(Cell::get)
+    }
+
+    /// While the guard lives, pool lookups on this thread find no pool.
+    pub(crate) struct NoPool(());
+
+    impl NoPool {
+        pub(crate) fn inject() -> NoPool {
+            NO_POOL.with(|c| c.set(true));
+            NoPool(())
+        }
+    }
+
+    impl Drop for NoPool {
+        fn drop(&mut self) {
+            NO_POOL.with(|c| c.set(false));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1074,15 +1165,25 @@ fn source<'a>(
     cancel: &AtomicBool,
 ) -> Result<Option<Source<'a>>, BounceCancelled> {
     let Some(pool) = pool_for_current_node() else {
+        COUNTERS.pool_unavailable.fetch_add(1, Ordering::Relaxed);
         return Ok(None);
     };
     if !pool.align.is_multiple_of(align.max(1)) {
+        COUNTERS
+            .alignment_mismatches
+            .fetch_add(1, Ordering::Relaxed);
         return Ok(None);
     }
     let need = if bytes > pool.size { 2 } else { 1 };
     Ok(match pool.acquire(dir, need, cancel)? {
         Some(lease) => Some(Source::Leased(lease)),
-        None => FallbackBuf::new(pool.size, pool.align).map(Source::Private),
+        None => {
+            let fallback = FallbackBuf::new(pool.size, pool.align).map(Source::Private);
+            if fallback.is_none() {
+                COUNTERS.pool_unavailable.fetch_add(1, Ordering::Relaxed);
+            }
+            fallback
+        }
     })
 }
 

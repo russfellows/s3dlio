@@ -344,6 +344,7 @@ fn per_call_bounce_put(
     alignment: usize,
     bounce_size: usize,
     alloc: AllocFn<'_>,
+    implicit: bool,
 ) -> Result<()> {
     let len = data.len() - base;
     let mut bounce_size = bounce_size;
@@ -358,7 +359,16 @@ fn per_call_bounce_put(
             .max()
             .unwrap_or(0);
         let mut buf = match alloc(need, alignment) {
-            Ok(b) => b,
+            Ok(b) => {
+                if implicit {
+                    // The pool could not serve this PUT: counted, outside the pooled cap.
+                    crate::direct_bounce::note_implicit_bounce(
+                        crate::direct_bounce::Direction::Put,
+                        need,
+                    );
+                }
+                b
+            }
             Err(e) => {
                 let smaller = round_down(need / 2, alignment);
                 if smaller < alignment {
@@ -404,8 +414,10 @@ fn per_call_bounce_put(
 ///   most 2 GiB; the unaligned tail is one zero-padded block.
 /// * Any other source goes through the bounce buffers chosen by the process-wide
 ///   [`crate::direct_bounce`] configuration: the shared warm ping-pong pool by default (the copy
-///   of chunk `k+1` overlaps the write of chunk `k`), or a private per-call buffer for small
-///   objects and when the pool is unavailable.
+///   of chunk `k+1` overlaps the write of chunk `k`), or a private per-call buffer when the
+///   pool is unavailable or cannot satisfy the alignment (counted in
+///   [`crate::direct_bounce::BounceStats::implicit_fallbacks`]; availability first, outside the
+///   pooled memory cap).
 ///
 /// `write_all_at` resumes after a short write, so a partial write is never lost; if a short
 /// write leaves the next offset unaligned the kernel refuses it (EINVAL) and the caller's
@@ -504,7 +516,11 @@ fn write_all_direct_with(
             write_all_at(file()?, &data[offset..offset + len], offset as u64)?;
         }
         if let Some(first) = chunks.first() {
-            per_call_bounce_put(file()?, data, first.offset, alignment, cap, alloc)?;
+            // Implicit (counted) only when this PUT wanted the pool and could not get it; the
+            // benchmark's `PerCall` strategy and the one-page tail of an aligned source are by
+            // design outside the pool.
+            let implicit = matches!(strategy, PutStrategy::Pooled) && direct_steps.is_empty();
+            per_call_bounce_put(file()?, data, first.offset, alignment, cap, alloc, implicit)?;
         }
     }
 
@@ -592,11 +608,13 @@ pub(crate) unsafe fn read_all_direct_into(
     if pooled_get(file_size, alignment, dest, cancel, &read_at)? {
         return Ok(());
     }
-    // No pool (it could not be created): one private bounce buffer.
+    // The pool could not serve the read: one private bounce buffer (implicit, counted, outside
+    // the pooled cap).
     let size = crate::direct_bounce::config()
         .buffer_size
         .min(round_up(file_size, alignment));
     let buf = AlignedBuf::new(size, alignment)?;
+    crate::direct_bounce::note_implicit_bounce(crate::direct_bounce::Direction::Get, size);
     let ptr = [SendPtr(buf.as_ptr() as *mut u8)];
     crate::direct_bounce::pingpong_get(file_size, alignment, size, dest, &ptr, &read_at, &|_| {})?;
     Ok(())
@@ -2479,6 +2497,135 @@ mod oversized_range_admission_tests {
         hold.release();
         assert_eq!(read.await.unwrap().unwrap().as_ref(), &data[..]);
         assert_eq!(pool.capacity(), CAP);
+    }
+}
+
+/// R6: when the shared bounce pool cannot serve a PUT (it could not be created, or it cannot give
+/// the requested alignment) the PUT still succeeds - availability first - with a private per-call
+/// bounce buffer. That memory is outside the pooled cap, so it must be COUNTED
+/// (`BounceStats::implicit_fallbacks` / `implicit_fallback_bytes`, with the cause), not silent.
+/// One test: the counters are process-wide, so the scenarios run one after the other.
+#[cfg(all(test, unix))]
+mod implicit_bounce_accounting_tests {
+    use super::*;
+    use crate::direct_bounce::{bounce_stats, test_seam::NoPool, PutStrategy};
+    use std::sync::atomic::AtomicBool;
+
+    fn scratch() -> tempfile::TempDir {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::TempDir::new_in(base).unwrap()
+    }
+
+    fn put(path: &Path, data: &[u8], alignment: usize) {
+        let open = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+        };
+        let cancel = AtomicBool::new(false);
+        write_all_direct_with(
+            &open,
+            data,
+            alignment,
+            PutStrategy::Pooled,
+            &AlignedBuf::new,
+            &cancel,
+        )
+        .expect("the PUT must succeed without the pool (availability first)");
+        assert_eq!(std::fs::read(path).unwrap(), data, "content");
+    }
+
+    #[test]
+    fn implicit_private_bounce_allocations_are_counted_with_their_cause() {
+        let cap = crate::direct_bounce::config().buffer_size;
+        let dir = scratch();
+        let len = 3 * 1024 * 1024 + 5;
+        assert!(
+            round_up(len, 8192) <= cap,
+            "needs a bounce size of at least 4 MiB"
+        );
+        // Never page-aligned: the source must be bounced.
+        let backing: Vec<u8> = (0..len + 1).map(|i| (i * 7 + 3) as u8).collect();
+        let data = &backing[1..];
+
+        // 1. A normal PUT is served by the pool: nothing implicit.
+        let before = bounce_stats();
+        put(&dir.path().join("pooled.bin"), data, 4096);
+        let after = bounce_stats();
+        assert_eq!(
+            after.implicit_fallbacks, before.implicit_fallbacks,
+            "pooled PUT counted"
+        );
+        assert_eq!(
+            after.implicit_fallback_bytes,
+            before.implicit_fallback_bytes
+        );
+        assert!(after.leases[0] > before.leases[0], "the pool was not used");
+
+        // 2. The pool cannot be created (injected): one counted private buffer, cause recorded,
+        //    no pool lease.
+        let before = bounce_stats();
+        {
+            let _no_pool = NoPool::inject();
+            put(&dir.path().join("nopool.bin"), data, 4096);
+        }
+        let after = bounce_stats();
+        assert_eq!(
+            after.implicit_fallbacks[0],
+            before.implicit_fallbacks[0] + 1
+        );
+        assert_eq!(after.implicit_fallbacks[1], before.implicit_fallbacks[1]);
+        assert_eq!(
+            after.implicit_fallback_bytes,
+            before.implicit_fallback_bytes + round_up(len, 4096) as u64,
+            "the bytes of the private buffer"
+        );
+        assert_eq!(after.pool_unavailable, before.pool_unavailable + 1);
+        assert_eq!(after.alignment_mismatches, before.alignment_mismatches);
+        assert_eq!(
+            after.leases, before.leases,
+            "the pool must not have been used"
+        );
+        assert_eq!(
+            after.fallback_live_bytes, 0,
+            "an implicit buffer is not a busy fallback"
+        );
+
+        // 3. The pool's buffers are page-aligned; a stricter alignment cannot be served by them.
+        let before = bounce_stats();
+        put(&dir.path().join("align.bin"), data, 8192);
+        let after = bounce_stats();
+        assert_eq!(
+            after.implicit_fallbacks[0],
+            before.implicit_fallbacks[0] + 1
+        );
+        assert_eq!(
+            after.implicit_fallback_bytes,
+            before.implicit_fallback_bytes + round_up(len, 8192) as u64
+        );
+        assert_eq!(after.alignment_mismatches, before.alignment_mismatches + 1);
+        assert_eq!(after.pool_unavailable, before.pool_unavailable);
+        assert_eq!(after.leases, before.leases);
+
+        // 4. A page-aligned source writes straight from memory and bounces only its one-page tail:
+        //    that is by design (never pooled), not an implicit fallback.
+        let mut aligned = AlignedBuf::new(8192 + 100, 4096).unwrap();
+        let aligned_len = 8192 + 100;
+        aligned.as_mut_slice()[..aligned_len].fill(0x5A);
+        let before = bounce_stats();
+        put(
+            &dir.path().join("aligned.bin"),
+            &aligned.as_slice()[..aligned_len],
+            4096,
+        );
+        let after = bounce_stats();
+        assert_eq!(
+            after.implicit_fallbacks, before.implicit_fallbacks,
+            "aligned tail counted"
+        );
     }
 }
 

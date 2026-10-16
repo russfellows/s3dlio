@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 //
-// The HARD bound on direct:// bounce memory under mixed concurrent GETs and PUTs WITH
-// CANCELLATIONS, measured independently of throughput:
+// The bound on POOLED direct:// bounce memory (the buffers the shared pool leases; it does not
+// cover the implicit per-call buffers of a pool that cannot serve a request, the opt-in `fallback`
+// buffers, GET destinations or writer staging - see direct_bounce.rs) under mixed concurrent GETs
+// and PUTs WITH CANCELLATIONS, measured independently of throughput:
 //   * by the pool's own gauge (`BounceStats::peak_leased_bytes`, updated at every lease), and
 //   * independently, by a global allocator that tracks the live bytes of every 4096-aligned
 //     allocation of exactly the bounce-buffer size (the pool's buffers; GET destinations and
