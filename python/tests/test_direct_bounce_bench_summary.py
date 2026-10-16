@@ -79,3 +79,29 @@ def test_pairs_busy_and_source_are_not_pooled(tmp_path):
 def test_script_is_importable_without_running():
     ns = runpy.run_path(str(SCRIPT), run_name="not_main")
     assert ns["arm_order"]("C32") < ns["arm_order"]("C64") < ns["arm_order"]("aligned")
+
+
+def test_implicit_fallbacks_are_warned_about(tmp_path):
+    bad = result("C32")
+    bad["pool"]["implicit_put"] = 3
+    bad["pool"]["pool_unavailable"] = 3
+    (tmp_path / "results.jsonl").write_text(json.dumps(bad) + "\n")
+    out = subprocess.run(
+        [sys.executable, str(SCRIPT), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "IMPLICIT private bounce allocations" in out, out
+    assert "NOT a pooled measurement" in out
+
+
+def test_clean_rows_have_no_implicit_warning(tmp_path):
+    (tmp_path / "results.jsonl").write_text(json.dumps(result("C32")) + "\n")
+    out = subprocess.run(
+        [sys.executable, str(SCRIPT), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "IMPLICIT" not in out

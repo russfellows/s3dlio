@@ -68,6 +68,28 @@ def main():
         cells[key].append(r)
         if r["pool"]["put_fallbacks"] or r["pool"]["get_fallbacks"]:
             bad.append(("pool fallbacks (busy policy)", key))
+        # Rows from before the implicit counters existed carry none of these keys.
+        implicit = [
+            f"{name}={r['pool'][name]}"
+            for name in (
+                "implicit_put",
+                "implicit_get",
+                "implicit_bytes",
+                "pool_unavailable",
+                "alignment_mismatches",
+            )
+            if r["pool"].get(name)
+        ]
+        if implicit:
+            bad.append(
+                (
+                    "IMPLICIT private bounce allocations ("
+                    + ", ".join(implicit)
+                    + "): "
+                    "the pool did not serve this row, it is NOT a pooled measurement",
+                    key,
+                )
+            )
     print("# direct:// bounce bench summary\n")
     print(f"source: `{out}`  (medians over repetitions; N shown)\n")
     print("## fio reference (raw device path, direct=1)\n")

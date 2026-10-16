@@ -131,14 +131,19 @@
 - **Round-7 (5/6): the bounce-memory bound is stated for the pooled path only, and the implicit fallback is counted
   (R6).** Earlier text called `nodes x pairs x 2 x size` the cap on all bounce memory and said nothing but the opt-in
   `fallback` policy allocates beyond the pool. That was too strong: when a node's pool cannot be created or cannot
-  give the requested alignment, a `direct://` PUT (and a `get_into` read) still succeeds - **availability first** -
+  give the requested alignment, a `direct://` PUT still succeeds - **availability first** -
   with a private per-call bounce buffer of up to one bounce size, uncounted and outside the cap. Those implicit
   allocations are now counted in `direct_bounce::bounce_stats()` (new `implicit_fallbacks` per direction,
   `implicit_fallback_bytes`, and the causes `pool_unavailable` / `alignment_mismatches`), the first is logged, and
   every "hard cap" statement (module docs, `docs/Environment_Variables.md`, constants, test comments) is narrowed to
   the pooled path, with the allocations outside it listed (opt-in `fallback` buffers, implicit buffers, aligned-PUT
-  tail block, default-mode GET destination, unaligned streaming-writer staging). `bounce_stats()` is no longer
-  hidden from the docs.
+  tail block, default-mode GET destination, range-read private buffers, unaligned streaming-writer staging).
+  `bounce_stats()` is no longer hidden from the docs and `BounceStats` is `#[non_exhaustive]`. The benchmark
+  (`examples/direct_bounce_bench.rs`) reports the implicit counters per row and the summary script warns when any is
+  non-zero (that row is not a pooled measurement). Known limits: oversized range reads are admitted by count
+  (`capacity` at a time), not by bytes, and a store without a range pool allocates without admission; the implicit
+  counters are cumulative (no live/peak gauge) and `pool_unavailable` also ticks for pooled-mode GETs that read
+  directly into their destination.
 - **Round-7 (6/6): small corrections.** `scripts/direct_bounce_bench_summary.py` now derives the arms from the data
   (a valid `C32` result used to be silently dropped) and groups by pairs, busy policy and source as well, so runs of
   different configurations are no longer pooled (`python/tests/test_direct_bounce_bench_summary.py`). The

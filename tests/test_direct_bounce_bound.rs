@@ -227,6 +227,10 @@ async fn peak_live_bounce_bytes_never_exceed_the_cap_under_mixed_cancelled_traff
     assert!(after.allocated_bytes <= cap as u64);
     assert_eq!(after.leased_bytes, 0, "a lease was not returned");
     assert_eq!(after.fallback_live_bytes, 0);
+    assert_eq!(
+        after.implicit_fallbacks, before.implicit_fallbacks,
+        "a request bypassed the pool with an implicit private buffer: the bound proves nothing"
+    );
     assert!(after.leases[0] > before.leases[0] && after.leases[1] > before.leases[1]);
 
     the_allocator_tracker_detects_an_overshoot();

@@ -1643,47 +1643,53 @@ impl ConfigurableFileSystemObjectStore {
             let direct = self.config.direct_io;
             let want_len = usize::try_from(read_length).map_err(|_| too_big())?;
             tokio::task::spawn_blocking(move || -> Result<Bytes> {
-                // The private-allocation permit lives as long as the buffer it admits.
+                // The private-allocation permit outlives the buffer it admits: the buffer is
+                // dropped explicitly below, before this local (the permit) goes out of scope.
                 let _admission = private_permit;
                 #[cfg(test)]
                 range_read_hold::hold_if_armed(&path);
-                let mut options = std::fs::OpenOptions::new();
-                options.read(true);
-                if direct {
-                    options.custom_flags(libc::O_DIRECT);
-                }
-                let file = options.open(&path)?;
-                let ptr = match (own.as_mut(), lease.as_deref_mut()) {
-                    (Some(o), _) => o.as_mut_ptr(),
-                    (None, Some(l)) => l.as_mut_ptr(),
-                    (None, None) => bail!("internal error: no range-read buffer"),
-                };
-                // Loop until the aligned range is filled or EOF: one read() may return far less
-                // than requested (O_DIRECT imposes per-call limits).
-                let mut bytes_read = 0usize;
-                while bytes_read < aligned_length {
-                    // SAFETY: `[bytes_read, aligned_length)` lies inside the buffer.
-                    let dst = SendPtr(unsafe { ptr.add(bytes_read) });
-                    let n = pread_raw(
-                        &file,
-                        dst,
-                        aligned_length - bytes_read,
-                        aligned_offset + bytes_read as u64,
-                    )?;
-                    if n == 0 {
-                        break; // EOF
+                let result = (|| -> Result<Bytes> {
+                    let mut options = std::fs::OpenOptions::new();
+                    options.read(true);
+                    if direct {
+                        options.custom_flags(libc::O_DIRECT);
                     }
-                    bytes_read += n;
-                }
-                // Extract the requested subrange: only bytes the kernel wrote ([0, bytes_read)).
-                let start = offset_adjustment.min(bytes_read);
-                let end = start.saturating_add(want_len).min(bytes_read);
-                let mut out = BytesMut::with_capacity(end - start);
-                // SAFETY: `[start, end)` is inside `[0, bytes_read)`, which pread initialised.
-                out.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(ptr.add(start), end - start)
-                });
-                Ok(out.freeze())
+                    let file = options.open(&path)?;
+                    let ptr = match (own.as_mut(), lease.as_deref_mut()) {
+                        (Some(o), _) => o.as_mut_ptr(),
+                        (None, Some(l)) => l.as_mut_ptr(),
+                        (None, None) => bail!("internal error: no range-read buffer"),
+                    };
+                    // Loop until the aligned range is filled or EOF: one read() may return far less
+                    // than requested (O_DIRECT imposes per-call limits).
+                    let mut bytes_read = 0usize;
+                    while bytes_read < aligned_length {
+                        // SAFETY: `[bytes_read, aligned_length)` lies inside the buffer.
+                        let dst = SendPtr(unsafe { ptr.add(bytes_read) });
+                        let n = pread_raw(
+                            &file,
+                            dst,
+                            aligned_length - bytes_read,
+                            aligned_offset + bytes_read as u64,
+                        )?;
+                        if n == 0 {
+                            break; // EOF
+                        }
+                        bytes_read += n;
+                    }
+                    // Extract the requested subrange: only bytes the kernel wrote ([0, bytes_read)).
+                    let start = offset_adjustment.min(bytes_read);
+                    let end = start.saturating_add(want_len).min(bytes_read);
+                    let mut out = BytesMut::with_capacity(end - start);
+                    // SAFETY: `[start, end)` is inside `[0, bytes_read)`, which pread initialised.
+                    out.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(ptr.add(start), end - start)
+                    });
+                    Ok(out.freeze())
+                })();
+                drop(own);
+                drop(lease);
+                result
             })
             .await?
         }
@@ -3159,9 +3165,10 @@ mod direct_io_chunking_tests {
             }
             w.finalize().await.unwrap();
             let syncs = SYNC_CALLS.with(|c| c.get()) - before;
-            assert!(
-                syncs >= 3,
-                "sync_writes must fsync after each write ({syncs})"
+            // Three page-aligned writes, each followed by an fsync, plus the one at finalize.
+            assert_eq!(
+                syncs, 4,
+                "sync_writes must fsync after each write and at finalize ({syncs})"
             );
             assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, 12 * MIB);
         }

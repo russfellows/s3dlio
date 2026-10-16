@@ -133,7 +133,7 @@ buffers, the result of a `direct://` GET) is written straight from the caller's 
   non-Linux OS has one pool. A node's pool is created lazily on its first use: its buffers are allocated and
   first-touched on that node (an `mbind` to the node, best effort, plus first touch from a thread pinned to the
   node's CPUs) and then kept for the life of the process.
-* **Ping-pong pairs.** A request leases one pair (2 buffers) for its whole duration. PUT: chunk `k+1` is copied
+* **Ping-pong pairs.** A request that moves more than one buffer's worth leases one pair (2 buffers) for its whole duration; a smaller one leases a single buffer (see below). PUT: chunk `k+1` is copied
   into one buffer while chunk `k` is written from the other, then they swap (the write runs on a helper thread).
   GET: chunk `k+1` is read into one buffer while chunk `k` is copied out of the other into the destination.
 * **Bounded POOLED memory.** The pool buffers total exactly **`nodes x pairs x 2 x size`** (default: 2 x 64 MiB =
@@ -159,8 +159,10 @@ buffers, the result of a `direct://` GET) is written straight from the caller's 
   of concurrent requests.
 * **Outside the pooled bound, by design:** the opt-in `fallback` buffers and the implicit ones above (each counted
   separately), the zero-padded 4 KiB tail block of a page-aligned PUT (one page per concurrent PUT), the object-sized
-  aligned destination a default-mode (`direct`) GET returns, and the up-to-64 MiB staging buffer of every unaligned
-  `direct://` streaming writer. Do not read `peak_leased_bytes <= bounce_memory_cap()` as a bound on the process's
+  aligned destination a default-mode (`direct`) GET returns, the private buffer of every `direct://` range read (sized
+  to the range; ranges larger than the range pool's buffer are admitted by count only, and a store without a range pool
+  allocates without admission), and the up-to-64 MiB staging buffer of every unaligned `direct://` streaming writer.
+  Only the implicit and `fallback` buffers are counted. Do not read `peak_leased_bytes <= bounce_memory_cap()` as a bound on the process's
   direct-I/O memory.
 * A GET can instead read straight into one fresh page-aligned buffer of the object's size (zero copies, but fresh
   page faults on every call): `S3DLIO_DIRECT_IO_GET_MODE=direct`, the current default. `pooled` sends GETs through

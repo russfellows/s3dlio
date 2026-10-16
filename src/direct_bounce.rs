@@ -20,7 +20,7 @@
 //!   then kept for the life of the process.
 //! * **Ping-pong pairs.** A pool holds `pairs` pairs of buffers (`S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE`,
 //!   default 1) of `buffer_size` bytes (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, 4..=64, default 64).
-//!   A request leases ONE pair for its whole duration:
+//!   A transfer of more than one buffer leases a PAIR for its whole duration (a smaller one leases a single buffer, see below):
 //!   * PUT: chunk `k` is copied into buffer A and written while chunk `k+1` is copied into buffer
 //!     B; then the buffers swap. The write runs on a helper thread, the copy on the caller's.
 //!   * GET: chunk `k+1` is read into buffer A by the helper thread while chunk `k` is copied out
@@ -45,8 +45,11 @@
 //!   first one is logged. Their number is bounded only by the number of concurrent requests.
 //! * **Outside the pooled bound, by design:** the opt-in `fallback` buffers and the implicit
 //!   ones above, the page-sized zero-padded tail block of an aligned PUT (one 4 KiB buffer per
-//!   concurrent aligned PUT), the object-sized destination a default-mode GET returns, and the
-//!   64 MiB staging of every unaligned streaming writer.
+//!   concurrent aligned PUT), the object-sized destination a default-mode GET returns, the
+//!   private buffers of `direct://` range reads (one per read, sized to the range; a range larger
+//!   than the range pool's buffer is admitted by count, `capacity` at a time, and a store with no
+//!   range pool allocates without admission), and the up-to-64 MiB staging of every unaligned
+//!   streaming writer. None of these is counted except the implicit and `fallback` buffers.
 //! * **Leases are RAII and owned by the blocking closure that does the I/O**: a cancelled
 //!   future can never return a buffer to the pool while a blocking write or read still uses it.
 //!   Buffers are acquired all-or-nothing in strict FIFO order (no hold-one/wait-for-one
@@ -245,8 +248,10 @@ fn add_gauge(live: &AtomicU64, peak: &AtomicU64, n: u64) {
     peak.fetch_max(now, Ordering::AcqRel);
 }
 
-/// Snapshot of the pool's use, per direction (`[put, get]`).
+/// Snapshot of the pool's use, per direction (`[put, get]`). `#[non_exhaustive]`: fields are added
+/// as the accounting grows, so external code reads it and cannot construct it with a literal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BounceStats {
     /// Pairs leased from the pool.
     pub leases: [u64; 2],
@@ -280,7 +285,9 @@ pub struct BounceStats {
     /// Cumulative bytes allocated by those implicit private bounce buffers.
     pub implicit_fallback_bytes: u64,
     /// Transfers for which no pooled (or busy-fallback) buffer could be provided: the node's pool
-    /// could not be created, or the fallback buffer could not be allocated.
+    /// could not be created, or the fallback buffer could not be allocated. Not a subset of
+    /// `implicit_fallbacks`: it also ticks for a pooled-mode GET that then reads directly into
+    /// its (already allocated) destination, which allocates no bounce buffer.
     pub pool_unavailable: u64,
     /// Transfers whose alignment the pool's buffers cannot satisfy.
     pub alignment_mismatches: u64,
@@ -735,7 +742,7 @@ impl NodePool {
         NodePool::from_buffers(bufs, self.size, self.align, self.busy)
     }
 
-    /// Bytes this pool holds (its share of the global cap).
+    /// Bytes this pool holds (its share of the pooled memory cap).
     #[cfg(test)]
     pub(crate) fn memory_bytes(&self) -> usize {
         self.bufs.len() * self.size

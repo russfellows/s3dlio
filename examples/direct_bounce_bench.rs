@@ -308,7 +308,8 @@ fn main() {
 \"cpu_user_s\":{:.3},\"cpu_sys_s\":{:.3},\"cpu_total_s\":{:.3},\"minflt\":{},\"majflt\":{},\
 \"peak_rss_mib\":{},\"errors\":{},\
 \"pool\":{{\"memory_cap_mib\":{},\"put_leases\":{},\"get_leases\":{},\"put_waited\":{},\"get_waited\":{},\
-\"put_wait_ms\":{},\"get_wait_ms\":{},\"put_fallbacks\":{},\"get_fallbacks\":{},\"pools_created\":{}}}}}",
+\"put_wait_ms\":{},\"get_wait_ms\":{},\"put_fallbacks\":{},\"get_fallbacks\":{},\"pools_created\":{},\
+\"implicit_put\":{},\"implicit_get\":{},\"implicit_bytes\":{},\"pool_unavailable\":{},\"alignment_mismatches\":{}}}}}",
             size / MIB,
             if source_aligned { "aligned" } else { "unaligned" },
             if busy == BusyPolicy::Wait { "wait" } else { "fallback" },
@@ -335,6 +336,11 @@ fn main() {
             d(stats0.fallbacks, stats1.fallbacks, 0),
             d(stats0.fallbacks, stats1.fallbacks, 1),
             stats1.pools_created,
+            d(stats0.implicit_fallbacks, stats1.implicit_fallbacks, 0),
+            d(stats0.implicit_fallbacks, stats1.implicit_fallbacks, 1),
+            stats1.implicit_fallback_bytes - stats0.implicit_fallback_bytes,
+            stats1.pool_unavailable - stats0.pool_unavailable,
+            stats1.alignment_mismatches - stats0.alignment_mismatches,
         );
         // A run that did not measure what was asked is not a result.
         let ok = elapsed >= window * 0.9 && po + go > 0 && shared.errors.load(Ordering::Relaxed) == 0;

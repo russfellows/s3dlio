@@ -159,7 +159,13 @@ async fn direct_put_of_an_unaligned_source_uses_only_the_bounded_pool() {
     let store = ConfigurableFileSystemObjectStore::new(direct_config());
     // The whole pool (every NUMA node of the host): nodes x pairs x 2 buffers of the configured size.
     let pool = s3dlio::direct_bounce::bounce_memory_cap();
+    let before = s3dlio::direct_bounce::bounce_stats();
     assert_put_does_not_copy(&store, "direct", DIRECT_PAYLOAD, pool, false).await;
+    let after = s3dlio::direct_bounce::bounce_stats();
+    assert_eq!(
+        after.implicit_fallbacks, before.implicit_fallbacks,
+        "the PUT bypassed the pool with an implicit private buffer: 'only the bounded pool' is false"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
