@@ -55,7 +55,10 @@
 - **`auto` no longer waits out the SDK's retry schedule on a VM without an identity (#253 review).** The managed
   identity attempt in `auto` has a deadline (`S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`, default 5000 ms; the SDK retries a
   404/410/5xx from the metadata service for about 72 s), after which `auto` moves on to `az`/`azd`; the same deadline applies when a managed identity that already won stalls
-  on a later token refresh, after which the chain is run again. A "not Azure"
+  on a later token refresh, after which the chain is run again without asking the managed identity a second time (a
+  stall costs one deadline, not two); a winner is forgotten only by the request that used it, so a slow failure cannot
+  discard a newer winner. Only managed identity has its own deadline: the HTTPS modes rely on the SDK's 20 s connect and
+  60 s read timeouts, and `az`/`azd` has none in `azure_identity` 1.0.0. A "not Azure"
   answer from the metadata probe is cached for 30 s (a failing chain no longer probes twice per request); a cached
   `auto` winner that starts failing makes that request run the chain again, so a working member further down is found
   without a restart; a configured service principal that fails before `auto` falls through is logged at `warn`. The
