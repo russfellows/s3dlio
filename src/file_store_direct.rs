@@ -2566,7 +2566,8 @@ mod implicit_bounce_accounting_tests {
         assert!(after.leases[0] > before.leases[0], "the pool was not used");
 
         // 2. The pool cannot be created (injected): one counted private buffer, cause recorded,
-        //    no pool lease.
+        //    (pool lease counters are process-wide and other tests lease concurrently, so the cause
+        //    counters, not leases, prove the pool was not used).
         let before = bounce_stats();
         {
             let _no_pool = NoPool::inject();
@@ -2586,10 +2587,6 @@ mod implicit_bounce_accounting_tests {
         assert_eq!(after.pool_unavailable, before.pool_unavailable + 1);
         assert_eq!(after.alignment_mismatches, before.alignment_mismatches);
         assert_eq!(
-            after.leases, before.leases,
-            "the pool must not have been used"
-        );
-        assert_eq!(
             after.fallback_live_bytes, 0,
             "an implicit buffer is not a busy fallback"
         );
@@ -2608,7 +2605,6 @@ mod implicit_bounce_accounting_tests {
         );
         assert_eq!(after.alignment_mismatches, before.alignment_mismatches + 1);
         assert_eq!(after.pool_unavailable, before.pool_unavailable);
-        assert_eq!(after.leases, before.leases);
 
         // 4. A page-aligned source writes straight from memory and bounces only its one-page tail:
         //    that is by design (never pooled), not an implicit fallback.
