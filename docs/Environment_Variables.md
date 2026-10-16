@@ -54,6 +54,20 @@ Set `S3DLIO_LOAD_DOTENV=1` (or a path) to keep that behaviour.
   Forked children inherit the parent's resolved policy and the file it already loaded: set the switch
   before importing s3dlio and forking, or use a freshly spawned process when the policy must differ.
 
+  **Recorded limits (not covered by the file).**
+  - The one-time warning about the retired `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is read on the first
+    URI classification, before the file is applied: a value that only the file carries never produces
+    that warning if classification is the first s3dlio call. Warning only; no setting is affected.
+  - The separate `s3dlio-oplog` crate (`OpLogStreamReader::from_file`: `S3DLIO_OPLOG_READ_BUF`,
+    `S3DLIO_OPLOG_READ_CHUNK_SIZE`) has no access to s3dlio's file policy and reads the real environment
+    only.
+  - Python helpers that read `os.environ` directly (`s3dlio.integrations.dlio` multipart configuration,
+    `s3dlio.compat.s3torchconnector`) see the interpreter's start-up copy, not variables the file
+    supplied (see the `os.environ` note below).
+  - `reqwest_client::build_reqwest_http_client_with_ca` (and `build_reqwest_http_client`,
+    `warmup_connection_pool`, which call it) apply the policy first like the other public builders, but
+    that protocol choice (HTTP/2 over TLS) has no automated first-call test.
+
   (Python's `os.environ` is a copy taken when the interpreter starts, so it does not show variables
   that s3dlio loads from the file; s3dlio and other native code read the real process environment.)
   Python users can also load the file themselves **before** `import s3dlio` (see below). An application
