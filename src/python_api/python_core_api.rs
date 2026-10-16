@@ -1858,7 +1858,8 @@ fn prepare_guard<'py>(
 }
 
 /// Counters of the buffer-export barrier (diagnostics and tests):
-/// `{"quiesce_timeouts": int, "queued": int}`.
+/// `{"quiesce_timeouts", "queued", "internal_errors", "shutdown_attach_waits",
+/// "shutdown_attach_wait_timeouts", "releaser_attaches", "test_releaser_parked"}`.
 #[pyfunction]
 fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let s = export_stats();
@@ -1866,7 +1867,22 @@ fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     d.set_item("quiesce_timeouts", s.quiesce_timeouts)?;
     d.set_item("queued", s.queued)?;
     d.set_item("internal_errors", s.internal_errors)?;
+    d.set_item("shutdown_attach_waits", s.shutdown_attach_waits)?;
+    d.set_item(
+        "shutdown_attach_wait_timeouts",
+        s.shutdown_attach_wait_timeouts,
+    )?;
+    d.set_item("releaser_attaches", s.releaser_attaches)?;
+    d.set_item("test_releaser_parked", s.test_releaser_parked)?;
     Ok(d)
+}
+
+/// Hidden test hook: queue an undrained export of `data` and, with `park_ms > 0`, park the
+/// autonomous releaser once between its attach-gate entry and `Python::try_attach`.
+#[pyfunction]
+#[pyo3(signature = (data, park_ms = 0))]
+fn _put_test_queue_export(py: Python<'_>, data: &Bound<'_, PyAny>, park_ms: u64) -> PyResult<()> {
+    super::put_payload::test_queue_undrained_export(py, data, park_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -3463,6 +3479,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(put_bytes_async, m)?)?;
     m.add_function(wrap_pyfunction!(_put_export_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_test_queue_export, m)?)?;
     m.add(
         "ExportStillReferencedError",
         m.py().get_type::<ExportStillReferencedError>(),

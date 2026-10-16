@@ -1013,6 +1013,14 @@ pub const ASYNC_EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// matters when nobody drains (for example a cancelled awaitable).
 pub const EXPORT_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// Upper bound (30 s) on how long the interpreter-exit callback waits, with the GIL detached, for
+/// the buffer-export releaser thread to leave an attach scope it had already entered (issue
+/// #238, Python 3.12 shutdown race). Generous because a draining releaser can run an exporter's
+/// Python `__release_buffer__`; it exists only so a wedged exporter can never hang exit forever.
+/// When it is exceeded the event is logged and counted
+/// (`s3dlio._put_export_stats()["shutdown_attach_wait_timeouts"]`) and exit continues.
+pub const RELEASER_ATTACH_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Default for how long a put waits, after the store finished with it, for every native reader
 /// of a borrowed Python buffer to let go (30 s). If a backend still holds a clone of the payload
 /// after this, the buffer stays PINNED (never released while it can still be read), the event is

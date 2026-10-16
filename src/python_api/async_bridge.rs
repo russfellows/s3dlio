@@ -325,8 +325,9 @@ fn drain_async_deliveries_at_exit(py: Python<'_>) {
     let timeout = crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT;
     DELIVERIES.close();
     let drained = py.detach(|| DELIVERIES.wait_idle(timeout));
-    // Release what buffer exports are queued and stop releasing/queueing for good (issue
-    // #238): nothing may attach to the interpreter once it starts finalizing.
+    // Close the buffer-export releaser's attach gate, wait (GIL detached) for any attach scope it
+    // is already in, release what is queued and stop releasing for good (issue #238): nothing
+    // may attach to the interpreter once it starts finalizing.
     super::put_payload::begin_shutdown(py);
     if !drained {
         tracing::warn!(

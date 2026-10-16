@@ -732,3 +732,61 @@ def test_barrier_failures_become_distinct_errors_with_the_outcome(work_dir):
         assert fast.result() == "r"
 
     run_bounded(go)
+
+
+# ---------------------------------------------------------------------------------------------
+# R2: the autonomous releaser's attach gate (Python 3.12 shutdown race). Deterministic: a test-only
+# hook parks the releaser thread BETWEEN entering the attach gate and Python::try_attach, then the
+# interpreter exits. The atexit callback must wait (GIL detached) for that attach scope to finish
+# BEFORE it returns, i.e. before CPython finalization can start.
+# ---------------------------------------------------------------------------------------------
+
+PARKED_RELEASER_EXIT = r"""
+import atexit, json, sys, time
+
+def report():
+    # Registered BEFORE `import s3dlio`, so (atexit is LIFO) it runs AFTER s3dlio's own exit
+    # callback has returned: the stats are the state at the moment finalization could begin.
+    import s3dlio
+    print("STATS " + json.dumps(s3dlio._put_export_stats()), flush=True)
+
+atexit.register(report)
+import s3dlio
+
+ba = bytearray(b"r" * 4096)
+# an export nobody drains + the releaser parks 1.5 s between its gate entry and try_attach
+s3dlio._put_test_queue_export(ba, 1500)
+deadline = time.monotonic() + 30
+while s3dlio._put_export_stats()["test_releaser_parked"] < 1:
+    assert time.monotonic() < deadline, "the releaser never reached the park point"
+    time.sleep(0.005)
+print("PARKED", flush=True)
+# fall off the end: the interpreter exits while the releaser is inside its attach scope
+"""
+
+
+def test_exit_waits_for_a_releaser_parked_before_try_attach(work_dir):
+    import json
+
+    started = time.monotonic()
+    r = subprocess.run(
+        [sys.executable, "-c", PARKED_RELEASER_EXIT],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+    assert r.returncode == 0, f"rc={r.returncode}\n{r.stdout}\n{r.stderr[-3000:]}"
+    assert "PARKED" in r.stdout, r.stdout
+    stats_lines = [l for l in r.stdout.splitlines() if l.startswith("STATS ")]
+    assert stats_lines, f"no stats line:\n{r.stdout}\n{r.stderr[-2000:]}"
+    stats = json.loads(stats_lines[-1][len("STATS ") :])
+    assert stats["shutdown_attach_waits"] == 1, (
+        f"atexit did not wait for the releaser's attach scope: {stats}"
+    )
+    assert stats["releaser_attaches"] == 1, (
+        f"atexit returned before the releaser finished attaching: {stats}"
+    )
+    assert stats["shutdown_attach_wait_timeouts"] == 0, stats
+    assert elapsed >= 1.4, f"exit did not wait for the parked releaser ({elapsed:.2f}s)"

@@ -86,15 +86,33 @@
 //!
 //! # Interpreter shutdown
 //!
-//! The atexit callback ([`begin_shutdown`]) sets a flag and drains the queue with the GIL.
-//! From then on the autonomous releaser thread never attaches again (and is not even started
-//! if the queue is created later), on every Python version. An export dropped after that is
-//! still QUEUED (never forgotten) so a thread that holds a real GIL token - a `put_bytes`
-//! finishing during exit - releases it; what nobody drains is abandoned with the process.
-//! (pyo3's own `Py_IsFinalizing` check inside `try_attach` exists only when built for Python
-//! 3.13 or newer, so it cannot be relied on for 3.12.) A releaser already blocked inside
-//! `try_attach` when the interpreter starts finalizing is the one residual race on Python
-//! <= 3.12; CPython then ends that thread.
+//! The atexit callback ([`begin_shutdown`]) closes the *autonomous attach gate* ([`AttachGate`]),
+//! waits - with the GIL DETACHED - until no autonomous attach scope is in flight, and only then
+//! drains the queue with the GIL and returns, so finalization never starts while the releaser
+//! thread is still on its way into (or inside) CPython. The gate is a Dekker-style handshake on
+//! two sequentially consistent atomics:
+//!
+//! * the releaser thread increments the in-flight counter, THEN checks the shutdown flag; when it
+//!   is set it decrements and exits, otherwise it calls `Python::try_attach` and decrements after
+//!   `try_attach` has returned (an RAII guard, so on every path including unwinding);
+//! * the atexit path stores the shutdown flag, THEN waits for the counter to reach zero.
+//!
+//! One of the two always sees the other: either the releaser sees the flag and never attaches, or
+//! atexit sees a non-zero counter and waits for that attach scope to finish. (A second flag check
+//! inside the attach closure, as before, could not close this: it runs after the attachment.) The
+//! wait must not hold the GIL - the releaser may be waiting for it - and is bounded by
+//! `RELEASER_ATTACH_DRAIN_TIMEOUT` (30 s, generous because a draining releaser can run an
+//! exporter's Python `__release_buffer__`); if it is exceeded the event is logged and counted
+//! (`shutdown_attach_wait_timeouts`) and exit continues, so a wedged exporter can never hang the
+//! process forever. That timeout is the only remaining way for the releaser to still be attached
+//! at finalization.
+//!
+//! From then on the releaser never attaches again (and is not even started if the queue is
+//! created later), on every Python version. An export dropped after that is still QUEUED (never
+//! forgotten) so a thread that holds a real GIL token - a `put_bytes` finishing during exit -
+//! releases it; what nobody drains is abandoned with the process. (pyo3's own `Py_IsFinalizing`
+//! check inside `try_attach` exists only when built for Python 3.13 or newer, so it cannot be
+//! relied on for 3.12; the gate does not depend on it.)
 //!
 //! # Other buffer details
 //!
@@ -122,7 +140,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use crate::constants::{
-    export_quiesce_timeout, EXPORT_RELEASE_GRACE, SNAPSHOT_GIL_DETACH_THRESHOLD,
+    export_quiesce_timeout, EXPORT_RELEASE_GRACE, RELEASER_ATTACH_DRAIN_TIMEOUT,
+    SNAPSHOT_GIL_DETACH_THRESHOLD,
 };
 
 /// How long the store reads the payload relative to the Python call.
@@ -312,6 +331,15 @@ pub(crate) struct ExportStats {
     pub(crate) queued: usize,
     /// Internal failures of the barrier machinery (buffer left pinned).
     pub(crate) internal_errors: u64,
+    /// Interpreter exits that had to wait for the releaser thread's attach scope (see
+    /// [`AttachGate`]).
+    pub(crate) shutdown_attach_waits: u64,
+    /// Of those, the waits that hit `RELEASER_ATTACH_DRAIN_TIMEOUT`.
+    pub(crate) shutdown_attach_wait_timeouts: u64,
+    /// Times the releaser thread attached to Python and drained.
+    pub(crate) releaser_attaches: usize,
+    /// Test hook: times the releaser parked at the armed point.
+    pub(crate) test_releaser_parked: u64,
 }
 
 pub(crate) fn export_stats() -> ExportStats {
@@ -319,7 +347,28 @@ pub(crate) fn export_stats() -> ExportStats {
         quiesce_timeouts: QUIESCE_TIMEOUTS.load(Ordering::Relaxed),
         queued: QUEUE.get().map_or(0, |q| q.count.load(Ordering::Acquire)),
         internal_errors: BARRIER_INTERNAL_ERRORS.load(Ordering::Relaxed),
+        shutdown_attach_waits: GATE.waits.load(Ordering::Relaxed),
+        shutdown_attach_wait_timeouts: GATE.wait_timeouts.load(Ordering::Relaxed),
+        releaser_attaches: QUEUE
+            .get()
+            .map_or(0, |q| q.attaches.load(Ordering::Relaxed)),
+        test_releaser_parked: TEST_RELEASER_PARKED.load(Ordering::SeqCst),
     }
+}
+
+/// Test hook (hidden `s3dlio._put_test_queue_export`): hold `data` as a blocking payload and drop
+/// it at once on this GIL-holding thread, so the export sits in the release queue with nobody
+/// draining it. When `park_ms > 0` the releaser thread then parks once, between entering the
+/// attach gate and `Python::try_attach`, for that long.
+pub(crate) fn test_queue_undrained_export(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    park_ms: u64,
+) -> PyResult<()> {
+    let payload = put_payload(py, data, PayloadUse::Blocking)?;
+    TEST_PARK_RELEASER_MS.store(park_ms, Ordering::SeqCst);
+    drop(payload);
+    Ok(())
 }
 
 /// A raw `Py_buffer` export (`PyBUF_SIMPLE`: any C-contiguous exporter, any item type).
@@ -410,8 +459,9 @@ struct ReleaseQueue {
     pending: Mutex<Vec<RawExport>>,
     wake: Condvar,
     count: AtomicUsize,
-    /// Set at interpreter exit: no export is released by the releaser, queued, or kept.
-    shutdown: &'static AtomicBool,
+    /// The autonomous attach gate (closed at interpreter exit): the releaser enters it before
+    /// every attach and never attaches once it is closed.
+    gate: &'static AttachGate,
     /// How long the releaser waits after a wake-up before attaching, so a `put_bytes` caller
     /// or the async delivery path (which drain the queue themselves) normally gets there first
     /// and the releaser finds nothing to do (no GIL traffic).
@@ -420,8 +470,114 @@ struct ReleaseQueue {
     attaches: AtomicUsize,
 }
 
-/// Set once by the atexit callback; see [`begin_shutdown`].
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// The process-wide gate, closed once by the atexit callback; see [`begin_shutdown`].
+static GATE: AttachGate = AttachGate::new();
+
+/// Gate for the releaser thread's autonomous attachments to the interpreter.
+///
+/// `enter` and `close_and_wait` are the two halves of a handshake (see the module docs,
+/// "Interpreter shutdown"): the in-flight counter is incremented BEFORE the flag is read, and the
+/// flag is stored BEFORE the counter is read, all `SeqCst`, so at least one side sees the other.
+pub(crate) struct AttachGate {
+    closed: AtomicBool,
+    in_flight: AtomicUsize,
+    idle: Mutex<()>,
+    idle_cv: Condvar,
+    /// Closings that found an attach scope in flight and had to wait for it.
+    waits: AtomicU64,
+    /// Closings whose wait hit the bound (an attach scope was still in flight).
+    wait_timeouts: AtomicU64,
+}
+
+/// RAII proof that one autonomous attach scope is in flight; dropping it (on any path) leaves
+/// the scope and wakes a waiting `close_and_wait`.
+pub(crate) struct AttachScope {
+    gate: &'static AttachGate,
+}
+
+impl AttachGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            idle: Mutex::new(()),
+            idle_cv: Condvar::new(),
+            waits: AtomicU64::new(0),
+            wait_timeouts: AtomicU64::new(0),
+        }
+    }
+
+    /// Count one attach scope, THEN check the flag: `None` (nothing counted) once closed.
+    pub(crate) fn enter(&'static self) -> Option<AttachScope> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let scope = AttachScope { gate: self }; // decrements on every path, including the refusal
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(scope)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Store the flag, THEN wait until no scope is in flight or `timeout` elapses. Call WITHOUT
+    /// the GIL: an in-flight scope may be waiting for it. `true` when drained.
+    pub(crate) fn close_and_wait(&self, timeout: Duration) -> bool {
+        self.closed.store(true, Ordering::SeqCst);
+        if self.in_flight.load(Ordering::SeqCst) == 0 {
+            return true;
+        }
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        let guard = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        let (_guard, _) = self
+            .idle_cv
+            .wait_timeout_while(guard, timeout, |_| {
+                self.in_flight.load(Ordering::SeqCst) > 0
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        let drained = self.in_flight.load(Ordering::SeqCst) == 0;
+        if !drained {
+            self.wait_timeouts.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                "s3dlio: the buffer-export releaser was still attached to the interpreter \
+                 {timeout:?} after shutdown began (an exporter's __release_buffer__ may be \
+                 stuck); giving up the wait so the process can exit"
+            );
+        }
+        drained
+    }
+}
+
+impl Drop for AttachScope {
+    fn drop(&mut self) {
+        if self.gate.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // Take the lock so a waiter between its check and its wait cannot miss the wake-up.
+            drop(
+                self.gate
+                    .idle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            self.gate.idle_cv.notify_all();
+        }
+    }
+}
+
+/// Test-only hook: park the releaser (in milliseconds, once) between its gate entry and
+/// `Python::try_attach`, the interval of the Python 3.12 shutdown race. Armed by the hidden
+/// `s3dlio._put_test_queue_export()`.
+static TEST_PARK_RELEASER_MS: AtomicU64 = AtomicU64::new(0);
+/// Times the releaser parked because of [`TEST_PARK_RELEASER_MS`].
+static TEST_RELEASER_PARKED: AtomicU64 = AtomicU64::new(0);
+
+fn park_releaser_for_test() {
+    let ms = TEST_PARK_RELEASER_MS.swap(0, Ordering::SeqCst);
+    if ms > 0 {
+        TEST_RELEASER_PARKED.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
 
 impl ReleaseQueue {
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<RawExport>> {
@@ -461,7 +617,9 @@ impl ReleaseQueue {
     /// Dedicated releaser: wait for work, give the callers a grace period to drain it
     /// themselves, then release what is left while holding the GIL. Exports stay in the queue
     /// until the GIL is held, so a thread that drains while it holds the GIL sees every export
-    /// that is not yet released. It never attaches once `shutdown` is set.
+    /// that is not yet released. Every attachment is made inside an [`AttachScope`] of the gate,
+    /// so the atexit path can close the gate and wait for it with the GIL detached; once the gate
+    /// is closed the releaser never attaches.
     fn run(&'static self) {
         loop {
             {
@@ -474,19 +632,21 @@ impl ReleaseQueue {
                 }
             }
             std::thread::sleep(self.grace);
-            if self.shutdown.load(Ordering::Acquire) {
+            // Counter first, flag second (see `AttachGate`): after this line either the gate is
+            // known closed, or a closing atexit will wait for this scope.
+            let Some(scope) = self.gate.enter() else {
                 return;
-            }
+            };
             if self.count.load(Ordering::Acquire) == 0 {
                 continue; // a caller drained it during the grace period
             }
+            park_releaser_for_test();
             let attached = Python::try_attach(|py| {
-                if !self.shutdown.load(Ordering::Acquire) {
-                    self.attaches.fetch_add(1, Ordering::Relaxed);
-                    self.drain(py);
-                }
+                self.attaches.fetch_add(1, Ordering::Relaxed);
+                self.drain(py);
             });
-            if attached.is_none() || self.shutdown.load(Ordering::Acquire) {
+            drop(scope); // after try_attach has returned
+            if attached.is_none() || self.gate.is_closed() {
                 return; // interpreter gone or exiting: abandon the rest with the process
             }
         }
@@ -495,14 +655,14 @@ impl ReleaseQueue {
     /// A queue with its releaser thread.
     fn start(
         grace: Duration,
-        shutdown: &'static AtomicBool,
+        gate: &'static AttachGate,
         spawn_releaser: bool,
     ) -> &'static ReleaseQueue {
         let queue: &'static ReleaseQueue = Box::leak(Box::new(ReleaseQueue {
             pending: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             count: AtomicUsize::new(0),
-            shutdown,
+            gate,
             grace,
             attaches: AtomicUsize::new(0),
         }));
@@ -527,11 +687,7 @@ static QUEUE: OnceLock<&'static ReleaseQueue> = OnceLock::new();
 fn global_queue() -> &'static ReleaseQueue {
     QUEUE.get_or_init(|| {
         // After shutdown no releaser thread is started (it could only attach to a dying interpreter).
-        ReleaseQueue::start(
-            EXPORT_RELEASE_GRACE,
-            &SHUTDOWN,
-            !SHUTDOWN.load(Ordering::Acquire),
-        )
+        ReleaseQueue::start(EXPORT_RELEASE_GRACE, &GATE, !GATE.is_closed())
     })
 }
 
@@ -549,13 +705,13 @@ pub(crate) fn exports_pending() -> bool {
         .is_some_and(|q| q.count.load(Ordering::Acquire) > 0)
 }
 
-/// Interpreter exit (called from the atexit callback, GIL held): release what is queued, then
-/// stop releasing and queueing for good. After this, dropping an export forgets it (the
-/// interpreter is about to finalize; nothing may attach to it any more) and the releaser
-/// thread never attaches again. This replaces relying on pyo3's `Py_IsFinalizing` check, which
-/// only exists when built for Python 3.13 or newer.
+/// Interpreter exit (called from the atexit callback, GIL held): close the autonomous attach
+/// gate, wait for any attach scope of the releaser thread to finish WITH THE GIL DETACHED
+/// (bounded by `RELEASER_ATTACH_DRAIN_TIMEOUT`), release what is queued, and stop releasing for
+/// good. After this the releaser never attaches again. This replaces relying on pyo3's
+/// `Py_IsFinalizing` check, which only exists when built for Python 3.13 or newer.
 pub(crate) fn begin_shutdown(py: Python<'_>) {
-    SHUTDOWN.store(true, Ordering::Release);
+    py.detach(|| GATE.close_and_wait(RELEASER_ATTACH_DRAIN_TIMEOUT));
     drain_pending_exports(py);
 }
 
@@ -1183,8 +1339,48 @@ mod tests {
         });
     }
 
-    fn leak_flag(v: bool) -> &'static AtomicBool {
-        Box::leak(Box::new(AtomicBool::new(v)))
+    fn leak_gate(closed: bool) -> &'static AttachGate {
+        let gate: &'static AttachGate = Box::leak(Box::new(AttachGate::new()));
+        if closed {
+            assert!(gate.close_and_wait(Duration::from_secs(1)));
+        }
+        gate
+    }
+
+    /// The attach gate: a closed gate refuses and counts nothing; a scope in flight is waited for
+    /// by the closer (and its wait is counted); a scope that never ends makes the wait give up
+    /// at its bound (counted) instead of hanging.
+    #[test]
+    fn attach_gate_refuses_after_close_and_closing_waits_for_a_scope_in_flight() {
+        let gate = leak_gate(false);
+        assert!(gate.close_and_wait(Duration::from_millis(10)), "idle gate");
+        assert_eq!(gate.waits.load(Ordering::Relaxed), 0);
+        assert!(gate.enter().is_none(), "closed gate admitted a scope");
+        assert_eq!(gate.in_flight.load(Ordering::SeqCst), 0, "refusal counted");
+
+        let gate = leak_gate(false);
+        let scope = gate.enter().expect("open gate");
+        let started = Instant::now();
+        let closer = std::thread::spawn(move || gate.close_and_wait(Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!closer.is_finished(), "closer did not wait for the scope");
+        assert!(gate.enter().is_none(), "closing gate admitted a new scope");
+        drop(scope);
+        assert!(
+            closer.join().unwrap(),
+            "closer gave up although the scope ended"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert_eq!(gate.waits.load(Ordering::Relaxed), 1);
+        assert_eq!(gate.wait_timeouts.load(Ordering::Relaxed), 0);
+
+        let gate = leak_gate(false);
+        let _stuck = gate.enter().expect("open gate");
+        assert!(
+            !gate.close_and_wait(Duration::from_millis(50)),
+            "must be bounded"
+        );
+        assert_eq!(gate.wait_timeouts.load(Ordering::Relaxed), 1);
     }
 
     /// Round 3 / item 3, round 5: once shutdown is flagged the releaser thread never attaches,
@@ -1193,7 +1389,7 @@ mod tests {
     #[test]
     fn after_shutdown_the_releaser_never_attaches_but_a_token_holder_still_releases() {
         init();
-        let flag = leak_flag(true);
+        let flag = leak_gate(true);
         let queue = ReleaseQueue::start(Duration::from_millis(5), flag, true);
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
@@ -1222,7 +1418,7 @@ mod tests {
     #[test]
     fn queue_started_after_shutdown_has_no_releaser_thread() {
         init();
-        let flag = leak_flag(true);
+        let flag = leak_gate(true);
         let queue = ReleaseQueue::start(Duration::from_millis(1), flag, false);
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
@@ -1242,7 +1438,7 @@ mod tests {
     #[test]
     fn caller_draining_within_the_grace_period_means_no_releaser_gil_traffic() {
         init();
-        let queue = ReleaseQueue::start(Duration::from_millis(300), leak_flag(false), true);
+        let queue = ReleaseQueue::start(Duration::from_millis(300), leak_gate(false), true);
         Python::attach(|py| {
             for _ in 0..20 {
                 let ba = PyByteArray::new(py, &[1u8; 4096]);
@@ -1266,7 +1462,7 @@ mod tests {
     #[test]
     fn releaser_releases_after_the_grace_period_when_nobody_drains() {
         init();
-        let queue = ReleaseQueue::start(Duration::from_millis(20), leak_flag(false), true);
+        let queue = ReleaseQueue::start(Duration::from_millis(20), leak_gate(false), true);
         let ba = Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let export = RawExport::acquire(ba.as_any()).unwrap().unwrap();
@@ -1287,7 +1483,7 @@ mod tests {
     #[test]
     fn queue_keeps_its_capacity_across_drains() {
         init();
-        let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_flag(false), true);
+        let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
         Python::attach(|py| {
             for round in 0..4 {
                 for _ in 0..8 {
@@ -1618,7 +1814,7 @@ mod tests {
     #[test]
     fn latch_ready_requires_released_as_well_as_dropped() {
         init();
-        let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_flag(false), true);
+        let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[3u8; 4096]);
             let export = RawExport::acquire(ba.as_any()).unwrap().unwrap();

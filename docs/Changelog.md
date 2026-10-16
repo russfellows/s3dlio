@@ -76,6 +76,17 @@
   single write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
   also left zero padding inside the object whenever `part_size` was not a multiple of 4096.
 
+- **Round-7 (1/6): the buffer-export releaser can no longer be inside CPython at interpreter finalization
+  (Python 3.12 shutdown race).** The autonomous releaser thread checked the shutdown flag and only then called
+  `Python::try_attach`; an attach already past the check could still be waiting for the GIL when the exit
+  callback returned and Python 3.12 began finalizing (pyo3's `Py_IsFinalizing` check exists only for 3.13+).
+  Every autonomous attach now runs inside an attach gate: the releaser increments an in-flight counter, then
+  checks the shutdown flag (if set it leaves without attaching), and decrements after `try_attach` returned; the
+  exit callback sets the flag, then waits for the counter to reach zero with the GIL released, bounded by 30 s
+  (logged and counted in `_put_export_stats()["shutdown_attach_wait_timeouts"]` if exceeded; exit then continues).
+  New diagnostics in `_put_export_stats()`: `shutdown_attach_waits`, `shutdown_attach_wait_timeouts`,
+  `releaser_attaches`. Tested deterministically on 3.12 and 3.13 with a hidden hook that parks the releaser
+  between the counter increment and `try_attach` while the interpreter exits.
 - **Round-6 edges of the borrowed-buffer barrier.** `GuardedFuture.cancel()` returns `False` once the put is
   already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
   the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really

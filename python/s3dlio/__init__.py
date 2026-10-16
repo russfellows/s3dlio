@@ -60,8 +60,11 @@ for _name in dir(_core):
         globals()[_name] = getattr(_core, _name)
 
 # Diagnostics for the borrowed-buffer completion barrier of put_bytes()/put_bytes_async():
-# {"quiesce_timeouts": int, "queued": int}. Underscore names are not re-exported by the loop above.
+# counters (quiesce_timeouts, queued, internal_errors, shutdown_attach_waits, ...). Underscore names
+# are not re-exported by the loop above.
 _put_export_stats = _core._put_export_stats
+# Hidden test hooks of the barrier (used only by python/tests/test_put_release_barrier.py).
+_put_test_queue_export = _core._put_test_queue_export
 
 # del _sys, _name, import_module, _native
 del _name
