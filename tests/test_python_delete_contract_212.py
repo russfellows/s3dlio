@@ -27,6 +27,7 @@ the point of them.
 
 import json
 import re
+import socket
 import textwrap
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -68,7 +69,7 @@ def _delete_objects_keys(body: bytes) -> list:
 class MockS3:
     """A path-style S3 server for the single bucket ``bkt``, with real state."""
 
-    def __init__(self, keys=()):
+    def __init__(self, keys=(), host="127.0.0.1"):
         self.keys = set(keys)
         self.log = []  # dicts: method, path, query, body_keys
         self.delete_status = None  # answer every delete request (DELETE, POST ?delete) with this status
@@ -123,8 +124,16 @@ class MockS3:
 
             do_GET = do_HEAD = do_POST = do_DELETE = do_PUT = _handle
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        server_class = ThreadingHTTPServer
+        if ":" in host:  # an IPv6 literal, e.g. "::1"
+
+            class server_class(ThreadingHTTPServer):
+                address_family = socket.AF_INET6
+
+        self.server = server_class((host, 0), Handler)
+        self.port = self.server.server_address[1]
+        self.server_name = f"[{host}]:{self.port}" if ":" in host else f"{host}:{self.port}"
+        self.url = f"http://{self.server_name}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 

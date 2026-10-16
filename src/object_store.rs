@@ -98,6 +98,8 @@ pub type ObjectMetadata = S3ObjectStat;
 /// Get the threshold size for using concurrent range requests.
 /// Objects/transfers above this size will use concurrent range GET for optimal performance.
 fn get_concurrent_threshold() -> u64 {
+    // The `.env` policy first (#243, review R9/F): `get_range_optimized` with a known length reads this before any client exists.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_CONCURRENT_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1509,6 +1511,8 @@ impl ObjectStore for S3ObjectStore {
         // Range optimization is ENABLED by default (v0.9.60+).
         // Set S3DLIO_ENABLE_RANGE_OPTIMIZATION=0 (or false/no/off/disable) to disable.
         // Setting it to 1/true/yes/on/enable is accepted but has no effect (already on).
+        // The policy first: this read is per call (not latched), so it must see the file.
+        crate::dotenv::apply();
         let use_optimized = std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
             .ok()
             .map(|v| {
@@ -2534,6 +2538,10 @@ pub struct AzureConfig {
 #[cfg(feature = "backend-azure")]
 impl Default for AzureConfig {
     fn default() -> Self {
+        // The `.env` policy first (#243, review R9): this public `Default` (and
+        // `AzureObjectStore::new`, which uses it) reads the Azure tuning settings before any
+        // Azure client exists.
+        crate::dotenv::apply();
         let download_mode = std::env::var(ENV_AZURE_DOWNLOAD_MODE)
             .ok()
             .and_then(|value| value.parse().ok())
@@ -3935,6 +3943,9 @@ pub(crate) fn s3_endpoint_url_from_authority(authority: &str) -> Result<String> 
 /// beyond the always-TLS default of 443. Comma-separated list of u16 ports in
 /// `S3DLIO_S3_ENDPOINT_TLS_PORTS`; invalid tokens are ignored.
 fn s3_endpoint_tls_ports_from_env() -> std::collections::HashSet<u16> {
+    // The `.env` policy first (#243, review R9): this decides http versus https for a server-named URI, and is reached from
+    // public constructors (`MultiEndpointStore::new`/`from_config`) before any client exists.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS")
         .ok()
         .map(|raw| {
@@ -4092,6 +4103,9 @@ pub fn store_for_uri_with_logger(
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
 
+    // The `.env` policy applies before any store reads a setting (#243).
+    crate::dotenv::apply();
+
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => FileSystemObjectStore::boxed(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
@@ -4158,6 +4172,9 @@ pub fn store_for_uri_with_config_and_logger(
 ) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
+
+    // The `.env` policy applies before any store reads a setting (#243).
+    crate::dotenv::apply();
 
     let store: Box<dyn ObjectStore> = match (infer_scheme(uri), config) {
         (Scheme::File, Some(crate::api::StorageConfig::File(cfg))) => {
@@ -4236,6 +4253,9 @@ pub fn direct_io_store_for_uri_with_logger(
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
 
+    // The `.env` policy applies before any store reads a setting (#243), as in `store_for_uri*`.
+    crate::dotenv::apply();
+
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
@@ -4287,6 +4307,9 @@ pub fn high_performance_store_for_uri_with_logger(
 ) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
+
+    // The `.env` policy applies before any store reads a setting (#243), as in `store_for_uri*`.
+    crate::dotenv::apply();
 
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
@@ -4374,6 +4397,9 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
 ) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
+
+    // The `.env` policy applies before any store reads a setting (#243), as in `store_for_uri*`.
+    crate::dotenv::apply();
 
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),

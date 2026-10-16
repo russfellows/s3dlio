@@ -60,6 +60,9 @@ impl ArrowObjectStore {
 
     /// The shared parser; `is_prefix` is true when the URI names a listing prefix.
     fn parse_as(uri: &str, is_prefix: bool) -> Result<(Arc<dyn AosObjectStore>, Path, Url)> {
+        // The `.env` policy first (#243, review R9/F): credentials and region are read here, and every public `ArrowObjectStore` method
+        // gets here before `store_for_uri` (which applies in `setup_arrow_environment`) is involved.
+        crate::dotenv::apply();
         let url = Url::parse(uri).context("invalid URI")?;
 
         match url.scheme() {
@@ -822,8 +825,8 @@ impl S3DlioObjectWriter for ArrowWriter {
 
 // Set up Arrow environment on module load
 fn setup_arrow_environment() {
-    // Load environment variables from .env file (same as rest of s3dlio)
-    let _ = dotenvy::dotenv();
+    // Apply the `.env` policy (S3DLIO_LOAD_DOTENV; off for library use, issue #243)
+    crate::dotenv::apply();
 
     // Try multiple approaches to disable EC2 metadata service
     unsafe {

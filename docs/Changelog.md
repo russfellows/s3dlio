@@ -185,6 +185,75 @@
   `..` segments are not yet guaranteed to round-trip through a listed URI on the Arrow backend (a
   separate, known limit that this fix does not change).
 
+### Changed (BEHAVIOUR CHANGE for library users)
+
+- **s3dlio no longer reads a `.env` file implicitly when used as a library (#243).** Until now every
+  S3 client build (and bucket/container listing) loaded `.env` from the process's current directory into
+  the environment of the whole host process, so which file was used, and which credentials, endpoints and
+  `S3DLIO_*` / `AWS_*` settings an embedded s3dlio (an inference server, a training job, a KV-cache tier)
+  ran with, depended on where the process happened to be started. There is now ONE switch,
+  `S3DLIO_LOAD_DOTENV`, read from the real environment once per process:
+  `1` / `true` / `yes` / `on` loads `.env` from the working directory (the old behaviour),
+  `0` / `false` / `no` / `off` never loads it, and any other value is a file path to load exactly that file. The default depends on the program:
+  **`s3-cli`: on** (CLI users keep today's behaviour), **library use, Rust and Python: off**.
+  **If you relied on the implicit load in a Rust or Python program, set `S3DLIO_LOAD_DOTENV=1`
+  (or `S3DLIO_LOAD_DOTENV=/path/to/file`), or call the new `s3dlio::dotenv::load_env_file(path)`.**
+  When a `.env` exists but is not loaded because of the library default, s3dlio logs one INFO line
+  saying how to enable it, and the "Missing AWS_ACCESS_KEY_ID ..." error carries the same hint (so a
+  Python user who sees only the exception learns that the file is being ignored). A variable that is
+  already set in the real environment is never overridden by the file, as before. A new public function,
+  `s3dlio::dotenv::load_env_file(path)`, loads a given `.env` file explicitly (it works whatever the
+  switch says). The six places that used to call `dotenvy` themselves (the two S3 client builders,
+  bucket listing, GCS container listing, the Arrow backend set-up and the `s3-cli` start-up) now go
+  through one helper, which also runs at the start of every library entry point: the Python extension
+  module's initialisation (`import s3dlio`), the global runtime, `store_for_uri*` and the Azure and GCS
+  client constructors, the S3 dataset constructors, `configure_thread_pools`, `Logger::new` and the
+  latched tuning knobs (unsigned payload, skip-HEAD, range optimisation, size cache, GCS RAPID). So a
+  `.env` that is switched on is in place before s3dlio reads those settings (`S3DLIO_RT_THREADS`,
+  `S3DLIO_OPLOG_*`, the range-GET settings, `AWS_ENDPOINT_URL`, `AWS_REGION`, ...), not only when the
+  first S3 client is built. `s3-cli` now loads the file before it builds its Tokio runtime; in Python
+  the native module (which loads it) is imported before s3dlio's own `torch` import. Not promised:
+  s3dlio cannot know whether its host already has threads or has already imported `torch`; a host that
+  needs a race-free environment loads the file (or sets the real environment) at the very start of the
+  process, and forked children inherit the parent's resolved policy. `import s3dlio` now imports the native module first, outside any `try`, so if it fails the caller sees that error instead of PyO3's "initialized once" message from a second attempt. `s3-cli` prints a
+  warning on stderr when `S3DLIO_LOAD_DOTENV` names a file it cannot read. Documented in the README and
+  `docs/Environment_Variables.md`. Review round 7: the file is now also loaded before the
+  independently public entry points that read or change a setting, not only before the S3 client
+  wrapper. Calling `set_s3_endpoint_override` first no longer lets an `AWS_ENDPOINT_URL_S3` that only
+  the file defines override the endpoint you just set; `build_smithy_http_client` /
+  `build_reqwest_http_client*` no longer build an HTTP/1.1 client when the file turns HTTP/2 on;
+  `H2WindowConfig::from_env`, `connect_timeout_secs`, `max_retry_attempts`, `mpi_world_size`,
+  `mpi_aware_thread_budget`, `effective_thread_budget`, `MultiEndpointStore::new` / `from_config`
+  (its `S3DLIO_S3_ENDPOINT_TLS_PORTS` decision), `AzureConfig::default` and the community GCS
+  `resolve_gcs_endpoint` return the file's values when they are the first s3dlio call.
+
+- **`file://` and `direct://` datasets now list their items as paths below the dataset root (#223).**
+  `Dataset::keys()` (Rust), `PyDataset.keys()` and `ObjectStoreMapDataset`'s keys (Python), and the item
+  identifiers yielded by `PyBytesAsyncDataLoader.items()` / `PyDataset.items()` used to be the bare file
+  name (`b.bin`), whatever directory the file was in, so two files with the same name in different
+  sub-directories were indistinguishable and a name could not be turned back into a path. They are now the
+  path below the dataset root with `/` separators (`sub/b.bin`); a dataset whose URI names one file keeps
+  that file's name. Code that matched or compared those names must use the new form. `s3://` keys are
+  unchanged (the full key from the bucket root). New: `Dataset::uris()` and `PyDataset.uris()` return
+  the URI that fetches each item, in the same order as the keys.
+
+### Fixed
+
+- **Python `ObjectStoreMapDataset` fetches each item by the exact key it listed (#223).** A dataset rooted
+  below the bucket root asked the server for the wrong object: `ObjectStoreMapDataset("s3://bkt/dir/")`
+  listed `dir/x` but requested `dir/dir/x` (the dataset's own key prefix was added a second time), so
+  every item failed to read, or read a different object if `dir/dir/x` existed. `s3://bkt//` and
+  `s3://bkt/dir//` behave the same way: the key that was listed is the key that is fetched, with a
+  leading or doubled `/` kept exactly. The same mistake hit `file://` and `direct://` datasets in two more
+  ways, fixed together: files in sub-directories were listed by bare file name and so were looked up in the
+  top directory, and a dataset whose URI names one file looked for `<file>/<file>`. The listed key of a
+  `file://` / `direct://` dataset is now the file's path below the dataset root (`sub/b.bin`; for a root
+  that names one file, its name) -- see the behaviour change above. `ObjectStoreMapDataset` no longer
+  builds a URI itself: the dataset, which already parsed its root (scheme, server, bucket or container),
+  returns the URI that fetches each listed item, so the server form `s3://host:port/bucket/dir/` (and
+  `s3://[::1]:port/bucket/dir/`) fetches from the right bucket, at the bucket root and below a prefix,
+  and `s3://bkt/` works as before.
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published

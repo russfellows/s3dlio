@@ -538,6 +538,11 @@ print(f"Throughput: {result['throughput_mb_s']} MB/s")
 
 ### Authentication
 
+Settings can also come from a `.env` file, but the Python library does **not** read one by default
+(since 0.9.128): set `S3DLIO_LOAD_DOTENV=1` (the working directory's `.env`) or
+`S3DLIO_LOAD_DOTENV=/path/to/file` in the environment. Variables that are already set are never
+overridden by the file. See [Environment Variables](Environment_Variables.md#env-files-s3dlio_load_dotenv).
+
 **Amazon S3 / S3-Compatible:**
 ```python
 import os
@@ -671,6 +676,12 @@ loader = DataLoader(dataset, batch_size=32, num_workers=4)
 for batch in loader:
     pass  # Train
 ```
+
+`ObjectStoreMapDataset` fetches every item by the exact object it listed. Keys: for `s3://` (also with
+the server form `s3://host:port/bucket/...`) the key is the full key from the bucket root, prefix included
+(`s3://bkt/dir/` lists `dir/x`); for `file://` and `direct://` it is the path below the dataset root
+(`sub/b.bin`, or just the file name when the URI names one file). `s3dlio.create_dataset(uri).uris()` gives the URI
+that fetches each item.
 
 ### JAX Integration
 

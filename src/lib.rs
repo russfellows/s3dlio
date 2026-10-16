@@ -29,6 +29,7 @@ pub mod checksum; // CRC-32C: the checksum every writer reports (#256)
 pub mod config;
 pub mod constants;
 pub mod data_formats;
+pub mod dotenv; // `.env` handling: the one S3DLIO_LOAD_DOTENV switch (#243)
 pub mod download;
 pub mod memory;
 pub mod object_size_cache; // v0.9.10: Pre-stat size caching for benchmarking
@@ -277,6 +278,12 @@ mod test_env;
 #[pymodule]
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     Python::initialize();
+
+    // Apply the `.env` policy FIRST: before anything below (thread-pool sizing, the first
+    // I/O call) reads an environment variable (#243). This is the first thing s3dlio
+    // does at import, and `s3dlio/torch.py` imports this module before `torch`; but
+    // anything the host imported or started before `import s3dlio` is outside our reach.
+    dotenv::apply();
 
     // Auto-size every process-wide thread pool (global Tokio runtime,
     // pyo3-async-runtimes runtime, Rayon global pool) from MPI/distributed-

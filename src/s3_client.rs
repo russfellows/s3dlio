@@ -7,7 +7,7 @@
 //! Owns a single global multi-thread Tokio runtime and the global S3 client.
 //!
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
@@ -59,6 +59,7 @@ pub(crate) fn resolve_s3_endpoint_override(
 /// this, so the global client, the store cache key and the diagnostics cannot
 /// disagree about which server a request goes to.
 pub fn s3_endpoint_url_from_env() -> Option<String> {
+    crate::dotenv::apply();
     resolve_s3_endpoint_override(
         env::var(ENV_ENDPOINT_URL_S3).ok().as_deref(),
         env::var(ENV_ENDPOINT_URL).ok().as_deref(),
@@ -82,7 +83,7 @@ pub fn s3_endpoint_url_from_env() -> Option<String> {
 ///   `getenv` directly (libc, native libraries, other Python extension modules
 ///   and their threads) is *not* covered by that lock.
 /// * **Other threads may exist.** Neither caller is single-threaded: the CLI
-///   runs under `#[tokio::main]` (worker threads already started), and Python
+///   has already built its Tokio runtime (worker threads started), and Python
 ///   `configure_s3` can run after s3dlio's Tokio/Rayon runtimes and arbitrary
 ///   Python or native threads have started -- the GIL does not stop non-Python
 ///   threads. The call must therefore be made at start-up, before S3 work or
@@ -92,6 +93,11 @@ pub fn s3_endpoint_url_from_env() -> Option<String> {
 ///   client (while the routing checks, which read the environment, would follow
 ///   the new value).
 pub fn set_s3_endpoint_override(url: &str) {
+    // The `.env` policy first (#243): the check below must see `AWS_ENDPOINT_URL_S3` as the
+    // file defines it, otherwise a file-only service endpoint is loaded AFTER this call and,
+    // having precedence, silently defeats the override. Idempotent; applying never calls back
+    // into this function.
+    crate::dotenv::apply();
     // SAFETY: `set_var` is unsafe only because of concurrent C `getenv` readers
     // (see "Limitations" above). All Rust-side readers are synchronised by std's
     // environment lock. This function cannot guarantee that no native thread
@@ -173,6 +179,8 @@ pub fn configure_for_concurrency(n: usize) {
 /// earlier automatic call, as long as it happens before the first actual S3
 /// operation / `create_async_loader` call, exactly as already documented.
 pub fn configure_thread_pools(threads: usize) {
+    // The MPI world-size variables sized below, and the pools built, come after the policy.
+    crate::dotenv::apply();
     let threads = if threads > 0 {
         threads
     } else {
@@ -218,6 +226,8 @@ pub fn configure_thread_pools(threads: usize) {
 pub fn unsigned_payload_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
+        // The value is latched for the process: the policy must come first (#243).
+        crate::dotenv::apply();
         std::env::var(crate::constants::ENV_UNSIGNED_PAYLOAD)
             .map(|v| {
                 matches!(
@@ -229,11 +239,26 @@ pub fn unsigned_payload_enabled() -> bool {
     })
 }
 
+/// The error for missing S3 credentials. When a `.env` file exists that s3dlio did not
+/// load (the library default, #243), the message says how to enable it: a Python user
+/// otherwise sees only "Missing ..." and never learns that the file is being ignored.
+fn missing_credentials_error() -> anyhow::Error {
+    match crate::dotenv::not_loaded_hint() {
+        Some(hint) => {
+            anyhow::anyhow!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY ({hint})")
+        }
+        None => anyhow::anyhow!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY"),
+    }
+}
+
 // Create (once) a background multi-thread Tokio runtime and return its Handle.
 // pub(crate) so that other modules (e.g. memory.rs) can spawn onto the same
 // runtime, ensuring consistent async behaviour across all URI schemes.
 pub(crate) fn global_rt_handle() -> &'static Handle {
     RT_HANDLE.get_or_init(|| {
+        // The `.env` policy applies before the runtime reads S3DLIO_RT_THREADS and before
+        // this runtime's own worker threads exist (#243). Host threads may already exist.
+        crate::dotenv::apply();
         let (tx, rx) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name("s3dlio-rt".to_string())
@@ -267,6 +292,10 @@ pub(crate) fn global_rt_handle() -> &'static Handle {
 ///
 /// See [`get_runtime_threads`] for the full rationale of the clamp and
 /// the `S3DLIO_RT_THREADS_UNSAFE=1` escape hatch.
+///
+/// Callers apply the `.env` policy first (`get_runtime_threads` via the global runtime,
+/// `constants::effective_thread_budget` itself); this reader does not, so that the public
+/// entry point's own apply is the one a test can show to be necessary.
 pub(crate) fn clamped_env_rt_threads() -> Option<usize> {
     let n = std::env::var("S3DLIO_RT_THREADS")
         .ok()
@@ -483,11 +512,11 @@ pub fn aws_s3_client() -> Result<Client> {
 pub async fn aws_s3_client_async() -> Result<Client> {
     let client_ref = CLIENT
         .get_or_try_init(|| async {
-            dotenvy::dotenv().ok();
+            crate::dotenv::apply();
 
             if env::var("AWS_ACCESS_KEY_ID").is_err() || env::var("AWS_SECRET_ACCESS_KEY").is_err()
             {
-                bail!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
+                return Err(missing_credentials_error());
             }
             info!("Initializing S3 client");
 
@@ -615,10 +644,10 @@ pub async fn create_s3_client_for_endpoint(
     endpoint_url: &str,
     http_client: Option<SharedHttpClient>,
 ) -> Result<Client> {
-    dotenvy::dotenv().ok();
+    crate::dotenv::apply();
 
     if env::var("AWS_ACCESS_KEY_ID").is_err() || env::var("AWS_SECRET_ACCESS_KEY").is_err() {
-        bail!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
+        return Err(missing_credentials_error());
     }
 
     let region = RegionProviderChain::first_try(env::var("AWS_REGION").ok().map(Region::new))

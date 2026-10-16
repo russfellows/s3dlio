@@ -657,6 +657,11 @@ fn build_reqwest_client_raw(
 pub fn build_smithy_http_client(
     ca_bundle_path: Option<&str>,
 ) -> anyhow::Result<aws_smithy_runtime_api::client::http::SharedHttpClient> {
+    // The `.env` policy first (#243, review R9): the HTTP version and pool settings are fixed
+    // when the client is built, so a file applied afterwards cannot repair it. This builder is
+    // public on its own (the S3 client wrapper applies before calling it, but is not the only
+    // route).
+    crate::dotenv::apply();
     let mode = h2c_mode_from_env();
     let modes = Http2Modes::from_env();
 
@@ -740,6 +745,9 @@ pub fn build_smithy_http_client(
 pub fn build_reqwest_http_client_with_ca(
     ca_bundle_path: Option<&str>,
 ) -> anyhow::Result<reqwest::Client> {
+    // The `.env` policy first (#243, review R9); see `build_smithy_http_client`. (The
+    // convenience builder and `warmup_connection_pool` go through here.)
+    crate::dotenv::apply();
     let modes = Http2Modes {
         h2c: false,
         https_h2: Http2Modes::from_env().https_h2,

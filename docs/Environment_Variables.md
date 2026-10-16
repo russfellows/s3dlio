@@ -2,6 +2,97 @@
 
 This document provides a comprehensive reference for all environment variables supported by s3dlio v0.7.5+.
 
+## `.env` files (`S3DLIO_LOAD_DOTENV`)
+
+s3dlio can read a `.env` file (`NAME=value` lines) into the process environment. Whether it does is
+decided by ONE switch, read from the **real process environment** (never from a `.env` file) once per
+process:
+
+| `S3DLIO_LOAD_DOTENV` | Effect |
+|----------------------|--------|
+| `1`, `true`, `yes` or `on` (any case) | Load `.env` from the working directory. As `dotenvy` has always done here, the nearest parent directory that contains a `.env` is used if the working directory has none. |
+| `0`, `false`, `no` or `off` (any case) | Never load a `.env` file. No log line, no hint. |
+| any other non-empty value | A file path: load exactly that file. A path that cannot be read is logged as a warning (`s3-cli` prints it on stderr, because no log subscriber exists yet when it loads the file) and nothing is loaded; the working directory's `.env` is not a fallback. |
+| unset or empty | The default of the running program, below. |
+
+Only the spellings above are booleans; any other value is a file path.
+
+### Defaults
+
+| Program | Default | |
+|---------|---------|--|
+| `s3-cli` | `1` (on) | CLI users keep the convenience; the file is loaded at start-up, before the command line is parsed and before any client exists. |
+| Library: Rust crate, Python package (`import s3dlio`) | `0` (off) | A `.env` in whatever directory the host process was started from would silently change credentials, endpoints and every other `S3DLIO_*` / `AWS_*` setting of the whole process. When a `.env` exists (in the working directory or a parent) but is not loaded because of this default, one INFO line is logged, naming `S3DLIO_LOAD_DOTENV` and `s3dlio::dotenv::load_env_file`, and the error for missing S3 credentials ("Missing AWS_ACCESS_KEY_ID ...") carries the same hint, which is how a Python user sees it. An explicit `0` logs nothing and adds nothing to the error. |
+
+Changed in 0.9.128 (#243): library use used to load `.env` implicitly at the first S3 client build.
+Set `S3DLIO_LOAD_DOTENV=1` (or a path) to keep that behaviour.
+
+### Which variables, and precedence
+
+- **Any** environment variable can come from the file: `AWS_*`, `S3DLIO_*`, `AZURE_*`,
+  `GOOGLE_*`, `RUST_LOG` and so on. (`S3DLIO_LOAD_DOTENV` itself cannot: it decides whether the file
+  is read at all.)
+- **The real environment wins.** A variable that is already set (exported in the shell, set by the
+  parent process, or set by the application before s3dlio ran) is **never overridden** by the file.
+  The file only provides the variables that are missing.
+- *When* the file is read: once per process, at the first of these, which is before s3dlio reads any
+  setting (so `S3DLIO_RT_THREADS`, the writer-side `S3DLIO_OPLOG_*` settings (the op-log reader's
+  `S3DLIO_OPLOG_READ_*` are not covered, see the recorded limits below), `S3DLIO_ENABLE_RANGE_OPTIMIZATION`,
+  `S3DLIO_RANGE_THRESHOLD_MB`, `AWS_ENDPOINT_URL`, `AWS_REGION` ... all see the file's values):
+
+  | Program | The file is read at |
+  |---------|---------------------|
+  | `s3-cli` | start-up, before the command line is parsed and before the Tokio runtime is built |
+  | Python | `import s3dlio`: the native module's initialisation, the first thing it does. `s3dlio/torch.py` imports the native module before `torch`, so the file is loaded before s3dlio's own torch import. A `torch` (or anything else) that the application imported **before** `import s3dlio` has already run: torch-side settings are not covered. |
+  | Rust | the first use of any entry point that reads or changes a setting: the global runtime, `configure_thread_pools`, `store_for_uri*`, an S3 / Azure / GCS client, the S3 dataset constructors, `Logger::new`, the process-wide endpoint and `set_s3_endpoint_override`, a bucket or container listing, the Arrow backend set-up, the public HTTP-client builders (`reqwest_client::build_smithy_http_client`, `build_reqwest_http_client*`), the public setting readers in `constants` (`H2WindowConfig::from_env`, `connect_timeout_secs`, `max_retry_attempts`, `mpi_world_size`, `mpi_aware_thread_budget`, `effective_thread_budget`), `MultiEndpointStore::new` / `from_config`, `AzureConfig::default`, and the latched knobs (`S3DLIO_UNSIGNED_PAYLOAD`, `S3DLIO_SKIP_HEAD`, `S3DLIO_ENABLE_RANGE_OPTIMIZATION`, `S3DLIO_RANGE_THRESHOLD_MB`, `S3DLIO_SIZE_CACHE_TTL_SECS`, `S3DLIO_GCS_RAPID`) |
+
+  **What this does not promise.** s3dlio cannot know whether its host is multi-threaded. A Python
+  application, an inference server or a Rust program may already have threads when it first calls
+  s3dlio, and setting an environment variable is not safe against another thread that is inside C
+  `getenv` at that moment. Only `s3-cli` loads the file as its first act on its main thread, with no
+  other thread running. A host that needs the file's values, or a race-free environment, before its own
+  threads start should load the file (or set the real environment) at the very start of the process.
+  Forked children inherit the parent's resolved policy and the file it already loaded: set the switch
+  before importing s3dlio and forking, or use a freshly spawned process when the policy must differ.
+
+  **Recorded limits (not covered by the file).**
+  - The one-time warning about the retired `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is read on the first
+    URI classification, before the file is applied: a value that only the file carries never produces
+    that warning if classification is the first s3dlio call. Warning only; no setting is affected.
+  - The separate `s3dlio-oplog` crate (`OpLogStreamReader::from_file`: `S3DLIO_OPLOG_READ_BUF`,
+    `S3DLIO_OPLOG_READ_CHUNK_SIZE`) has no access to s3dlio's file policy and reads the real environment
+    only.
+  - Python helpers that read `os.environ` directly (`s3dlio.integrations.dlio` multipart configuration,
+    `s3dlio.compat.s3torchconnector`) see the interpreter's start-up copy, not variables the file
+    supplied (see the `os.environ` note below).
+  - `reqwest_client::build_reqwest_http_client_with_ca` (and `build_reqwest_http_client`,
+    `warmup_connection_pool`, which call it) apply the policy first like the other public builders, but
+    that protocol choice (HTTP/2 over TLS) has no automated first-call test.
+
+  (Python's `os.environ` is a copy taken when the interpreter starts, so it does not show variables
+  that s3dlio loads from the file; s3dlio and other native code read the real process environment.)
+  Python users can also load the file themselves **before** `import s3dlio` (see below). An application
+  that needs the file's values before its own first call into s3dlio should load it first thing:
+
+```rust
+// Rust: load a specific file explicitly; variables that are already set are kept.
+s3dlio::dotenv::load_env_file("/etc/myapp/s3dlio.env")?;
+```
+
+```python
+# Python: use python-dotenv (or set os.environ yourself) BEFORE importing s3dlio,
+# or run the process with S3DLIO_LOAD_DOTENV=/etc/myapp/s3dlio.env
+from dotenv import load_dotenv
+load_dotenv("/etc/myapp/s3dlio.env")
+import s3dlio
+```
+
+```bash
+S3DLIO_LOAD_DOTENV=1 python train.py                        # the working directory's .env
+S3DLIO_LOAD_DOTENV=/etc/myapp/s3dlio.env python train.py    # exactly that file
+S3DLIO_LOAD_DOTENV=0 s3-cli ls s3://bucket/                 # s3-cli without reading .env
+```
+
 ## HTTP Client & Performance Optimization
 
 ### Redirect Following (for AIStore and other S3-compatible services that use 3xx redirects)

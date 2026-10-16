@@ -102,6 +102,10 @@ impl Dataset for MultiBackendDataset {
         Some(self.uris.clone())
     }
 
+    fn uris(&self) -> Option<Vec<String>> {
+        Some(self.uris.clone())
+    }
+
     async fn get(&self, idx: usize) -> Result<Self::Item, DatasetError> {
         let uri = self
             .uris

@@ -21,6 +21,14 @@ except Exception:
 from importlib import import_module  # noqa: E402 -- must follow the version-detection try/except above
 from typing import List  # noqa: E402 -- avoid confusion with Rust-exported `list` symbol; must follow the version-detection try/except above
 
+# The native module is imported FIRST, outside any try/except. Its initialisation applies
+# the `.env` policy (S3DLIO_LOAD_DOTENV, issue #243) before anything else runs, and if it
+# fails, the original error must reach the caller: a PyO3 module can be initialised only
+# once per process, so a retry (as the torch block below would otherwise cause, by
+# swallowing the ImportError and importing again further down) replaces the real
+# failure with PyO3's "initialized once" message.
+_core = import_module(__name__ + "._pymod")  # this is the compiled extension
+
 # PyTorch integration (optional - only import if torch is available)
 try:
     from .torch import (
@@ -51,8 +59,7 @@ except ImportError:
 # Expose it as a submodule (optional but handy)
 # _sys.modules[__name__ + "._pymod"] = _native
 
-# Keep a stable handle to the native module.
-_core = import_module(__name__ + "._pymod")  # this is the compiled extension
+# `_core` (the native module) was imported at the top of this file.
 
 # Re-export all public symbols from the native module at package top-level
 for _name in dir(_core):

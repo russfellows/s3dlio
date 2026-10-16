@@ -292,6 +292,7 @@ fn get_skip_head() -> bool {
     // Lazily check env var once and latch if set.
     static ENV_CHECKED: OnceLock<bool> = OnceLock::new();
     *ENV_CHECKED.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         let from_env = std::env::var("S3DLIO_SKIP_HEAD")
             .ok()
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
@@ -309,6 +310,7 @@ fn get_skip_head() -> bool {
 /// (S3ObjectStore::get() honours this too — now consistent on ALL paths).
 fn get_range_opt_enabled() -> bool {
     *RANGE_OPT_ENABLED.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
             .ok()
             .map(|v| {
@@ -326,6 +328,7 @@ fn get_range_opt_enabled() -> bool {
 /// Set above file size (e.g. 1000 for 147 MiB files) to force single-GET.
 fn get_range_threshold_bytes() -> u64 {
     *RANGE_THRESHOLD_BYTES.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         let mb = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -346,6 +349,7 @@ fn get_range_threshold_bytes() -> u64 {
 /// evicted first; an expired entry is removed when a lookup finds it.
 fn get_size_cache() -> &'static Arc<ObjectSizeCache> {
     GLOBAL_SIZE_CACHE.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         let ttl_secs = std::env::var("S3DLIO_SIZE_CACHE_TTL_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1109,7 +1113,7 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
 pub fn list_buckets_at(server: Option<&S3Server>) -> Result<Vec<BucketInfo>> {
     let server = server.cloned();
     run_on_global_rt(async move {
-        dotenvy::dotenv().ok();
+        crate::dotenv::apply();
 
         // Log resolved params for diagnostics (pure helper, no side effects).
         let endpoint_url_for_log = match &server {
@@ -1869,6 +1873,8 @@ async fn attempt_range_chunk_fill(
 
 /// Get optimal chunk size based on total transfer size
 fn get_optimal_chunk_size(total_bytes: u64) -> usize {
+    // The `.env` policy first (#243, review R9): `S3DLIO_CHUNK_SIZE` may come from the file.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_CHUNK_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1889,6 +1895,8 @@ fn get_optimal_chunk_size(total_bytes: u64) -> usize {
 
 /// Get optimal concurrency based on total transfer size
 fn get_optimal_concurrency(total_bytes: u64) -> usize {
+    // The `.env` policy first (#243, review R9): `S3DLIO_RANGE_CONCURRENCY` may come from the file.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_RANGE_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse().ok())

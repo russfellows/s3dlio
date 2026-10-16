@@ -94,6 +94,7 @@ impl AzureBlob {
     /// Example: AZURE_STORAGE_ENDPOINT=http://localhost:10000 + account="devstoreaccount1"
     ///          → http://localhost:10000/devstoreaccount1
     pub fn with_default_credential(account: &str, container: &str) -> Result<Self> {
+        crate::dotenv::apply();
         // Check for custom endpoint (for Azurite or other emulators/proxies)
         if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
             .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
@@ -113,6 +114,7 @@ impl AzureBlob {
 
     /// Same, when a full endpoint URL (possibly emulator) is provided.
     pub fn with_default_credential_from_url(account_url: &str, container: &str) -> Result<Self> {
+        crate::dotenv::apply();
         let service_url = Url::parse(account_url)
             .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?;
         let credential = if service_url.scheme() == "https" {
@@ -651,6 +653,8 @@ impl AzureBlob {
 ///
 /// This is extracted as a pure function for testability.
 pub fn resolve_azure_account_url(account: &str) -> String {
+    // The `.env` policy first (#243, review R9/F): a public setting reader (the endpoint may come from the opted-in file).
+    crate::dotenv::apply();
     if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
         .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
     {
@@ -677,6 +681,7 @@ pub fn resolve_azure_account_url(account: &str) -> String {
 /// Credentials follow the same chain as [`AzureBlob::with_default_credential`]:
 /// environment variables, managed identity, developer tools, etc.
 pub async fn list_account_containers(account: &str) -> Result<Vec<(String, Option<String>)>> {
+    crate::dotenv::apply();
     let account_url = resolve_azure_account_url(account);
 
     let credential = shared_credential()?;

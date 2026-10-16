@@ -82,6 +82,8 @@ pub const ENV_CONNECT_TIMEOUT_SECS: &str = "S3DLIO_CONNECT_TIMEOUT_SECS";
 /// the constants module so reqwest_client.rs, s3_client.rs, and any future
 /// HTTP transport read from the same source.
 pub fn connect_timeout_secs() -> u64 {
+    // The `.env` policy first (#243, review R9): a public setting reader, so a first call sees the opted-in file's value.
+    crate::dotenv::apply();
     std::env::var(ENV_CONNECT_TIMEOUT_SECS)
         .ok()
         .and_then(|s| s.parse().ok())
@@ -118,6 +120,8 @@ pub const ENV_MAX_RETRY_ATTEMPTS: &str = "S3DLIO_MAX_RETRY_ATTEMPTS";
 /// when unset or unparseable.  Clamped to a minimum of 1 (zero retries
 /// would mean "do not even attempt", which the SDK rejects).
 pub fn max_retry_attempts() -> u32 {
+    // The `.env` policy first (#243, review R9): a public setting reader, so a first call sees the opted-in file's value.
+    crate::dotenv::apply();
     std::env::var(ENV_MAX_RETRY_ATTEMPTS)
         .ok()
         .and_then(|s| s.parse().ok())
@@ -180,6 +184,9 @@ pub fn size_cache_max_entries() -> usize {
 /// Falls back to `1` (single process, i.e. "no MPI detected") when none are
 /// set or unparseable. Never returns 0.
 pub fn mpi_world_size() -> usize {
+    // The `.env` policy first (#243, review R9): the world size may come from the opted-in file (also covers
+    // `mpi_aware_thread_budget`, which reads it through this function).
+    crate::dotenv::apply();
     std::env::var("OMPI_COMM_WORLD_SIZE")
         .or_else(|_| std::env::var("PMI_SIZE"))
         .or_else(|_| std::env::var("WORLD_SIZE"))
@@ -227,6 +234,8 @@ pub fn mpi_aware_thread_budget() -> usize {
 /// 2. [`mpi_aware_thread_budget`] when `mpi_world_size() > 1`
 /// 3. `max(4, num_cpus)` — floor at 4 for tiny single/dual-core VMs
 pub fn effective_thread_budget() -> usize {
+    // The `.env` policy first (#243, review R9): `S3DLIO_RT_THREADS` and the world size may come from the opted-in file.
+    crate::dotenv::apply();
     if let Some(n) = crate::s3_client::clamped_env_rt_threads() {
         return n;
     }
@@ -763,6 +772,8 @@ impl H2WindowConfig {
     /// - `S3DLIO_H2_STREAM_WINDOW_MB` / `S3DLIO_H2_CONN_WINDOW_MB` are clamped
     ///   to [`H2_WINDOW_MB_HARD_CAP`] and must be > 0.
     pub fn from_env() -> Self {
+        // The `.env` policy first (#243, review R9): a public setting reader, so a first call sees the opted-in file's values.
+        crate::dotenv::apply();
         // ── Adaptive flag ──────────────────────────────────────────────────
         let adaptive = match std::env::var(ENV_H2_ADAPTIVE_WINDOW) {
             Err(_) => true, // default: adaptive ON
