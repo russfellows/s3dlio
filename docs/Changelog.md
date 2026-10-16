@@ -16,7 +16,8 @@
   then `az`/`azd`, skips members whose variables are not set, falls through a member that cannot produce a token (for
   example a VM with no assigned identity goes on to `az`), uses the first that works for the rest of the process, and
   lists every member tried and why if none works. The Azure metadata probe runs on the blocking pool with an overall
-  bound of under 0.5 s and is not memoised as a "no". Set `S3DLIO_AZURE_CREDENTIAL=cli` for the old behaviour.
+  bound of under 0.5 s; a negative ("not Azure") result is cached for 30 s, a positive result is not separately
+  cached by the probe helper (the winning credential is what is cached). Set `S3DLIO_AZURE_CREDENTIAL=cli` for the old behaviour.
   Credentials are created once per mode and kept for the life of the process: a rotated secret, certificate or
   token file needs a restart.
   `AZURE_AUTHORITY_HOST` (https only) is honoured by the SDK for the Entra ID modes. `sas` appends
@@ -53,7 +54,8 @@
   userinfo.
 - **`auto` no longer waits out the SDK's retry schedule on a VM without an identity (#253 review).** The managed
   identity attempt in `auto` has a deadline (`S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`, default 5000 ms; the SDK retries a
-  404/410/5xx from the metadata service for about 72 s), after which `auto` moves on to `az`/`azd`. A "not Azure"
+  404/410/5xx from the metadata service for about 72 s), after which `auto` moves on to `az`/`azd`; the same deadline applies when a managed identity that already won stalls
+  on a later token refresh, after which the chain is run again. A "not Azure"
   answer from the metadata probe is cached for 30 s (a failing chain no longer probes twice per request); a cached
   `auto` winner that starts failing makes that request run the chain again, so a working member further down is found
   without a restart; a configured service principal that fails before `auto` falls through is logged at `warn`. The

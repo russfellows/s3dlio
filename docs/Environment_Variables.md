@@ -469,7 +469,8 @@ working member further down is found without a restart. If none works the error 
 configured service principal (workload identity, client secret, client certificate) that fails is logged at `warn`
 level before `auto` moves on. The managed-identity attempt has its own deadline, `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`
 (default 5000): the SDK retries a 404/410/5xx from the instance metadata service with back-off for about 72 s, which
-is too long to wait before trying `az`. The metadata probe runs off the async runtime's workers and is bounded: at
+is too long to wait before trying `az`. The same deadline applies when a managed identity that already won stalls on a
+later token refresh (the chain is then run again). The metadata probe runs off the async runtime's workers and is bounded: at
 most 250 ms to connect plus one 250 ms deadline to read the answer (under 0.5 s). It runs only when nothing else
 decides the managed-identity question, and a "not Azure" answer is believed for 30 s, so a failing chain does not
 probe on every request. **Changed in this release:** before, the default was `az`/`azd` only and the
