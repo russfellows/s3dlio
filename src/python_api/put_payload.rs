@@ -18,7 +18,7 @@
 //! | exact `bytes`                                       | 0 copies                 | 0 copies                   | 0 copies                       |
 //! | any other C-contiguous buffer (bytearray, memoryview, numpy, `array.array`, ctypes, mmap, ...) | 0 copies | 1 snapshot copy (GIL released above 256 KiB) | 0 copies |
 //! | non-contiguous (strided, reversed, transposed) view | 1 gather copy, GIL held  | same                       | same                           |
-//! | not a buffer, only `__bytes__()` / `bytes(obj)`     | 1 copy, made by Python   | same                       | same                           |
+//! | not a buffer, only `__bytes__()`                    | 1 copy, made by Python   | same                       | same                           |
 //!
 //! "0 copies" means the native code reads the caller's own memory. For a buffer export
 //! the `Py_buffer` is held as the owner of the `Bytes` ([`Bytes::from_owner`]) and read with
@@ -135,9 +135,10 @@
 //! extension, a device) is a DATA RACE with the copy: the snapshot is then undefined and the
 //! behaviour is undefined in the Rust sense; multi-threaded callers that mutate shared buffers
 //! must serialise the call with their writers. An allocation failure is a `MemoryError`.
-//! The streaming writers (`write_chunk`, `write_owned_bytes`, `MultipartUploadWriter.write`)
-//! use the same conversion but are STRICT: only buffer-protocol objects and objects with
-//! `__bytes__()` are accepted (`put_bytes` keeps its `bytes(obj)` fallback).
+//! Every writer (`put_bytes`, `put_bytes_async`, `write_chunk`, `write_owned_bytes`,
+//! `MultipartUploadWriter.write`) uses the same STRICT conversion (issue #261): only
+//! buffer-protocol objects and objects with `__bytes__()` are accepted. An int or a bool (which
+//! `bytes(5)` would turn into five zero bytes) and an arbitrary iterable are a `TypeError`.
 //! They BORROW the buffer for the one call (no thread may modify it until the call returns; the
 //! export is released before it returns). `write_owned_bytes(copy=True)` and
 //! `MultipartUploadWriter.write(copy=True)` instead take one snapshot with the GIL held
@@ -1266,14 +1267,14 @@ impl Held {
 /// only buffer-protocol objects and objects with `__bytes__()` are accepted - NOT an int (which
 /// `bytes(5)` would turn into five zero bytes) or an arbitrary iterable.
 pub(crate) fn hold_for_call(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Held> {
-    payload_parts(py, data, PayloadUse::Blocking, true).map(Held)
+    payload_parts(py, data, PayloadUse::Blocking).map(Held)
 }
 
 /// The streaming writers' `copy=True`: `data` as `Bytes` that nothing else can modify. A mutable
 /// exporter is copied once with the GIL held; exact `bytes` and `BytesView` are returned as they
 /// are (immutable, zero copies). Strict like [`hold_for_call`].
 pub(crate) fn snapshot_for_call(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Bytes> {
-    match payload_parts(py, data, PayloadUse::SnapshotUnderGil, true)? {
+    match payload_parts(py, data, PayloadUse::SnapshotUnderGil)? {
         Parts::Plain(bytes) => Ok(bytes),
         // Not produced for SnapshotUnderGil; copy defensively rather than assume.
         Parts::Export(owner, _) => {
@@ -1296,13 +1297,13 @@ pub(crate) fn put_payload_from_py(
 }
 
 /// Like [`put_payload_from_py`] but also returns the completion barrier of a held export.
-/// (`put_bytes` keeps accepting anything `bytes(obj)` accepts, as before.)
+/// Strict (issue #261): an int, a bool or an arbitrary iterable is a `TypeError`.
 pub(crate) fn put_payload(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
     usage: PayloadUse,
 ) -> PyResult<Payload> {
-    Ok(match payload_parts(py, data, usage, false)? {
+    Ok(match payload_parts(py, data, usage)? {
         Parts::Plain(bytes) => Payload { bytes, latch: None },
         Parts::Export(owner, latch) => {
             let bytes = Bytes::from_owner(owner);
@@ -1323,12 +1324,7 @@ pub(crate) fn put_payload(
     })
 }
 
-fn payload_parts(
-    py: Python<'_>,
-    data: &Bound<'_, PyAny>,
-    usage: PayloadUse,
-    strict: bool,
-) -> PyResult<Parts> {
+fn payload_parts(py: Python<'_>, data: &Bound<'_, PyAny>, usage: PayloadUse) -> PyResult<Parts> {
     let plain = Parts::Plain;
     // 1. s3dlio's own BytesView: refcount clone. MUST come first: BytesView also implements
     //    the buffer protocol, which used to shadow this branch (issue #238).
@@ -1383,17 +1379,10 @@ fn payload_parts(
         }
     }
 
-    // 5. Last resort: `__bytes__()`, and (unless `strict`) `bytes(obj)`; Python's fresh `bytes`
-    //    is wrapped (one copy). `bytes(obj)` would turn an int into that many zero bytes and
-    //    accept any iterable of ints, which the streaming writers must refuse.
-    let bytes_result = data.call_method0("__bytes__").or_else(|e| {
-        if strict {
-            Err(e)
-        } else {
-            py.get_type::<PyBytes>().call1((data,))
-        }
-    });
-    match bytes_result {
+    // 5. Last resort: `__bytes__()` only; Python's fresh `bytes` is wrapped (one copy). There is
+    //    NO `bytes(obj)` fallback (issue #261): it would turn an int or a bool into that many
+    //    zero bytes and accept any iterable of ints, which every writer must refuse.
+    match data.call_method0("__bytes__") {
         Ok(bytes_obj) => match bytes_obj.cast_exact::<PyBytes>() {
             Ok(b) => Ok(plain(bytes_from_pybytes(b))),
             Err(_) => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
@@ -2157,17 +2146,16 @@ mod tests {
                 resizable(ba.as_any()),
                 "released directly with the py token"
             );
-            // put_bytes keeps its liberal bytes(obj) fallback (unchanged behaviour)
-            assert_eq!(
-                put_payload_from_py(
-                    py,
-                    &objs.get_item("list").unwrap().unwrap(),
-                    PayloadUse::Blocking
-                )
-                .unwrap()
-                .as_ref(),
-                &[1u8, 2, 3]
-            );
+            // put_bytes uses the same strict conversion (issue #261): no bytes(obj) fallback
+            for (name, obj) in objs.iter() {
+                let e = put_payload_from_py(py, &obj, PayloadUse::Blocking)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name} accepted by put_bytes"));
+                assert!(
+                    e.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                    "{name}"
+                );
+            }
         });
     }
 

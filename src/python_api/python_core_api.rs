@@ -1635,8 +1635,9 @@ fn put_outcome_text(result: &PyResult<()>) -> String {
 /// * A non-contiguous view: one gather copy with the GIL held; `__bytes__()`-only object:
 ///   one copy. (`borrow` has no effect on these.)
 ///
-/// Design philosophy: Be liberal in what you accept, optimize based on what you get.
-/// Never reject valid data - match the permissiveness of minio/boto3/s3torch.
+/// Accepted payloads (issue #261): `bytes`, any buffer-protocol object, and any object with
+/// `__bytes__()`. An int, a bool or an arbitrary iterable is refused with a `TypeError`
+/// before anything is submitted (`bytes(5)` used to write five zero bytes).
 #[pyfunction]
 #[pyo3(signature = (uri, data, *, borrow = false))]
 fn put_bytes_async<'py>(
@@ -2591,7 +2592,9 @@ fn mkdir_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyA
 
     future_into_py(py, async move {
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
-        store.mkdir(&uri).await.map_err(py_err)
+        store.mkdir(&uri).await.map_err(py_err)?;
+        // Python `None` (the Rust unit would reach Python as `()`, an empty tuple; issue #233).
+        Python::attach(|py| Ok(py.None()))
     })
 }
 
@@ -5674,7 +5677,15 @@ async def scn_error_then_settle(start):
                 Some(failure) => Err(failure_error(failure)),
                 None => Ok(()),
             };
-            drop(native_future);
+            // NOT dropped here: the guard is destroyed implicitly, with the rest of this future's
+            // locals, as a normally completed request future is. The check reads it (so it is
+            // used) and proves it is still alive at this point.
+            assert!(
+                native_future
+                    .as_ref()
+                    .is_none_or(|guard| !guard.0.finished()),
+                "the native future guard was dropped before the call returned"
+            );
             outcome
         }
 
@@ -5693,7 +5704,15 @@ async def scn_error_then_settle(start):
                 Some(failure) => Err(failure_error(failure)),
                 None => Ok(self.head_result.clone()),
             };
-            drop(native_future);
+            // NOT dropped here: the guard is destroyed implicitly, with the rest of this future's
+            // locals, as a normally completed request future is. The check reads it (so it is
+            // used) and proves it is still alive at this point.
+            assert!(
+                native_future
+                    .as_ref()
+                    .is_none_or(|guard| !guard.0.finished()),
+                "the native future guard was dropped before the call returned"
+            );
             outcome
         }
 
@@ -6663,6 +6682,30 @@ async def scn_error_then_settle(start):
         });
     }
 
+    /// Normal completion, with the native future destroyed IMPLICITLY (the fake store does not
+    /// drop its guard itself; it asserts the guard is still alive when the call returns, so an
+    /// explicit early drop would fail the call). Repeated, with a plain and a slow `Drop`, so the
+    /// order is not one lucky schedule: the guard is gone before the latch is marked, the export
+    /// is released once, and the call returned its value.
+    #[test]
+    fn get_completed_request_future_is_destroyed_implicitly_before_the_latch_is_marked() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for round in 0..10 {
+                for slow in [false, true] {
+                    let what = format!("GET completion round {round}, slow drop {slow}");
+                    let (probe, latch, ex) =
+                        run_get_with_probe(py, &driver, Ending::Completion, slow);
+                    assert!(probe.finished(), "{what}: the guard never ran its Drop");
+                    probe.assert_dropped_before_any_marking(&what);
+                    assert_eq!(latch_state(&latch), (true, true), "{what}");
+                    assert_eq!(attr_usize(&ex, "releases"), 1, "{what}");
+                }
+            }
+        });
+    }
+
     /// While a blocked native request is in flight nothing of the call is marked, and the
     /// awaitable stays pending.
     #[test]
@@ -7255,6 +7298,26 @@ async def scn_error_then_settle(start):
         });
     }
 
+    /// HEAD twin of `get_completed_request_future_is_destroyed_implicitly_before_the_latch_is_marked`:
+    /// the fake `head` leaves its guard to be destroyed implicitly, and the token completes
+    /// exactly once, after it.
+    #[test]
+    fn head_completed_request_future_is_destroyed_implicitly_before_the_token_completes() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for round in 0..10 {
+                for slow in [false, true] {
+                    let what = format!("HEAD completion round {round}, slow drop {slow}");
+                    let (probe, latch) = run_head_with_probe(py, &driver, Ending::Completion, slow);
+                    assert!(probe.finished(), "{what}: the guard never ran its Drop");
+                    probe.assert_dropped_before_any_marking(&what);
+                    assert_head_quiesced(py, &latch, probe.token_baseline);
+                }
+            }
+        });
+    }
+
     #[test]
     fn head_latch_stays_unmarked_while_a_blocked_request_is_in_flight() {
         init();
@@ -7796,5 +7859,217 @@ def unsupported_is_raised_synchronously(core):
                 "HEAD exports no buffer"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- #261 (PUT payload conversion is strict) and #233 (`mkdir_async` returns None).
+//
+// Embedded interpreter, local `file://` store only. A rejected payload must be refused
+// BEFORE anything is submitted, so the target object must not exist afterwards.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod put_strict_payload_and_mkdir_tests {
+    use super::*;
+    use pyo3::ffi::c_str;
+    use pyo3::types::{PyCFunction, PyDict, PyModule, PyTuple};
+
+    const SCENARIO_PY: &std::ffi::CStr = c_str!(
+        "
+import asyncio
+
+class B:
+    def __bytes__(self):
+        return b'xyz'
+
+bad = {
+    'int': 5,
+    'bool': True,
+    'false': False,
+    'list': [1, 2, 3],
+    'tuple': (1, 2, 3),
+    'generator': (i for i in range(3)),
+    'range': range(4),
+}
+good = {
+    'bytes': (b'abc', b'abc'),
+    'bytearray': (bytearray(b'abc'), b'abc'),
+    'memoryview': (memoryview(b'abc'), b'abc'),
+    'dunder_bytes': (B(), b'xyz'),
+}
+
+async def _main(start):
+    try:
+        return await start()
+    except BaseException as e:
+        return e
+
+def run(start):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_main(start))
+    finally:
+        loop.close()
+"
+    );
+
+    fn init() {
+        Python::initialize();
+    }
+
+    fn scenario(py: Python<'_>) -> Bound<'_, PyModule> {
+        PyModule::from_code(
+            py,
+            SCENARIO_PY,
+            c_str!("s3dlio_put_strict_scenario.py"),
+            c_str!("_s3dlio_put_strict_scenario"),
+        )
+        .expect("scenario module")
+    }
+
+    /// The Python callable `start()` that calls `put_bytes_async(uri, data, borrow=borrow)`.
+    fn put_async_start<'py>(
+        py: Python<'py>,
+        uri: String,
+        data: Py<PyAny>,
+        borrow: bool,
+    ) -> Bound<'py, PyAny> {
+        PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |args: &Bound<'_, PyTuple>,
+                  _: Option<&Bound<'_, PyDict>>|
+                  -> PyResult<Py<PyAny>> {
+                let py = args.py();
+                put_bytes_async(py, &uri, data.bind(py), borrow).map(Bound::unbind)
+            },
+        )
+        .expect("start closure")
+        .into_any()
+    }
+
+    fn uri_in(dir: &std::path::Path, name: &str) -> (String, std::path::PathBuf) {
+        let path = dir.join(name);
+        (format!("file://{}", path.display()), path)
+    }
+
+    fn is_type_error(py: Python<'_>, e: &PyErr) -> bool {
+        e.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
+    }
+
+    /// #261: `put_bytes` refuses an int, a bool and arbitrary iterables with a `TypeError`
+    /// before it submits anything (`bytes(5)` used to write five zero bytes).
+    #[test]
+    fn put_bytes_refuses_ints_bools_and_iterables_before_submission() {
+        init();
+        Python::attach(|py| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let bad = scenario(py).getattr("bad").unwrap();
+            let bad = bad.cast::<PyDict>().unwrap();
+            for (name, obj) in bad.iter() {
+                let (uri, path) = uri_in(dir.path(), &format!("sync-{name}"));
+                let outcome = put_bytes(py, &uri, &obj);
+                match outcome {
+                    Err(e) => assert!(is_type_error(py, &e), "{name}: {e}"),
+                    Ok(()) => panic!("{name}: put_bytes accepted the payload"),
+                }
+                assert!(!path.exists(), "{name}: an object was written");
+            }
+        });
+    }
+
+    /// #261: `put_bytes_async` refuses the same payloads synchronously, before the awaitable
+    /// exists, with and without `borrow`.
+    #[test]
+    fn put_bytes_async_refuses_ints_bools_and_iterables_before_submission() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let bad = module.getattr("bad").unwrap();
+            let bad = bad.cast::<PyDict>().unwrap();
+            for borrow in [false, true] {
+                for (name, obj) in bad.iter() {
+                    let (uri, path) = uri_in(dir.path(), &format!("async-{borrow}-{name}"));
+                    let start = put_async_start(py, uri, obj.unbind(), borrow);
+                    let outcome = module.getattr("run").unwrap().call1((start,)).unwrap();
+                    let is_type_error = outcome
+                        .is_instance(&py.get_type::<pyo3::exceptions::PyTypeError>())
+                        .unwrap();
+                    assert!(
+                        is_type_error,
+                        "{name} (borrow={borrow}): expected a TypeError, got {outcome:?}"
+                    );
+                    assert!(
+                        !path.exists(),
+                        "{name} (borrow={borrow}): an object was written"
+                    );
+                }
+            }
+        });
+    }
+
+    /// #261: bytes, buffers and objects with `__bytes__()` still work through both entry
+    /// points, and the right bytes are written.
+    #[test]
+    fn put_bytes_still_accepts_bytes_buffers_and_dunder_bytes() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let good = module.getattr("good").unwrap();
+            let good = good.cast::<PyDict>().unwrap();
+            for (name, pair) in good.iter() {
+                let (obj, expected): (Bound<'_, PyAny>, Vec<u8>) = pair.extract().unwrap();
+
+                let (uri, path) = uri_in(dir.path(), &format!("sync-{name}"));
+                put_bytes(py, &uri, &obj).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(std::fs::read(&path).unwrap(), expected, "{name}: sync");
+
+                for borrow in [false, true] {
+                    let (uri, path) = uri_in(dir.path(), &format!("async-{borrow}-{name}"));
+                    let start = put_async_start(py, uri, obj.clone().unbind(), borrow);
+                    let outcome = module.getattr("run").unwrap().call1((start,)).unwrap();
+                    assert!(
+                        !outcome.is_instance_of::<pyo3::exceptions::PyBaseException>(),
+                        "{name} (borrow={borrow}): {outcome:?}"
+                    );
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        expected,
+                        "{name}: async, borrow={borrow}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// #233: `mkdir_async` resolves to Python `None` (it used to resolve to `()`, an empty
+    /// tuple), and the directory exists afterwards.
+    #[test]
+    fn mkdir_async_returns_python_none() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let target = dir.path().join("made").join("deeper");
+            let uri = format!("file://{}/", target.display());
+            let start = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>,
+                      _: Option<&Bound<'_, PyDict>>|
+                      -> PyResult<Py<PyAny>> {
+                    mkdir_async(args.py(), &uri).map(Bound::unbind)
+                },
+            )
+            .expect("start closure")
+            .into_any();
+            let outcome = module.getattr("run").unwrap().call1((start,)).unwrap();
+            assert!(outcome.is_none(), "mkdir_async resolved to {outcome:?}");
+            assert!(target.is_dir(), "the directory was not made");
+        });
     }
 }
