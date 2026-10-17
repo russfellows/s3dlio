@@ -2757,6 +2757,18 @@ pub(crate) struct RangePart<'a> {
     pub(crate) buf: &'a mut [u8],
 }
 
+/// The object version a ranged read is pinned to: the ETag and whole-object size of the fresh
+/// HEAD, on the client whose server the read goes to.
+pub(crate) struct PinnedRead<'a> {
+    pub(crate) client: &'a aws_sdk_s3::Client,
+    pub(crate) bucket: &'a str,
+    pub(crate) key: &'a str,
+    /// Sent as `If-Match` on every range and retry.
+    pub(crate) etag: &'a str,
+    /// The whole-object size every `Content-Range` must report.
+    pub(crate) total: u64,
+}
+
 /// Split `dst` into parts of `chunk_size` bytes (the last one may be shorter), lazily, so a
 /// small chunk size never builds a vector with one entry per part.
 fn range_parts(dst: &mut [u8], chunk_size: usize) -> Result<impl Iterator<Item = RangePart<'_>>> {
@@ -2779,14 +2791,17 @@ fn range_parts(dst: &mut [u8], chunk_size: usize) -> Result<impl Iterator<Item =
 /// `Content-Range` that was asked for and a total equal to `total`.  Every failure is typed;
 /// as the read is pinned, a 404 is `VersionChanged`, never absence.
 pub(crate) async fn attempt_range_part_into(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    if_match: &str,
-    total: u64,
+    read: &PinnedRead<'_>,
     part: &mut RangePart<'_>,
     span: &mut SpanMark<'_>,
 ) -> Result<()> {
+    let PinnedRead {
+        client,
+        bucket,
+        key,
+        etag: if_match,
+        total,
+    } = *read;
     let len = len_to_u64(part.buf.len())?;
     let Some(last) = len.checked_sub(1).and_then(|l| part.offset.checked_add(l)) else {
         // An empty part has no valid range (`bytes=a--1` is never sent) and nothing to read.
@@ -2858,11 +2873,7 @@ pub(crate) async fn attempt_range_part_into(
 /// One part with its retries: the same budget and backoff as the single GET, and the typed
 /// verdict.  Every attempt carries `If-Match`, so a retry can never read another version.
 async fn range_part_with_retries(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    etag: &str,
-    total: u64,
+    read: &PinnedRead<'_>,
     mut part: RangePart<'_>,
     progress: &ReceiveProgress,
 ) -> Result<()> {
@@ -2870,8 +2881,7 @@ async fn range_part_with_retries(
     let mut span = SpanMark::new(progress);
     let mut last: Option<anyhow::Error> = None;
     for attempt in 1..=attempts {
-        match attempt_range_part_into(client, bucket, key, etag, total, &mut part, &mut span).await
-        {
+        match attempt_range_part_into(read, &mut part, &mut span).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if !RetryClassify::is_retryable(&e) {
@@ -2894,16 +2904,11 @@ async fn range_part_with_retries(
 
 /// Read all `parts` of one object version, at most `max_concurrency` at a time.
 ///
-/// `etag` is the version every range is pinned to and `total` the whole-object size, both
-/// from the fresh HEAD.  The parts are futures of THIS task (a sliding window over
+/// `read` names the version every range is pinned to (the ETag and total of the fresh HEAD).  The parts are futures of THIS task (a sliding window over
 /// `FuturesUnordered`); on the first error the others are dropped, which stops their
 /// writers before this function returns.
 pub(crate) async fn concurrent_range_get_into<'a, I>(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    etag: &str,
-    total: u64,
+    read: &PinnedRead<'_>,
     parts: I,
     max_concurrency: usize,
     progress: &ReceiveProgress,
@@ -2917,9 +2922,7 @@ where
     loop {
         while in_flight.len() < max_concurrency {
             let Some(part) = pending.next() else { break };
-            in_flight.push(range_part_with_retries(
-                client, bucket, key, etag, total, part, progress,
-            ));
+            in_flight.push(range_part_with_retries(read, part, progress));
         }
         match in_flight.next().await {
             Some(Ok(())) => {}
@@ -2972,17 +2975,14 @@ async fn get_into_fanout(
     match (size, etag) {
         (Some(total), Some(etag)) => {
             let parts = range_parts(dst, chunk_size)?;
-            concurrent_range_get_into(
+            let read = PinnedRead {
                 client,
                 bucket,
                 key,
-                &etag,
+                etag: &etag,
                 total,
-                parts,
-                concurrency,
-                progress,
-            )
-            .await
+            };
+            concurrent_range_get_into(&read, parts, concurrency, progress).await
         }
         _ => get_into_single(client, bucket, key, dst, progress).await,
     }
