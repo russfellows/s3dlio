@@ -26,6 +26,22 @@ use crate::object_store::{
     CompressionConfig, ObjectMetadata, ObjectProperties, ObjectStore, ObjectWriter,
 };
 
+/// A file modification time as an RFC 3339 UTC string (#263), the form `ObjectMetadata::last_modified`
+/// carries for every other backend.
+///
+/// The sub-second part the filesystem reported is kept (`2025-05-16T09:46:12.500Z`); a whole-second
+/// time has none (`2025-05-16T09:46:12Z`).  A time before the Unix epoch, or one outside the
+/// range RFC 3339 here can express, has no such string and is reported as absent rather than
+/// guessed.  Shared by the `file://` and the direct-I/O store.
+pub(crate) fn modified_time_rfc3339(time: std::time::SystemTime) -> Option<String> {
+    let since_epoch = time
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?;
+    let secs = i64::try_from(since_epoch.as_secs()).ok()?;
+    let datetime = chrono::DateTime::from_timestamp(secs, since_epoch.subsec_nanos())?;
+    Some(datetime.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+}
+
 /// Configuration for FileSystemObjectStore
 ///
 /// **Performance Note**: Range parallelism may be **counterproductive** for local files
@@ -302,17 +318,7 @@ impl FileSystemObjectStore {
         let metadata = fs::metadata(path).await?;
 
         // Create ObjectMetadata compatible with S3ObjectStat
-        let last_modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map(|duration| {
-                // Convert to RFC 3339 format like S3 uses
-                let secs = duration.as_secs();
-                let datetime =
-                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-                format!("{:?}", datetime) // Simple formatting for now
-            });
+        let last_modified = metadata.modified().ok().and_then(modified_time_rfc3339);
 
         let file_hash = format!(
             "file-{}-{}",
@@ -938,5 +944,64 @@ impl ObjectStore for FileSystemObjectStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod modified_time_tests {
+    use super::modified_time_rfc3339;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn at(secs: u64, nanos: u32) -> SystemTime {
+        UNIX_EPOCH + Duration::new(secs, nanos)
+    }
+
+    /// A whole-second UTC time is an RFC 3339 string, not a `SystemTime { .. }` dump (#263).
+    #[test]
+    fn utc_time_is_rfc3339() {
+        assert_eq!(
+            modified_time_rfc3339(at(1_747_388_772, 0)).as_deref(),
+            Some("2025-05-16T09:46:12Z")
+        );
+        assert_eq!(
+            modified_time_rfc3339(UNIX_EPOCH).as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
+    }
+
+    /// The fraction the filesystem reported is kept, down to the nanosecond.
+    #[test]
+    fn fractional_time_keeps_its_precision() {
+        for (nanos, want) in [
+            (500_000_000, "2025-05-16T09:46:12.500Z"),
+            (123_456_000, "2025-05-16T09:46:12.123456Z"),
+            (123_456_789, "2025-05-16T09:46:12.123456789Z"),
+        ] {
+            assert_eq!(
+                modified_time_rfc3339(at(1_747_388_772, nanos)).as_deref(),
+                Some(want),
+                "{nanos} ns"
+            );
+        }
+    }
+
+    /// The output parses back to the same instant, so nothing but formatting changed.
+    #[test]
+    fn output_round_trips_to_the_same_instant() {
+        let text = modified_time_rfc3339(at(1_900_000_000, 7_008_009)).expect("present");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&text).expect("RFC 3339");
+        assert_eq!(parsed.timestamp(), 1_900_000_000);
+        assert_eq!(parsed.timestamp_subsec_nanos(), 7_008_009);
+    }
+
+    /// A time with no RFC 3339 form is absent, never an empty string or a made-up time: before the
+    /// epoch, and past the range the calendar type can hold.
+    #[test]
+    fn unrepresentable_time_is_absent() {
+        assert_eq!(
+            modified_time_rfc3339(UNIX_EPOCH - Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(modified_time_rfc3339(at(10_000_000_000_000, 0)), None);
     }
 }

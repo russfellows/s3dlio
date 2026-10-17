@@ -1242,14 +1242,7 @@ impl ConfigurableFileSystemObjectStore {
         let last_modified = metadata
             .modified()
             .ok()
-            .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map(|duration| {
-                // Convert to RFC 3339 format like S3 uses
-                let secs = duration.as_secs();
-                let datetime =
-                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-                format!("{:?}", datetime) // Simple formatting for now
-            });
+            .and_then(crate::file_store::modified_time_rfc3339);
 
         let file_hash = format!(
             "file-{}-{}",

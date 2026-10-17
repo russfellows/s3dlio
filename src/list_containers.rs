@@ -269,6 +269,19 @@ async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     Ok(containers)
 }
 
+/// A GCS bucket creation time as an RFC 3339 string (#263).
+///
+/// GCS reports it as Google's `Timestamp`, whose `Debug` form is a struct dump
+/// (`Timestamp { seconds: .., nanos: .. }`), not a date.  Google's `String::from(Timestamp)`
+/// gives RFC 3339 in UTC and keeps the fraction when there is one.  An absent time stays absent.
+#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+fn bucket_time_rfc3339<T>(time: Option<T>) -> Option<String>
+where
+    T: Into<String>,
+{
+    time.map(Into::into)
+}
+
 #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
 async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     use google_cloud_gax::paginator::ItemPaginator;
@@ -292,7 +305,7 @@ async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
             .unwrap_or(&bucket.name)
             .to_string();
         trace!("GCS LIST BUCKETS: bucket={}", short_name);
-        let date = bucket.create_time.map(|t| format!("{:?}", t));
+        let date = bucket_time_rfc3339(bucket.create_time);
         containers.push(ContainerInfo {
             uri: format!("gs://{}", short_name),
             name: short_name,
@@ -427,6 +440,71 @@ mod tests {
         assert_eq!(names, vec!["alpha", "beta"]);
         assert!(entries[0].uri.starts_with("file://"));
         assert!(entries[0].creation_date.is_none());
+    }
+
+    /// A bucket whose creation time is parsed from `rfc3339`, built without naming the timestamp
+    /// type (it lives in a crate this one does not depend on directly).
+    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    fn bucket_created(rfc3339: &str) -> google_cloud_storage::model::Bucket {
+        let mut bucket = google_cloud_storage::model::Bucket::default();
+        bucket.create_time = Some(rfc3339.try_into().expect("valid timestamp"));
+        bucket
+    }
+
+    /// A synthetic UTC creation time is an RFC 3339 string, not a struct dump (#263).
+    #[test]
+    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    fn utc_bucket_time_is_rfc3339() {
+        let bucket = bucket_created("2025-05-16T09:46:12Z");
+        assert_eq!(
+            bucket_time_rfc3339(bucket.create_time).as_deref(),
+            Some("2025-05-16T09:46:12Z")
+        );
+    }
+
+    /// The fraction is kept, down to the nanosecond.
+    #[test]
+    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    fn fractional_bucket_time_keeps_its_precision() {
+        for (input, want) in [
+            ("2025-05-16T09:46:12.5Z", "2025-05-16T09:46:12.5Z"),
+            ("2025-05-16T09:46:12.123456Z", "2025-05-16T09:46:12.123456Z"),
+            (
+                "2025-05-16T09:46:12.123456789Z",
+                "2025-05-16T09:46:12.123456789Z",
+            ),
+        ] {
+            let bucket = bucket_created(input);
+            assert_eq!(
+                bucket_time_rfc3339(bucket.create_time).as_deref(),
+                Some(want),
+                "{input}"
+            );
+        }
+    }
+
+    /// The output parses back to the same instant, so nothing but formatting changed.
+    #[test]
+    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    fn bucket_time_round_trips_to_the_same_instant() {
+        let bucket = bucket_created("2031-02-03T04:05:06.007008009Z");
+        let text = bucket_time_rfc3339(bucket.create_time).expect("present");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&text).expect("RFC 3339");
+        let want_secs = chrono::NaiveDate::from_ymd_opt(2031, 2, 3)
+            .and_then(|d| d.and_hms_opt(4, 5, 6))
+            .expect("valid date")
+            .and_utc()
+            .timestamp();
+        assert_eq!(parsed.timestamp(), want_secs);
+        assert_eq!(parsed.timestamp_subsec_nanos(), 7_008_009);
+    }
+
+    /// An absent creation time stays absent; it is never an empty string or a zero time.
+    #[test]
+    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    fn absent_bucket_time_stays_absent() {
+        let bucket = google_cloud_storage::model::Bucket::default();
+        assert_eq!(bucket_time_rfc3339(bucket.create_time), None);
     }
 
     #[test]
