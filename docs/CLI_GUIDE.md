@@ -377,7 +377,9 @@ mean "everything under".
 
 ### get - High-Performance Download
 
-Download objects with advanced options for maximum throughput.
+Read objects with concurrency for maximum throughput. `get` fetches the object bytes and reports the
+byte count and throughput; it does **not** write them to a file and has no `--output` option. To save
+objects to a local path use [download](#download---download-objects).
 
 On `s3://` the URI selects as described under [ls](#ls---list-objects): `s3-cli get s3://b/file.txt`
 downloads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` downloads everything under `dl/`
@@ -389,15 +391,21 @@ pattern fails before any request is sent. `--pattern` cannot be combined with `-
 follow it (tracked in #220).
 
 ```bash
-s3-cli get [OPTIONS] <URI>
+s3-cli get [OPTIONS] [URI]
 ```
 
-**Options:**
+**Options** (exactly the options `s3-cli get --help` lists):
 | Option | Description |
 |--------|-------------|
-| `-j, --jobs <N>` | Concurrent downloads (default: 64) |
-| `-p, --pattern <REGEX>` | Regex (client-side) that narrows the selection; matched against each entry relative to the listing base |
-| `-o, --output <PATH>` | Output path (default: current directory) |
+| `[URI]` | A full key, a directory ending with `/`, or a `*` / `**` glob; optional when `--keylist` is given |
+| `-p, --pattern <REGEX>` | Regex (client-side) that narrows the selection; matched against each entry relative to the listing base. Not valid with `--keylist` or `--offset/--length` |
+| `-j, --jobs <JOBS>` | Maximum concurrent GET requests (default: 64, max 4096; accepts `k` and `m` suffixes) |
+| `--concurrent <CONCURRENT>` | Alternative to `--jobs`, for `mp` compatibility (max 4096) |
+| `--keylist <KEYLIST>` | File containing a list of URIs to read, one per line |
+| `-r, --recursive` | Perform the operation recursively |
+| `--offset <OFFSET>` | Byte offset for a range request (single-object GET only) |
+| `--length <LENGTH>` | Number of bytes to read for a range request (to the end if omitted) |
+| `--endpoints <HOST:PORT[,HOST:PORT...]>` | Comma-separated S3 endpoints for multi-endpoint GET, round-robin; requires an `s3://` URI |
 
 ```bash
 # Only the .bin objects under data/
