@@ -22,13 +22,25 @@
 // that into an abort instead of exhausting the host) or hangs on the empty semaphore (the
 // timeout turns that into a failure); neither can freeze or exhaust the test run.
 
-#[allow(dead_code)] // the shared mock module is imported whole; this binary uses part of it
-mod common;
+// The address-space limit (`ulimit -v`) is a Linux mechanism, so the file is Linux-only.
+#![cfg(target_os = "linux")]
 
-use common::mock_s3_server::{
+// Only the mock server file is included, not all of tests/common.  This binary uses part of
+// the mock's API (a few of its request-recording fields and helper methods are unused here),
+// so the expectation is on this one module and fails if the warnings ever stop.
+#[path = "common/mock_s3_server.rs"]
+#[expect(
+    dead_code,
+    reason = "this binary uses only part of the shared mock server API"
+)]
+mod mock_s3_server;
+
+use mock_s3_server::{
     ensure_mock_s3_server, key_path, unique_test_key, SIZED_OBJECT_BODY, SIZED_OBJECT_MARKER,
 };
+use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const BUCKET: &str = "mock-bucket";
@@ -61,7 +73,7 @@ fn child_run_case() {
         .enable_all()
         .build()
         .expect("runtime");
-    let (_port, state) = ensure_mock_s3_server();
+    let state = ensure_mock_s3_server().1;
     let key = unique_test_key(SIZED_OBJECT_MARKER);
     let uri = format!("s3://{BUCKET}/{key}");
 
@@ -102,25 +114,88 @@ fn child_run_case() {
 
 struct ChildOutcome {
     timed_out: bool,
+    /// Set when the child was still alive after the whole SIGTERM ladder.
+    survivor_pid: Option<u32>,
     status: Option<std::process::ExitStatus>,
     output: String,
 }
 
-fn terminate(child: &mut std::process::Child) {
-    // A two-step ladder with the default SIGTERM disposition; the child installs no handler.
+/// The most output kept from one child stream; the rest is read and discarded.
+const KEEP_OUTPUT_BYTES: usize = 1 << 20;
+/// How long to wait for a reader thread to see end-of-file after the child exited.
+const READER_GRACE: Duration = Duration::from_secs(5);
+
+/// Drain `stream` on its own thread, so a chatty child can never fill a pipe and block.
+/// The kept text (at most [`KEEP_OUTPUT_BYTES`]) is sent when the stream ends.
+fn drain<R: Read + Send + 'static>(mut stream: R) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let room = KEEP_OUTPUT_BYTES.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+        }
+        // The receiver may be gone (the parent gave up); nothing else to do then.
+        tx.send(String::from_utf8_lossy(&kept).into_owned()).ok();
+    });
+    rx
+}
+
+/// A two-step SIGTERM ladder with the default disposition (the child installs no handler).
+/// Returns whether the child exited.  There is no SIGKILL: a child that outlives the ladder
+/// is reported to the caller, which must not wait on it.
+fn terminate(child: &mut std::process::Child) -> bool {
     for _ in 0..2 {
-        let _ = Command::new("kill")
+        Command::new("kill")
             .args(["-TERM", &child.id().to_string()])
-            .status();
+            .status()
+            .ok();
         let until = Instant::now() + Duration::from_secs(3);
         while Instant::now() < until {
             if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    false
 }
+
+/// Variables from a developer or CI shell that would change which server the child talks
+/// to, which credentials or profile it resolves, or how it retries and times out.  Every
+/// endpoint, profile and transport variable `s3_client.rs` and the AWS SDK honour is here.
+const SCRUBBED_ENV: &[&str] = &[
+    "S3DLIO_CHUNK_SIZE",
+    "S3DLIO_RANGE_CONCURRENCY",
+    "S3DLIO_RANGE_THRESHOLD_MB",
+    "S3DLIO_SKIP_HEAD",
+    "S3DLIO_FOLLOW_REDIRECTS",
+    "S3DLIO_OPERATION_TIMEOUT_SECS",
+    "S3DLIO_CONNECT_TIMEOUT_SECS",
+    "S3DLIO_MAX_RETRY_ATTEMPTS",
+    "S3DLIO_EXTRA_TRANSIENT_CODES",
+    "S3DLIO_RT_THREADS",
+    "S3DLIO_RT_THREADS_UNSAFE",
+    "AWS_ENDPOINT_URL_S3",
+    "AWS_ENDPOINT_URL",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_SESSION_TOKEN",
+    "AWS_CA_BUNDLE",
+    "AWS_DEFAULT_REGION",
+    "AWS_ROLE_ARN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+];
 
 fn run_case(case: &str, expect: &str, env: &[(&str, &str)]) -> ChildOutcome {
     let exe = std::env::current_exe().expect("test executable path");
@@ -140,51 +215,66 @@ fn run_case(case: &str, expect: &str, env: &[(&str, &str)]) -> ChildOutcome {
         .env(CHILD_EXPECT, expect)
         // Fewer malloc arenas keep the address-space limit about real memory.
         .env("MALLOC_ARENA_MAX", "2")
-        // Values inherited from a developer shell must not change the outcome.
-        .env_remove("S3DLIO_CHUNK_SIZE")
-        .env_remove("S3DLIO_RANGE_CONCURRENCY")
-        .env_remove("S3DLIO_RANGE_THRESHOLD_MB")
         .env("S3DLIO_ENABLE_RANGE_OPTIMIZATION", "1")
-        .env_remove("S3DLIO_SKIP_HEAD")
         .env("S3DLIO_LOAD_DOTENV", "0")
+        // No instance-metadata lookups if credentials were somehow missing.
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Values inherited from a developer shell must not change the outcome.
+    for name in SCRUBBED_ENV {
+        cmd.env_remove(name);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("spawn the child test process");
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
 
     let deadline = Instant::now() + HARD_TIMEOUT;
     let mut timed_out = false;
+    let mut survivor_pid = None;
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) if Instant::now() >= deadline => {
                 timed_out = true;
-                terminate(&mut child);
+                if !terminate(&mut child) {
+                    survivor_pid = Some(child.id());
+                }
                 break child.try_wait().ok().flatten();
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(_) => break None,
         }
     };
-    let out = child.wait_with_output();
-    let output = match out {
-        Ok(o) => format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        ),
-        Err(e) => format!("(output unavailable: {e})"),
+
+    // A surviving child still holds its pipes open: waiting for end-of-file would block.
+    let collect = |rx: Option<mpsc::Receiver<String>>| match (rx, survivor_pid) {
+        (Some(rx), None) => rx
+            .recv_timeout(READER_GRACE)
+            .unwrap_or_else(|_| "(output incomplete)".to_string()),
+        (Some(_), Some(_)) => "(child still running; output not collected)".to_string(),
+        (None, _) => "(no output stream)".to_string(),
     };
+    let output = format!("{}\n{}", collect(stdout), collect(stderr));
     ChildOutcome {
         timed_out,
+        survivor_pid,
         status,
         output,
     }
 }
 
 fn assert_verified(what: &str, o: ChildOutcome) {
+    if let Some(pid) = o.survivor_pid {
+        panic!(
+            "{what}: the child (pid {pid}) is STILL RUNNING after the SIGTERM ladder; it was not \
+             killed and not waited for, and needs to be stopped by hand"
+        );
+    }
     assert!(
         !o.timed_out,
         "{what}: HUNG past {HARD_TIMEOUT:?} (the setting was not validated)\n{}",
