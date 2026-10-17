@@ -614,6 +614,12 @@ pub(crate) struct ResponseLengths {
 /// * Without one (a 200: the service ignored the range, or an unranged retry after the 416 that
 ///   an empty blob gives): `Content-Length` is the blob size and the body length. The SDK does not
 ///   expose the status, so a missing `Content-Range` means a whole-blob reply.
+///
+/// Recorded limit: because the status is not visible, a 206 whose `Content-Range` was stripped
+/// (by a broken service or proxy) and whose `Content-Length` equals the request is read as a
+/// whole blob of that length, even when the blob is larger. A real Azure service always sends
+/// `Content-Range` on a 206. The request is not widened (for example to `N + 1` bytes) to detect
+/// this, because the one-bounded-range request shape is fixed by the plan.
 pub(crate) fn response_lengths(
     content_range: Option<&str>,
     content_length: Option<u64>,
@@ -666,6 +672,14 @@ pub(crate) fn response_lengths(
 /// response already covers the requested range, and then (line 84) returns the first response's
 /// body directly, with no partition buffer and no worker task. `if_match` pins a retry to the
 /// first response's ETag.
+///
+/// The no-remaining-ranges path assumes the service honours the range. A reply shorter than the
+/// range asked for (a short 206 that is not the tail of the blob) leaves the SDK with ranges
+/// still to fetch, so it starts its partition task (a zero-filled buffer of `partition_size`
+/// bytes that reads the first body) BEFORE `get_into` sees the response and refuses it (see
+/// `response_lengths`). The refusal still happens before any byte reaches the destination, but
+/// that buffer exists, and the SDK's follow-up requests for the missing ranges are driven only
+/// if the refused response's body is polled, which `get_into` does not do.
 fn get_into_options(
     expected_len: u64,
     if_match: Option<&str>,
@@ -702,7 +716,6 @@ fn usable_etag(etag: Option<&azure_core::http::Etag>) -> Option<String> {
 /// * a chunk that would pass the end of `dst`: `LengthMismatch` (the chunk is not copied);
 /// * a stream that ends before `dst` is full: a `Transport` error (a truncated transfer);
 /// * a stream error: an [`AzureRequestError`] (SAS redacted, credential mode named for a 401/403).
-///
 async fn receive_into<S>(
     mut body: S,
     dst: &mut [u8],
@@ -1067,8 +1080,8 @@ impl AzureBlob {
             .map_err(|e| header_error("x-ms-version-id", e))?;
         Ok(Some(HeadMetadata {
             size,
-            etag: etag.map(|e| e.to_string()),
-            version_id,
+            etag: etag.map(|e| e.to_string()).filter(|e| !e.trim().is_empty()),
+            version_id: version_id.filter(|v| !v.trim().is_empty()),
         }))
     }
 
@@ -1077,7 +1090,7 @@ impl AzureBlob {
     /// long.
     ///
     /// * `dst.len() > 0`: one bounded range `0..dst.len()`, `parallel = 1`,
-    ///   `partition_size = dst.len()` (see [`get_into_options`]), so the SDK returns the first
+    ///   `partition_size = dst.len()` (see `get_into_options`), so the SDK returns the first
     ///   response's body directly, with no partition buffer. The blob size comes from the
     ///   `Content-Range` total (206) or `Content-Length` (200) and must equal `dst.len()` BEFORE
     ///   any byte is copied; otherwise `LengthMismatch` (a non-empty oversized or undersized blob
@@ -1088,6 +1101,18 @@ impl AzureBlob {
     /// * Retries keep the first response's ETag (`If-Match`). A 412, or a 404 on a pinned retry,
     ///   is `VersionChanged`. A response without a strong ETag pins nothing: once a byte has
     ///   been written, a failure is final rather than retried from pieces of unknown versions.
+    ///
+    /// * Two retry layers act on a request. The SDK pipeline's own retries (408, 429, 500, 502,
+    ///   503, 504 and every connection or I/O failure; `max_retries` 8 by default, exponential
+    ///   back-off from 200 ms, 60 s in all) run INSIDE each s3dlio attempt and resend the same
+    ///   request, `If-Match` included. `S3DLIO_MAX_RETRY_ATTEMPTS` counts s3dlio attempts only,
+    ///   so one attempt that keeps failing with a status the SDK retries can send up to nine
+    ///   requests.
+    ///
+    /// Recorded limit: the SDK hides the HTTP status, so a 206 whose `Content-Range` was stripped
+    /// and whose `Content-Length` equals `dst.len()` is read as a whole blob of that length even
+    /// when the blob is larger (see `response_lengths`). A real Azure service always sends the
+    /// header.
     ///
     /// `progress` counts the distinct positions written and survives errors and cancellation.
     /// Every writer runs inside this future, so dropping it stops all writes. A failure never
@@ -2472,6 +2497,19 @@ mod get_into_tests {
         assert_eq!(lens(Some("bytes 0-0/7"), Some(1), 1).unwrap(), l(7, 1));
     }
 
+    /// Recorded limit: the SDK hides the status, so a 206 stripped of `Content-Range` whose
+    /// `Content-Length` equals the request reads as a whole blob of that length.
+    #[test]
+    fn recorded_limit_a_206_without_content_range_is_taken_for_a_whole_blob() {
+        assert_eq!(
+            response_lengths(None, Some(60), 60).unwrap(),
+            ResponseLengths {
+                total: 60,
+                body_len: 60
+            }
+        );
+    }
+
     #[test]
     fn response_lengths_refuses_what_it_cannot_check() {
         let refused = |range: Option<&str>, length: Option<u64>, request: u64| {
@@ -2491,13 +2529,22 @@ mod get_into_tests {
 
     #[test]
     fn options_ask_one_bounded_range_with_partition_equal_to_it() {
-        for expected in [1u64, 7, 4 * 1024 * 1024, 4 * 1024 * 1024 + 1, 1 << 33] {
+        let mut sizes = vec![1u64, 7, 4 * 1024 * 1024, 4 * 1024 * 1024 + 1];
+        // 8 GiB fits a usize on a 64-bit platform only: there it must work, and on a 32-bit one
+        // it must be refused rather than truncated.
+        let huge = 1u64 << 33;
+        if usize::try_from(huge).is_ok() {
+            sizes.push(huge);
+        } else {
+            assert!(get_into_options(huge, None).is_err());
+        }
+        for expected in sizes {
             let o = get_into_options(expected, None).expect("options");
             assert_eq!(o.range, Some(HttpRange::new(0, expected)));
             assert_eq!(o.parallel, NonZeroUsize::new(1));
             // partition_size == the range length is what leaves the SDK no remaining ranges.
             assert_eq!(
-                o.partition_size.map(|p| p.get() as u64),
+                o.partition_size.and_then(|p| u64::try_from(p.get()).ok()),
                 Some(expected),
                 "{expected}"
             );

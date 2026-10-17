@@ -11,7 +11,9 @@
 //! For the caller-buffer GET tests (#264) it also: enforces `If-Match` (412 `ConditionNotMet`),
 //! serves per-blob ETags and version ids (or none), can answer a missing container, can cap the
 //! length of a ranged reply, and can cut a GET body short after the headers (a mid-stream
-//! failure), optionally changing the blob afterwards.
+//! failure), optionally changing the blob afterwards. A scripted GET can also answer a status
+//! (429, 503, 507 ...), close the connection without a reply, or stall after some bytes. A flag
+//! strips `Content-Range` from ranged replies (a 206 that does not say which part it carries).
 //!
 //! Include with `#[path = "common/azure_fake.rs"] mod azure_fake;`.
 
@@ -25,7 +27,6 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
@@ -57,6 +58,35 @@ fn cut_body(sent: Bytes) -> Body {
     BodyExt::boxed(StreamBody::new(futures::stream::iter(frames).chain(cut)))
 }
 
+/// `sent` and then silence: the headers (with the full declared length) and the first bytes go
+/// out, then the body never yields again and the connection stays open.
+fn stalled_body(sent: Bytes) -> Body {
+    use futures::StreamExt;
+    let mut frames: Vec<Result<Frame<Bytes>, std::io::Error>> = Vec::new();
+    if !sent.is_empty() {
+        frames.push(Ok(Frame::data(sent)));
+    }
+    let pending = futures::stream::pending::<Result<Frame<Bytes>, std::io::Error>>();
+    BodyExt::boxed(StreamBody::new(
+        futures::stream::iter(frames).chain(pending),
+    ))
+}
+
+/// Marks the reply `handle` hands back when the connection must be closed without a reply.
+const DROP_MARKER: &str = "x-fake-drop-connection";
+
+/// Returned to hyper to close the connection without answering the request.
+#[derive(Debug)]
+struct ConnectionDropped;
+
+impl std::fmt::Display for ConnectionDropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("fake: connection dropped")
+    }
+}
+
+impl std::error::Error for ConnectionDropped {}
+
 #[derive(Clone, Debug)]
 pub struct Req {
     pub method: String,
@@ -79,12 +109,22 @@ pub enum AfterFault {
     OmitEtag,
 }
 
-/// One scripted GET failure: the reply declares the full length, sends `truncate_after` bytes of
-/// it and then the connection is cut; afterwards `then` is applied to the blob.
+/// One scripted GET failure, consumed first in first out by GETs of an existing blob.
 #[derive(Clone, Debug)]
-pub struct GetFault {
-    pub truncate_after: usize,
-    pub then: AfterFault,
+pub enum GetFault {
+    /// The reply declares the full length, sends `truncate_after` bytes of it and then the
+    /// connection is cut; afterwards `then` is applied to the blob.
+    Cut {
+        truncate_after: usize,
+        then: AfterFault,
+    },
+    /// The reply is this HTTP status with an empty body (and this `x-ms-error-code`, if any).
+    Status { status: u16, code: Option<String> },
+    /// The request is read and the connection is closed without any reply.
+    Drop,
+    /// The reply declares the full length, sends `after` bytes of it and then stalls for good:
+    /// the connection stays open and the body never yields again.
+    Stall { after: usize },
 }
 
 pub struct Fake {
@@ -112,7 +152,9 @@ pub struct Fake {
     pub ignore_range: bool,
     /// `If-Match` is not enforced (a service or proxy that ignores the condition).
     pub ignore_if_match: bool,
-    /// Scripted GET failures, consumed first in first out by GETs of an existing blob.
+    /// Ranged replies are 206 without a `Content-Range` header (the body is still the range).
+    pub strip_content_range: bool,
+    /// Scripted GET failures (see [`GetFault`]).
     pub get_faults: VecDeque<GetFault>,
 }
 
@@ -131,6 +173,7 @@ impl Default for Fake {
             range_cap: None,
             ignore_range: false,
             ignore_if_match: false,
+            strip_content_range: false,
             get_faults: VecDeque::new(),
         }
     }
@@ -301,6 +344,32 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Body> {
                     .unwrap();
             };
             let total = data.len();
+            // A scripted status or dropped connection answers before anything else is looked at.
+            if method == Method::GET
+                && matches!(
+                    fake.get_faults.front(),
+                    Some(GetFault::Status { .. } | GetFault::Drop)
+                )
+            {
+                match fake.get_faults.pop_front() {
+                    Some(GetFault::Status { status, code }) => {
+                        let mut builder = Response::builder().status(
+                            StatusCode::from_u16(status)
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        );
+                        if let Some(code) = code {
+                            builder = builder.header("x-ms-error-code", code);
+                        }
+                        return builder.body(full(Bytes::new())).unwrap();
+                    }
+                    _ => {
+                        return Response::builder()
+                            .header(DROP_MARKER, "1")
+                            .body(full(Bytes::new()))
+                            .unwrap();
+                    }
+                }
+            }
             let etag = fake
                 .etags
                 .get(&path)
@@ -350,8 +419,10 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Body> {
                     if let Some(cap) = fake.range_cap {
                         end = end.min(start + cap.max(1) - 1);
                     }
-                    builder =
-                        builder.header("content-range", format!("bytes {start}-{end}/{total}"));
+                    if !fake.strip_content_range {
+                        builder =
+                            builder.header("content-range", format!("bytes {start}-{end}/{total}"));
+                    }
                     (StatusCode::PARTIAL_CONTENT, data[start..=end].to_vec())
                 }
                 _ => (StatusCode::OK, data),
@@ -367,30 +438,32 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Body> {
                 // the first `truncate_after` bytes go out, then the connection is cut.
                 let fault = fake.get_faults.pop_front();
                 let declared = chunk.len();
-                let cut = fault.is_some();
                 let sent = match &fault {
-                    Some(f) => chunk[..f.truncate_after.min(declared)].to_vec(),
-                    None => chunk,
-                };
-                if let Some(f) = fault {
-                    match f.then {
-                        AfterFault::Nothing => {}
-                        AfterFault::Delete => {
-                            fake.blobs.remove(&path);
-                        }
-                        AfterFault::Replace(content, new_etag) => {
-                            fake.blobs.insert(path.clone(), content);
-                            fake.etags.insert(path.clone(), new_etag);
-                        }
-                        AfterFault::OmitEtag => {
-                            fake.omit_etag = true;
-                        }
+                    Some(GetFault::Cut { truncate_after, .. }) => {
+                        chunk[..(*truncate_after).min(declared)].to_vec()
                     }
-                }
-                let body = if cut {
-                    cut_body(Bytes::from(sent))
-                } else {
-                    full(Bytes::from(sent))
+                    Some(GetFault::Stall { after }) => chunk[..(*after).min(declared)].to_vec(),
+                    _ => chunk,
+                };
+                let body = match fault {
+                    Some(GetFault::Cut { then, .. }) => {
+                        match then {
+                            AfterFault::Nothing => {}
+                            AfterFault::Delete => {
+                                fake.blobs.remove(&path);
+                            }
+                            AfterFault::Replace(content, new_etag) => {
+                                fake.blobs.insert(path.clone(), content);
+                                fake.etags.insert(path.clone(), new_etag);
+                            }
+                            AfterFault::OmitEtag => {
+                                fake.omit_etag = true;
+                            }
+                        }
+                        cut_body(Bytes::from(sent))
+                    }
+                    Some(GetFault::Stall { .. }) => stalled_body(Bytes::from(sent)),
+                    _ => full(Bytes::from(sent)),
                 };
                 builder
                     .header("content-length", declared.to_string())
@@ -417,7 +490,14 @@ pub async fn start() -> (State, u16) {
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let state = Arc::clone(&state);
-                    async move { Ok::<_, Infallible>(handle(state, req).await) }
+                    async move {
+                        let reply = handle(state, req).await;
+                        if reply.headers().contains_key(DROP_MARKER) {
+                            Err(ConnectionDropped)
+                        } else {
+                            Ok(reply)
+                        }
+                    }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(tcp), service)
@@ -499,10 +579,38 @@ pub fn set_version_id(state: &State, key: &str, version: &str) {
         .insert(format!("acct/ctr/{key}"), version.to_string());
 }
 
-/// Queue a scripted GET failure (see [`GetFault`]).
+/// Queue a scripted body cut (see [`GetFault::Cut`]).
 pub fn push_get_fault(state: &State, truncate_after: usize, then: AfterFault) {
-    state.lock().unwrap().get_faults.push_back(GetFault {
-        truncate_after,
-        then,
-    });
+    push_fault(
+        state,
+        GetFault::Cut {
+            truncate_after,
+            then,
+        },
+    );
+}
+
+/// Queue a scripted status reply (see [`GetFault::Status`]).
+pub fn push_get_status(state: &State, status: u16, code: Option<&str>) {
+    push_fault(
+        state,
+        GetFault::Status {
+            status,
+            code: code.map(str::to_string),
+        },
+    );
+}
+
+/// Queue a connection closed without a reply (see [`GetFault::Drop`]).
+pub fn push_get_drop(state: &State) {
+    push_fault(state, GetFault::Drop);
+}
+
+/// Queue a body that stalls after `after` bytes (see [`GetFault::Stall`]).
+pub fn push_get_stall(state: &State, after: usize) {
+    push_fault(state, GetFault::Stall { after });
+}
+
+fn push_fault(state: &State, fault: GetFault) {
+    state.lock().unwrap().get_faults.push_back(fault);
 }
