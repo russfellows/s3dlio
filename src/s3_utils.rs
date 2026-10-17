@@ -220,11 +220,15 @@ where
         SdkError::ServiceError(s) => s.err().code().map(str::to_owned),
         _ => None,
     };
+    // A construction failure (the request could not be built) is told apart from a
+    // timeout or dispatch failure, both of which have no response either.
+    let construction = matches!(&e, SdkError::ConstructionFailure(_));
     anyhow::Error::new(crate::retry::SdkFailure::new(
         format!("{}: {}", ctx, format_sdk_error(&e)),
         retryable,
         status,
         code,
+        construction,
     ))
 }
 

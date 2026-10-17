@@ -1488,12 +1488,25 @@ fn is_retryable_gcs_read_error(message: &str) -> bool {
 /// * 412 or `FailedPrecondition` is `VersionChanged`;
 /// * 403 or `PermissionDenied` is `Forbidden`;
 /// * `Unavailable` or `ResourceExhausted`, or HTTP 503 or 429, is `Throttled`;
+/// * gRPC `DeadlineExceeded` is `Transport`: the deadline expired before a usable answer, like
+///   a timeout;
+/// * HTTP 408 (parity with S3), gRPC `Internal` and gRPC `Aborted` are `Server`: the service
+///   asks for the request to be repeated;
 /// * a typed transport failure (timeout, connect, I/O, or a transport error without an
 ///   HTTP status) is `Transport`;
 /// * any other HTTP 5xx is `Server`;
-/// * everything else is `Other`.
+/// * everything else is `Other`, in particular HTTP 401 and gRPC `Unauthenticated` (a
+///   credential problem, not retried), and gRPC `Unknown` and `Cancelled` (no evidence the
+///   service failed, not retried).
 #[cfg(not(feature = "gcs-community"))]
-pub fn classify_gcs_failure(e: &google_cloud_gax::error::Error) -> ObjectErrorKind {
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the stage C provider receive paths (#264)"
+    )
+)]
+pub(crate) fn classify_gcs_failure(e: &google_cloud_gax::error::Error) -> ObjectErrorKind {
     use google_cloud_gax::error::rpc::Code;
     let http = e.http_status_code();
     let code = e.status().map(|s| s.code);
@@ -1507,6 +1520,10 @@ pub fn classify_gcs_failure(e: &google_cloud_gax::error::Error) -> ObjectErrorKi
         || matches!(http, Some(503 | 429))
     {
         ObjectErrorKind::Throttled
+    } else if code == Some(Code::DeadlineExceeded) {
+        ObjectErrorKind::Transport
+    } else if matches!(code, Some(Code::Internal | Code::Aborted)) || http == Some(408) {
+        ObjectErrorKind::Server
     } else if http.is_none() && (e.is_timeout() || e.is_connect() || e.is_transport()) {
         ObjectErrorKind::Transport
     } else if matches!(http, Some(500..=599)) {
@@ -1520,13 +1537,35 @@ pub fn classify_gcs_failure(e: &google_cloud_gax::error::Error) -> ObjectErrorKi
 /// [`ObjectError`](crate::object_error::ObjectError) context.
 ///
 /// `err` must carry a `google_cloud_gax` error (found through any context layers).  An error
-/// that does not, or that already carries an `ObjectError`, is returned unchanged: an
-/// unclassified error stays unclassified, and the typed-only retry rule
-/// ([`gcs_typed_retry_verdict`]) then never retries it.  The attached message names the HTTP
-/// status and gRPC code only.
+/// that does not is returned unchanged: an unclassified error stays unclassified, and the
+/// typed-only retry rule ([`gcs_typed_retry_verdict`]) then never retries it.
+///
+/// An error that already carries an `ObjectError` is returned unchanged, with one exception:
+/// on a `pinned` read whose outer kind is `NotFound`, a `VersionChanged` is attached over it
+/// (the outer classification wins), because a pinned read never reports absence.
+///
+/// The attached `ObjectError`'s own message is built only from the HTTP status and the gRPC
+/// code name, never from server-supplied text.  The retained source error, reachable through
+/// `{:#}`, `{:?}` or the chain, is the `google_cloud_gax` error itself and is NOT redacted by
+/// this module.
 #[cfg(not(feature = "gcs-community"))]
-pub fn attach_gcs_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
-    if crate::object_error::object_error(&err).is_some() {
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the stage C provider receive paths (#264)"
+    )
+)]
+pub(crate) fn attach_gcs_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
+    if let Some(existing) = crate::object_error::object_error(&err) {
+        if pinned && existing.kind == ObjectErrorKind::NotFound {
+            return crate::object_error::attach_object_error(
+                err,
+                ObjectErrorKind::VersionChanged,
+                "gs",
+                "pinned version no longer found",
+            );
+        }
         return err;
     }
     let Some(g) = err.downcast_ref::<google_cloud_gax::error::Error>() else {
@@ -1554,7 +1593,14 @@ pub fn attach_gcs_classification(err: anyhow::Error, pinned: bool) -> anyhow::Er
 /// is not [`is_retryable_gcs_read_error`] (message text) and not the generic conservative
 /// fallback of `RetryClassify`; it never authorizes combining unpinned responses either.
 #[cfg(not(feature = "gcs-community"))]
-pub fn gcs_typed_retry_verdict(err: &anyhow::Error) -> bool {
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the stage C provider receive paths (#264)"
+    )
+)]
+pub(crate) fn gcs_typed_retry_verdict(err: &anyhow::Error) -> bool {
     matches!(
         crate::object_error::object_error(err).map(|o| o.kind),
         Some(ObjectErrorKind::Throttled | ObjectErrorKind::Transport | ObjectErrorKind::Server)
@@ -2860,6 +2906,27 @@ mod object_error_tests {
         assert_eq!(classify_gcs_failure(&Gax::deser("bad body")), Other);
     }
 
+    /// The mapping choices of the typed classifier that are not obvious from the status alone.
+    #[test]
+    fn deadline_internal_aborted_and_408_are_transient_and_the_rest_are_other() {
+        use ObjectErrorKind::*;
+        // 408 is the S3 parity choice: Server.
+        assert_eq!(classify_gcs_failure(&http(408)), Server);
+        // The deadline expired before an answer: like a timeout.
+        assert_eq!(
+            classify_gcs_failure(&grpc(Code::DeadlineExceeded)),
+            Transport
+        );
+        // The service asked for the request to be repeated.
+        assert_eq!(classify_gcs_failure(&grpc(Code::Internal)), Server);
+        assert_eq!(classify_gcs_failure(&grpc(Code::Aborted)), Server);
+        // No evidence of a service failure, or a credential problem: Other.
+        assert_eq!(classify_gcs_failure(&grpc(Code::Unknown)), Other);
+        assert_eq!(classify_gcs_failure(&grpc(Code::Cancelled)), Other);
+        assert_eq!(classify_gcs_failure(&grpc(Code::Unauthenticated)), Other);
+        assert_eq!(classify_gcs_failure(&http(401)), Other);
+    }
+
     /// The typed-only predicate retries typed transient and transport errors, including 503.
     #[test]
     fn typed_transient_and_transport_errors_are_retried() {
@@ -2867,8 +2934,12 @@ mod object_error_tests {
             http(503),
             http(429),
             http(500),
+            http(408),
             grpc(Code::Unavailable),
             grpc(Code::ResourceExhausted),
+            grpc(Code::DeadlineExceeded),
+            grpc(Code::Internal),
+            grpc(Code::Aborted),
             Gax::io("connection reset"),
             Gax::timeout("deadline"),
             Gax::connect("refused"),
@@ -2911,6 +2982,10 @@ mod object_error_tests {
             grpc(Code::NotFound),
             http(412),
             grpc(Code::FailedPrecondition),
+            http(401),
+            grpc(Code::Unauthenticated),
+            grpc(Code::Unknown),
+            grpc(Code::Cancelled),
         ] {
             let err = classified(e, false);
             assert!(!gcs_typed_retry_verdict(&err), "{:?}", kind_of(&err));
@@ -2935,6 +3010,26 @@ mod object_error_tests {
         let first = classified(http(404), false);
         assert_eq!(kind_of(&first), ObjectErrorKind::NotFound);
         assert!(crate::delete_contract::is_not_found(&first));
+    }
+
+    /// An error that already carries an outer `NotFound` is upgraded to `VersionChanged` on a
+    /// pinned read, and left alone otherwise.
+    #[test]
+    fn pinned_attach_upgrades_an_existing_not_found() {
+        let first = classified(http(404), false);
+        assert_eq!(kind_of(&first), ObjectErrorKind::NotFound);
+        let upgraded = attach_gcs_classification(first, true);
+        assert_eq!(kind_of(&upgraded), ObjectErrorKind::VersionChanged);
+        assert!(!gcs_typed_retry_verdict(&upgraded));
+        assert!(!crate::delete_contract::is_not_found(&upgraded));
+        // Not pinned: unchanged.
+        let first = classified(http(404), false);
+        let same = attach_gcs_classification(first, false);
+        assert_eq!(kind_of(&same), ObjectErrorKind::NotFound);
+        // Pinned, but another kind: unchanged.
+        let forbidden = classified(http(403), false);
+        let same = attach_gcs_classification(forbidden, true);
+        assert_eq!(kind_of(&same), ObjectErrorKind::Forbidden);
     }
 
     /// The attached message names status and code only.

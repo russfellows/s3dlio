@@ -198,7 +198,14 @@ impl AzureRequestError {
 
     /// The typed classification of this failure (plan §4.5 A2), see
     /// [`classify_azure_failure`].
-    pub fn object_error_kind(&self) -> ObjectErrorKind {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called by the stage C provider receive paths (#264)"
+        )
+    )]
+    pub(crate) fn object_error_kind(&self) -> ObjectErrorKind {
         classify_azure_failure(
             self.inner.http_status().map(u16::from),
             self.error_code(),
@@ -233,7 +240,14 @@ fn azure_error_is_transport(e: &azure_core::Error) -> bool {
 /// * 429 and 503 are `Throttled`; any other 5xx is `Server`;
 /// * a failure with no response (connection, I/O) is `Transport`;
 /// * anything else, including every other 404, is `Other`.
-pub fn classify_azure_failure(
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the stage C provider receive paths (#264)"
+    )
+)]
+pub(crate) fn classify_azure_failure(
     status: Option<u16>,
     code: Option<&str>,
     transport: bool,
@@ -252,23 +266,42 @@ pub fn classify_azure_failure(
 
 /// Attach the Azure classification of `err` as an
 /// [`ObjectError`](crate::object_error::ObjectError) context.  `err` must carry an
-/// [`AzureRequestError`]; one that does not, or that already carries an `ObjectError`, is
-/// returned unchanged.  The attached message names the status and code only, so the SAS
-/// redaction of the source text is not at risk.
-pub fn attach_azure_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
-    if crate::object_error::object_error(&err).is_some() {
+/// [`AzureRequestError`]; one that does not is returned unchanged.
+///
+/// An error that already carries an `ObjectError` is returned unchanged, with one exception:
+/// on a `pinned` read whose outer kind is `NotFound`, a `VersionChanged` is attached over it
+/// (the outer classification wins), because a pinned read never reports absence.
+///
+/// The attached `ObjectError`'s own message is built only from the HTTP status and a
+/// sanitised service code (`[A-Za-z0-9._-]`, at most 64 characters).  The retained source
+/// error, reachable through `{:#}`, `{:?}` or the chain, is not redacted by this module; for
+/// Azure it is the [`AzureRequestError`], which `azure_error` already redacted (SAS tokens
+/// removed).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the stage C provider receive paths (#264)"
+    )
+)]
+pub(crate) fn attach_azure_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
+    if let Some(existing) = crate::object_error::object_error(&err) {
+        if pinned && existing.kind == ObjectErrorKind::NotFound {
+            return crate::object_error::attach_object_error(
+                err,
+                ObjectErrorKind::VersionChanged,
+                "az",
+                "pinned version no longer found",
+            );
+        }
         return err;
     }
     let Some(az) = err.downcast_ref::<AzureRequestError>() else {
         return err;
     };
     let kind = az.object_error_kind();
-    let message = match (az.http_status(), az.error_code()) {
-        (Some(s), Some(c)) => format!("status {}, code {c}", u16::from(s)),
-        (Some(s), None) => format!("status {}", u16::from(s)),
-        (None, Some(c)) => format!("code {c}"),
-        (None, None) => "no HTTP response".to_string(),
-    };
+    let message =
+        crate::object_error::status_code_message(az.http_status().map(u16::from), az.error_code());
     if pinned {
         crate::object_error::attach_pinned_read_error(err, kind, "az", message)
     } else {
@@ -1843,6 +1876,41 @@ mod object_error_tests {
         let container =
             attach_azure_classification(http_error(404, Some("ContainerNotFound")), false);
         assert!(!crate::delete_contract::is_not_found(&container));
+    }
+
+    /// An error that already carries an outer `NotFound` is upgraded to `VersionChanged` on a
+    /// pinned read, and left alone otherwise.
+    #[test]
+    fn pinned_attach_upgrades_an_existing_not_found() {
+        let first = attach_azure_classification(http_error(404, Some("BlobNotFound")), false);
+        assert_eq!(kind_of(&first), ObjectErrorKind::NotFound);
+        let upgraded = attach_azure_classification(first, true);
+        assert_eq!(kind_of(&upgraded), ObjectErrorKind::VersionChanged);
+        assert!(!upgraded.is_retryable());
+        assert!(!crate::delete_contract::is_not_found(&upgraded));
+        // Not pinned: unchanged.
+        let first = attach_azure_classification(http_error(404, Some("BlobNotFound")), false);
+        let same = attach_azure_classification(first, false);
+        assert_eq!(kind_of(&same), ObjectErrorKind::NotFound);
+        // Pinned, but another kind: unchanged.
+        let forbidden = attach_azure_classification(http_error(403, None), false);
+        let same = attach_azure_classification(forbidden, true);
+        assert_eq!(kind_of(&same), ObjectErrorKind::Forbidden);
+    }
+
+    /// A server-supplied code with control characters, or a very long one, never reaches the
+    /// attached message intact.
+    #[test]
+    fn hostile_codes_are_sanitised_in_the_attached_message() {
+        let e = attach_azure_classification(http_error(400, Some("Bad\r\nCode\x07 x")), false);
+        let text = object_error(&e).expect("typed").to_string();
+        assert!(text.contains("status 400, code BadCodex"), "{text:?}");
+        assert!(!text.contains('\n') && !text.contains('\x07'), "{text:?}");
+        let long = "Z".repeat(500);
+        let e = attach_azure_classification(http_error(400, Some(&long)), false);
+        let text = object_error(&e).expect("typed").to_string();
+        assert!(text.len() < 150, "{} bytes", text.len());
+        assert!(text.contains(&"Z".repeat(64)) && !text.contains(&"Z".repeat(65)));
     }
 
     /// The attached message names status and code only, and the redacted source text is

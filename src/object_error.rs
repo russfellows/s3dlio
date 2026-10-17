@@ -22,15 +22,22 @@
 //   the Python exception mapping) uses this one lookup; a source-chain walk
 //   remains only as the fallback for errors that carry no `ObjectError`.
 // * The message inside an `ObjectError` is built by the attaching site from
-//   non-sensitive fields only (status, service code), never from the source's
-//   own text, so it is redacted by construction.
+//   the HTTP status and a sanitised service code only ([`sanitize_service_code`]:
+//   `[A-Za-z0-9._-]`, at most 64 characters), never from the source's own text.
+//   That covers the `ObjectError`'s own `Display` and `Debug`.  It does NOT
+//   redact the retained source error: printing the chain (`{:#}`, `{:?}`) also
+//   prints the source, which this module does not touch.  For Azure the source
+//   is the already-redacted `AzureRequestError`; for S3 and GCS it is the
+//   flattened SDK text or the gax error as the caller produced it.
 
 use std::fmt;
 
 /// What kind of failure an object operation reported.
 ///
 /// The kind is a *semantic* classification, independent of the provider SDK.
+/// New kinds may be added, so a match outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ObjectErrorKind {
     /// The object does not exist (first request, or a typed HEAD).
     NotFound,
@@ -85,7 +92,10 @@ impl ObjectErrorKind {
 
 /// A typed object error, attached as an `anyhow` context (see the module docs).
 ///
-/// `message` is private and already redacted by the attaching site.
+/// `message` is private.  The attaching helpers build it from the HTTP status and a
+/// sanitised service code only (see [`sanitize_service_code`]); it holds no URL, token
+/// or source error text.  That is a statement about this message alone: the source error
+/// retained under the context is not redacted by this module.
 pub struct ObjectError {
     /// The classification.
     pub kind: ObjectErrorKind,
@@ -96,7 +106,8 @@ pub struct ObjectError {
 
 impl ObjectError {
     /// Build an error.  `message` must contain no secrets (no URLs, tokens or
-    /// source error text); the attaching helpers pass status and code only.
+    /// source error text); the attaching helpers pass the status and a sanitised
+    /// code only.
     pub fn new(kind: ObjectErrorKind, provider: &'static str, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -143,10 +154,57 @@ pub fn object_error(err: &anyhow::Error) -> Option<&ObjectError> {
     err.downcast_ref::<ObjectError>()
 }
 
+/// The longest service error code (in characters) kept in an [`ObjectError`] message.
+const MAX_SERVICE_CODE_CHARS: usize = 64;
+
+/// A server-supplied service error code made safe to put in an [`ObjectError`] message.
+///
+/// Keeps only `[A-Za-z0-9._-]` and at most 64 characters, so a hostile or malformed
+/// response cannot inject newlines, control characters or an unbounded string into an error
+/// message.  Real S3 and Azure codes (`NoSuchKey`, `BlobNotFound`, `Throttling`) pass
+/// unchanged.  `None` when nothing is left.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the stage C provider receive paths (#264)"
+    )
+)]
+pub(crate) fn sanitize_service_code(code: &str) -> Option<String> {
+    let kept: String = code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(MAX_SERVICE_CODE_CHARS)
+        .collect();
+    (!kept.is_empty()).then_some(kept)
+}
+
+/// The [`ObjectError`] message for a failure with an optional HTTP `status` and optional
+/// service `code`: `status 404, code NoSuchKey`, `status 404`, `code Foo` or
+/// `no HTTP response`.  The code goes through [`sanitize_service_code`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the stage C provider receive paths (#264)"
+    )
+)]
+pub(crate) fn status_code_message(status: Option<u16>, code: Option<&str>) -> String {
+    match (status, code.and_then(sanitize_service_code)) {
+        (Some(s), Some(c)) => format!("status {s}, code {c}"),
+        (Some(s), None) => format!("status {s}"),
+        (None, Some(c)) => format!("code {c}"),
+        (None, None) => "no HTTP response".to_string(),
+    }
+}
+
 /// Attach a classification over `source`, keeping `source` recoverable.
 ///
 /// The returned error's top-level text is the [`ObjectError`]'s; the source's
 /// own message stays one layer down (`{:#}` prints both).
+///
+/// The `ObjectError`'s message is whatever the caller passes; the source is kept as is
+/// and is not redacted here.
 pub fn attach_object_error(
     source: anyhow::Error,
     kind: ObjectErrorKind,
@@ -289,5 +347,39 @@ mod tests {
     fn object_error_is_send_sync_static_error() {
         fn assert_traits<T: std::error::Error + Send + Sync + 'static>() {}
         assert_traits::<ObjectError>();
+    }
+
+    /// Newlines, control characters and spaces are dropped; a long code is cut to 64.
+    #[test]
+    fn server_codes_are_sanitised_before_they_reach_a_message() {
+        assert_eq!(
+            sanitize_service_code("NoSuchKey").as_deref(),
+            Some("NoSuchKey")
+        );
+        assert_eq!(
+            sanitize_service_code("Blob.Not_Found-1").as_deref(),
+            Some("Blob.Not_Found-1")
+        );
+        let hostile = "Bad\r\nInjected: header\x1b[31m \u{202e}x";
+        assert_eq!(
+            sanitize_service_code(hostile).as_deref(),
+            Some("BadInjectedheader31mx")
+        );
+        let long = "A".repeat(500);
+        assert_eq!(sanitize_service_code(&long).map(|s| s.len()), Some(64));
+        assert_eq!(sanitize_service_code("\n\t "), None);
+        assert_eq!(sanitize_service_code(""), None);
+
+        // The message built from them carries none of it.
+        let msg = status_code_message(Some(400), Some(hostile));
+        assert_eq!(msg, "status 400, code BadInjectedheader31mx");
+        assert!(!msg.contains('\n') && !msg.contains('\x1b'), "{msg:?}");
+        let msg = status_code_message(Some(400), Some(&long));
+        assert_eq!(msg.len(), "status 400, code ".len() + 64);
+        assert_eq!(status_code_message(None, None), "no HTTP response");
+        assert_eq!(status_code_message(Some(503), None), "status 503");
+        assert_eq!(status_code_message(None, Some("X")), "code X");
+        // A code that is all junk is as good as absent.
+        assert_eq!(status_code_message(Some(500), Some("\n\n")), "status 500");
     }
 }

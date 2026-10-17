@@ -152,13 +152,17 @@ where
     }
 }
 
-/// Classify an S3 failure from its HTTP `status` and service error `code`
-/// (plan §4.5 A2).  Pure: no I/O, no environment.
+/// Classify an S3 failure from its HTTP `status`, service error `code` and
+/// whether the SDK reported a `construction_failure` (plan §4.5 A2).  Pure: no
+/// I/O, no environment.
 ///
 /// `pinned` is true once the read has pinned an ETag; the pinned-read override
 /// then takes precedence over the table below: a 404 (or `NoSuchKey` /
 /// `NotFound`) or a 412 on a pinned read means the pinned version is gone, so
 /// it is [`ObjectErrorKind::VersionChanged`], never absence.
+///
+/// A missing bucket is not object absence: the code `NoSuchBucket` is always
+/// `Other` (not retried), pinned or not, matching Azure's `ContainerNotFound`.
 ///
 /// Otherwise the table is code-first, preserving [`status_is_retryable`]'s
 /// order for ordinary failures:
@@ -167,18 +171,32 @@ where
 ///    transient tables plus `S3DLIO_EXTRA_TRANSIENT_CODES`, including
 ///    `ExpiredToken` and `RequestExpired`) is retryable even on a 403: a
 ///    throttling-table code is `Throttled`, any other transient code `Server`;
-/// 2. 404, `NoSuchKey` or `NotFound` is `NotFound`;
+/// 2. the code `NoSuchBucket` is `Other`; then 404, `NoSuchKey` or `NotFound`
+///    is `NotFound`;
 /// 3. 412 is `VersionChanged`;
 /// 4. any remaining 403 (e.g. `AccessDenied`) is `Forbidden`;
 /// 5. 429 or 503 is `Throttled`; 408 or any other 5xx is `Server`;
-/// 6. a failure with no HTTP response (connect, timeout, body stream) is
-///    `Transport`;
+/// 6. a failure with no HTTP response is `Transport` (connect, timeout,
+///    dispatch, body stream), except a `construction_failure` (the request
+///    could not even be built, a deterministic client-side error), which is
+///    `Other`;
 /// 7. anything else is `Other`.
-pub fn classify_s3_failure(
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the stage C provider receive paths (#264)"
+    )
+)]
+pub(crate) fn classify_s3_failure(
     status: Option<u16>,
     code: Option<&str>,
     pinned: bool,
+    construction_failure: bool,
 ) -> ObjectErrorKind {
+    if code == Some("NoSuchBucket") {
+        return ObjectErrorKind::Other;
+    }
     if pinned {
         let gone = status == Some(404)
             || status == Some(412)
@@ -205,6 +223,7 @@ pub fn classify_s3_failure(
         Some(403) => ObjectErrorKind::Forbidden,
         Some(429 | 503) => ObjectErrorKind::Throttled,
         Some(408 | 500..=599) => ObjectErrorKind::Server,
+        None if construction_failure => ObjectErrorKind::Other,
         None => ObjectErrorKind::Transport,
         Some(_) => ObjectErrorKind::Other,
     }
@@ -215,25 +234,42 @@ pub fn classify_s3_failure(
 ///
 /// The status and code come from the [`SdkFailure`] `err` carries (a failure
 /// from the AWS SDK).  An error with no `SdkFailure`, e.g. a body-stream
-/// error, had no HTTP response and is therefore `Transport` (step 6).  An
-/// error that already carries an `ObjectError` is returned unchanged: the
-/// existing classification is the more specific one.  The attached message
-/// names the status and code only; the SDK text stays in the source below it.
-pub fn attach_s3_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
-    if crate::object_error::object_error(&err).is_some() {
+/// error, had no HTTP response and is therefore `Transport` (step 6).
+///
+/// An error that already carries an `ObjectError` is returned unchanged, with
+/// one exception: on a `pinned` read whose outer kind is `NotFound`, a
+/// `VersionChanged` is attached over it (the outer classification wins),
+/// because a pinned read never reports absence.
+///
+/// The attached `ObjectError`'s own message is built only from the status and a
+/// sanitised service code (`[A-Za-z0-9._-]`, at most 64 characters).  The
+/// retained source error, reachable through `{:#}`, `{:?}` or the chain, is the
+/// flattened SDK text and is NOT redacted by this module.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the stage C provider receive paths (#264)"
+    )
+)]
+pub(crate) fn attach_s3_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
+    if let Some(existing) = crate::object_error::object_error(&err) {
+        if pinned && existing.kind == ObjectErrorKind::NotFound {
+            return crate::object_error::attach_object_error(
+                err,
+                ObjectErrorKind::VersionChanged,
+                "s3",
+                "pinned version no longer found",
+            );
+        }
         return err;
     }
-    let (status, code) = match err.downcast_ref::<SdkFailure>() {
-        Some(f) => (f.status(), f.code().map(str::to_owned)),
-        None => (None, None),
+    let (status, code, construction) = match err.downcast_ref::<SdkFailure>() {
+        Some(f) => (f.status(), f.code().map(str::to_owned), f.is_construction()),
+        None => (None, None, false),
     };
-    let kind = classify_s3_failure(status, code.as_deref(), pinned);
-    let message = match (status, code.as_deref()) {
-        (Some(s), Some(c)) => format!("status {s}, code {c}"),
-        (Some(s), None) => format!("status {s}"),
-        (None, Some(c)) => format!("code {c}"),
-        (None, None) => "no HTTP response".to_string(),
-    };
+    let kind = classify_s3_failure(status, code.as_deref(), pinned, construction);
+    let message = crate::object_error::status_code_message(status, code.as_deref());
     crate::object_error::attach_object_error(err, kind, "s3", message)
 }
 
@@ -255,6 +291,7 @@ pub(crate) struct SdkFailure {
     retryable: bool,
     status: Option<u16>,
     code: Option<String>,
+    construction: bool,
 }
 
 impl SdkFailure {
@@ -263,12 +300,14 @@ impl SdkFailure {
         retryable: bool,
         status: Option<u16>,
         code: Option<String>,
+        construction: bool,
     ) -> Self {
         Self {
             message,
             retryable,
             status,
             code,
+            construction,
         }
     }
 
@@ -280,6 +319,12 @@ impl SdkFailure {
     /// The service error code of the failed request, if the response had one.
     pub(crate) fn code(&self) -> Option<&str> {
         self.code.as_deref()
+    }
+
+    /// Whether the SDK reported a construction failure: the request could not
+    /// be built, so nothing was sent.
+    pub(crate) fn is_construction(&self) -> bool {
+        self.construction
     }
 }
 
@@ -787,7 +832,7 @@ mod tests {
     #[test]
     fn s3_table_steps_in_order() {
         use ObjectErrorKind::*;
-        let c = |s, code, pinned| classify_s3_failure(s, code, pinned);
+        let c = |s, code, pinned| classify_s3_failure(s, code, pinned, false);
         // 1. a transient code wins even on a 403: throttling table -> Throttled, other -> Server.
         assert_eq!(c(Some(403), Some("ExpiredToken"), false), Server);
         assert_eq!(c(Some(403), Some("RequestExpired"), false), Server);
@@ -829,28 +874,34 @@ mod tests {
     fn s3_pinned_404_and_412_are_version_changed() {
         use ObjectErrorKind::*;
         assert_eq!(
-            classify_s3_failure(Some(404), Some("NoSuchKey"), true),
+            classify_s3_failure(Some(404), Some("NoSuchKey"), true, false),
             VersionChanged
         );
-        assert_eq!(classify_s3_failure(Some(404), None, true), VersionChanged);
-        assert_eq!(classify_s3_failure(Some(412), None, true), VersionChanged);
+        assert_eq!(
+            classify_s3_failure(Some(404), None, true, false),
+            VersionChanged
+        );
+        assert_eq!(
+            classify_s3_failure(Some(412), None, true, false),
+            VersionChanged
+        );
         // Over a transient code, the override still wins.
         assert_eq!(
-            classify_s3_failure(Some(404), Some("SlowDown"), true),
+            classify_s3_failure(Some(404), Some("SlowDown"), true, false),
             VersionChanged
         );
         // Not-found by code alone is also absence of the pinned version.
         assert_eq!(
-            classify_s3_failure(None, Some("NoSuchKey"), true),
+            classify_s3_failure(None, Some("NoSuchKey"), true, false),
             VersionChanged
         );
         // Ordinary failures are classified as without a pin.
         assert_eq!(
-            classify_s3_failure(Some(403), Some("AccessDenied"), true),
+            classify_s3_failure(Some(403), Some("AccessDenied"), true, false),
             Forbidden
         );
-        assert_eq!(classify_s3_failure(Some(503), None, true), Throttled);
-        assert_eq!(classify_s3_failure(None, None, true), Transport);
+        assert_eq!(classify_s3_failure(Some(503), None, true, false), Throttled);
+        assert_eq!(classify_s3_failure(None, None, true, false), Transport);
         // End to end, with the verdict.
         let e = classified(404, "NoSuchKey", true);
         assert_eq!(kind_of(&e), VersionChanged);
@@ -980,5 +1031,99 @@ mod tests {
             retry_get_body(op).await.expect_err("fails");
             assert_eq!(calls.load(Ordering::Relaxed), 1, "{kind:?}");
         }
+    }
+
+    /// A request that could not be built has no response and is `Other`; a timeout or a
+    /// dispatch failure has no response and is `Transport`.  The retry verdicts are the
+    /// ones the SDK-error classifier already gave (construction: never; the rest: retried).
+    #[test]
+    fn construction_failure_is_other_but_timeout_and_dispatch_are_transport() {
+        use aws_smithy_runtime_api::client::result::ConnectorError;
+        let construction: SdkError<GetObjectError, HttpResponse> =
+            SdkError::construction_failure("bad request");
+        let dispatch: SdkError<GetObjectError, HttpResponse> =
+            SdkError::dispatch_failure(ConnectorError::io("reset".into()));
+        let timeout: SdkError<GetObjectError, HttpResponse> = SdkError::timeout_error("slow");
+
+        let e = crate::s3_utils::sdk_anyhow("S3 GET failed", construction);
+        assert!(e
+            .downcast_ref::<SdkFailure>()
+            .expect("sdk")
+            .is_construction());
+        let e = attach_s3_classification(e, false);
+        assert_eq!(kind_of(&e), ObjectErrorKind::Other);
+        assert!(!e.is_retryable(), "a construction failure is never retried");
+
+        for sdk in [dispatch, timeout] {
+            let e = crate::s3_utils::sdk_anyhow("S3 GET failed", sdk);
+            assert!(!e
+                .downcast_ref::<SdkFailure>()
+                .expect("sdk")
+                .is_construction());
+            let e = attach_s3_classification(e, false);
+            assert_eq!(kind_of(&e), ObjectErrorKind::Transport);
+            assert!(e.is_retryable());
+        }
+        // The pure table: only a response-less construction failure changes.
+        use ObjectErrorKind::*;
+        assert_eq!(classify_s3_failure(None, None, false, true), Other);
+        assert_eq!(classify_s3_failure(None, None, false, false), Transport);
+        assert_eq!(classify_s3_failure(Some(503), None, false, true), Throttled);
+    }
+
+    /// A missing bucket is an error, not object absence (parity with Azure's
+    /// `ContainerNotFound`): `Other`, not retried, not "not found", pinned or not.
+    #[test]
+    fn no_such_bucket_is_other_not_absence() {
+        for pinned in [false, true] {
+            let e = classified(404, "NoSuchBucket", pinned);
+            assert_eq!(kind_of(&e), ObjectErrorKind::Other, "pinned={pinned}");
+            assert!(!e.is_retryable());
+            assert!(!crate::delete_contract::is_not_found(&e));
+        }
+        assert_eq!(
+            classify_s3_failure(Some(404), Some("NoSuchBucket"), false, false),
+            ObjectErrorKind::Other
+        );
+        // NoSuchKey on the same status is still absence.
+        assert_eq!(
+            kind_of(&classified(404, "NoSuchKey", false)),
+            ObjectErrorKind::NotFound
+        );
+    }
+
+    /// An error that already carries an outer `NotFound` is upgraded to `VersionChanged` on a
+    /// pinned read, and left alone otherwise.
+    #[test]
+    fn pinned_attach_upgrades_an_existing_not_found() {
+        let first = classified(404, "NoSuchKey", false);
+        assert_eq!(kind_of(&first), ObjectErrorKind::NotFound);
+        let upgraded = attach_s3_classification(first, true);
+        assert_eq!(kind_of(&upgraded), ObjectErrorKind::VersionChanged);
+        assert!(!upgraded.is_retryable());
+        assert!(!crate::delete_contract::is_not_found(&upgraded));
+        // Not pinned: unchanged.
+        let first = classified(404, "NoSuchKey", false);
+        let same = attach_s3_classification(first, false);
+        assert_eq!(kind_of(&same), ObjectErrorKind::NotFound);
+        // Pinned, but another kind: unchanged.
+        let forbidden = classified(403, "AccessDenied", false);
+        let same = attach_s3_classification(forbidden, true);
+        assert_eq!(kind_of(&same), ObjectErrorKind::Forbidden);
+    }
+
+    /// A server-supplied code with control characters, or a very long one, never reaches the
+    /// attached message intact.
+    #[test]
+    fn hostile_codes_are_sanitised_in_the_attached_message() {
+        let e = classified(400, "Bad\r\nCode\x07 x", false);
+        let text = object_error(&e).expect("typed").to_string();
+        assert!(text.contains("status 400, code BadCodex"), "{text:?}");
+        assert!(!text.contains('\n') && !text.contains('\x07'), "{text:?}");
+        let long = "Z".repeat(500);
+        let e = classified(400, &long, false);
+        let text = object_error(&e).expect("typed").to_string();
+        assert!(text.len() < 150, "{} bytes", text.len());
+        assert!(text.contains(&"Z".repeat(64)) && !text.contains(&"Z".repeat(65)));
     }
 }
