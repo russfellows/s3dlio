@@ -506,3 +506,136 @@ async fn a_404_on_a_pinned_repair_is_a_version_change() {
     assert!(!crate::delete_contract::is_not_found(&err));
     assert_eq!(progress.filled(), 6);
 }
+
+// ---------------------------------------------------------------------------
+// Literal object names: the URL path segment the opener builds
+// ---------------------------------------------------------------------------
+
+/// An opener for the literal object name `object`.
+fn opener_for<'a>(storage: &'a Storage, object: &'a str) -> HttpOpener<'a> {
+    HttpOpener {
+        storage,
+        bucket_name: BUCKET,
+        object,
+    }
+}
+
+/// The path of the single request an unpinned full open of `object` sends.
+async fn path_sent_for(object: &str) -> String {
+    let data = object_bytes();
+    let server = Server::start([Reply::whole(GEN, &data)]).await;
+    let storage = server.client().await;
+    let mut opened = opener_for(&storage, object)
+        .open(&OpenRequest {
+            start: 0,
+            limit: None,
+            generation: None,
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .expect("opened");
+    assert_eq!(drain(opened.stream.as_mut()).await, data);
+    let seen = server.requests();
+    assert_eq!(seen.len(), 1, "one request for {object:?}");
+    seen[0].path().to_string()
+}
+
+/// The pinned fork's URL encoder leaves `%` alone, so a literal `%2F` in an object name would
+/// reach GCS as an escape and be decoded to `/` (a different object).  The opener therefore
+/// sends every literal `%` as `%25`, and the fork encodes the rest.  Each row is
+/// (literal object name, the path segment after `/o/` that must reach the server).
+#[tokio::test]
+async fn literal_object_names_reach_the_server_as_the_exact_path_segment() {
+    let rows = [
+        ("a%2Fb", "a%252Fb"),
+        ("100%", "100%25"),
+        ("%", "%25"),
+        ("%25", "%2525"),
+        ("x@y", "x%40y"),
+        ("k=v", "k%3Dv"),
+        ("p/q/r", "p%2Fq%2Fr"),
+        ("name.", "name."),
+        ("a b", "a%20b"),
+        ("a\\b", "a%5Cb"),
+        ("a\\%b", "a%5C%25b"),
+        ("dir/a%2Fb c=d@e%", "dir%2Fa%252Fb%20c%3Dd%40e%25"),
+    ];
+    let mut wrong = Vec::new();
+    for (literal, segment) in rows {
+        let want = format!("/storage/v1/b/bucket/o/{segment}");
+        let got = path_sent_for(literal).await;
+        if got != want {
+            wrong.push(format!("{literal:?}: sent {got}, wanted {want}"));
+        }
+    }
+    assert!(wrong.is_empty(), "wrong paths:\n{}", wrong.join("\n"));
+}
+
+/// The escape is applied to the name on every open, so a repair (pinned, ranged) of a name with
+/// a `%` names the same object as the first request.
+#[tokio::test]
+async fn a_repair_open_of_a_percent_name_names_the_same_object() {
+    let data = object_bytes();
+    let server = Server::start([Reply::ranged(GEN, 6, &data[6..])]).await;
+    let storage = server.client().await;
+    let mut opened = opener_for(&storage, "a%2Fb")
+        .open(&OpenRequest {
+            start: 6,
+            limit: None,
+            generation: Some(GEN),
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .expect("opened");
+    assert_eq!(drain(opened.stream.as_mut()).await, &data[6..]);
+    let seen = server.requests();
+    assert_eq!(seen[0].path(), "/storage/v1/b/bucket/o/a%252Fb");
+    assert_eq!(seen[0].query("generation").as_deref(), Some("77"));
+}
+
+/// The Rapid route puts the object name in a protobuf field, not in a URL, so it must receive the
+/// literal name unchanged: the escape belongs to `HttpOpener::open` alone.  No local server can
+/// drive the Rapid opener (see the header), so this reads the source: the escape helper is called
+/// only inside the HTTP opener, and the Rapid opener and the Rapid branch of `get_object_into`
+/// hand `object` to `open_object` untouched.
+#[test]
+fn the_rapid_route_receives_the_literal_name_unchanged() {
+    let src = include_str!("google_gcs_client.rs");
+    let rapid_at = src
+        .find("impl ReadOpener for RapidOpener")
+        .expect("Rapid opener impl");
+    let rapid_end = src[rapid_at..]
+        .find("impl GcsClient")
+        .expect("end of Rapid impl")
+        + rapid_at;
+    let rapid = &src[rapid_at..rapid_end];
+    assert!(rapid.contains("open_object(self.bucket_name, self.object)"));
+    assert!(!rapid.contains("http_media_object_name"), "{rapid}");
+
+    let into_at = src
+        .find("pub async fn get_object_into")
+        .expect("get_object_into");
+    let into = &src[into_at..];
+    let into = &into[..into.find("pub async fn head_typed").expect("end")];
+    let rapid_branch = &into[into.find("if rapid {").expect("rapid branch")..];
+    let rapid_branch = &rapid_branch[..rapid_branch.find("} else {").expect("else")];
+    assert!(
+        rapid_branch.contains("            object,\n"),
+        "{rapid_branch}"
+    );
+    assert!(
+        !rapid_branch.contains("http_media_object_name"),
+        "{rapid_branch}"
+    );
+
+    // The helper has exactly one caller outside its definition and tests: the HTTP opener.
+    let before_tests = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests")];
+    let calls: Vec<_> = before_tests
+        .match_indices("http_media_object_name(")
+        .collect();
+    assert_eq!(calls.len(), 2, "one definition and one call");
+    let http_at = before_tests
+        .find("impl ReadOpener for HttpOpener")
+        .expect("HTTP opener impl");
+    assert!(calls[1].0 > http_at && calls[1].0 < rapid_at);
+}

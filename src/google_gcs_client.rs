@@ -2197,6 +2197,30 @@ mod caller_buffer {
         pub(super) object: &'a str,
     }
 
+    /// The object name as the pinned fork's HTTP `read_object` must be given it, so that the
+    /// URL names exactly the literal object.
+    ///
+    /// `read_object` builds `/storage/v1/b/{bucket}/o/{enc(object)}?alt=media`, and its `enc`
+    /// (`storage/client.rs`) encodes the characters GCS requires (`/`, `@`, `=`, space, ...) but
+    /// deliberately PRESERVES `%` (its own test maps `preserve%percent%21` to itself).  A literal
+    /// `%2F` in an object name would therefore reach GCS as an escape and be decoded to `/`, which
+    /// names a different object.  Sending every literal `%` as `%25` makes the fork's encoder
+    /// produce the right URL for any name.
+    ///
+    /// The same mechanism covers `\`: `enc` leaves it alone, and the URL parser then reads it as a
+    /// `/` in an http path (measured: `a\b` reached the server as `a/b`), so it is sent as `%5C`.
+    /// The `%` replacement runs first, so the `%` of a `%5C` is never doubled.
+    ///
+    /// Only the HTTP route needs this.  The Rapid route carries the name in a protobuf field, not
+    /// a URL, and must receive it unchanged.
+    fn http_media_object_name(object: &str) -> std::borrow::Cow<'_, str> {
+        if object.contains(['%', '\\']) {
+            std::borrow::Cow::Owned(object.replace('%', "%25").replace('\\', "%5C"))
+        } else {
+            std::borrow::Cow::Borrowed(object)
+        }
+    }
+
     struct HttpStream(ReadObjectResponse);
 
     #[async_trait]
@@ -2218,7 +2242,8 @@ mod caller_buffer {
         /// 12`).  The size check of a repair against `dst.len()` therefore compares the whole
         /// object, as it does for the first request.  The generation is `x-goog-generation`.
         async fn open(&self, request: &OpenRequest) -> Result<Opened, GaxError> {
-            let mut builder = self.storage.read_object(self.bucket_name, self.object);
+            let object = http_media_object_name(self.object);
+            let mut builder = self.storage.read_object(self.bucket_name, object.as_ref());
             if let Some(generation) = request.generation {
                 builder = builder.set_generation(generation);
             }
