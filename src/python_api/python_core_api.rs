@@ -5,21 +5,24 @@
 
 use super::async_bridge::future_into_py;
 use super::put_payload::{
-    deadline_warning_text, export_stats, hold_for_call, latch_ready, note_internal_error,
-    put_payload, quiesce_async, quiesce_blocking, snapshot_for_call, Latch, PayloadUse,
+    acquire_writable, deadline_warning_text, export_stats, hold_for_call, latch_ready,
+    note_internal_error, put_payload, quiesce_async, quiesce_blocking, snapshot_for_call, Latch,
+    PayloadUse, WritableExport,
 };
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyFileNotFoundError, PyNotImplementedError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyDictMethods, PyList, PyListMethods};
 use pyo3::Bound;
 
+use tokio::sync::oneshot;
 use tokio::task;
 
+use std::future::Future;
 use std::path::PathBuf;
 
 use tracing::{debug, warn, Level};
@@ -28,6 +31,7 @@ use tracing::{debug, warn, Level};
 use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
 use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::list_containers::list_containers as list_containers_rs;
+use crate::object_error::{object_error, ObjectErrorKind};
 use crate::object_store::{
     get_many_with_stores, store_for_uri_with_logger, store_routing_endpoint_for_uri,
 };
@@ -46,7 +50,8 @@ use crate::file_store_direct::ConfigurableFileSystemObjectStore;
 #[cfg(feature = "backend-azure")]
 use crate::object_store::AzureObjectStore;
 use crate::object_store::{
-    CompressionConfig, ObjectStore, ObjectWriter, S3ObjectStore, WriterOptions,
+    CompressionConfig, HeadMetadata, ObjectStore, ObjectWriter, ReceiveProgress, S3ObjectStore,
+    WriterOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -2014,6 +2019,451 @@ fn _put_test_release_retained() -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Caller-buffer GET, typed HEAD and pure capabilities (#264, plan §4.5 A5)
+// ---------------------------------------------------------------------------
+
+create_exception!(
+    _pymod,
+    ObjectNotFoundError,
+    PyFileNotFoundError,
+    "The object does not exist (get_into_async on a missing object; head_async reports \
+     absence as None instead)."
+);
+
+create_exception!(
+    _pymod,
+    LengthMismatchError,
+    PyValueError,
+    "The object's size is not the expected length. `.expected` is the length the caller \
+     asked for; `.actual` is the object's size, or None when it is not known. Nothing in the \
+     destination buffer is valid after this error."
+);
+
+create_exception!(
+    _pymod,
+    UnsupportedOperationError,
+    PyNotImplementedError,
+    "This build or provider does not support the operation (see object_capabilities). \
+     Nothing was fetched and no fallback was attempted."
+);
+
+/// The result of `head_async` for an object that exists: its size and opaque identity.
+///
+/// Frozen: the fields cannot be assigned, and equal values hash equal.
+#[pyclass(name = "ObjectMetadata", frozen, eq, hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PyHeadMetadata {
+    /// The object size in bytes (never negative).
+    #[pyo3(get)]
+    size: u64,
+    /// The entity tag exactly as the provider reports it (opaque, not assumed to be an MD5).
+    #[pyo3(get)]
+    etag: Option<String>,
+    /// The provider's version identifier (S3 version id, GCS generation), when it reports one.
+    #[pyo3(get)]
+    version_id: Option<String>,
+}
+
+#[pymethods]
+impl PyHeadMetadata {
+    fn __repr__(&self) -> String {
+        format!(
+            "ObjectMetadata(size={}, etag={:?}, version_id={:?})",
+            self.size, self.etag, self.version_id
+        )
+    }
+}
+
+impl From<HeadMetadata> for PyHeadMetadata {
+    fn from(meta: HeadMetadata) -> Self {
+        Self {
+            size: meta.size,
+            etag: meta.etag,
+            version_id: meta.version_id,
+        }
+    }
+}
+
+/// The Python exception for a failed object operation (A2, A5 "Results and errors"): the typed
+/// classification when the error carries one, otherwise the generic `RuntimeError` of [`py_err`].
+/// The message is the whole error chain either way.
+///
+/// Needs the GIL (`LengthMismatchError` gets `.expected` / `.actual` set), so it runs where the
+/// result is delivered to Python (see [`Outcome`]), never on a runtime worker.
+fn object_py_err(py: Python<'_>, err: &anyhow::Error) -> PyErr {
+    let Some(typed) = object_error(err) else {
+        return py_err(err);
+    };
+    let message = error_chain_message(err);
+    match typed.kind {
+        ObjectErrorKind::NotFound => ObjectNotFoundError::new_err(message),
+        ObjectErrorKind::LengthMismatch { expected, actual } => {
+            let exception = LengthMismatchError::new_err(message);
+            let value = exception.value(py);
+            // Setting a plain attribute on a fresh exception does not fail in practice. If it
+            // ever did, the classification matters more than the attributes: keep the type.
+            let set = value
+                .setattr("expected", expected)
+                .and_then(|()| value.setattr("actual", actual));
+            if let Err(e) = set {
+                warn!("s3dlio: could not set LengthMismatchError.expected/actual: {e}");
+            }
+            exception
+        }
+        ObjectErrorKind::Unsupported => UnsupportedOperationError::new_err(message),
+        _ => py_err(err),
+    }
+}
+
+/// The value a caller-buffer GET or typed HEAD future resolves to. A failure travels as DATA
+/// until the result is delivered, and only then becomes the typed Python exception
+/// ([`object_py_err`]): `IntoPyObject` runs with the GIL held, on the delivery path, so the
+/// conversion never makes a Tokio worker wait for the GIL.
+struct Outcome<T>(anyhow::Result<T>);
+
+impl<'py, T> IntoPyObject<'py> for Outcome<T>
+where
+    T: IntoPyObject<'py>,
+{
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        match self.0 {
+            Ok(value) => value.into_bound_py_any(py),
+            Err(err) => Err(object_py_err(py, &err)),
+        }
+    }
+}
+
+/// Which operation a capability check is for.
+#[derive(Clone, Copy)]
+enum Operation {
+    GetInto,
+    Head,
+}
+
+/// Step 1 of A5: pure capability check. `ValueError` for a malformed URI,
+/// `UnsupportedOperationError` (synchronously) when this build or provider lacks the operation.
+fn require_capability(uri: &str, operation: Operation) -> PyResult<()> {
+    let caps = crate::capabilities::object_capabilities(uri)
+        .map_err(|e| PyValueError::new_err(error_chain_message(&e)))?;
+    let (supported, name) = match operation {
+        Operation::GetInto => (caps.get_into, "get_into_async"),
+        Operation::Head => (caps.head, "head_async"),
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(UnsupportedOperationError::new_err(format!(
+            "{name} is not supported for {} URIs in this build (see object_capabilities)",
+            caps.provider
+        )))
+    }
+}
+
+/// `expected_len` as a `usize`: an integer (not a bool), non-negative, within `usize`.
+fn checked_expected_len(value: &Bound<'_, PyAny>) -> PyResult<usize> {
+    use pyo3::exceptions::PyTypeError;
+    if value.is_instance_of::<pyo3::types::PyBool>() {
+        return Err(PyTypeError::new_err(
+            "expected_len must be an integer, not a bool",
+        ));
+    }
+    let n: i128 = value.extract().map_err(|_| {
+        // Not an int, or an int too large even for i128.
+        if value.is_instance_of::<pyo3::types::PyInt>() {
+            PyValueError::new_err("expected_len is too large")
+        } else {
+            PyTypeError::new_err("expected_len must be an integer")
+        }
+    })?;
+    if n < 0 {
+        return Err(PyValueError::new_err(format!(
+            "expected_len must not be negative, got {n}"
+        )));
+    }
+    usize::try_from(n).map_err(|_| PyValueError::new_err("expected_len is too large"))
+}
+
+/// The two steps of starting an awaitable that tests need to fail on demand. The live
+/// implementation is [`LiveSeams`]; tests substitute failing ones.
+trait StartSeams {
+    /// Hand the native future to the Python event loop (`future_into_py`). On failure the future
+    /// is dropped without having run.
+    fn bridge<'py, F, T>(&self, py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
+    where
+        F: Future<Output = PyResult<T>> + Send + 'static,
+        T: for<'a> IntoPyObject<'a> + Send + 'static;
+
+    /// Wrap the bridged future in the guarded completion (`PreparedGuard::instantiate`).
+    fn instantiate<'py>(
+        &self,
+        py: Python<'py>,
+        guard: PreparedGuard<'py>,
+        inner: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>>;
+}
+
+/// The real bridge and guard constructor.
+struct LiveSeams;
+
+impl StartSeams for LiveSeams {
+    fn bridge<'py, F, T>(&self, py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
+    where
+        F: Future<Output = PyResult<T>> + Send + 'static,
+        T: for<'a> IntoPyObject<'a> + Send + 'static,
+    {
+        future_into_py(py, fut)
+    }
+
+    fn instantiate<'py>(
+        &self,
+        py: Python<'py>,
+        guard: PreparedGuard<'py>,
+        inner: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        guard.instantiate(py, inner)
+    }
+}
+
+/// Request cancellation of `future`, ignoring any failure to do so. Used only on the failure
+/// paths of starting an awaitable, where the original error is what the caller must see and
+/// nothing may wait on the outcome of the cancellation.
+fn cancel_ignoring_errors(future: &Bound<'_, PyAny>) {
+    if let Err(e) = future.call_method0("cancel") {
+        debug!("s3dlio: ignoring an error cancelling an awaitable that failed to start: {e}");
+    }
+}
+
+/// Read the object at `uri` into `dst`, which must be a writable, C-contiguous byte buffer
+/// (`bytearray`, `memoryview` of bytes, a NumPy `uint8` array, an `mmap`, ...). Returns an
+/// awaitable that resolves to `expected_len` once exactly `expected_len` bytes have been
+/// written into `dst[:expected_len]`.
+///
+/// `expected_len` is the object's size: a different size fails with `LengthMismatchError`
+/// (`.expected`, `.actual`) and nothing is written past `expected_len`. A missing object raises
+/// `ObjectNotFoundError`; a build or provider without the operation raises
+/// `UnsupportedOperationError` immediately (see `object_capabilities`). No fallback download
+/// plus copy is ever made.
+///
+/// While the awaitable is pending, native code has exclusive use of `dst[:expected_len]`: do not
+/// read, modify, resize or reuse the buffer until the awaitable has finished (result, exception
+/// or cancelled). The export blocks resizing but cannot stop a racing writer. The awaitable
+/// never finishes while a native writer remains or before the export has been released, so the
+/// buffer is safe to reuse right after the `await`, including after an error or a cancellation.
+/// After a failure the contents of `dst[:expected_len]` are unspecified. A failure before the
+/// transfer starts (for example, no running event loop) releases the buffer before it raises.
+#[pyfunction]
+#[pyo3(signature = (uri, dst, *, expected_len))]
+fn get_into_async<'py>(
+    py: Python<'py>,
+    uri: &str,
+    dst: &Bound<'py, PyAny>,
+    expected_len: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let uri = uri.to_owned();
+
+    // Step 1: pure capability check; unsupported raises here, synchronously.
+    require_capability(&uri, Operation::GetInto)?;
+    let expected_len = checked_expected_len(expected_len)?;
+
+    // Step 2: build the store on the caller thread (#173).
+    let store = py
+        .detach(|| get_or_create_store(&uri, global_logger()))
+        .map_err(py_err)?;
+
+    // Step 3 (the latch; the guard is prepared from it in `get_into_with_store`). The guard and
+    // the export always share this one latch.
+    let latch = Latch::new();
+    get_into_with_store(py, &LiveSeams, store, uri, dst, expected_len, latch)
+}
+
+/// Steps 3 to 7 of A5 for a store that is already built: prepare the guard on `latch` (3),
+/// acquire the export on the same latch (4), bridge a task that waits for the export before it
+/// touches the store (5), instantiate the guard (6; never `wrap_in_guard`, whose error path
+/// waits on the latch) and hand the export to the task (7).
+///
+/// A failure in 3 or 4 holds no export and raises directly. A failure in 5 to 7, before the send
+/// succeeded, releases the export directly with this GIL token (no queue, no wait), cancels what
+/// exists (ignoring cancel errors) and raises the ORIGINAL error: the buffer is reusable at once.
+/// Once the send succeeded nothing fallible remains.
+fn get_into_with_store<'py, S: StartSeams>(
+    py: Python<'py>,
+    seams: &S,
+    store: Arc<dyn ObjectStore>,
+    uri: String,
+    dst: &Bound<'py, PyAny>,
+    expected_len: usize,
+    latch: Arc<Latch>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let guard = prepare_guard(py, latch.clone())?;
+    let owner = acquire_writable(py, dst, expected_len, &latch)?;
+
+    let (tx, rx) = oneshot::channel::<WritableExport>();
+    let task = async move {
+        // The export arrives only after the guard exists: no native write before that.
+        let mut owner = match rx.await {
+            Ok(owner) => owner,
+            Err(_) => {
+                return Ok::<_, PyErr>(Outcome(Err(anyhow::anyhow!(
+                    "the destination buffer was never handed to the read"
+                ))));
+            }
+        };
+        // `owner` is declared before the `get_into` future, so it drops after every writer.
+        let progress = ReceiveProgress::new();
+        let result = store.get_into(&uri, owner.as_mut_slice(), &progress).await;
+        Ok(Outcome(result.map(|()| expected_len)))
+    };
+
+    let inner = match seams.bridge(py, task) {
+        Ok(inner) => inner,
+        Err(e) => {
+            drop(tx);
+            owner.release(py);
+            return Err(e);
+        }
+    };
+    let guarded = match seams.instantiate(py, guard, inner.clone()) {
+        Ok(guarded) => guarded,
+        Err(e) => {
+            drop(tx);
+            owner.release(py);
+            cancel_ignoring_errors(&inner);
+            return Err(e);
+        }
+    };
+    match tx.send(owner) {
+        Ok(()) => Ok(guarded),
+        Err(owner) => {
+            owner.release(py);
+            cancel_ignoring_errors(&guarded);
+            Err(PyRuntimeError::new_err(
+                "get_into_async could not hand the destination buffer to its task",
+            ))
+        }
+    }
+}
+
+/// Marks a `head_async` call's latch when it is dropped: the point at which no native request
+/// of the call can still be running. There is no buffer, so both latch signals are set together.
+///
+/// It is moved into the future before the request exists and is the FIRST local of the future
+/// body, so it drops after any request future, wherever the future is dropped: unpolled, on a
+/// closed start channel, on cancellation, on a panic or on completion. `Drop` takes no GIL.
+struct HeadQuiescence {
+    latch: Arc<Latch>,
+}
+
+impl Drop for HeadQuiescence {
+    fn drop(&mut self) {
+        self.latch.mark_dropped();
+        self.latch.mark_released();
+        #[cfg(test)]
+        head_token_tests::note_completion(&self.latch);
+    }
+}
+
+/// Look up the object at `uri` without reading it. Returns an awaitable that resolves to an
+/// `ObjectMetadata` (`size`, `etag`, `version_id`), or to `None` when the object does not
+/// exist. Every other failure, including a missing bucket or container, raises. A build or
+/// provider without the operation raises `UnsupportedOperationError` immediately.
+///
+/// Like `get_into_async` the awaitable never finishes while a native request of the call
+/// remains, so callers can bound outstanding native work; there is no buffer to release.
+#[pyfunction]
+fn head_async<'py>(py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
+    let uri = uri.to_owned();
+
+    // Capability `head` (not `get_into`), then the store on the caller thread.
+    require_capability(&uri, Operation::Head)?;
+    let store = py
+        .detach(|| get_or_create_store(&uri, global_logger()))
+        .map_err(py_err)?;
+
+    let latch = Latch::new();
+    head_with_store(py, &LiveSeams, store, uri, latch)
+}
+
+/// The HEAD half of A5 for a store that is already built.
+///
+/// The start channel carries a unit permit. The [`HeadQuiescence`] token holds the latch and is
+/// built before the future. A failure before the permit is sent drops `tx`, cancels what exists
+/// (ignoring cancel errors) and raises the original error: the token marks the latch when the
+/// future drops, and nothing waits.
+fn head_with_store<'py, S: StartSeams>(
+    py: Python<'py>,
+    seams: &S,
+    store: Arc<dyn ObjectStore>,
+    uri: String,
+    latch: Arc<Latch>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let guard = prepare_guard(py, latch.clone())?;
+
+    let (tx, rx) = oneshot::channel::<()>();
+    let token = HeadQuiescence { latch };
+    let task = async move {
+        // First local: dropped last, after any request future (see `HeadQuiescence`).
+        let _quiescence = token;
+        if rx.await.is_err() {
+            return Ok::<_, PyErr>(Outcome(Err(anyhow::anyhow!(
+                "the HEAD request was never started"
+            ))));
+        }
+        let result = store.head(&uri).await;
+        Ok(Outcome(result.map(|found| found.map(PyHeadMetadata::from))))
+    };
+
+    let inner = match seams.bridge(py, task) {
+        Ok(inner) => inner,
+        Err(e) => {
+            drop(tx);
+            return Err(e);
+        }
+    };
+    let guarded = match seams.instantiate(py, guard, inner.clone()) {
+        Ok(guarded) => guarded,
+        Err(e) => {
+            drop(tx);
+            cancel_ignoring_errors(&inner);
+            return Err(e);
+        }
+    };
+    match tx.send(()) {
+        Ok(()) => Ok(guarded),
+        Err(()) => {
+            cancel_ignoring_errors(&guarded);
+            Err(PyRuntimeError::new_err(
+                "head_async could not start its request",
+            ))
+        }
+    }
+}
+
+/// What this build can do for `uri`, from the scheme alone: no store, credentials, client or
+/// network. Returns `{"provider": str, "get_into": bool, "head": bool}`; `provider` is `"s3"`,
+/// `"az"`, `"gs"`, `"file"`, `"direct"` or `"unknown"`. `get_into` and `head` say whether
+/// `get_into_async` and `head_async` are available for the URI in this build.
+///
+/// `ValueError` for a URI that is malformed for a known object scheme. A true answer is
+/// structural: a store can still refuse a URI that passes here (for example an Azure account
+/// name that depends on the configured endpoint). Rapid versus standard GCS routing is resolved
+/// during real I/O, never here.
+#[pyfunction]
+#[pyo3(name = "object_capabilities")]
+fn object_capabilities_py<'py>(py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyDict>> {
+    let caps = crate::capabilities::object_capabilities(uri)
+        .map_err(|e| PyValueError::new_err(error_chain_message(&e)))?;
+    let result = PyDict::new(py);
+    result.set_item("provider", caps.provider)?;
+    result.set_item("get_into", caps.get_into)?;
+    result.set_item("head", caps.head)?;
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
 // mkdir() - Create directory/prefix for any backend
 // ---------------------------------------------------------------------------
 
@@ -3594,6 +4044,23 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "ExportStillReferencedError",
         m.py().get_type::<ExportStillReferencedError>(),
     )?;
+    // Caller-buffer GET, typed HEAD and pure capabilities (#264)
+    m.add_function(wrap_pyfunction!(object_capabilities_py, m)?)?;
+    m.add_function(wrap_pyfunction!(get_into_async, m)?)?;
+    m.add_function(wrap_pyfunction!(head_async, m)?)?;
+    m.add_class::<PyHeadMetadata>()?;
+    m.add(
+        "ObjectNotFoundError",
+        m.py().get_type::<ObjectNotFoundError>(),
+    )?;
+    m.add(
+        "LengthMismatchError",
+        m.py().get_type::<LengthMismatchError>(),
+    )?;
+    m.add(
+        "UnsupportedOperationError",
+        m.py().get_type::<UnsupportedOperationError>(),
+    )?;
     m.add_function(wrap_pyfunction!(mkdir, m)?)?;
     m.add_function(wrap_pyfunction!(mkdir_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
@@ -4460,6 +4927,9 @@ mod issue204_store_cache_tests {
             "put_bytes_async",
             "mkdir_async",
             "put_many_async",
+            // The caller-buffer GET and typed HEAD (#264): the store is built on the caller thread.
+            "get_into_async",
+            "head_async",
             // `get_many` for az:// / gs:// goes through this helper (#242 review).
             "get_many_cached_stores",
         ] {
@@ -4588,5 +5058,1756 @@ mod borrowed_put_guard_tests {
         let before = export_stats().internal_errors;
         note_internal_error();
         assert_eq!(export_stats().internal_errors, before + 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- caller-buffer GET, typed HEAD and pure capabilities (#264, stage B3b).
+// ---------------------------------------------------------------------------
+
+/// Counts the completions of `HeadQuiescence` tokens, per latch (test hook, see its `Drop`).
+#[cfg(test)]
+mod head_token_tests {
+    use super::*;
+
+    static COMPLETIONS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn note_completion(latch: &Arc<Latch>) {
+        COMPLETIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::as_ptr(latch) as usize);
+    }
+
+    /// Completions recorded for `latch` so far. An allocator may reuse a freed latch's address,
+    /// so a test compares against the value it read before the call.
+    pub(super) fn completions(latch: &Arc<Latch>) -> usize {
+        let key = Arc::as_ptr(latch) as usize;
+        COMPLETIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|seen| **seen == key)
+            .count()
+    }
+}
+
+#[cfg(test)]
+mod caller_buffer_tests {
+    use super::*;
+    use crate::object_error::attach_object_error;
+    use async_trait::async_trait;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// The URI handed to the internal functions; the fake store ignores it.
+    const URI: &str = "s3://bucket/key";
+    /// The canary byte every test buffer starts filled with.
+    const CANARY: u8 = 0xCC;
+    /// Far below the 30 s quiesce timeout: a test that took this long waited on a barrier.
+    const NO_BARRIER_WAIT: Duration = Duration::from_secs(10);
+
+    // ---- the Python side of the harness ----
+
+    /// `Exporter` is a writable byte buffer that counts its exports and releases (PEP 688), so a
+    /// test can assert "exactly one release". `run` drives one scenario on a fresh event loop
+    /// with a hard timeout, so a broken barrier fails instead of hanging.
+    const DRIVER_PY: &std::ffi::CStr = c_str!(
+        "import asyncio
+import ctypes
+
+class Exporter:
+    def __init__(self, n, fill=204):
+        self.ba = bytearray([fill]) * n
+        self.exports = 0
+        self.releases = 0
+    def __buffer__(self, flags):
+        self.exports += 1
+        return memoryview(self.ba)
+    def __release_buffer__(self, view):
+        self.releases += 1
+        view.release()
+    def address(self):
+        c = (ctypes.c_char * len(self.ba)).from_buffer(self.ba)
+        a = ctypes.addressof(c)
+        del c
+        return a
+    def resizable(self):
+        try:
+            self.ba.append(0)
+            self.ba.pop()
+        except BufferError:
+            return False
+        return True
+
+def run(main, *args):
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(main(*args))
+        timer = loop.call_later(20, loop.stop)
+        try:
+            return loop.run_until_complete(task)
+        finally:
+            timer.cancel()
+    finally:
+        loop.close()
+
+async def scn_await(start):
+    return await start()
+
+async def scn_error(start):
+    try:
+        await start()
+    except BaseException as e:
+        return e
+    raise AssertionError('expected an error')
+
+async def scn_cancel_now(start):
+    fut = start()
+    cancel = fut.cancel()
+    try:
+        await fut
+    except asyncio.CancelledError:
+        return (cancel, 'cancelled')
+    return (cancel, 'finished')
+
+async def scn_cancel_when(start, entered):
+    fut = start()
+    while not entered():
+        await asyncio.sleep(0.002)
+    cancel = fut.cancel()
+    try:
+        await fut
+    except asyncio.CancelledError:
+        return (cancel, 'cancelled')
+    return (cancel, 'finished')
+
+async def scn_cancel_after(start):
+    fut = start()
+    value = await fut
+    return (value, fut.cancel(), fut.done(), fut.cancelled())
+"
+    );
+
+    struct Driver<'py> {
+        module: Bound<'py, PyModule>,
+    }
+
+    impl<'py> Driver<'py> {
+        fn new(py: Python<'py>) -> Self {
+            let module = PyModule::from_code(
+                py,
+                DRIVER_PY,
+                c_str!("s3dlio_caller_buffer_driver.py"),
+                c_str!("_s3dlio_caller_buffer_driver"),
+            )
+            .expect("driver module");
+            Self { module }
+        }
+
+        fn exporter(&self, n: usize) -> Bound<'py, PyAny> {
+            self.module
+                .getattr("Exporter")
+                .and_then(|class| class.call1((n, CANARY)))
+                .expect("Exporter")
+        }
+
+        /// Run `scenario(start, *extra)` to completion on a fresh event loop.
+        fn run(
+            &self,
+            scenario: &str,
+            start: Bound<'py, PyAny>,
+            extra: Vec<Bound<'py, PyAny>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let py = self.module.py();
+            let mut args = vec![self.module.getattr(scenario)?, start];
+            args.extend(extra);
+            self.module
+                .getattr("run")?
+                .call1(pyo3::types::PyTuple::new(py, args)?)
+        }
+    }
+
+    fn attr_usize(obj: &Bound<'_, PyAny>, name: &str) -> usize {
+        obj.getattr(name).unwrap().extract().unwrap()
+    }
+
+    fn method_bool(obj: &Bound<'_, PyAny>, name: &str) -> bool {
+        obj.call_method0(name).unwrap().extract().unwrap()
+    }
+
+    fn contents(exporter: &Bound<'_, PyAny>) -> Vec<u8> {
+        exporter.getattr("ba").unwrap().extract().unwrap()
+    }
+
+    fn latch_state(latch: &Latch) -> (bool, bool) {
+        (latch.is_dropped(), latch.is_released())
+    }
+
+    /// Wait (GIL released) until `ready` holds, at most `NO_BARRIER_WAIT`.
+    fn wait_until(py: Python<'_>, ready: impl Fn() -> bool + Send + Sync) -> bool {
+        py.detach(|| {
+            let deadline = Instant::now() + NO_BARRIER_WAIT;
+            while Instant::now() < deadline {
+                if ready() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            ready()
+        })
+    }
+
+    /// Let tasks that would start native work, if they could, run (GIL released).
+    fn let_runtime_settle(py: Python<'_>) {
+        py.detach(|| std::thread::sleep(Duration::from_millis(60)));
+    }
+
+    // ---- the deterministic fake store ----
+
+    #[derive(Clone, Copy)]
+    enum Failure {
+        NotFound,
+        Length,
+        LengthUnknown,
+        Unsupported,
+        Forbidden,
+        VersionChanged,
+        Plain,
+    }
+
+    fn failure_error(failure: Failure) -> anyhow::Error {
+        let source = anyhow::anyhow!("sdk source");
+        match failure {
+            Failure::NotFound => attach_object_error(
+                source,
+                ObjectErrorKind::NotFound,
+                "s3",
+                "status 404, code NoSuchKey",
+            ),
+            Failure::Length => attach_object_error(
+                source,
+                ObjectErrorKind::LengthMismatch {
+                    expected: 8,
+                    actual: Some(5),
+                },
+                "s3",
+                "",
+            ),
+            Failure::LengthUnknown => attach_object_error(
+                source,
+                ObjectErrorKind::LengthMismatch {
+                    expected: 8,
+                    actual: None,
+                },
+                "s3",
+                "",
+            ),
+            Failure::Unsupported => {
+                attach_object_error(source, ObjectErrorKind::Unsupported, "s3", "no")
+            }
+            Failure::Forbidden => {
+                attach_object_error(source, ObjectErrorKind::Forbidden, "s3", "status 403")
+            }
+            Failure::VersionChanged => {
+                attach_object_error(source, ObjectErrorKind::VersionChanged, "s3", "status 412")
+            }
+            Failure::Plain => anyhow::anyhow!("plain failure"),
+        }
+        .context("caller-buffer operation failed")
+    }
+
+    /// A store whose `get_into` and `head` are scripted. It records what it was given.
+    struct FakeStore {
+        /// Written to the front of the destination by a successful (or half of it by a failed)
+        /// `get_into`.
+        fill: Vec<u8>,
+        /// Hold inside the native call until the test adds a permit to `gate`.
+        block: bool,
+        gate: tokio::sync::Semaphore,
+        panic: bool,
+        failure: Option<Failure>,
+        /// What `head` returns on success: `None` is an absent object.
+        head_result: Option<HeadMetadata>,
+        get_calls: AtomicUsize,
+        head_calls: AtomicUsize,
+        entered: AtomicBool,
+        /// `(address, length)` of the destination of every `get_into` call.
+        seen: Mutex<Vec<(usize, usize)>>,
+        /// `(releases, resizable)` of the destination observed INSIDE the start call, at the moment
+        /// it returned an error (see `get_start`): proves the release was direct, not queued.
+        error_probe: Mutex<Option<(usize, bool)>>,
+    }
+
+    impl FakeStore {
+        fn new() -> Self {
+            Self {
+                fill: vec![0x5A; 8],
+                block: false,
+                gate: tokio::sync::Semaphore::new(0),
+                panic: false,
+                failure: None,
+                head_result: Some(HeadMetadata {
+                    size: 8,
+                    etag: Some("\"etag-1\"".to_string()),
+                    version_id: Some("gen-7".to_string()),
+                }),
+                get_calls: AtomicUsize::new(0),
+                head_calls: AtomicUsize::new(0),
+                entered: AtomicBool::new(false),
+                seen: Mutex::new(Vec::new()),
+                error_probe: Mutex::new(None),
+            }
+        }
+
+        fn filling(mut self, fill: Vec<u8>) -> Self {
+            self.fill = fill;
+            self
+        }
+
+        fn blocking(mut self) -> Self {
+            self.block = true;
+            self
+        }
+
+        fn panicking(mut self) -> Self {
+            self.panic = true;
+            self
+        }
+
+        fn failing(mut self, failure: Failure) -> Self {
+            self.failure = Some(failure);
+            self
+        }
+
+        fn absent(mut self) -> Self {
+            self.head_result = None;
+            self
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+
+        fn head_calls(&self) -> usize {
+            self.head_calls.load(Ordering::SeqCst)
+        }
+
+        fn seen(&self) -> Vec<(usize, usize)> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        fn error_probe(&self) -> Option<(usize, bool)> {
+            *self.error_probe.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FakeStore {
+        async fn get_into(
+            &self,
+            _uri: &str,
+            dst: &mut [u8],
+            progress: &ReceiveProgress,
+        ) -> anyhow::Result<()> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((dst.as_ptr() as usize, dst.len()));
+            self.entered.store(true, Ordering::SeqCst);
+            if self.panic {
+                panic!("fake store panics inside the native future");
+            }
+            if self.block {
+                // Held until the test adds a permit; a dropped future just stops here.
+                let _permit = self.gate.acquire().await?;
+            }
+            let n = self.fill.len().min(dst.len());
+            // A failure first writes half of what it would have: partial progress.
+            let written = if self.failure.is_some() { n / 2 } else { n };
+            dst[..written].copy_from_slice(&self.fill[..written]);
+            crate::receive_progress::SpanMark::new(progress).record_copy(0, written as u64)?;
+            match self.failure {
+                Some(failure) => Err(failure_error(failure)),
+                None => Ok(()),
+            }
+        }
+
+        async fn head(&self, _uri: &str) -> anyhow::Result<Option<HeadMetadata>> {
+            self.head_calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.store(true, Ordering::SeqCst);
+            if self.panic {
+                panic!("fake store panics inside the native future");
+            }
+            if self.block {
+                let _permit = self.gate.acquire().await?;
+            }
+            match self.failure {
+                Some(failure) => Err(failure_error(failure)),
+                None => Ok(self.head_result.clone()),
+            }
+        }
+
+        async fn get(&self, _uri: &str) -> anyhow::Result<Bytes> {
+            anyhow::bail!("not scripted")
+        }
+        async fn get_range(
+            &self,
+            _uri: &str,
+            _offset: u64,
+            _length: Option<u64>,
+        ) -> anyhow::Result<Bytes> {
+            anyhow::bail!("not scripted")
+        }
+        async fn put(&self, _uri: &str, _data: Bytes) -> anyhow::Result<()> {
+            anyhow::bail!("not scripted")
+        }
+        async fn put_multipart(
+            &self,
+            _uri: &str,
+            _data: Bytes,
+            _part_size: Option<usize>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not scripted")
+        }
+        async fn list(&self, _uri_prefix: &str, _recursive: bool) -> anyhow::Result<Vec<String>> {
+            anyhow::bail!("not scripted")
+        }
+        fn list_stream<'a>(
+            &'a self,
+            _uri_prefix: &'a str,
+            _recursive: bool,
+        ) -> Pin<Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send + 'a>> {
+            Box::pin(futures::stream::empty())
+        }
+        async fn stat(&self, _uri: &str) -> anyhow::Result<crate::object_store::ObjectMetadata> {
+            anyhow::bail!("not scripted")
+        }
+        async fn delete(&self, _uri: &str) -> anyhow::Result<()> {
+            anyhow::bail!("not scripted")
+        }
+        async fn delete_batch(&self, _uris: &[String]) -> anyhow::Result<()> {
+            anyhow::bail!("not scripted")
+        }
+        async fn delete_prefix(&self, _uri_prefix: &str) -> anyhow::Result<()> {
+            anyhow::bail!("not scripted")
+        }
+        async fn create_container(&self, _name: &str) -> anyhow::Result<()> {
+            anyhow::bail!("not scripted")
+        }
+        async fn delete_container(&self, _name: &str) -> anyhow::Result<()> {
+            anyhow::bail!("not scripted")
+        }
+        async fn get_writer(&self, _uri: &str) -> anyhow::Result<Box<dyn ObjectWriter>> {
+            anyhow::bail!("not scripted")
+        }
+    }
+
+    // ---- failure injection ----
+
+    #[derive(Clone, Default)]
+    enum BridgeMode {
+        /// The real `future_into_py`.
+        #[default]
+        Live,
+        /// `future_into_py` fails (the future is dropped unrun).
+        Fail,
+        /// The bridge "succeeds" but the Rust future is gone: the start receiver is closed.
+        DropFuture,
+        /// The real bridge, but the future is not polled until the test adds a permit to the
+        /// semaphore: a cancellation can then arrive before the future's first poll.
+        Gated(Arc<tokio::sync::Semaphore>),
+    }
+
+    #[derive(Clone, Default)]
+    struct TestSeams {
+        bridge: BridgeMode,
+        fail_instantiate: bool,
+        /// Run just before the guard is instantiated, i.e. before the start permit or the
+        /// export is sent.
+        probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl StartSeams for TestSeams {
+        fn bridge<'py, F, T>(&self, py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
+        where
+            F: Future<Output = PyResult<T>> + Send + 'static,
+            T: for<'a> IntoPyObject<'a> + Send + 'static,
+        {
+            match &self.bridge {
+                BridgeMode::Live => future_into_py(py, fut),
+                BridgeMode::Fail => {
+                    drop(fut);
+                    Err(PyRuntimeError::new_err("injected bridge failure"))
+                }
+                BridgeMode::DropFuture => {
+                    drop(fut);
+                    py.import("asyncio")?
+                        .call_method0("get_running_loop")?
+                        .call_method0("create_future")
+                }
+                BridgeMode::Gated(gate) => {
+                    let gate = Arc::clone(gate);
+                    future_into_py(py, async move {
+                        let _permit = gate
+                            .acquire()
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        fut.await
+                    })
+                }
+            }
+        }
+
+        fn instantiate<'py>(
+            &self,
+            py: Python<'py>,
+            guard: PreparedGuard<'py>,
+            inner: Bound<'py, PyAny>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            if let Some(probe) = &self.probe {
+                probe();
+            }
+            if self.fail_instantiate {
+                drop(guard);
+                return Err(PyRuntimeError::new_err("injected guard failure"));
+            }
+            guard.instantiate(py, inner)
+        }
+    }
+
+    impl TestSeams {
+        fn bridge(mut self, mode: BridgeMode) -> Self {
+            self.bridge = mode;
+            self
+        }
+        fn failing_guard(mut self) -> Self {
+            self.fail_instantiate = true;
+            self
+        }
+        /// Assert, just before the start permit/export is sent, that the store was never
+        /// called (after giving a premature task time to call it).
+        fn assert_store_untouched_before_start(mut self, store: &Arc<FakeStore>) -> Self {
+            let store = Arc::clone(store);
+            self.probe = Some(Arc::new(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                assert_eq!(
+                    store.get_calls(),
+                    0,
+                    "native GET started before the transfer"
+                );
+                assert_eq!(
+                    store.head_calls(),
+                    0,
+                    "native HEAD started before the permit"
+                );
+            }));
+            self
+        }
+    }
+
+    /// The Python callable `start()` of one internal GET call.
+    fn get_start<'py>(
+        py: Python<'py>,
+        seams: TestSeams,
+        store: &Arc<FakeStore>,
+        dst: &Bound<'py, PyAny>,
+        expected_len: usize,
+        latch: &Arc<Latch>,
+    ) -> Bound<'py, PyAny> {
+        let store = Arc::clone(store);
+        let dst = dst.clone().unbind();
+        let latch = Arc::clone(latch);
+        pyo3::types::PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |args: &Bound<'_, pyo3::types::PyTuple>,
+                  _kwargs: Option<&Bound<'_, PyDict>>|
+                  -> PyResult<Py<PyAny>> {
+                let py = args.py();
+                let store_dyn: Arc<dyn ObjectStore> = store.clone();
+                let result = get_into_with_store(
+                    py,
+                    &seams,
+                    store_dyn,
+                    URI.to_owned(),
+                    dst.bind(py),
+                    expected_len,
+                    latch.clone(),
+                );
+                if result.is_err() {
+                    let dst = dst.bind(py);
+                    *store.error_probe.lock().unwrap() =
+                        Some((attr_usize(dst, "releases"), method_bool(dst, "resizable")));
+                }
+                result.map(Bound::unbind)
+            },
+        )
+        .expect("start closure")
+        .into_any()
+    }
+
+    /// The Python callable `start()` of one internal HEAD call.
+    fn head_start<'py>(
+        py: Python<'py>,
+        seams: TestSeams,
+        store: &Arc<FakeStore>,
+        latch: &Arc<Latch>,
+    ) -> Bound<'py, PyAny> {
+        let store = Arc::clone(store);
+        let latch = Arc::clone(latch);
+        pyo3::types::PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |args: &Bound<'_, pyo3::types::PyTuple>,
+                  _kwargs: Option<&Bound<'_, PyDict>>|
+                  -> PyResult<Py<PyAny>> {
+                let store: Arc<dyn ObjectStore> = store.clone();
+                head_with_store(args.py(), &seams, store, URI.to_owned(), latch.clone())
+                    .map(Bound::unbind)
+            },
+        )
+        .expect("start closure")
+        .into_any()
+    }
+
+    /// The Python callable `entered()`: has the fake store been called?
+    fn entered_fn<'py>(py: Python<'py>, store: &Arc<FakeStore>) -> Bound<'py, PyAny> {
+        let store = Arc::clone(store);
+        pyo3::types::PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |_args: &Bound<'_, pyo3::types::PyTuple>,
+                  _kwargs: Option<&Bound<'_, PyDict>>|
+                  -> PyResult<bool> { Ok(store.entered.load(Ordering::SeqCst)) },
+        )
+        .expect("entered closure")
+        .into_any()
+    }
+
+    fn init() {
+        Python::initialize();
+    }
+
+    fn is_instance<T: pyo3::type_object::PyTypeInfo>(
+        py: Python<'_>,
+        obj: &Bound<'_, PyAny>,
+    ) -> bool {
+        obj.is_instance(&py.get_type::<T>()).unwrap()
+    }
+
+    // =======================================================================
+    // Pure capabilities
+    // =======================================================================
+
+    #[test]
+    fn object_capabilities_returns_the_dict() {
+        init();
+        Python::attach(|py| {
+            let native = cfg!(all(
+                feature = "native-backends",
+                not(feature = "arrow-backend")
+            ));
+            let get = |uri: &str| {
+                let d = object_capabilities_py(py, uri).unwrap();
+                let provider: String = d.get_item("provider").unwrap().unwrap().extract().unwrap();
+                let get_into: bool = d.get_item("get_into").unwrap().unwrap().extract().unwrap();
+                let head: bool = d.get_item("head").unwrap().unwrap().extract().unwrap();
+                assert_eq!(d.len(), 3, "exactly provider, get_into, head");
+                (provider, get_into, head)
+            };
+            assert_eq!(get("s3://bucket/key"), ("s3".to_string(), native, native));
+            assert_eq!(get("file:///tmp/x"), ("file".to_string(), false, false));
+            assert_eq!(get("direct:///tmp/x"), ("direct".to_string(), false, false));
+            assert_eq!(get("ftp://host/x"), ("unknown".to_string(), false, false));
+        });
+    }
+
+    #[test]
+    fn object_capabilities_malformed_uri_is_a_value_error() {
+        init();
+        Python::attach(|py| {
+            // An empty Azure container (#224) is malformed in every environment.
+            let err = object_capabilities_py(py, "az://account//key").expect_err("malformed");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+            let err = object_capabilities_py(py, "s3://").expect_err("malformed");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+        });
+    }
+
+    // =======================================================================
+    // Synchronous refusals: nothing is exported, no store is built
+    // =======================================================================
+
+    fn store_builds_for(uri: &str) -> usize {
+        STORE_BUILD_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|built| built.as_str() == uri)
+            .count()
+    }
+
+    #[test]
+    fn unsupported_provider_raises_synchronously_before_any_export_or_store() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let n = 4i32.into_pyobject(py).unwrap().into_any();
+            for uri in [
+                "file:///tmp/s3dlio-b3b-unsupported",
+                "direct:///tmp/s3dlio-b3b-x",
+            ] {
+                let ex = driver.exporter(16);
+                let err = get_into_async(py, uri, &ex, &n).expect_err("unsupported");
+                assert!(err.is_instance_of::<UnsupportedOperationError>(py), "{err}");
+                assert!(err.is_instance_of::<PyNotImplementedError>(py), "{err}");
+                assert_eq!(
+                    attr_usize(&ex, "exports"),
+                    0,
+                    "{uri}: the buffer was exported"
+                );
+                assert_eq!(store_builds_for(uri), 0, "{uri}: a store was built");
+
+                let err = head_async(py, uri).expect_err("unsupported");
+                assert!(err.is_instance_of::<UnsupportedOperationError>(py), "{err}");
+                assert_eq!(store_builds_for(uri), 0, "{uri}: a store was built");
+            }
+        });
+    }
+
+    #[test]
+    fn malformed_uri_is_a_value_error_before_any_export() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let n = 4i32.into_pyobject(py).unwrap().into_any();
+            let err = get_into_async(py, "az://account//key", &ex, &n).expect_err("malformed");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+            assert_eq!(attr_usize(&ex, "exports"), 0);
+            let err = head_async(py, "az://account//key").expect_err("malformed");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+        });
+    }
+
+    #[test]
+    fn expected_len_is_validated_before_the_buffer_is_exported() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let uri = "s3://bucket/key";
+            let call = |value: Bound<'_, PyAny>| get_into_async(py, uri, &ex, &value).map(|_| ());
+            let int = |v: i64| v.into_pyobject(py).unwrap().into_any();
+
+            let err = call(int(-1)).expect_err("negative");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+            let err =
+                call(py.eval(c_str!("2 ** 200"), None, None).unwrap()).expect_err("too large");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+            let err =
+                call(true.into_pyobject(py).unwrap().to_owned().into_any()).expect_err("bool");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                "{err}"
+            );
+            let err = call("4".into_pyobject(py).unwrap().into_any()).expect_err("str");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                "{err}"
+            );
+            // Larger than the buffer: acquire_writable refuses (and releases) it.
+            let err = call(int(17)).expect_err("longer than the buffer");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+
+            assert_eq!(
+                attr_usize(&ex, "exports"),
+                attr_usize(&ex, "releases"),
+                "every export was released"
+            );
+            assert!(method_bool(&ex, "resizable"));
+        });
+    }
+
+    // =======================================================================
+    // GET: ordinary completion, pointer identity, canaries, one release
+    // =======================================================================
+
+    #[test]
+    fn get_completes_into_the_callers_memory_with_one_export_and_one_release() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let address: usize = ex.call_method0("address").unwrap().extract().unwrap();
+            let store = Arc::new(FakeStore::new().filling(vec![0x5A; 8]));
+            let latch = Latch::new();
+            let seams = TestSeams::default().assert_store_untouched_before_start(&store);
+            let start = get_start(py, seams, &store, &ex, 8, &latch);
+
+            let value = driver.run("scn_await", start, vec![]).unwrap();
+            assert_eq!(value.extract::<usize>().unwrap(), 8, "returns expected_len");
+
+            // Pointer identity and length: the store wrote into the caller's allocation.
+            assert_eq!(store.seen(), vec![(address, 8)]);
+            // The data landed, and nothing past expected_len was touched.
+            let bytes = contents(&ex);
+            assert_eq!(&bytes[..8], &[0x5A; 8]);
+            assert!(bytes[8..].iter().all(|&b| b == CANARY), "canaries damaged");
+            // Exactly one export, released exactly once, on the call's one latch.
+            assert_eq!(attr_usize(&ex, "exports"), 1);
+            assert_eq!(attr_usize(&ex, "releases"), 1);
+            assert_eq!(latch_state(&latch), (true, true));
+            assert!(method_bool(&ex, "resizable"));
+            assert_eq!(store.get_calls(), 1);
+            assert!(started.elapsed() < NO_BARRIER_WAIT);
+        });
+    }
+
+    #[test]
+    fn get_into_an_empty_span_passes_an_empty_slice_and_writes_nothing() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let start = get_start(py, TestSeams::default(), &store, &ex, 0, &latch);
+            let value = driver.run("scn_await", start, vec![]).unwrap();
+            assert_eq!(value.extract::<usize>().unwrap(), 0);
+            let seen = store.seen();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].1, 0, "an empty destination");
+            assert!(contents(&ex).iter().all(|&b| b == CANARY));
+            assert_eq!(attr_usize(&ex, "releases"), 1);
+
+            // A zero-length exporter has no (or a dangling) pointer: still fine.
+            let empty = driver.exporter(0);
+            let latch = Latch::new();
+            let start = get_start(py, TestSeams::default(), &store, &empty, 0, &latch);
+            driver.run("scn_await", start, vec![]).unwrap();
+            assert_eq!(attr_usize(&empty, "releases"), 1);
+        });
+    }
+
+    // =======================================================================
+    // GET: pre-transfer failures (the start gate)
+    // =======================================================================
+
+    /// The invariants every pre-transfer failure shares: the ORIGINAL error, no native call,
+    /// the buffer untouched, released exactly once and directly, reusable at once, the latch
+    /// signalled, and no barrier wait.
+    fn assert_get_pre_transfer_failure(
+        py: Python<'_>,
+        ex: &Bound<'_, PyAny>,
+        store: &FakeStore,
+        latch: &Latch,
+        error: &Bound<'_, PyAny>,
+        original: &str,
+        started: Instant,
+    ) {
+        let text = error.str().unwrap().to_string();
+        assert!(
+            text.contains(original),
+            "the original error was lost: {text}"
+        );
+        assert!(
+            !is_instance::<ExportStillReferencedError>(py, error),
+            "a quiescence timeout was raised: {text}"
+        );
+        assert_eq!(
+            store.error_probe(),
+            Some((1, true)),
+            "the export was not released directly before the error was raised"
+        );
+        assert_eq!(attr_usize(ex, "exports"), 1);
+        assert_eq!(attr_usize(ex, "releases"), 1, "exactly one release");
+        assert_eq!(latch_state(latch), (true, true));
+        assert!(
+            method_bool(ex, "resizable"),
+            "the buffer is not reusable right after the failure"
+        );
+        let_runtime_settle(py);
+        assert_eq!(store.get_calls(), 0, "a native read started");
+        assert!(
+            contents(ex).iter().all(|&b| b == CANARY),
+            "the destination was written"
+        );
+        assert!(started.elapsed() < NO_BARRIER_WAIT, "waited on a barrier");
+    }
+
+    #[test]
+    fn get_guard_constructor_failure_releases_directly_and_raises_the_original_error() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let seams = TestSeams::default().failing_guard();
+            let start = get_start(py, seams, &store, &ex, 8, &latch);
+            let error = driver.run("scn_error", start, vec![]).unwrap();
+            assert_get_pre_transfer_failure(
+                py,
+                &ex,
+                &store,
+                &latch,
+                &error,
+                "injected guard failure",
+                started,
+            );
+        });
+    }
+
+    #[test]
+    fn get_bridge_failure_releases_directly_and_raises_the_original_error() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let seams = TestSeams::default().bridge(BridgeMode::Fail);
+            let start = get_start(py, seams, &store, &ex, 8, &latch);
+            let error = driver.run("scn_error", start, vec![]).unwrap();
+            assert_get_pre_transfer_failure(
+                py,
+                &ex,
+                &store,
+                &latch,
+                &error,
+                "injected bridge failure",
+                started,
+            );
+        });
+    }
+
+    /// The REAL bridge fails when there is no running event loop: the same pre-transfer path,
+    /// not injected.
+    #[test]
+    fn get_real_bridge_failure_without_an_event_loop_leaves_the_buffer_reusable() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let store_dyn: Arc<dyn ObjectStore> = store.clone();
+            let err = get_into_with_store(
+                py,
+                &LiveSeams,
+                store_dyn,
+                URI.to_owned(),
+                &ex,
+                8,
+                latch.clone(),
+            )
+            .expect_err("no running event loop");
+            // Observed right after the call returned, as `get_start` does.
+            *store.error_probe.lock().unwrap() =
+                Some((attr_usize(&ex, "releases"), method_bool(&ex, "resizable")));
+            let error = err.value(py).clone().into_any();
+            assert_get_pre_transfer_failure(
+                py,
+                &ex,
+                &store,
+                &latch,
+                &error,
+                "no running event loop",
+                started,
+            );
+        });
+    }
+
+    #[test]
+    fn get_closed_start_receiver_releases_directly_and_cancels() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let seams = TestSeams::default().bridge(BridgeMode::DropFuture);
+            let start = get_start(py, seams, &store, &ex, 8, &latch);
+            let error = driver.run("scn_error", start, vec![]).unwrap();
+            assert_get_pre_transfer_failure(
+                py,
+                &ex,
+                &store,
+                &latch,
+                &error,
+                "could not hand the destination",
+                started,
+            );
+        });
+    }
+
+    #[test]
+    fn get_makes_no_native_call_before_the_export_is_transferred() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            // The probe runs before the send and asserts the (already spawned, live) task has
+            // not called the store after 60 ms; the guard failure then keeps the send from ever
+            // happening, so the store must never be called afterwards either.
+            let seams = TestSeams::default()
+                .assert_store_untouched_before_start(&store)
+                .failing_guard();
+            let start = get_start(py, seams, &store, &ex, 8, &latch);
+            let error = driver.run("scn_error", start, vec![]).unwrap();
+            assert!(error
+                .str()
+                .unwrap()
+                .to_string()
+                .contains("injected guard failure"));
+            let_runtime_settle(py);
+            assert_eq!(store.get_calls(), 0);
+            assert!(
+                contents(&ex).iter().all(|&b| b == CANARY),
+                "a native write happened"
+            );
+        });
+    }
+
+    // =======================================================================
+    // GET: cancellation, panic
+    // =======================================================================
+
+    #[test]
+    fn get_cancel_before_the_first_poll_never_starts_a_native_read() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            // The task is not polled until the gate opens, and the gate never opens.
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let seams = TestSeams::default().bridge(BridgeMode::Gated(gate));
+            let start = get_start(py, seams, &store, &ex, 8, &latch);
+            let outcome = driver.run("scn_cancel_now", start, vec![]).unwrap();
+            let (cancel, state): (bool, String) = outcome.extract().unwrap();
+            assert!(cancel, "cancel() is True while the work is pending");
+            assert_eq!(state, "cancelled");
+            let_runtime_settle(py);
+            assert_eq!(
+                store.get_calls(),
+                0,
+                "a native read started after the cancel"
+            );
+            // The export was transferred into the channel and dropped with it: queued, then
+            // released by the guard's barrier, exactly once.
+            assert_eq!(attr_usize(&ex, "exports"), 1);
+            assert_eq!(attr_usize(&ex, "releases"), 1);
+            assert_eq!(latch_state(&latch), (true, true));
+            assert!(method_bool(&ex, "resizable"));
+            assert!(contents(&ex).iter().all(|&b| b == CANARY));
+            assert!(started.elapsed() < NO_BARRIER_WAIT);
+        });
+    }
+
+    /// With the live bridge a cancel right after the call may or may not beat the task's first
+    /// poll; the invariants hold either way.
+    #[test]
+    fn get_cancel_immediately_after_the_call_always_ends_cancelled_and_released() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for _ in 0..20 {
+                let ex = driver.exporter(16);
+                let store = Arc::new(FakeStore::new());
+                let latch = Latch::new();
+                let start = get_start(py, TestSeams::default(), &store, &ex, 8, &latch);
+                let outcome = driver.run("scn_cancel_now", start, vec![]).unwrap();
+                let (cancel, state): (bool, String) = outcome.extract().unwrap();
+                assert!(cancel);
+                assert_eq!(state, "cancelled");
+                assert_eq!(attr_usize(&ex, "releases"), 1);
+                assert_eq!(latch_state(&latch), (true, true));
+                assert!(method_bool(&ex, "resizable"));
+            }
+        });
+    }
+
+    #[test]
+    fn get_cancel_during_the_native_read_ends_cancelled_after_the_writers_stopped() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new().blocking());
+            let latch = Latch::new();
+            let start = get_start(py, TestSeams::default(), &store, &ex, 8, &latch);
+            let entered = entered_fn(py, &store);
+            let outcome = driver.run("scn_cancel_when", start, vec![entered]).unwrap();
+            let (cancel, state): (bool, String) = outcome.extract().unwrap();
+            assert!(cancel, "cancel() is True while the read is pending");
+            assert_eq!(state, "cancelled");
+            assert_eq!(store.get_calls(), 1);
+            assert_eq!(attr_usize(&ex, "releases"), 1);
+            assert_eq!(latch_state(&latch), (true, true));
+            assert!(method_bool(&ex, "resizable"));
+            assert!(started.elapsed() < NO_BARRIER_WAIT);
+        });
+    }
+
+    #[test]
+    fn get_cancel_is_false_once_the_outcome_is_fixed() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let start = get_start(py, TestSeams::default(), &store, &ex, 8, &latch);
+            let outcome = driver.run("scn_cancel_after", start, vec![]).unwrap();
+            let (value, cancel, done, cancelled): (usize, bool, bool, bool) =
+                outcome.extract().unwrap();
+            assert_eq!(value, 8);
+            assert!(!cancel, "cancel() on a finished awaitable is False");
+            assert!(done && !cancelled, "the result stands");
+        });
+    }
+
+    #[test]
+    fn get_panic_inside_the_native_future_is_delivered_and_the_buffer_released() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new().panicking());
+            let latch = Latch::new();
+            let start = get_start(py, TestSeams::default(), &store, &ex, 8, &latch);
+            let error = driver.run("scn_error", start, vec![]).unwrap();
+            let text = error.str().unwrap().to_string();
+            assert!(text.contains("panicked"), "{text}");
+            assert!(
+                !is_instance::<ExportStillReferencedError>(py, &error),
+                "{text}"
+            );
+            assert_eq!(store.get_calls(), 1);
+            assert_eq!(attr_usize(&ex, "releases"), 1);
+            assert_eq!(latch_state(&latch), (true, true));
+            assert!(method_bool(&ex, "resizable"));
+            assert!(started.elapsed() < NO_BARRIER_WAIT);
+        });
+    }
+
+    // =======================================================================
+    // GET and HEAD: error mapping, end to end
+    // =======================================================================
+
+    /// `(failure, expected class name, expected, actual)`.
+    #[allow(clippy::type_complexity)] // a test table
+    const MAPPING: &[(Failure, &str, Option<u64>, Option<u64>)] = &[
+        (Failure::NotFound, "ObjectNotFoundError", None, None),
+        (Failure::Length, "LengthMismatchError", Some(8), Some(5)),
+        (Failure::LengthUnknown, "LengthMismatchError", Some(8), None),
+        (
+            Failure::Unsupported,
+            "UnsupportedOperationError",
+            None,
+            None,
+        ),
+        (Failure::Forbidden, "RuntimeError", None, None),
+        (Failure::VersionChanged, "RuntimeError", None, None),
+        (Failure::Plain, "RuntimeError", None, None),
+    ];
+
+    fn assert_mapped(
+        py: Python<'_>,
+        error: &Bound<'_, PyAny>,
+        class: &str,
+        expected: Option<u64>,
+        actual: Option<u64>,
+    ) {
+        let name: String = error.get_type().name().unwrap().to_string();
+        assert_eq!(name, class, "{error}");
+        match class {
+            "ObjectNotFoundError" => assert!(is_instance::<PyFileNotFoundError>(py, error)),
+            "LengthMismatchError" => {
+                assert!(is_instance::<PyValueError>(py, error));
+                let got_expected: Option<u64> =
+                    error.getattr("expected").unwrap().extract().unwrap();
+                let got_actual: Option<u64> = error.getattr("actual").unwrap().extract().unwrap();
+                assert_eq!(got_expected, expected, "{error}");
+                assert_eq!(got_actual, actual, "{error}");
+            }
+            "UnsupportedOperationError" => {
+                assert!(is_instance::<PyNotImplementedError>(py, error))
+            }
+            _ => {
+                assert!(!is_instance::<ObjectNotFoundError>(py, error));
+                assert!(!is_instance::<LengthMismatchError>(py, error));
+                assert!(!is_instance::<UnsupportedOperationError>(py, error));
+            }
+        }
+        // The message is the whole chain: the outer context is kept.
+        let text = error.str().unwrap().to_string();
+        assert!(text.contains("caller-buffer operation failed"), "{text}");
+    }
+
+    #[test]
+    fn get_failures_map_to_the_typed_python_exceptions() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for &(failure, class, expected, actual) in MAPPING {
+                let ex = driver.exporter(16);
+                let store = Arc::new(FakeStore::new().failing(failure));
+                let latch = Latch::new();
+                let start = get_start(py, TestSeams::default(), &store, &ex, 8, &latch);
+                let error = driver.run("scn_error", start, vec![]).unwrap();
+                assert_mapped(py, &error, class, expected, actual);
+                // After a failure the buffer is still released and reusable, and the partial
+                // write stays inside expected_len.
+                assert_eq!(attr_usize(&ex, "releases"), 1, "{class}");
+                assert!(method_bool(&ex, "resizable"), "{class}");
+                assert!(contents(&ex)[8..16].iter().all(|&b| b == CANARY), "{class}");
+            }
+        });
+    }
+
+    #[test]
+    fn head_failures_map_to_the_typed_python_exceptions() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for &(failure, class, expected, actual) in MAPPING {
+                let store = Arc::new(FakeStore::new().failing(failure));
+                let latch = Latch::new();
+                let start = head_start(py, TestSeams::default(), &store, &latch);
+                let error = driver.run("scn_error", start, vec![]).unwrap();
+                assert_mapped(py, &error, class, expected, actual);
+                assert_eq!(latch_state(&latch), (true, true), "{class}");
+            }
+        });
+    }
+
+    /// The mapping itself, over every kind and through nested string contexts.
+    #[test]
+    fn object_py_err_maps_every_kind() {
+        init();
+        Python::attach(|py| {
+            use anyhow::Context;
+            use ObjectErrorKind::*;
+            let kinds = [
+                (NotFound, "ObjectNotFoundError"),
+                (
+                    LengthMismatch {
+                        expected: 3,
+                        actual: Some(4),
+                    },
+                    "LengthMismatchError",
+                ),
+                (Unsupported, "UnsupportedOperationError"),
+                (VersionChanged, "RuntimeError"),
+                (Forbidden, "RuntimeError"),
+                (Throttled, "RuntimeError"),
+                (Transport, "RuntimeError"),
+                (Server, "RuntimeError"),
+                (Other, "RuntimeError"),
+            ];
+            for (kind, class) in kinds {
+                let typed = attach_object_error(anyhow::anyhow!("source"), kind, "gs", "msg");
+                let nested = Err::<(), _>(typed)
+                    .context("inner string context")
+                    .context("outer string context")
+                    .unwrap_err();
+                let err = object_py_err(py, &nested);
+                assert_eq!(err.get_type(py).name().unwrap().to_string(), class);
+                let text = err.value(py).str().unwrap().to_string();
+                assert!(text.contains("outer string context"), "{text}");
+                assert!(text.contains("source"), "the whole chain is kept: {text}");
+            }
+            // The outermost classification wins: VersionChanged over a NotFound is not absence.
+            let inner = attach_object_error(anyhow::anyhow!("s"), NotFound, "s3", "404");
+            let outer = attach_object_error(inner, VersionChanged, "s3", "pinned");
+            assert_eq!(
+                object_py_err(py, &outer)
+                    .get_type(py)
+                    .name()
+                    .unwrap()
+                    .to_string(),
+                "RuntimeError"
+            );
+            // No ObjectError at all: today's behaviour.
+            assert!(
+                object_py_err(py, &anyhow::anyhow!("plain")).is_instance_of::<PyRuntimeError>(py)
+            );
+        });
+    }
+
+    // =======================================================================
+    // HEAD
+    // =======================================================================
+
+    /// The invariants of every HEAD that never started a request or ended without finishing it:
+    /// exactly one quiescence-token completion, both terminal latch signals, no buffer.
+    fn assert_head_quiesced(py: Python<'_>, latch: &Arc<Latch>, before: usize) {
+        let l = Arc::clone(latch);
+        assert!(
+            wait_until(py, move || l.is_dropped() && l.is_released()),
+            "the quiescence token never completed"
+        );
+        // Let a second (wrong) completion show up, then count.
+        let_runtime_settle(py);
+        assert_eq!(
+            head_token_tests::completions(latch) - before,
+            1,
+            "exactly one quiescence-token completion"
+        );
+        assert_eq!(latch_state(latch), (true, true));
+    }
+
+    #[test]
+    fn head_completes_with_metadata_one_token_completion_and_no_buffer() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let before = head_token_tests::completions(&latch);
+            let seams = TestSeams::default().assert_store_untouched_before_start(&store);
+            let start = head_start(py, seams, &store, &latch);
+            let meta = driver.run("scn_await", start, vec![]).unwrap();
+            assert_eq!(
+                meta.get_type().name().unwrap().to_string(),
+                "ObjectMetadata"
+            );
+            assert_eq!(attr_usize(&meta, "size"), 8);
+            assert_eq!(
+                meta.getattr("etag")
+                    .unwrap()
+                    .extract::<Option<String>>()
+                    .unwrap(),
+                Some("\"etag-1\"".to_string())
+            );
+            assert_eq!(
+                meta.getattr("version_id")
+                    .unwrap()
+                    .extract::<Option<String>>()
+                    .unwrap(),
+                Some("gen-7".to_string())
+            );
+            assert_eq!(store.head_calls(), 1);
+            assert_eq!(store.get_calls(), 0);
+            assert_head_quiesced(py, &latch, before);
+            assert!(started.elapsed() < NO_BARRIER_WAIT);
+        });
+    }
+
+    #[test]
+    fn head_of_an_absent_object_is_none() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let store = Arc::new(FakeStore::new().absent());
+            let latch = Latch::new();
+            let before = head_token_tests::completions(&latch);
+            let start = head_start(py, TestSeams::default(), &store, &latch);
+            let result = driver.run("scn_await", start, vec![]).unwrap();
+            assert!(result.is_none());
+            assert_head_quiesced(py, &latch, before);
+        });
+    }
+
+    fn assert_head_pre_start_failure(
+        py: Python<'_>,
+        store: &FakeStore,
+        latch: &Arc<Latch>,
+        before: usize,
+        error: &Bound<'_, PyAny>,
+        original: &str,
+        started: Instant,
+    ) {
+        let text = error.str().unwrap().to_string();
+        assert!(
+            text.contains(original),
+            "the original error was lost: {text}"
+        );
+        assert!(
+            !is_instance::<ExportStillReferencedError>(py, error),
+            "{text}"
+        );
+        assert_head_quiesced(py, latch, before);
+        assert_eq!(store.head_calls(), 0, "a native HEAD started");
+        assert!(started.elapsed() < NO_BARRIER_WAIT, "waited on a barrier");
+    }
+
+    #[test]
+    fn head_guard_constructor_failure_cancels_and_the_token_marks_the_latch() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let before = head_token_tests::completions(&latch);
+            let seams = TestSeams::default().failing_guard();
+            let start = head_start(py, seams, &store, &latch);
+            let error = driver.run("scn_error", start, vec![]).unwrap();
+            assert_head_pre_start_failure(
+                py,
+                &store,
+                &latch,
+                before,
+                &error,
+                "injected guard failure",
+                started,
+            );
+        });
+    }
+
+    #[test]
+    fn head_bridge_failure_drops_the_future_and_the_token_marks_the_latch() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let before = head_token_tests::completions(&latch);
+            let seams = TestSeams::default().bridge(BridgeMode::Fail);
+            let start = head_start(py, seams, &store, &latch);
+            let error = driver.run("scn_error", start, vec![]).unwrap();
+            assert_head_pre_start_failure(
+                py,
+                &store,
+                &latch,
+                before,
+                &error,
+                "injected bridge failure",
+                started,
+            );
+        });
+    }
+
+    #[test]
+    fn head_real_bridge_failure_without_an_event_loop() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let before = head_token_tests::completions(&latch);
+            let store_dyn: Arc<dyn ObjectStore> = store.clone();
+            let err = head_with_store(py, &LiveSeams, store_dyn, URI.to_owned(), latch.clone())
+                .expect_err("no running event loop");
+            let error = err.value(py).clone().into_any();
+            assert_head_pre_start_failure(
+                py,
+                &store,
+                &latch,
+                before,
+                &error,
+                "no running event loop",
+                started,
+            );
+        });
+    }
+
+    #[test]
+    fn head_closed_start_receiver_cancels_and_the_token_marks_the_latch() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let before = head_token_tests::completions(&latch);
+            let seams = TestSeams::default().bridge(BridgeMode::DropFuture);
+            let start = head_start(py, seams, &store, &latch);
+            let error = driver.run("scn_error", start, vec![]).unwrap();
+            assert_head_pre_start_failure(
+                py,
+                &store,
+                &latch,
+                before,
+                &error,
+                "could not start its request",
+                started,
+            );
+        });
+    }
+
+    #[test]
+    fn head_cancel_before_the_first_poll_never_starts_a_request() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let before = head_token_tests::completions(&latch);
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let seams = TestSeams::default().bridge(BridgeMode::Gated(gate));
+            let start = head_start(py, seams, &store, &latch);
+            let outcome = driver.run("scn_cancel_now", start, vec![]).unwrap();
+            let (cancel, state): (bool, String) = outcome.extract().unwrap();
+            assert!(cancel);
+            assert_eq!(state, "cancelled");
+            assert_head_quiesced(py, &latch, before);
+            assert_eq!(store.head_calls(), 0, "a request started after the cancel");
+            assert!(started.elapsed() < NO_BARRIER_WAIT);
+        });
+    }
+
+    #[test]
+    fn head_cancel_during_the_request_ends_cancelled_after_the_token_completed() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let store = Arc::new(FakeStore::new().blocking());
+            let latch = Latch::new();
+            let before = head_token_tests::completions(&latch);
+            let start = head_start(py, TestSeams::default(), &store, &latch);
+            let entered = entered_fn(py, &store);
+            let outcome = driver.run("scn_cancel_when", start, vec![entered]).unwrap();
+            let (cancel, state): (bool, String) = outcome.extract().unwrap();
+            assert!(cancel, "cancel() is True while the request is pending");
+            assert_eq!(state, "cancelled");
+            assert_eq!(store.head_calls(), 1);
+            assert_head_quiesced(py, &latch, before);
+            assert!(started.elapsed() < NO_BARRIER_WAIT);
+        });
+    }
+
+    #[test]
+    fn head_cancel_is_false_once_the_outcome_is_fixed() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let start = head_start(py, TestSeams::default(), &store, &latch);
+            let outcome = driver.run("scn_cancel_after", start, vec![]).unwrap();
+            let (value, cancel, done, cancelled): (Bound<'_, PyAny>, bool, bool, bool) =
+                outcome.extract().unwrap();
+            assert_eq!(attr_usize(&value, "size"), 8);
+            assert!(!cancel);
+            assert!(done && !cancelled);
+        });
+    }
+
+    #[test]
+    fn head_panic_inside_the_native_future_is_delivered_and_the_token_completes() {
+        init();
+        Python::attach(|py| {
+            let started = Instant::now();
+            let driver = Driver::new(py);
+            let store = Arc::new(FakeStore::new().panicking());
+            let latch = Latch::new();
+            let before = head_token_tests::completions(&latch);
+            let start = head_start(py, TestSeams::default(), &store, &latch);
+            let error = driver.run("scn_error", start, vec![]).unwrap();
+            let text = error.str().unwrap().to_string();
+            assert!(text.contains("panicked"), "{text}");
+            assert!(
+                !is_instance::<ExportStillReferencedError>(py, &error),
+                "{text}"
+            );
+            assert_head_quiesced(py, &latch, before);
+            assert!(started.elapsed() < NO_BARRIER_WAIT);
+        });
+    }
+
+    // =======================================================================
+    // ObjectMetadata
+    // =======================================================================
+
+    #[test]
+    fn object_metadata_is_frozen_hashable_and_has_a_repr() {
+        init();
+        Python::attach(|py| {
+            let make = |size: u64, etag: Option<&str>, version: Option<&str>| {
+                Py::new(
+                    py,
+                    PyHeadMetadata {
+                        size,
+                        etag: etag.map(str::to_owned),
+                        version_id: version.map(str::to_owned),
+                    },
+                )
+                .unwrap()
+                .into_bound(py)
+                .into_any()
+            };
+            let a = make(5, Some("e"), None);
+            let b = make(5, Some("e"), None);
+            let c = make(6, Some("e"), None);
+            assert!(a.eq(&b).unwrap());
+            assert!(!a.eq(&c).unwrap());
+            assert_eq!(a.hash().unwrap(), b.hash().unwrap());
+            assert_eq!(attr_usize(&a, "size"), 5);
+            assert!(a.getattr("version_id").unwrap().is_none());
+            assert_eq!(
+                a.repr().unwrap().to_string(),
+                "ObjectMetadata(size=5, etag=Some(\"e\"), version_id=None)"
+            );
+            let err = a.setattr("size", 9).expect_err("frozen");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py),
+                "{err}"
+            );
+            let set = pyo3::types::PySet::new(py, [a.clone(), b, c]).unwrap();
+            assert_eq!(set.len(), 2);
+        });
+    }
+
+    // =======================================================================
+    // Structure: the A5 order, the one latch, no wait on the pre-transfer path
+    // =======================================================================
+
+    /// Source of the function `name`: from its `fn` line to the closing brace at column 0.
+    fn function_source(name: &str) -> String {
+        let src = include_str!("python_core_api.rs");
+        let start = ["<'py, S: StartSeams>(", "<'py>(", "("]
+            .iter()
+            .find_map(|generics| src.find(&format!("\nfn {name}{generics}")))
+            .unwrap_or_else(|| panic!("function {name} not found"));
+        let rest = &src[start + 1..];
+        let end = rest.find("\n}\n").expect("end of function");
+        rest[..end].to_string()
+    }
+
+    fn assert_in_order(body: &str, label: &str, needles: &[&str]) {
+        let mut at = 0;
+        for needle in needles {
+            let found = body[at..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("{label}: `{needle}` missing or out of order"));
+            at += found + needle.len();
+        }
+    }
+
+    #[test]
+    fn get_into_async_follows_the_a5_step_order() {
+        let entry = function_source("get_into_async");
+        assert_in_order(
+            &entry,
+            "get_into_async",
+            &[
+                "require_capability(",
+                "checked_expected_len(",
+                ".detach(",
+                "get_or_create_store(",
+                "Latch::new()",
+                "get_into_with_store(",
+            ],
+        );
+        assert_eq!(
+            entry.matches("Latch::new()").count(),
+            1,
+            "one latch per call"
+        );
+        let inner = function_source("get_into_with_store");
+        assert_in_order(
+            &inner,
+            "get_into_with_store",
+            &[
+                "prepare_guard(py, latch.clone())",
+                "acquire_writable(py, dst, expected_len, &latch)",
+                "oneshot::channel::<WritableExport>()",
+                "seams.bridge(",
+                "seams.instantiate(",
+                "tx.send(owner)",
+            ],
+        );
+        assert!(
+            !inner.contains("Latch::new()"),
+            "the guard and the export share the caller's latch"
+        );
+        for body in [&entry, &inner] {
+            assert!(
+                !body.contains("wrap_in_guard("),
+                "its error path waits on the latch"
+            );
+            assert!(
+                !body.contains("quiesce_blocking("),
+                "nothing may wait on the pre-transfer path"
+            );
+            assert!(!body.contains("quiesce_async("));
+        }
+        // The task binds the export before calling the store.
+        assert_in_order(
+            &inner,
+            "task",
+            &[
+                "rx.await",
+                "store.get_into(&uri, owner.as_mut_slice(), &progress)",
+            ],
+        );
+        // Every pre-transfer failure releases directly.
+        assert!(inner.matches("owner.release(py)").count() >= 3);
+    }
+
+    #[test]
+    fn head_async_follows_the_a5_step_order() {
+        let entry = function_source("head_async");
+        assert_in_order(
+            &entry,
+            "head_async",
+            &[
+                "require_capability(&uri, Operation::Head)",
+                ".detach(",
+                "get_or_create_store(",
+                "Latch::new()",
+                "head_with_store(",
+            ],
+        );
+        assert_eq!(entry.matches("Latch::new()").count(), 1);
+        let inner = function_source("head_with_store");
+        assert_in_order(
+            &inner,
+            "head_with_store",
+            &[
+                "prepare_guard(py, latch.clone())",
+                "oneshot::channel::<()>()",
+                "HeadQuiescence { latch }",
+                "seams.bridge(",
+                "seams.instantiate(",
+                "tx.send(())",
+            ],
+        );
+        // The token is the first local of the future body.
+        assert_in_order(
+            &inner,
+            "future body",
+            &[
+                "async move {",
+                "let _quiescence = token;",
+                "rx.await",
+                "store.head(",
+            ],
+        );
+        for body in [&entry, &inner] {
+            assert!(!body.contains("wrap_in_guard("));
+            assert!(!body.contains("quiesce_blocking("));
+            assert!(
+                !body.contains("acquire_writable("),
+                "HEAD exports no buffer"
+            );
+        }
     }
 }

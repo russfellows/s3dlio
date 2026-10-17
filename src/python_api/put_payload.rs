@@ -955,25 +955,11 @@ impl Drop for ExportOwner {
 /// interpreter); [`ExportOwnerMut::release`] releases directly with a `py` token, no queue.
 /// `len` is the number of bytes the writer may use (`expected_len`, never more than the
 /// exporter's length).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into get_into_async in the next step (#264)"
-    )
-)]
 struct ExportOwnerMut {
     inner: ExportOwner,
     len: usize,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into get_into_async in the next step (#264)"
-    )
-)]
 impl ExportOwnerMut {
     /// Take ownership of `export` (attaching `latch` to it) and validate it with
     /// [`check_writable_view`] for `len` bytes, so no `ExportOwnerMut` can exist for a view that
@@ -1036,13 +1022,6 @@ impl ExportOwnerMut {
 /// the call is terminal, nothing else reads, writes, resizes or reuses that memory. In
 /// particular, two concurrent receives into the same or overlapping memory are forbidden, since
 /// each would hold a `&mut [u8]` over bytes the other also writes (aliasing mutable references).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into get_into_async in the next step (#264)"
-    )
-)]
 pub(crate) struct WritableExport {
     owner: ExportOwnerMut,
 }
@@ -1061,13 +1040,6 @@ const _: () = {
     assert_send::<WritableExport>();
 };
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into get_into_async in the next step (#264)"
-    )
-)]
 impl WritableExport {
     /// Exactly `expected_len` bytes (never the exporter's full length); empty when 0.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -1086,13 +1058,6 @@ impl WritableExport {
 /// pointer-bearing formats), `expected_len` within the exporter's length (checked conversion),
 /// a non-null pointer when there is data, and (defense behind the `PyBUF_C_CONTIGUOUS` request) no
 /// suboffsets and a really C-contiguous layout.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into get_into_async in the next step (#264)"
-    )
-)]
 fn check_writable_view(view: &ffi::Py_buffer, expected_len: usize) -> PyResult<()> {
     use pyo3::exceptions::{PyBufferError, PyTypeError, PyValueError};
     if view.readonly != 0 {
@@ -1172,13 +1137,6 @@ fn check_writable_view(view: &ffi::Py_buffer, expected_len: usize) -> PyResult<(
 /// (success: when the returned export is released or dropped). That includes the
 /// `PyObject_GetBuffer` failure path, which marks both at once because nothing is held and no
 /// owner will ever do it. Pass a fresh latch for every call; a latch must not be reused.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into get_into_async in the next step (#264)"
-    )
-)]
 pub(crate) fn acquire_writable(
     py: Python<'_>,
     dst: &Bound<'_, PyAny>,
