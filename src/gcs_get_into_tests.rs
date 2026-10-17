@@ -955,3 +955,23 @@ fn the_receive_loop_uses_only_the_typed_verdict_and_stays_in_its_task() {
     }
     assert!(budget.contains("gcs_typed_retry_verdict"));
 }
+
+/// The futures the ObjectStore wiring will await are `Send` (a compile-time check): the
+/// receive loop, and both client entry points.
+#[test]
+fn the_receive_futures_are_send() {
+    fn is_send<T: Send>(_: &T) {}
+    fn client_futures(client: &GcsClient) {
+        let mut buf = [0u8; 1];
+        let progress = ReceiveProgress::new();
+        is_send(&client.get_object_into("b", "o", &mut buf, &progress));
+        is_send(&client.head_typed("b", "o"));
+    }
+    std::hint::black_box(client_futures as fn(&GcsClient));
+
+    let fake = Fake::new(Vec::new(), 4);
+    let mut buf = [0u8; 1];
+    let progress = ReceiveProgress::new();
+    let cfg = config(false);
+    is_send(&receive_into(&fake, WHAT, &mut buf, &progress, &cfg));
+}
