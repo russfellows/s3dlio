@@ -375,3 +375,60 @@ fn valid_settings_still_download_the_object_unchanged() {
         ),
     );
 }
+
+/// The object is 16 bytes and the default chunk is 1 MiB, so the object fits one chunk and
+/// the concurrency setting is never needed.  It is still an invalid setting: whether it is
+/// rejected must not depend on the object's size.
+#[test]
+fn range_concurrency_env_zero_is_rejected_for_a_small_object_on_the_concurrent_range_path() {
+    assert_verified(
+        "S3DLIO_RANGE_CONCURRENCY=0 (small object), get_object_concurrent_range_async",
+        run_case(
+            "concurrent_range",
+            "reject:S3DLIO_RANGE_CONCURRENCY",
+            &[("S3DLIO_RANGE_CONCURRENCY", "0")],
+        ),
+    );
+}
+
+#[test]
+fn range_concurrency_env_zero_is_rejected_for_a_small_object_on_the_known_size_path() {
+    assert_verified(
+        "S3DLIO_RANGE_CONCURRENCY=0 (small object), get_object_uri_optimized_async",
+        run_case(
+            "uri_optimized",
+            "reject:S3DLIO_RANGE_CONCURRENCY",
+            &[
+                ("S3DLIO_RANGE_THRESHOLD_MB", "0"),
+                ("S3DLIO_RANGE_CONCURRENCY", "0"),
+            ],
+        ),
+    );
+}
+
+/// A concurrency above what a semaphore can hold would panic in `Semaphore::new`; it is
+/// rejected by name instead, for a small object and for one that is split into ranges.
+#[test]
+fn range_concurrency_env_above_the_semaphore_limit_is_rejected_by_name() {
+    let too_many = usize::MAX.to_string();
+    assert_verified(
+        "S3DLIO_RANGE_CONCURRENCY=usize::MAX (small object), get_object_concurrent_range_async",
+        run_case(
+            "concurrent_range",
+            "reject:S3DLIO_RANGE_CONCURRENCY",
+            &[("S3DLIO_RANGE_CONCURRENCY", &too_many)],
+        ),
+    );
+    assert_verified(
+        "S3DLIO_RANGE_CONCURRENCY=usize::MAX (split object), get_object_uri_optimized_async",
+        run_case(
+            "uri_optimized",
+            "reject:S3DLIO_RANGE_CONCURRENCY",
+            &[
+                ("S3DLIO_RANGE_THRESHOLD_MB", "0"),
+                ("S3DLIO_CHUNK_SIZE", "4"),
+                ("S3DLIO_RANGE_CONCURRENCY", &too_many),
+            ],
+        ),
+    );
+}

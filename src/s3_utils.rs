@@ -1610,8 +1610,11 @@ pub(crate) async fn get_object_concurrent_range_with_client(
 
     let total_bytes = end_offset - start_offset;
 
-    // Determine optimal strategy based on size
+    // Determine optimal strategy based on size.  Both limits are resolved and validated
+    // BEFORE the small-object shortcut, so an invalid setting is rejected whatever the
+    // object's size (issue #235).
     let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
+    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
 
     // Use single request for small objects
     if total_bytes <= effective_chunk_size as u64 {
@@ -1624,8 +1627,6 @@ pub(crate) async fn get_object_concurrent_range_with_client(
     }
 
     // Use concurrent ranges for large objects
-    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
-
     debug!(
         "Using concurrent range GET: {} bytes, chunk_size={}, concurrency={}",
         total_bytes, effective_chunk_size, effective_concurrency
@@ -1905,9 +1906,16 @@ fn require_effective_chunk_size(name: &str, value: usize) -> Result<usize> {
     Ok(value)
 }
 
-/// Issue #235: a range concurrency of 0 builds a semaphore with no permits.
+/// Issue #235: a range concurrency of 0 builds a semaphore with no permits, and one above
+/// [`Semaphore::MAX_PERMITS`] makes `Semaphore::new` panic.  Both are errors naming `name`.
 fn require_effective_concurrency(name: &str, value: usize) -> Result<usize> {
     crate::concurrency::require_concurrency_at_least_one(name, value)?;
+    if value > Semaphore::MAX_PERMITS {
+        bail!(
+            "{name} must be an integer >= 1 and <= {} (the most permits a semaphore holds), got {value}",
+            Semaphore::MAX_PERMITS
+        );
+    }
     Ok(value)
 }
 
@@ -2620,7 +2628,10 @@ async fn get_object_with_known_size_async(
     }
 
     let total_bytes = end_offset - start_offset;
+    // Both limits are resolved and validated BEFORE the small-object shortcut, so an invalid
+    // setting is rejected whatever the object's size (issue #235).
     let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
+    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
 
     // If total fits in one chunk, use a single range request (no concurrency overhead).
     if total_bytes <= effective_chunk_size as u64 {
@@ -2630,7 +2641,6 @@ async fn get_object_with_known_size_async(
         return get_object_range_async(bucket, key, start_offset, Some(total_bytes)).await;
     }
 
-    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
     let client = aws_s3_client_async().await?;
     concurrent_range_get_impl(
         &client,
@@ -3675,6 +3685,34 @@ mod range_limit_resolution_tests {
         assert!(format!("{chunk:#}").contains("chunk_size"), "{chunk:#}");
         let conc = resolve_range_concurrency(Some(0), 64).expect_err("zero argument");
         assert!(format!("{conc:#}").contains("max_concurrency"), "{conc:#}");
+    }
+
+    /// A concurrency above `Semaphore::MAX_PERMITS` would panic in `Semaphore::new`: it is
+    /// rejected by name, from the environment and as an argument.  The limit itself is valid.
+    #[test]
+    fn concurrency_above_the_semaphore_limit_is_rejected_by_name() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        let limit = Semaphore::MAX_PERMITS;
+        std::env::set_var(ENV_RANGE_CONCURRENCY, (limit + 1).to_string());
+        let env_err = resolve_range_concurrency(None, 64).expect_err("above the limit");
+        let text = format!("{env_err:#}");
+        assert!(text.contains("S3DLIO_RANGE_CONCURRENCY"), "{text}");
+        assert!(text.contains(&limit.to_string()), "{text}");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, usize::MAX.to_string());
+        assert!(resolve_range_concurrency(None, 64).is_err());
+        std::env::remove_var(ENV_RANGE_CONCURRENCY);
+        let arg_err = resolve_range_concurrency(Some(limit + 1), 64).expect_err("above the limit");
+        assert!(
+            format!("{arg_err:#}").contains("max_concurrency"),
+            "{arg_err:#}"
+        );
+        assert_eq!(
+            resolve_range_concurrency(Some(limit), 64).expect("at the limit"),
+            limit
+        );
+        // What the guard protects: the limit builds a semaphore, one more would panic.
+        assert_eq!(Semaphore::new(limit).available_permits(), limit);
     }
 
     #[test]
