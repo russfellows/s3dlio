@@ -2407,57 +2407,23 @@ where
     engine.download(object_size, get_range, None).await
 }
 
+/// Split an Azure URI into `(account, container, key)`.
+///
+/// - `az://{account}/{container}/{key...}`
+/// - `http(s)://{account}.blob.core.windows.net/{container}/{key...}`
+///
+/// The STRUCTURE (account, container and key, an empty container refused per #224, unsafe
+/// account characters refused) is validated by the environment-free
+/// [`crate::capabilities::parse_azure_uri_pure`], which this delegates to. This function then adds
+/// the endpoint-dependent step: it canonicalises the account according to the configured
+/// endpoint (lower-cased for Azure, kept as written for an emulator, length-checked for Azure).
+/// The pure parser is structural validation, not full parity with this function.
 #[cfg(feature = "backend-azure")]
 fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
-    // Supports:
-    // - az://{account}/{container}/{key...}
-    // - http(s)://{account}.blob.core.windows.net/{container}/{key...}
-    if let Some(rest) = uri.strip_prefix("az://") {
-        let mut it = rest.splitn(3, '/');
-        let account = it
-            .next()
-            .ok_or_else(|| anyhow!("missing account in az:// URI"))?;
-        let container = it
-            .next()
-            .ok_or_else(|| anyhow!("missing container in az:// URI"))?;
-        let key = it.next().unwrap_or("").to_string();
-        // Refuse an account that could redirect the request before anything uses it.
-        let account = crate::azure_client::canonical_account_name(account)?;
-        return Ok((account, container.to_string(), key));
-    }
-
-    if is_azure_blob_host(uri) {
-        // audit #154 bug 4.2 (E1): this previously hard-required a
-        // "https://" prefix via strip_prefix, so a URL that `infer_scheme`
-        // had already routed here as Azure (e.g.
-        // "http://myacct.blob.core.windows.net/container/key") failed with
-        // a confusing "expected https:// for Azure URL" instead of parsing.
-        // Accept any scheme prefix once the host is confirmed to be an
-        // Azure Blob Storage host -- the scheme doesn't change which
-        // account/container/key the URL names.
-        let after_scheme = uri
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .ok_or_else(|| anyhow!("expected a scheme (http:// or https://) for Azure URL"))?;
-        let mut host_and_path = after_scheme.splitn(2, '/');
-        let host = host_and_path.next().unwrap_or("");
-        let path = host_and_path.next().unwrap_or("");
-        let account = host
-            .split('.')
-            .next()
-            .ok_or_else(|| anyhow!("bad Azure host"))?;
-        // The first path segment is the container; the single `/` after it is the
-        // separator, and the rest is the key exactly as written (issue #198), like the
-        // `az://` form above: `c//k` is the container `c` and the key `/k`.
-        let (container, key) = path.split_once('/').unwrap_or((path, ""));
-        if container.is_empty() {
-            bail!("missing container in URL path");
-        }
-        let account = crate::azure_client::canonical_account_name(account)?;
-        return Ok((account, container.to_string(), key.to_string()));
-    }
-
-    bail!("not a recognized Azure URI: {}", uri)
+    let (account, container, key) = crate::capabilities::parse_azure_uri_pure(uri)?;
+    // Refuse an account that could redirect the request before anything uses it.
+    let account = crate::azure_client::canonical_account_name(&account)?;
+    Ok((account, container, key))
 }
 
 /// `delete_batch` grouping key for Azure URIs: `((account, container), key)`.
@@ -5510,6 +5476,49 @@ mod s3_object_store_tests {
             "https://acct.blob.core.windows.net//k",
         ] {
             assert!(parse_azure_uri(uri).is_err(), "{uri}");
+        }
+    }
+
+    // Issue #224: `az://account//key` has an EMPTY container. It used to parse (container "",
+    // key "key") and reach the client builder; it must now be refused by parsing alone, like the
+    // https form above.
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_az_uri_with_an_empty_container_is_an_error() {
+        for uri in [
+            "az://account//key",
+            "az://account//",
+            "az://account/",
+            "az://account",
+            "az://account///key",
+        ] {
+            let err = parse_azure_uri(uri).expect_err(uri);
+            assert!(format!("{err:#}").contains("container"), "{uri}: {err:#}");
+        }
+    }
+
+    // The valid forms #224 must not disturb: roots, nested keys, percent signs, and keys that
+    // are literal (`%2F` stays three characters).
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_az_uri_valid_roots_and_literal_keys_still_parse() {
+        for (uri, want) in [
+            ("az://account/cont", ("account", "cont", "")),
+            ("az://account/cont/", ("account", "cont", "")),
+            ("az://account/cont/k", ("account", "cont", "k")),
+            ("az://account/cont//k", ("account", "cont", "/k")),
+            ("az://account/cont/a%2Fb", ("account", "cont", "a%2Fb")),
+            (
+                "az://account/cont/100%25/x%",
+                ("account", "cont", "100%25/x%"),
+            ),
+        ] {
+            let (account, container, key) = parse_azure_uri(uri).expect(uri);
+            assert_eq!(
+                (account.as_str(), container.as_str(), key.as_str()),
+                want,
+                "{uri}"
+            );
         }
     }
 

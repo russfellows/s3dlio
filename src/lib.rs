@@ -25,6 +25,7 @@ pub use api::*;
 // ===== Internal Modules (Implementation) =====
 // These are public for internal use but may change without notice
 
+pub mod capabilities; // pure, environment-free object capabilities (plan §4.5 A3, #264)
 pub mod checksum; // CRC-32C: the checksum every writer reports (#256)
 pub mod config;
 pub mod constants;
@@ -59,9 +60,11 @@ use pyo3::prelude::*;
 // Internal modules - these may change in future versions
 pub(crate) mod delete_batch_plan; // pure URI-grouping helpers for delete_batch (#179)
 pub mod delete_contract; // delete contract A shared by s3-cli and the Python API (#210, #167, #212)
+pub mod object_error; // typed object errors for the caller-buffer GET and typed HEAD (plan §4.5 A2)
 pub mod object_store;
 #[cfg(any(feature = "backend-azure", feature = "backend-gcs", test))]
 pub(crate) mod read_buffer; // streamed-GET destination buffer, sized once (#252)
+pub mod receive_progress; // distinct-position progress of one receive (plan §4.5 A1, A7)
 pub(crate) mod redirect_client; // HTTP 307 redirect following (for AIStore compatibility)
 pub mod retry; // v0.9.108+ Phase 4: shared retry helper for body-transfer failures
 pub mod s3_client;
