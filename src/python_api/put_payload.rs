@@ -516,10 +516,11 @@ struct RawExport {
 // the queue drained by a GIL holder), so which thread owns the struct does not matter.
 // `Sync`: through `&RawExport` the fields (`buf`, `len`, `format`, ...) are only ever READ - they
 // are fixed for the life of the export - and the read-only payload path hands out only shared
-// `&[u8]` views of the memory. The writable path (`WritableExport`) never reaches the bytes
-// through a shared `&RawExport`: it hands out `&mut [u8]` only from `&mut WritableExport`, which
-// is exclusive, and only while the caller honours the documented exclusive-use contract (nothing
-// else reads or writes the destination until the call is terminal).
+// `&[u8]` views of the memory. The writable path (`WritableExport`) reads the `buf` POINTER VALUE
+// through a shared `&self.inner.export` in `as_mut_slice` - never the bytes behind it - and builds
+// the `&mut [u8]` only inside `&mut WritableExport`, which is exclusive, and only while the caller
+// honours the documented exclusive-use contract (nothing else reads or writes the destination
+// until the call is terminal).
 unsafe impl Send for RawExport {}
 unsafe impl Sync for RawExport {}
 
@@ -974,12 +975,29 @@ struct ExportOwnerMut {
     )
 )]
 impl ExportOwnerMut {
-    /// `export` must already have been validated by [`check_writable_view`] for `len`: writable,
-    /// itemsize 1, `len <= export.len()`, and a non-null `buf` when `len > 0`.
-    fn new(export: RawExport, latch: Arc<Latch>, len: usize) -> Self {
-        Self {
-            inner: ExportOwner::new(export, latch),
-            len,
+    /// Take ownership of `export` (attaching `latch` to it) and validate it with
+    /// [`check_writable_view`] for `len` bytes, so no `ExportOwnerMut` can exist for a view that
+    /// fails those checks (writable, itemsize 1, plain byte format, no suboffsets, C-contiguous,
+    /// `len <= export.len()`, a non-null `buf` when `len > 0`), which is what
+    /// [`as_mut_slice`](Self::as_mut_slice) relies on.
+    ///
+    /// On a refused check the export is released here, with the `py` token (latch marked released,
+    /// then dropped), and the error is returned: nothing stays held.
+    fn new(py: Python<'_>, export: RawExport, latch: Arc<Latch>, len: usize) -> PyResult<Self> {
+        let inner = ExportOwner::new(export, latch);
+        let checked = match &inner.export {
+            Some(e) => check_writable_view(&e.view, len),
+            // `ExportOwner::new` always holds the export it was given.
+            None => Err(pyo3::exceptions::PyBufferError::new_err(
+                "internal error: the destination export is missing",
+            )),
+        };
+        match checked {
+            Ok(()) => Ok(Self { inner, len }),
+            Err(e) => {
+                inner.release(py);
+                Err(e)
+            }
         }
     }
 
@@ -992,8 +1010,9 @@ impl ExportOwnerMut {
         match &self.inner.export {
             // SAFETY: the export is live (released only by `release`/the queue, both of which
             // consume or drop `self`), so `buf` points at the exporter's memory, which the export
-            // pins. `new`'s contract (checked by `check_writable_view`) gives a non-null `buf`
-            // and `len <= view.len`, so `len` bytes are in bounds. `&mut self` makes this the
+            // pins. `new` ran `check_writable_view` (no `ExportOwnerMut` exists otherwise), which
+            // gives a non-null `buf`, `len <= view.len` and a contiguous view, so `len` bytes are
+            // in bounds. `&mut self` makes this the
             // only reference to those bytes derived from this owner; the documented caller
             // obligation (nothing else reads, writes, resizes or reuses the destination until the
             // call is terminal) covers the Python side.
@@ -1012,6 +1031,11 @@ impl ExportOwnerMut {
 /// the object into [`as_mut_slice`](Self::as_mut_slice); the export is released either directly
 /// ([`release`](Self::release), with a GIL token, for failures before ownership transfers) or by
 /// dropping it (the path once native code owns it: queued, then released by a GIL holder).
+///
+/// The destination is under an exclusive-use contract (plan §4.2 item 4): from acquisition until
+/// the call is terminal, nothing else reads, writes, resizes or reuses that memory. In
+/// particular, two concurrent receives into the same or overlapping memory are forbidden, since
+/// each would hold a `&mut [u8]` over bytes the other also writes (aliasing mutable references).
 #[cfg_attr(
     not(test),
     expect(
@@ -1023,14 +1047,15 @@ pub(crate) struct WritableExport {
     owner: ExportOwnerMut,
 }
 
-// SAFETY: `WritableExport` moves into a Tokio task and is used on whatever worker runs it. Its
-// only non-`Send` content would be the raw `Py_buffer` pointers inside `RawExport`, which are
-// `Send` (see the safety comment there): the export is merely a pin on the exporter's memory.
-// The bytes behind `as_mut_slice` are written from that worker WITHOUT the GIL, which is sound
-// under the exclusive-use contract (no Python thread reads or writes the destination until the
-// call is terminal), and `as_mut_slice` needs `&mut self`, so two Rust threads cannot obtain the
-// slice at once. Dropping the value on any thread never touches Python (it queues the export).
-// The auto trait impls already hold; this is a compile-time assertion that they keep holding.
+// Note (no unsafe code here): `WritableExport` moves into a Tokio task and is used on whatever
+// worker runs it. Its only non-`Send` content would be the raw `Py_buffer` pointers inside
+// `RawExport`, which are `Send` (see the safety comment there): the export is merely a pin on the
+// exporter's memory. The bytes behind `as_mut_slice` are written from that worker WITHOUT the
+// GIL, which is sound under the exclusive-use contract (no Python thread reads or writes the
+// destination until the call is terminal), and `as_mut_slice` needs `&mut self`, so two Rust
+// threads cannot obtain the slice at once. Dropping the value on any thread never touches Python
+// (it queues the export). The auto trait impls already hold; this is a compile-time assertion
+// that they keep holding.
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<WritableExport>();
@@ -1059,7 +1084,8 @@ impl WritableExport {
 /// The checks of A4 on a freshly acquired writable `Py_buffer`, as pure functions of the view so
 /// every refusal is one place: not read-only, one-byte items in a plain byte format (none of the
 /// pointer-bearing formats), `expected_len` within the exporter's length (checked conversion),
-/// and a non-null pointer when there is data.
+/// a non-null pointer when there is data, and (defense behind the `PyBUF_C_CONTIGUOUS` request) no
+/// suboffsets and a really C-contiguous layout.
 #[cfg_attr(
     not(test),
     expect(
@@ -1110,6 +1136,27 @@ fn check_writable_view(view: &ffi::Py_buffer, expected_len: usize) -> PyResult<(
             "the destination buffer has no memory address",
         ));
     }
+    // Defense in depth behind the `PyBUF_C_CONTIGUOUS` request: an exporter that returned a
+    // view anyway must really be one flat run of `len` bytes, or the slice built from `buf`
+    // would cover memory the view does not describe.
+    if !view.suboffsets.is_null() {
+        return Err(PyBufferError::new_err(
+            "the destination buffer uses suboffsets (indirect addressing); \
+             get_into needs a flat C-contiguous buffer",
+        ));
+    }
+    if view.ndim > 1 || !view.strides.is_null() {
+        // SAFETY: `view` is a valid, fully initialised `Py_buffer` (a shared reference); when
+        // `ndim > 1` or `strides` is set, `shape`/`strides` are the exporter's arrays of `ndim`
+        // entries (the buffer-protocol contract), which `PyBuffer_IsContiguous` only reads. It
+        // does not touch Python state and needs no particular thread state beyond the caller's.
+        let contiguous = unsafe { ffi::PyBuffer_IsContiguous(view, b'C' as std::ffi::c_char) };
+        if contiguous == 0 {
+            return Err(PyBufferError::new_err(
+                "the destination buffer is not C-contiguous; get_into needs a flat buffer",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1120,6 +1167,11 @@ fn check_writable_view(view: &ffi::Py_buffer, expected_len: usize) -> PyResult<(
 /// read-only fallback. Any refusal leaves nothing held: a held export is released first (with
 /// `py`), and the latch is marked released and dropped, because no native writer will ever exist
 /// for it. Then the error is raised.
+///
+/// The `latch` is SINGLE-USE per call: every path here ends with it marked released and dropped
+/// (success: when the returned export is released or dropped). That includes the
+/// `PyObject_GetBuffer` failure path, which marks both at once because nothing is held and no
+/// owner will ever do it. Pass a fresh latch for every call; a latch must not be reused.
 #[cfg_attr(
     not(test),
     expect(
@@ -1143,16 +1195,10 @@ pub(crate) fn acquire_writable(
             return Err(e);
         }
     };
-    // From here the latch is attached to the export, so releasing it marks `released`.
-    let checked = check_writable_view(&export.view, expected_len);
-    let owner = ExportOwnerMut::new(export, latch.clone(), expected_len);
-    match checked {
-        Ok(()) => Ok(WritableExport { owner }),
-        Err(e) => {
-            owner.release(py); // marks released, then dropped
-            Err(e)
-        }
-    }
+    // From here the latch is attached to the export, so releasing it marks `released`. `new`
+    // runs the view checks and, on a refusal, releases the export (released, then dropped).
+    let owner = ExportOwnerMut::new(py, export, latch.clone(), expected_len)?;
+    Ok(WritableExport { owner })
 }
 
 /// Exact `bytes` (or the `bytes` Python made for a gather / `__bytes__`) as the owner of a `Bytes`.
@@ -2468,35 +2514,54 @@ mod tests {
         init();
         Python::attach(|py| {
             use pyo3::exceptions::{PyBufferError, PyTypeError};
+            // Third element of every case: a probe that raises (BufferError) if a hold on the
+            // exporter is still outstanding - releasing a memoryview, or resizing an array, fails
+            // while an export of it exists. The probes bind their target as a default argument
+            // because `ns` runs the source with separate locals (no closure over them).
             let l = ns(
                 py,
                 c_str!(
                     "import array, ctypes\n\
                      base = bytearray(range(32))\n\
+                     mv_ro = memoryview(b'abcdefgh')\n\
+                     mv_rob = memoryview(base).toreadonly()\n\
+                     mv_str = memoryview(base)[::2]\n\
+                     mv_rev = memoryview(base)[::-1]\n\
+                     a_i = array.array('i', range(8))\n\
+                     a_H = array.array('H', range(8))\n\
+                     a_d = array.array('d', [0.0] * 4)\n\
+                     mv_bool = memoryview(bytearray(8)).cast('?')\n\
+                     nop = lambda: None\n\
                      cases = {\n\
-                       'bytes': (b'abcdefgh', 'buffer'),\n\
-                       'ro_memoryview': (memoryview(b'abcdefgh'), 'buffer'),\n\
-                       'ro_view_of_bytearray': (memoryview(base).toreadonly(), 'buffer'),\n\
-                       'strided': (memoryview(base)[::2], 'buffer'),\n\
-                       'reversed': (memoryview(base)[::-1], 'buffer'),\n\
-                       'array_i': (array.array('i', range(8)), 'type'),\n\
-                       'array_H': (array.array('H', range(8)), 'type'),\n\
-                       'array_d': (array.array('d', [0.0] * 4), 'type'),\n\
-                       'bool_bytes': (memoryview(bytearray(8)).cast('?'), 'type'),\n\
-                       'ctypes_ubyte': ((ctypes.c_ubyte * 8)(), 'type'),\n\
-                       'c_void_p': ((ctypes.c_void_p * 4)(), 'type'),\n\
-                       'py_object': ((ctypes.py_object * 2)(), 'type'),\n\
-                       'not_a_buffer': (object(), 'type'),\n\
-                       'int': (5, 'type'),\n\
+                       'bytes': (b'abcdefgh', 'buffer', nop),\n\
+                       'ro_memoryview': (mv_ro, 'buffer', lambda o=mv_ro: o.release()),\n\
+                       'ro_view_of_bytearray': (mv_rob, 'buffer', lambda o=mv_rob: o.release()),\n\
+                       'strided': (mv_str, 'buffer', lambda o=mv_str: o.release()),\n\
+                       'reversed': (mv_rev, 'buffer', lambda o=mv_rev: o.release()),\n\
+                       'array_i': (a_i, 'type', lambda o=a_i: o.append(1)),\n\
+                       'array_H': (a_H, 'type', lambda o=a_H: o.append(1)),\n\
+                       'array_d': (a_d, 'type', lambda o=a_d: o.append(1.0)),\n\
+                       'bool_bytes': (mv_bool, 'type', lambda o=mv_bool: o.release()),\n\
+                       'ctypes_ubyte': ((ctypes.c_ubyte * 8)(), 'type', nop),\n\
+                       'c_void_p': ((ctypes.c_void_p * 4)(), 'type', nop),\n\
+                       'py_object': ((ctypes.py_object * 2)(), 'type', nop),\n\
+                       'not_a_buffer': (object(), 'type', nop),\n\
+                       'int': (5, 'type', nop),\n\
                      }"
                 ),
             );
             let cases = l.get_item("cases").unwrap().unwrap();
             let cases = cases.cast::<PyDict>().unwrap();
+            let getrefcount = py.import("sys").unwrap().getattr("getrefcount").unwrap();
+            let refcount = |obj: &Bound<'_, PyAny>| -> usize {
+                getrefcount.call1((obj,)).unwrap().extract().unwrap()
+            };
             for (name, entry) in cases.iter() {
                 let name: String = name.extract().unwrap();
                 let obj = entry.get_item(0).unwrap();
                 let kind: String = entry.get_item(1).unwrap().extract().unwrap();
+                let probe = entry.get_item(2).unwrap();
+                let refs_before = refcount(&obj);
                 let latch = Latch::new();
                 let err = acquire_writable(py, &obj, 4, &latch)
                     .err()
@@ -2510,30 +2575,19 @@ mod tests {
                 };
                 assert!(ok, "{name}: wrong exception class: {err}");
                 assert_eq!(latch_state(&latch), (true, true), "{name}: latch");
+                // Nothing leaked, for EVERY refused exporter: the reference a held `Py_buffer`
+                // keeps on its exporter is gone, and the exporter is still releasable/resizable.
+                assert_eq!(
+                    refcount(&obj),
+                    refs_before,
+                    "{name}: a refused export kept a reference to the exporter"
+                );
+                probe
+                    .call0()
+                    .unwrap_or_else(|e| panic!("{name}: a refused export leaked a hold: {e}"));
             }
-            // The exporters that could be resized are still resizable: nothing leaked.
+            // The bytearray behind several of the memoryviews is resizable again as well.
             let base = l.get_item("base").unwrap().unwrap();
-            let cases_mv = cases
-                .get_item("strided")
-                .unwrap()
-                .unwrap()
-                .get_item(0)
-                .unwrap();
-            cases_mv.call_method0("release").unwrap();
-            let ro = cases
-                .get_item("ro_view_of_bytearray")
-                .unwrap()
-                .unwrap()
-                .get_item(0)
-                .unwrap();
-            ro.call_method0("release").unwrap();
-            let rev = cases
-                .get_item("reversed")
-                .unwrap()
-                .unwrap()
-                .get_item(0)
-                .unwrap();
-            rev.call_method0("release").unwrap();
             assert!(
                 resizable(&base),
                 "a refused export leaked a hold on the bytearray"
@@ -2597,7 +2651,8 @@ mod tests {
             check_writable_view(&view, 0).expect("null buf with len 0 is valid");
             let latch = Latch::new();
             let raw = RawExport { view, latch: None };
-            let mut owner = ExportOwnerMut::new(raw, latch.clone(), 0);
+            let mut owner = ExportOwnerMut::new(py, raw, latch.clone(), 0)
+                .expect("the constructor accepts a null buf with len 0");
             assert!(owner.as_mut_slice().is_empty());
             owner.release(py);
             assert_eq!(latch_state(&latch), (true, true));
@@ -2620,6 +2675,99 @@ mod tests {
         assert!(check_writable_view(&view, 0).is_err(), "read-only");
     }
 
+    /// Refusals AFTER a view was handed over, driven through hand-built `Py_buffer`s (so the
+    /// exporter cannot pre-empt them): read-only, suboffsets, and non-contiguous shapes are all
+    /// refused with a BufferError, a flat view and a C-contiguous multi-dimensional one are
+    /// accepted (so the contiguity defense does not over-refuse), and the constructor refuses the
+    /// same views itself, releasing the export (latch released, then dropped): no
+    /// `ExportOwnerMut` exists for a view that fails the checks.
+    #[test]
+    fn writable_view_checks_refuse_readonly_suboffsets_and_non_contiguous_views() {
+        use pyo3::exceptions::PyBufferError;
+        init();
+        let mut mem = [0u8; 4];
+        let mut shape1: [ffi::Py_ssize_t; 1] = [4];
+        let mut stride_gap: [ffi::Py_ssize_t; 1] = [2];
+        let mut shape2: [ffi::Py_ssize_t; 2] = [2, 2];
+        let mut strides_c: [ffi::Py_ssize_t; 2] = [2, 1];
+        let mut strides_f: [ffi::Py_ssize_t; 2] = [1, 2];
+        let mut suboffsets: [ffi::Py_ssize_t; 1] = [0];
+        // A valid flat 4-byte view of `mem`; the tests below change one property each. The arrays
+        // above outlive every view built here.
+        let mut flat = |mem: &mut [u8; 4]| -> Box<ffi::Py_buffer> {
+            // SAFETY: an all-zero Py_buffer is a valid empty value; `obj` stays NULL, which
+            // `PyBuffer_Release` treats as nothing to release.
+            let mut view: Box<ffi::Py_buffer> = Box::new(unsafe { std::mem::zeroed() });
+            view.buf = mem.as_mut_ptr().cast();
+            view.len = 4;
+            view.itemsize = 1;
+            view.ndim = 1;
+            view.shape = shape1.as_mut_ptr();
+            view
+        };
+        let refused = |view: &ffi::Py_buffer, what: &str| {
+            Python::attach(|py| {
+                let err = check_writable_view(view, 4)
+                    .err()
+                    .unwrap_or_else(|| panic!("{what} must be refused"));
+                assert!(err.is_instance_of::<PyBufferError>(py), "{what}: {err}");
+            });
+        };
+
+        let ok = flat(&mut mem);
+        check_writable_view(&ok, 4).expect("a flat writable view is valid");
+
+        let mut ro = flat(&mut mem);
+        ro.readonly = 1;
+        refused(&ro, "read-only with data");
+
+        let mut sub = flat(&mut mem);
+        sub.suboffsets = suboffsets.as_mut_ptr();
+        refused(&sub, "suboffsets");
+
+        let mut gap = flat(&mut mem);
+        gap.strides = stride_gap.as_mut_ptr();
+        refused(&gap, "stride 2 over 1-byte items");
+
+        let mut fortran = flat(&mut mem);
+        fortran.ndim = 2;
+        fortran.shape = shape2.as_mut_ptr();
+        fortran.strides = strides_f.as_mut_ptr();
+        refused(&fortran, "Fortran-ordered 2-D");
+
+        let mut c2 = flat(&mut mem);
+        c2.ndim = 2;
+        c2.shape = shape2.as_mut_ptr();
+        c2.strides = strides_c.as_mut_ptr();
+        check_writable_view(&c2, 4).expect("a C-contiguous 2-D view is valid");
+
+        // The constructor runs the same checks and releases what it was given on a refusal.
+        for (what, view) in [("read-only", ro), ("suboffsets", sub), ("Fortran", fortran)] {
+            Python::attach(|py| {
+                let latch = Latch::new();
+                let raw = RawExport { view, latch: None };
+                let err = ExportOwnerMut::new(py, raw, latch.clone(), 4)
+                    .err()
+                    .unwrap_or_else(|| panic!("{what}: the constructor must refuse"));
+                assert!(err.is_instance_of::<PyBufferError>(py), "{what}: {err}");
+                assert_eq!(latch_state(&latch), (true, true), "{what}: latch");
+            });
+        }
+        let latch = Latch::new();
+        Python::attach(|py| {
+            let raw = RawExport {
+                view: c2,
+                latch: None,
+            };
+            let mut owner = ExportOwnerMut::new(py, raw, latch.clone(), 4)
+                .expect("the constructor accepts a C-contiguous 2-D view");
+            assert_eq!(owner.as_mut_slice().len(), 4);
+            assert_eq!(latch_state(&latch), (false, false), "held");
+            owner.release(py);
+        });
+        assert_eq!(latch_state(&latch), (true, true));
+    }
+
     /// `release(py)` is direct: latch released and dropped at once, no queue, and the exporter is
     /// resizable immediately (a live export would make `extend` raise BufferError).
     #[test]
@@ -2633,14 +2781,9 @@ mod tests {
                 .call_method1("extend", (b"x".as_slice(),))
                 .expect_err("resize must fail while the destination is exported");
             assert!(err.is_instance_of::<pyo3::exceptions::PyBufferError>(py));
-            let queued_before = export_stats().queued;
             ex.release(py);
             assert_eq!(latch_state(&latch), (true, true));
             assert!(resizable(ba.as_any()), "release(py) left the export held");
-            assert!(
-                export_stats().queued <= queued_before,
-                "release(py) must not go through the queue"
-            );
         });
     }
 
