@@ -3019,10 +3019,6 @@ pub(crate) async fn get_into_with_client(
 /// retries and the fan-out HEAD never write one.
 ///
 /// [`S3Ops::get_into`]: crate::s3_ops::S3Ops::get_into
-#[expect(
-    dead_code,
-    reason = "wired by S3ObjectStore::get_into at the integration step (#264)"
-)]
 pub(crate) async fn get_into_global(
     bucket: &str,
     key: &str,
@@ -3085,10 +3081,6 @@ pub(crate) async fn head_typed_with_client(
 /// (one `HEAD` row, written by [`S3Ops::head_typed`]).
 ///
 /// [`S3Ops::head_typed`]: crate::s3_ops::S3Ops::head_typed
-#[expect(
-    dead_code,
-    reason = "wired by S3ObjectStore::head at the integration step (#264)"
-)]
 pub(crate) async fn head_typed(
     bucket: &str,
     key: &str,

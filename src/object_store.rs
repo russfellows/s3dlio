@@ -1670,6 +1670,47 @@ impl ObjectStore for S3ObjectStore {
         s3_get_object_range_uri_async(uri, offset, length).await
     }
 
+    /// Caller-buffer GET (plan §4.5 A1, A6, A8). A per-endpoint store reads through its OWN
+    /// client and writes no row; a store on the process-wide client passes `self.rows()`, so
+    /// only a helper-row store (an endpoint store of a `MultiEndpointStore`) writes the S3
+    /// helper row. Otherwise the caller (`LoggedObjectStore`) writes the one logical row.
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        debug!(
+            "S3ObjectStore::get_into uri='{}', expected_len={}",
+            uri,
+            dst.len()
+        );
+        // Issue #197: a URI naming another server is an error, never run here.
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+
+        match &self.client {
+            Some(client) => {
+                crate::s3_utils::get_into_with_client(client, &bucket, &key, dst, progress).await
+            }
+            None => {
+                crate::s3_utils::get_into_global(&bucket, &key, dst, progress, self.rows()).await
+            }
+        }
+    }
+
+    /// Typed HEAD: `Ok(None)` only for typed absence. Client choice and row ownership are
+    /// those of [`S3ObjectStore::get_into`].
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        debug!("S3ObjectStore::head uri='{}'", uri);
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+
+        match &self.client {
+            Some(client) => crate::s3_utils::head_typed_with_client(client, &bucket, &key).await,
+            None => crate::s3_utils::head_typed(&bucket, &key, self.rows()).await,
+        }
+    }
+
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         if !uri.starts_with("s3://") {
             bail!("S3ObjectStore expected s3:// URI");
@@ -3011,6 +3052,25 @@ impl ObjectStore for AzureObjectStore {
         Ok(b)
     }
 
+    /// Caller-buffer GET (plan §4.5 A1, A8): the URI goes through the same parser as every
+    /// other Azure operation. The row, if any, is the `LoggedObjectStore` wrapper's.
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
+        debug!(
+            "AzureObjectStore::get_into uri='{}', expected_len={}",
+            uri,
+            dst.len()
+        );
+        cli.get_into(&key, dst, progress).await
+    }
+
+    /// Typed HEAD: `Ok(None)` only for a typed missing blob (a missing container is an error).
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
+        debug!("AzureObjectStore::head uri='{}'", uri);
+        cli.head_typed(&key).await
+    }
+
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         debug!("AzureObjectStore::put uri='{}', {} bytes", uri, data.len());
@@ -3690,6 +3750,32 @@ impl ObjectStore for GcsObjectStore {
         client
             .get_object_range(&bucket, &object, offset, length)
             .await
+    }
+
+    /// Caller-buffer GET (plan §4.5 A1, A8), official GCS client only: the community client
+    /// keeps the `Unsupported` trait default. The row, if any, is the wrapper's.
+    #[cfg(not(feature = "gcs-community"))]
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        debug!(
+            "GcsObjectStore::get_into uri='{}', expected_len={}",
+            uri,
+            dst.len()
+        );
+        let client = self.get_client().await?;
+        client
+            .get_object_into(&bucket, &object, dst, progress)
+            .await
+    }
+
+    /// Typed HEAD, official GCS client only. GCS cannot tell an absent bucket from an absent
+    /// object, so both are `Ok(None)`.
+    #[cfg(not(feature = "gcs-community"))]
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        debug!("GcsObjectStore::head uri='{}'", uri);
+        let client = self.get_client().await?;
+        client.head_typed(&bucket, &object).await
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {

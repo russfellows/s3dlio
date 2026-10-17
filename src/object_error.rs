@@ -163,13 +163,6 @@ const MAX_SERVICE_CODE_CHARS: usize = 64;
 /// response cannot inject newlines, control characters or an unbounded string into an error
 /// message.  Real S3 and Azure codes (`NoSuchKey`, `BlobNotFound`, `Throttling`) pass
 /// unchanged.  `None` when nothing is left.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the stage C provider receive paths (#264)"
-    )
-)]
 pub(crate) fn sanitize_service_code(code: &str) -> Option<String> {
     let kept: String = code
         .chars()
@@ -182,13 +175,6 @@ pub(crate) fn sanitize_service_code(code: &str) -> Option<String> {
 /// The [`ObjectError`] message for a failure with an optional HTTP `status` and optional
 /// service `code`: `status 404, code NoSuchKey`, `status 404`, `code Foo` or
 /// `no HTTP response`.  The code goes through [`sanitize_service_code`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the stage C provider receive paths (#264)"
-    )
-)]
 pub(crate) fn status_code_message(status: Option<u16>, code: Option<&str>) -> String {
     match (status, code.and_then(sanitize_service_code)) {
         (Some(s), Some(c)) => format!("status {s}, code {c}"),

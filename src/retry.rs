@@ -181,13 +181,6 @@ where
 ///    could not even be built, a deterministic client-side error), which is
 ///    `Other`;
 /// 7. anything else is `Other`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the stage C provider receive paths (#264)"
-    )
-)]
 pub(crate) fn classify_s3_failure(
     status: Option<u16>,
     code: Option<&str>,
@@ -245,13 +238,6 @@ pub(crate) fn classify_s3_failure(
 /// sanitised service code (`[A-Za-z0-9._-]`, at most 64 characters).  The
 /// retained source error, reachable through `{:#}`, `{:?}` or the chain, is the
 /// flattened SDK text and is NOT redacted by this module.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the stage C provider receive paths (#264)"
-    )
-)]
 pub(crate) fn attach_s3_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
     if let Some(existing) = crate::object_error::object_error(&err) {
         if pinned && existing.kind == ObjectErrorKind::NotFound {
