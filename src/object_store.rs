@@ -550,8 +550,11 @@ pub trait ObjectStore: Send + Sync {
 
     /// Typed HEAD: the size and identity of an object, or `None` when it does not exist.
     ///
-    /// Absence is `Ok(None)`. Every other failure, including a missing bucket or container,
-    /// a refusal and a transport failure, is an error.
+    /// Absence is `Ok(None)`. A provider that cannot tell an absent bucket from an absent object
+    /// reports both as `Ok(None)`: S3's bodyless HEAD 404 and GCS's `NotFound` carry no such
+    /// distinction, and no extra probe is made to manufacture one. A missing container that the
+    /// provider does distinguish (Azure `ContainerNotFound`) is an error, as are a refusal (403),
+    /// a transport failure and every other failure.
     ///
     /// The default returns an error of kind
     /// [`ObjectErrorKind::Unsupported`](crate::object_error::ObjectErrorKind::Unsupported).
@@ -1714,8 +1717,9 @@ impl ObjectStore for S3ObjectStore {
         }
     }
 
-    /// Typed HEAD: `Ok(None)` only for typed absence. Client choice and row ownership are
-    /// those of [`S3ObjectStore::get_into`].
+    /// Typed HEAD: `Ok(None)` only for typed absence. S3's bodyless HEAD 404 cannot tell an
+    /// absent bucket from an absent key, so both are `Ok(None)`. Client choice and row ownership
+    /// are those of [`S3ObjectStore::get_into`].
     async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
         if !uri.starts_with("s3://") {
             bail!("S3ObjectStore expected s3:// URI");

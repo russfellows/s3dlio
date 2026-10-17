@@ -2432,8 +2432,11 @@ impl Drop for HeadQuiescence {
 
 /// Look up the object at `uri` without reading it. Returns an awaitable that resolves to an
 /// `ObjectMetadata` (`size`, `etag`, `version_id`), or to `None` when the object does not
-/// exist. Every other failure, including a missing bucket or container, raises. A build or
-/// provider without the operation raises `UnsupportedOperationError` immediately.
+/// exist. S3's bodyless HEAD 404 and GCS's `NotFound` cannot tell an absent bucket from an
+/// absent object, so on `s3://` and `gs://` a missing bucket also resolves to `None`; no extra
+/// probe is made to tell them apart. A missing Azure container is distinguishable and raises.
+/// A 403 and every other failure raises. A build or provider without the operation raises
+/// `UnsupportedOperationError` immediately.
 ///
 /// Like `get_into_async` the awaitable never finishes while a native request of the call
 /// remains, so callers can bound outstanding native work; there is no buffer to release (and so
@@ -2600,7 +2603,10 @@ fn mkdir_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyA
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
         store.mkdir(&uri).await.map_err(py_err)?;
         // Python `None` (the Rust unit would reach Python as `()`, an empty tuple; issue #233).
-        Python::attach(|py| Ok(py.None()))
+        // `Option<()>` converts to `None` INSIDE the exit-safe delivery (issue #192). This body
+        // must never attach to Python itself: it runs on a Tokio worker before the delivery gate
+        // takes its ticket, so a late completion could attach during interpreter finalization.
+        Ok(None::<()>)
     })
 }
 
@@ -8232,6 +8238,100 @@ def run(start):
             .into_any();
             let outcome = module.getattr("run").unwrap().call1((start,)).unwrap();
             assert!(outcome.is_none(), "mkdir_async resolved to {outcome:?}");
+            assert!(target.is_dir(), "the directory was not made");
+        });
+    }
+
+    /// The Python side of the C-F2 regression: start `mkdir_async`, then WITHOUT awaiting (so the
+    /// event-loop thread keeps the GIL) ask Rust whether the future body has finished.
+    const GIL_HELD_PY: &std::ffi::CStr = c_str!(
+        "
+import asyncio
+
+async def _main(start, body_finished):
+    fut = start()
+    finished = body_finished()
+    return (finished, await fut)
+
+def run(start, body_finished):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_main(start, body_finished))
+    finally:
+        loop.close()
+"
+    );
+
+    /// C-F2 (late completion / shutdown): the `mkdir_async` future body must finish its work
+    /// WITHOUT the GIL. After the interpreter is unavailable (here: the GIL is held by this
+    /// thread, as it is for a delivery that completes after the shutdown drain closed the gate),
+    /// a body that ends in its own `Python::attach` (the old code) is stuck on a Tokio worker,
+    /// outside the exit-safe delivery gate. A body that returns a Rust value finishes, and only
+    /// the gated delivery converts it. The wait is bounded; the result is still `None` once the
+    /// GIL is released.
+    #[test]
+    fn mkdir_async_body_finishes_without_the_gil_so_conversion_stays_in_the_gated_delivery() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        init();
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                GIL_HELD_PY,
+                c_str!("s3dlio_mkdir_gil_held.py"),
+                c_str!("_s3dlio_mkdir_gil_held"),
+            )
+            .expect("gil-held module");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let target = dir.path().join("late").join("completion");
+            let uri = format!("file://{}/", target.display());
+            let finished = Arc::new(AtomicBool::new(false));
+
+            let armed = Arc::clone(&finished);
+            let start = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>,
+                      _: Option<&Bound<'_, PyDict>>|
+                      -> PyResult<Py<PyAny>> {
+                    // The hook is per thread: it is armed on the thread that calls mkdir_async.
+                    crate::python_api::async_bridge::body_finished_hook::arm(Arc::clone(&armed));
+                    mkdir_async(args.py(), &uri).map(Bound::unbind)
+                },
+            )
+            .expect("start closure");
+
+            // Runs with the GIL held: it never detaches, which is the point.
+            let watched = Arc::clone(&finished);
+            let body_finished = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |_: &Bound<'_, PyTuple>, _: Option<&Bound<'_, PyDict>>| -> PyResult<bool> {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !watched.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Ok(watched.load(Ordering::SeqCst))
+                },
+            )
+            .expect("body_finished closure");
+
+            let outcome = module
+                .getattr("run")
+                .unwrap()
+                .call1((start, body_finished))
+                .unwrap();
+            let (body_done_without_gil, value): (bool, Bound<'_, PyAny>) =
+                outcome.extract().expect("(bool, value)");
+            assert!(
+                body_done_without_gil,
+                "the mkdir_async future body did not finish while the GIL was unavailable: it \
+                 attaches to Python itself, outside the exit-safe delivery gate (C-F2, #192)"
+            );
+            assert!(value.is_none(), "mkdir_async resolved to {value:?}");
             assert!(target.is_dir(), "the directory was not made");
         });
     }
