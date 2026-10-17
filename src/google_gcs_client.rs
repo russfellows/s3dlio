@@ -1800,7 +1800,10 @@ mod caller_buffer {
         pub retry_delay: fn(usize) -> Duration,
         /// Attempts allowed while nothing has been written yet.
         pub max_open_attempts: usize,
-        /// Repairs allowed after some bytes were written (pinned reads only).
+        /// Consecutive repairs allowed after some bytes were written (pinned reads only) without
+        /// the cursor advancing past the previous repair point.  A repair that advances the
+        /// cursor starts the count again, so a large read with many advancing repairs is not
+        /// failed by this bound; a read that keeps failing without progress is.
         pub max_repairs: usize,
     }
 
@@ -1814,6 +1817,16 @@ mod caller_buffer {
                 max_repairs: GCS_FULL_READ_REPAIR_MAX_ATTEMPTS,
             }
         }
+    }
+
+    /// The limits for one caller-buffer read of `len` bytes.  The chunk timeout is the same on
+    /// both routes (HTTP and Rapid), sized to the bytes expected: a stalled body is a typed
+    /// timeout, classified Transport, and the pinned read is repaired.
+    pub(super) fn read_config(rapid: bool, len: usize) -> Result<ReceiveConfig> {
+        Ok(ReceiveConfig::new(
+            rapid,
+            gcs_read_chunk_timeout(to_u64(len)?),
+        ))
     }
 
     fn to_u64(v: usize) -> Result<u64> {
@@ -1832,14 +1845,19 @@ mod caller_buffer {
         })
     }
 
-    /// Attach the typed classification to a gax failure.  `pinned` upgrades a 404 to
-    /// `VersionChanged`: once a generation is pinned, absence is never reported.
-    fn gax_failure(e: GaxError, what: &str, phase: &str, pinned: bool) -> anyhow::Error {
-        attach_gcs_classification(
-            anyhow::Error::new(e)
-                .context(format!("GCS caller-buffer GET {phase} failed for {what}")),
-            pinned,
-        )
+    /// Attach the typed classification to a gax failure.  `context` says which operation
+    /// failed, in the caller's words (the phase differs: opening a read, a stream, a HEAD).
+    /// `pinned` upgrades a 404 to `VersionChanged`: once a generation is pinned, absence is
+    /// never reported.
+    fn gax_failure(e: GaxError, context: String, pinned: bool) -> anyhow::Error {
+        attach_gcs_classification(anyhow::Error::new(e).context(context), pinned)
+    }
+
+    /// What may be logged about a failure: its classification (provider, kind, HTTP status
+    /// and gRPC code) and nothing else.  The source chain behind `{:#}` can carry text the
+    /// server supplied, such as an error body, so it is never logged.
+    pub(super) fn loggable(err: &anyhow::Error) -> String {
+        object_error(err).map_or_else(|| "unclassified failure".to_string(), ToString::to_string)
     }
 
     fn length_mismatch(what: &str, expected: u64, actual: Option<u64>) -> anyhow::Error {
@@ -1879,7 +1897,10 @@ mod caller_buffer {
     #[derive(Default)]
     struct Budget {
         failures_before_data: usize,
+        /// Repairs used since the cursor last advanced past the previous repair point.
         repairs: usize,
+        /// Where the cursor stood at the most recent repair.
+        last_repair_at: Option<usize>,
     }
 
     impl Budget {
@@ -1910,16 +1931,28 @@ mod caller_buffer {
                 if !pinned || cursor >= len {
                     return None;
                 }
-                self.take_repair(cfg)
+                self.take_repair(cfg, cursor)
             }
         }
 
-        /// Use one repair, returning its delay, or `None` when none are left.
-        fn take_repair(&mut self, cfg: &ReceiveConfig) -> Option<Duration> {
+        /// Use one repair at `cursor`, returning its delay, or `None` when none are left.
+        ///
+        /// The bound is on repairs that make no progress: when `cursor` is past where the
+        /// previous repair began, the repair did advance the read and the count starts again.
+        /// A read that advances is therefore never failed by the count, however many
+        /// repairs its size needs; one that stalls at the same place is.
+        fn take_repair(&mut self, cfg: &ReceiveConfig, cursor: usize) -> Option<Duration> {
+            if self
+                .last_repair_at
+                .is_some_and(|previous| cursor > previous)
+            {
+                self.repairs = 0;
+            }
             if self.repairs >= cfg.max_repairs {
                 return None;
             }
-            self.repairs += 1;
+            self.repairs = self.repairs.saturating_add(1);
+            self.last_repair_at = Some(cursor);
             Some((cfg.retry_delay)(self.repairs))
         }
     }
@@ -1996,10 +2029,17 @@ mod caller_buffer {
                             }
                         }
                     }
-                    let err = gax_failure(e, what, "open", was_pinned);
+                    let err = gax_failure(
+                        e,
+                        format!("GCS caller-buffer GET could not open {what}"),
+                        was_pinned,
+                    );
                     match budget.next_delay(cfg, &err, cursor, len, was_pinned) {
                         Some(delay) => {
-                            debug!("GCS caller-buffer GET of {what}: retrying the open: {err:#}");
+                            debug!(
+                                "GCS caller-buffer GET of {what}: retrying the open: {}",
+                                loggable(&err)
+                            );
                             back_off(delay).await;
                             continue 'attempt;
                         }
@@ -2057,11 +2097,16 @@ mod caller_buffer {
                         cursor = end;
                     }
                     Some(Err(e)) => {
-                        let err = gax_failure(e, what, "stream", pinned.is_some());
+                        let err = gax_failure(
+                            e,
+                            format!("GCS caller-buffer GET stream failed for {what}"),
+                            pinned.is_some(),
+                        );
                         match budget.next_delay(cfg, &err, cursor, len, pinned.is_some()) {
                             Some(delay) => {
                                 debug!(
-                                    "GCS caller-buffer GET of {what}: repairing at offset {cursor}: {err:#}"
+                                    "GCS caller-buffer GET of {what}: repairing at offset {cursor}: {}",
+                                    loggable(&err)
                                 );
                                 back_off(delay).await;
                                 continue 'attempt;
@@ -2078,7 +2123,7 @@ mod caller_buffer {
             // A clean end that is short.  A pinned read that made progress repairs the suffix;
             // anything else is a length mismatch.
             if pinned.is_some() && cursor > before {
-                if let Some(delay) = budget.take_repair(cfg) {
+                if let Some(delay) = budget.take_repair(cfg, cursor) {
                     debug!(
                         "GCS caller-buffer GET of {what}: short end at {cursor} of {len}, repairing the suffix"
                     );
@@ -2122,7 +2167,7 @@ mod caller_buffer {
         match result {
             Ok(obj) => metadata_with_generation(&obj, key).map(Some),
             Err(e) => {
-                let err = gax_failure(e, what, "HEAD", false);
+                let err = gax_failure(e, format!("GCS HEAD failed for {what}"), false);
                 match object_error(&err).map(|o| o.kind) {
                     Some(ObjectErrorKind::NotFound) => Ok(None),
                     _ => Err(err),
@@ -2144,10 +2189,12 @@ mod caller_buffer {
     // -- the real openers --------------------------------------------------
 
     /// Standard buckets: the HTTP `read_object` route.
-    struct HttpOpener<'a> {
-        storage: &'a Storage,
-        bucket_name: &'a str,
-        object: &'a str,
+    ///
+    /// The fields are `pub(super)` so the tests can drive this real opener against a local server.
+    pub(super) struct HttpOpener<'a> {
+        pub(super) storage: &'a Storage,
+        pub(super) bucket_name: &'a str,
+        pub(super) object: &'a str,
     }
 
     struct HttpStream(ReadObjectResponse);
@@ -2161,6 +2208,15 @@ mod caller_buffer {
 
     #[async_trait]
     impl ReadOpener for HttpOpener<'_> {
+        /// Opens `GET ...?alt=media`: `set_generation` becomes the `generation` query parameter
+        /// and the range becomes the `Range` header (`bytes=a-b`, or `bytes=a-` to the end).
+        ///
+        /// The object's size is `x-goog-stored-content-length`.  On the live JSON media API that
+        /// header carries the FULL stored size on ranged (206) responses as well as on unranged
+        /// ones (measured 2026-10: `Range: bytes=4-15` on a 16-byte object gives
+        /// `content-range: bytes 4-15/16`, `x-goog-stored-content-length: 16`, `content-length:
+        /// 12`).  The size check of a repair against `dst.len()` therefore compares the whole
+        /// object, as it does for the first request.  The generation is `x-goog-generation`.
         async fn open(&self, request: &OpenRequest) -> Result<Opened, GaxError> {
             let mut builder = self.storage.read_object(self.bucket_name, self.object);
             if let Some(generation) = request.generation {
@@ -2184,21 +2240,22 @@ mod caller_buffer {
             })
         }
 
+        /// Not available on the HTTP route.  The descriptor is a Rapid concept: `receive_into`
+        /// asks for one only when `ReceiveConfig::rapid` is set, which this route never sets.  The
+        /// answer is a typed, non-retryable error, not a data GET whose body would be thrown away.
         async fn describe(&self, generation: Option<i64>) -> Result<Object, GaxError> {
-            let opened = self
-                .open(&OpenRequest {
-                    start: 0,
-                    limit: None,
-                    generation,
-                })
-                .await?;
-            Ok(Object::default()
-                .set_size(opened.facts.size)
-                .set_generation(opened.facts.generation))
+            Err(GaxError::binding(format!(
+                "the HTTP route has no object descriptor (Rapid buckets only); generation {generation:?} was requested"
+            )))
         }
     }
 
     /// Rapid buckets: the existing `open_object` (BidiReadObject) route.
+    ///
+    /// No local test drives this opener: the pinned fork has no local bidi-streaming server to
+    /// point it at, so its `set_generation`, range mapping and descriptor facts are covered by the
+    /// live Rapid gate of plan section 8 (the "Existing GCS Rapid route" row), not by a unit
+    /// test.  The receive loop above it is tested with the fake opener in `rapid` mode.
     struct RapidOpener<'a> {
         storage: &'a Storage,
         bucket_name: &'a str,
@@ -2281,7 +2338,9 @@ mod caller_buffer {
         ) -> Result<()> {
             let what = format!("gs://{bucket}/{object}");
             let bucket_name = format_bucket_name(bucket);
-            if self.is_rapid_bucket(bucket).await {
+            let rapid = self.is_rapid_bucket(bucket).await;
+            let cfg = read_config(rapid, dst.len())?;
+            if rapid {
                 debug!("GCS GET INTO (gRPC): {what}, {} bytes", dst.len());
                 let opener = RapidOpener {
                     storage: &self.storage,
@@ -2289,7 +2348,6 @@ mod caller_buffer {
                     object,
                     attempt_timeout: gcs_bidi_attempt_timeout(),
                 };
-                let cfg = ReceiveConfig::new(true, gcs_read_chunk_timeout(to_u64(dst.len())?));
                 receive_into(&opener, &what, dst, progress, &cfg).await
             } else {
                 debug!("GCS GET INTO (HTTP): {what}, {} bytes", dst.len());
@@ -2298,7 +2356,6 @@ mod caller_buffer {
                     bucket_name: &bucket_name,
                     object,
                 };
-                let cfg = ReceiveConfig::new(false, None);
                 receive_into(&opener, &what, dst, progress, &cfg).await
             }
         }
@@ -2359,7 +2416,7 @@ mod tests {
     /// Serialize all tests that mutate environment variables.  Without this
     /// guard two tests running in parallel could observe each other's
     /// `set_var` / `remove_var` calls and produce non-deterministic results.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    pub(super) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     // ------------------------------------------------------------------
     // parse_gcs_uri
@@ -3648,3 +3705,8 @@ mod head_typed_tests;
 #[cfg(all(test, not(feature = "gcs-community")))]
 #[path = "gcs_get_into_tests.rs"]
 mod get_into_tests;
+
+// Tests of the real HTTP opener against a local HTTP server (generation, range, size facts).
+#[cfg(all(test, not(feature = "gcs-community")))]
+#[path = "gcs_http_opener_tests.rs"]
+mod http_opener_tests;

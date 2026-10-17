@@ -186,6 +186,9 @@ aws-smithy-types = "^1"        # needed for SdkBody::empty() in test fixtures
 rcgen        = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 hyper        = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util   = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+# src/gcs_http_opener_tests.rs: anonymous credentials for the native GCS client pointed at a
+# local test server (same pinned fork as google-cloud-storage, already in Cargo.lock)
+google-cloud-auth = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2", default-features = false }
 
 # (No extra crate needed for the Phase 1 allocation tests — they use a small
 # in-tree peak-tracking wrapper around System, defined in

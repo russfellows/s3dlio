@@ -12,7 +12,8 @@
 // credentials.
 
 use super::caller_buffer::{
-    receive_into, ChunkStream, ObjectFacts, OpenRequest, Opened, ReadOpener, ReceiveConfig,
+    loggable, read_config, receive_into, ChunkStream, ObjectFacts, OpenRequest, Opened, ReadOpener,
+    ReceiveConfig,
 };
 use super::*;
 use crate::object_error::{object_error, ObjectErrorKind};
@@ -107,7 +108,11 @@ struct State {
     /// Chunks actually pulled from any stream.
     pulled: usize,
     describes: usize,
+    /// The generation each `describe` was asked for, in order.
+    describe_generations: Vec<Option<i64>>,
     describe_fail: Option<Fail>,
+    /// What responses report as the object's size (`None` = its real length).
+    report_size: Option<i64>,
 }
 
 struct Fake(Arc<Mutex<State>>);
@@ -124,7 +129,9 @@ impl Fake {
             chunk,
             pulled: 0,
             describes: 0,
+            describe_generations: Vec::new(),
             describe_fail: None,
+            report_size: None,
         })))
     }
 
@@ -216,7 +223,9 @@ impl ReadOpener for Fake {
             chunks.push_back(Bytes::from(std::mem::replace(&mut served, rest)));
         }
         let facts = ObjectFacts {
-            size: i64::try_from(st.data.len()).expect("size"),
+            size: st
+                .report_size
+                .unwrap_or_else(|| i64::try_from(st.data.len()).expect("size")),
             generation: st.report_generation.unwrap_or(st.generation),
         };
         Ok(Opened {
@@ -229,14 +238,18 @@ impl ReadOpener for Fake {
         })
     }
 
-    async fn describe(&self, _generation: Option<i64>) -> Result<Object, Gax> {
+    async fn describe(&self, generation: Option<i64>) -> Result<Object, Gax> {
         let mut st = self.0.lock().expect("lock");
         st.describes += 1;
+        st.describe_generations.push(generation);
         if let Some(f) = st.describe_fail {
             return Err(f.build());
         }
         Ok(Object::default()
-            .set_size(i64::try_from(st.data.len()).expect("size"))
+            .set_size(
+                st.report_size
+                    .unwrap_or_else(|| i64::try_from(st.data.len()).expect("size")),
+            )
             .set_generation(st.report_generation.unwrap_or(st.generation)))
     }
 }
@@ -256,6 +269,11 @@ fn config(rapid: bool) -> ReceiveConfig {
         max_open_attempts: 3,
         max_repairs: 4,
     }
+}
+
+/// The generation each descriptor request asked for.
+fn descriptor_generations(fake: &Fake) -> Vec<Option<i64>> {
+    fake.with(|s| s.describe_generations.clone())
 }
 
 struct Outcome {
@@ -476,22 +494,67 @@ async fn progress_is_kept_when_the_read_fails() {
     assert!(out.dst()[40..].iter().all(|b| *b == FILL));
 }
 
-/// Repairs are bounded: after the allowed number the typed error is returned, with the
-/// progress made.
+/// Repairs that make no progress are bounded: after the allowed number the typed error is
+/// returned, with the progress made.  The first read delivers 10 bytes; every repair after it
+/// breaks again at the same cursor.
 #[tokio::test]
-async fn repairs_are_bounded() {
-    let fake =
-        Fake::new(pattern(100, 3), 10).script((0..10).map(|_| Step::BreakAfter(10, Fail::Io)));
+async fn repairs_without_progress_are_bounded() {
+    let fake = Fake::new(pattern(100, 3), 10).script(
+        std::iter::once(Step::BreakAfter(10, Fail::Io))
+            .chain((0..10).map(|_| Step::BreakAfter(0, Fail::Io))),
+    );
     let out = run(&fake, 100, &config(false)).await;
     assert_eq!(out.kind(), ObjectErrorKind::Transport);
-    // The first read plus four repairs, ten bytes each.
+    // The first read plus four repairs, none of which advanced the cursor.
     assert_eq!(fake.requests().len(), 5);
-    assert_eq!(out.progress.filled(), 50);
+    assert_eq!(out.progress.filled(), 10);
     let err = out.result.as_ref().expect_err("failed");
     assert!(
         err.downcast_ref::<Gax>().is_some(),
         "the typed source stays recoverable"
     );
+    out.assert_canary_intact();
+}
+
+/// A repair that advances the cursor starts the count again: a large read that needs far more
+/// repairs than `max_repairs` (4 here) still completes, every repair resuming at the cursor
+/// under the pinned generation, and each position counted once.
+#[tokio::test]
+async fn advancing_repairs_do_not_exhaust_the_budget() {
+    let data = pattern(100, 3);
+    // Ten bytes per request: the first read and nine repairs.
+    let fake = Fake::new(data.clone(), 5).script((0..9).map(|_| Step::BreakAfter(10, Fail::Io)));
+    let out = run(&fake, 100, &config(false)).await;
+    out.result.as_ref().expect("received through many repairs");
+    assert_eq!(out.dst(), &data[..]);
+    assert_eq!(out.progress.filled(), 100);
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 10);
+    for (index, (start, limit, generation)) in requests.iter().enumerate().skip(1) {
+        let at = u64::try_from(index * 10).expect("offset");
+        assert_eq!(*start, at);
+        assert_eq!(*limit, Some(100 - at));
+        assert_eq!(*generation, Some(GEN));
+    }
+    out.assert_canary_intact();
+}
+
+/// The bound counts repairs since the cursor last advanced: stalls that are interleaved with
+/// progress never add up to the limit, and the read still fails after `max_repairs` stalls in a
+/// row at one place.
+#[tokio::test]
+async fn the_count_restarts_after_progress_and_then_bounds_the_next_stall() {
+    // 10 bytes, then three stalls (3 repairs), then 10 more bytes, then stalls without end.
+    let mut steps = vec![Step::BreakAfter(10, Fail::Io)];
+    steps.extend((0..3).map(|_| Step::BreakAfter(0, Fail::Io)));
+    steps.push(Step::BreakAfter(10, Fail::Io));
+    steps.extend((0..10).map(|_| Step::BreakAfter(0, Fail::Io)));
+    let fake = Fake::new(pattern(100, 3), 10).script(steps);
+    let out = run(&fake, 100, &config(false)).await;
+    assert_eq!(out.kind(), ObjectErrorKind::Transport);
+    // 1 first read + 3 stalled repairs + 1 repair that advanced + 4 stalled repairs.
+    assert_eq!(fake.requests().len(), 9);
+    assert_eq!(out.progress.filled(), 20);
     out.assert_canary_intact();
 }
 
@@ -825,6 +888,7 @@ async fn zero_length_rapid_reads_the_descriptor_and_requests_no_data() {
     out.result.as_ref().expect("empty object");
     assert!(fake.requests().is_empty(), "no data range may be requested");
     assert_eq!(fake.with(|s| s.describes), 1);
+    assert_eq!(descriptor_generations(&fake), vec![None]);
     out.assert_canary_intact();
 
     // A non-empty object: the descriptor's size is the authority.
@@ -850,12 +914,14 @@ async fn zero_length_rapid_descriptor_failures_are_classified() {
     let out = run(&fake, 0, &config(true)).await;
     assert_eq!(out.kind(), ObjectErrorKind::NotFound);
     assert_eq!(fake.with(|s| s.describes), 1);
+    assert_eq!(descriptor_generations(&fake), vec![None]);
 
     let fake = Fake::new(Vec::new(), 4);
     fake.with(|s| s.describe_fail = Some(Fail::Http(403)));
     let out = run(&fake, 0, &config(true)).await;
     assert_eq!(out.kind(), ObjectErrorKind::Forbidden);
     assert_eq!(fake.with(|s| s.describes), 1);
+    assert_eq!(descriptor_generations(&fake), vec![None]);
 
     let fake = Fake::new(Vec::new(), 4);
     fake.with(|s| s.describe_fail = Some(Fail::Grpc(Code::Unavailable)));
@@ -866,6 +932,7 @@ async fn zero_length_rapid_descriptor_failures_are_classified() {
         3,
         "retried up to the attempt limit"
     );
+    assert_eq!(descriptor_generations(&fake), vec![None; 3]);
 }
 
 // ---------------------------------------------------------------------------
@@ -887,6 +954,7 @@ async fn rapid_out_of_range_on_an_empty_object_is_a_length_mismatch() {
         }
     );
     assert_eq!(fake.with(|s| s.describes), 1);
+    assert_eq!(descriptor_generations(&fake), vec![None]);
     out.assert_canary_intact();
 }
 
@@ -911,6 +979,7 @@ async fn out_of_range_on_the_http_route_stays_a_failure_without_a_descriptor_che
     let out = run(&fake, 10, &config(false)).await;
     assert_eq!(out.kind(), ObjectErrorKind::Other);
     assert_eq!(fake.with(|s| s.describes), 0);
+    assert!(descriptor_generations(&fake).is_empty());
 }
 
 /// Rapid, non-zero destination, ordinary object: the existing full-read route is used and
@@ -928,6 +997,142 @@ async fn rapid_receive_repairs_with_the_generation_pinned() {
     );
     assert_eq!(out.progress.filled(), 30);
     out.assert_canary_intact();
+}
+
+// ---------------------------------------------------------------------------
+// The span is complete, the stream still fails
+// ---------------------------------------------------------------------------
+
+/// A retryable stream error that arrives after ALL bytes were received has no suffix left to
+/// resume.  It is returned as the typed Transport error: no repair is asked for, because a
+/// zero-length segment means "to the end" in this SDK fork, and exactly one request was made.
+#[tokio::test]
+async fn a_stream_error_after_every_byte_is_returned_without_a_repair() {
+    let data = pattern(10, 2);
+    let fake = Fake::new(data.clone(), 4).script([Step::BreakAfter(10, Fail::Io), Step::Serve]);
+    let out = run(&fake, 10, &config(false)).await;
+    assert_eq!(out.kind(), ObjectErrorKind::Transport);
+    assert_eq!(
+        fake.requests(),
+        vec![(0, None, None)],
+        "no repair of a complete span"
+    );
+    assert_eq!(out.progress.filled(), 10);
+    assert_eq!(out.dst(), &data[..]);
+    out.assert_canary_intact();
+}
+
+// ---------------------------------------------------------------------------
+// Sizes
+// ---------------------------------------------------------------------------
+
+/// A negative size is an error, never a zero or a wrapped huge number: the read fails as
+/// `Other` before any byte is copied.
+#[tokio::test]
+async fn a_negative_reported_size_is_an_error_and_nothing_is_written() {
+    for (data, n) in [(pattern(10, 1), 10), (Vec::new(), 0)] {
+        let fake = Fake::new(data, 4);
+        fake.with(|s| s.report_size = Some(-1));
+        let out = run(&fake, n, &config(false)).await;
+        assert_eq!(out.kind(), ObjectErrorKind::Other, "destination of {n}");
+        assert_eq!(
+            fake.with(|s| s.pulled),
+            0,
+            "the body must be dropped unread"
+        );
+        assert_eq!(fake.requests().len(), 1, "a bad size is not retried");
+        assert_eq!(out.progress.filled(), 0);
+        assert!(out.dst().iter().all(|b| *b == FILL));
+        out.assert_canary_intact();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error context and logging
+// ---------------------------------------------------------------------------
+
+/// The error context names the phase that failed: opening a read, or its stream.
+#[tokio::test]
+async fn the_error_context_names_the_phase() {
+    let fake = Fake::new(pattern(10, 1), 4).script([Step::FailOpen(Fail::Http(403))]);
+    let out = run(&fake, 10, &config(false)).await;
+    let message = format!("{:#}", out.result.as_ref().expect_err("failed"));
+    assert!(message.contains("could not open"), "{message}");
+    assert!(!message.contains("HEAD"), "{message}");
+
+    let fake = Fake::new(pattern(10, 1), 4).script([Step::BreakAfter(4, Fail::Http(403))]);
+    let out = run(&fake, 10, &config(false)).await;
+    let message = format!("{:#}", out.result.as_ref().expect_err("failed"));
+    assert!(message.contains("stream failed"), "{message}");
+    assert!(!message.contains("HEAD"), "{message}");
+}
+
+/// What is logged about a failure is its classification only: server-supplied text in the
+/// error body never reaches a log line.
+#[test]
+fn logged_failures_carry_the_classification_and_never_the_body() {
+    let classified = |fail: Fail| {
+        let err = attach_gcs_classification(anyhow::Error::new(fail.build()), false);
+        loggable(&err)
+    };
+    let text = classified(Fail::HttpWithText(503));
+    assert!(text.contains("status 503"), "{text}");
+    assert!(!text.contains("unavailable timeout"), "{text}");
+    let text = classified(Fail::GrpcWithText(Code::Unavailable));
+    assert!(text.contains("Unavailable"), "{text}");
+    assert!(!text.contains("resource_exhausted"), "{text}");
+    assert_eq!(
+        loggable(&anyhow::anyhow!("SECRET-PAYLOAD")),
+        "unclassified failure"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The chunk timeout of the real routes
+// ---------------------------------------------------------------------------
+
+/// The standard (HTTP) route applies the same chunk timeout as Rapid: the configuration the
+/// real entry point builds is the same for both, sized to the bytes expected, and honours the
+/// documented environment override (0 turns it off).
+#[test]
+fn both_routes_apply_the_chunk_timeout() {
+    let var = "S3DLIO_GCS_READ_CHUNK_TIMEOUT_SECS";
+    // The configurations are gathered with the environment lock held and the variable restored;
+    // the assertions run after it is released, so a failure cannot poison the lock for the
+    // other environment tests.
+    let timeouts = |value: Option<&str>, len: usize| -> Vec<(bool, Option<Duration>)> {
+        let _guard = super::tests::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = std::env::var(var).ok();
+        match value {
+            Some(value) => std::env::set_var(var, value),
+            None => std::env::remove_var(var),
+        }
+        let found = [false, true]
+            .into_iter()
+            .map(|rapid| {
+                let cfg = read_config(rapid, len);
+                (rapid, cfg.ok().and_then(|cfg| cfg.chunk_timeout))
+            })
+            .collect();
+        match before {
+            Some(value) => std::env::set_var(var, value),
+            None => std::env::remove_var(var),
+        }
+        found
+    };
+
+    let seven = Some(Duration::from_secs(7));
+    assert_eq!(
+        timeouts(Some("7"), 4096),
+        vec![(false, seven), (true, seven)]
+    );
+    assert_eq!(timeouts(Some("0"), 4096), vec![(false, None), (true, None)]);
+
+    let size = 8 * 1024 * 1024;
+    let scaled = Some(Duration::from_secs(12));
+    assert_eq!(timeouts(None, size), vec![(false, scaled), (true, scaled)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +1157,9 @@ fn the_receive_loop_uses_only_the_typed_verdict_and_stays_in_its_task() {
         assert!(!code.contains("is_retryable_gcs_read_error"));
         assert!(!code.contains("tokio::spawn"));
         assert!(!code.contains("spawn_blocking"));
+        // A failure's source chain can carry server-supplied body text; logs use `loggable`.
+        assert!(!code.contains("err:#"));
+        assert!(!code.contains("{e:#}"));
     }
     assert!(budget.contains("gcs_typed_retry_verdict"));
 }

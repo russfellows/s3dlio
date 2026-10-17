@@ -195,6 +195,15 @@ fn other_failures_are_never_absence() {
     }
 }
 
+/// A failed HEAD says so: its context names the HEAD, not a GET.
+#[test]
+fn a_failed_head_names_the_head_in_its_context() {
+    let err = head(Err(http(403))).expect_err("forbidden");
+    let message = format!("{err:#}");
+    assert!(message.contains("GCS HEAD failed"), "{message}");
+    assert!(!message.contains("GET"), "{message}");
+}
+
 /// A negative size is an error: it is never read as 0 (an empty object) and never wraps.
 #[test]
 fn negative_size_is_an_error_not_zero() {

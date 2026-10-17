@@ -5284,6 +5284,7 @@ dependencies = [
  "futures-util",
  "gcloud-storage",
  "glob",
+ "google-cloud-auth",
  "google-cloud-gax",
  "google-cloud-gax-internal",
  "google-cloud-storage",
