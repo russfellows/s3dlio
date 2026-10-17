@@ -1365,24 +1365,25 @@ pub(crate) async fn get_object_concurrent_range_with_client(
         )
     })? as u64;
 
-    // Calculate actual range
+    // Calculate actual range.  `saturating_add` and `saturating_sub` keep an offset or a
+    // length near `u64::MAX` from overflowing, and a range that starts at or past the end of
+    // the object has `total_bytes == 0`.
     let start_offset = offset;
     let end_offset = match length {
-        Some(len) => std::cmp::min(start_offset + len, object_size),
+        Some(len) => std::cmp::min(start_offset.saturating_add(len), object_size),
         None => object_size,
     };
+    let total_bytes = end_offset.saturating_sub(start_offset);
+
+    // Both limits are resolved and validated BEFORE any shortcut (the empty success at or past
+    // the end of the object, and the small-object single request), so an invalid setting is
+    // rejected whatever the object's size or the offset (issue #235).
+    let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
+    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
 
     if start_offset >= object_size {
         return Ok(Bytes::new());
     }
-
-    let total_bytes = end_offset - start_offset;
-
-    // Determine optimal strategy based on size.  Both limits are resolved and validated
-    // BEFORE the small-object shortcut, so an invalid setting is rejected whatever the
-    // object's size (issue #235).
-    let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
-    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
 
     // Use single request for small objects
     if total_bytes <= effective_chunk_size as u64 {
@@ -2388,18 +2389,20 @@ async fn get_object_with_known_size_async(
     require_chunk_size_at_least_one(chunk_size)?;
     let start_offset = offset;
     let end_offset = match length {
-        Some(len) => std::cmp::min(start_offset + len, object_size),
+        Some(len) => std::cmp::min(start_offset.saturating_add(len), object_size),
         None => object_size,
     };
+    // 0 when the range starts at or past the end of the object (no subtraction underflow).
+    let total_bytes = end_offset.saturating_sub(start_offset);
+    // Both limits are resolved and validated BEFORE any shortcut (the empty success at or past
+    // the end of the object, and the small-object single request), so an invalid setting is
+    // rejected whatever the object's size or the offset (issue #235).
+    let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
+    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
+
     if start_offset >= object_size {
         return Ok(Bytes::new());
     }
-
-    let total_bytes = end_offset - start_offset;
-    // Both limits are resolved and validated BEFORE the small-object shortcut, so an invalid
-    // setting is rejected whatever the object's size (issue #235).
-    let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
-    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
 
     // If total fits in one chunk, use a single range request (no concurrency overhead).
     if total_bytes <= effective_chunk_size as u64 {
@@ -3505,5 +3508,73 @@ mod range_limit_resolution_tests {
             resolve_range_chunk_size(None, 300 * 1024 * 1024).expect("default"),
             8 * 1024 * 1024
         );
+    }
+
+    /// Stage B follow-up F1: the known-size path returns an empty success at or past the end of
+    /// the object.  That shortcut used to run BEFORE the environment-derived limits were
+    /// resolved, so a zero escaped the validation for an empty object and for offsets at and
+    /// beyond the end.  The path is reached by `get_object_uri_optimized_async` with offset 0
+    /// only, so the offsets can only be driven here, on the private function.  No request is
+    /// made on any of these calls (a rejected setting returns before a client is built, and an
+    /// empty success never builds one).
+    #[tokio::test]
+    async fn known_size_path_validates_the_environment_at_and_past_the_end() {
+        let _guard = crate::test_env::lock_async().await;
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        // (object size, offset, length): an empty object; exactly at the end; beyond the end;
+        // an offset and length whose sum overflows a u64.
+        let shapes: [(u64, u64, Option<u64>); 5] = [
+            (0, 0, None),
+            (16, 16, None),
+            (16, 1000, None),
+            (16, 16, Some(8)),
+            (16, u64::MAX, Some(u64::MAX)),
+        ];
+        for variable in VARS {
+            for (size, offset, length) in shapes {
+                std::env::remove_var(ENV_RANGE_CHUNK_SIZE);
+                std::env::remove_var(ENV_RANGE_CONCURRENCY);
+                std::env::set_var(variable, "0");
+                let err = get_object_with_known_size_async(
+                    "bucket", "key", size, offset, length, None, None,
+                )
+                .await
+                .expect_err(&format!(
+                    "{variable}=0 must be rejected (size {size}, offset {offset}, length {length:?})"
+                ));
+                let text = format!("{err:#}");
+                assert!(text.contains(variable), "must name {variable}: {text}");
+                assert!(text.contains(">= 1"), "must give the valid range: {text}");
+
+                // The control: valid settings keep the empty success for the same call.
+                std::env::set_var(ENV_RANGE_CHUNK_SIZE, "4");
+                std::env::set_var(ENV_RANGE_CONCURRENCY, "2");
+                let body = get_object_with_known_size_async(
+                    "bucket", "key", size, offset, length, None, None,
+                )
+                .await
+                .expect("valid settings give an empty success");
+                assert!(body.is_empty());
+            }
+        }
+    }
+
+    /// An explicit argument still wins over the environment on the same shortcut: a zero in the
+    /// environment is not consulted when the caller passed the setting (and the argument is
+    /// itself validated).
+    #[tokio::test]
+    async fn known_size_path_explicit_arguments_keep_precedence_at_the_end() {
+        let _guard = crate::test_env::lock_async().await;
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "0");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "0");
+        let body = get_object_with_known_size_async("b", "k", 16, 16, None, Some(4), Some(2))
+            .await
+            .expect("explicit valid arguments override the zero environment");
+        assert!(body.is_empty());
+        let err = get_object_with_known_size_async("b", "k", 16, 16, None, Some(4), Some(0))
+            .await
+            .expect_err("an explicit zero concurrency is rejected by name");
+        assert!(format!("{err:#}").contains("max_concurrency"), "{err:#}");
     }
 }

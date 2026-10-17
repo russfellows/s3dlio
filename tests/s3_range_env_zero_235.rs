@@ -74,16 +74,28 @@ fn child_run_case() {
         .build()
         .expect("runtime");
     let state = ensure_mock_s3_server().1;
-    let key = unique_test_key(SIZED_OBJECT_MARKER);
+    // The mock reports a 16-byte object for a key with the sized marker, and an EMPTY object
+    // (HEAD says 0 bytes) for every other key.
+    let key = if case.ends_with("_empty") {
+        unique_test_key("empty-obj")
+    } else {
+        unique_test_key(SIZED_OBJECT_MARKER)
+    };
     let uri = format!("s3://{BUCKET}/{key}");
 
     let result = rt.block_on(async {
+        let ranged = |offset: u64| {
+            s3dlio::s3_utils::get_object_concurrent_range_async(&uri, offset, None, None, None)
+        };
         match case.as_str() {
-            "concurrent_range" => {
-                s3dlio::s3_utils::get_object_concurrent_range_async(&uri, 0, None, None, None).await
+            "concurrent_range" | "concurrent_range_empty" => ranged(0).await,
+            // Exactly at the end of the 16-byte object, and well beyond it.
+            "concurrent_range_at_eof" => ranged(SIZED_OBJECT_BODY.len() as u64).await,
+            "concurrent_range_past_eof" => ranged(1000).await,
+            // Threshold 0 sends the (16-byte, or empty) object through the known-size range path.
+            "uri_optimized" | "uri_optimized_empty" => {
+                s3dlio::s3_utils::get_object_uri_optimized_async(&uri).await
             }
-            // Threshold 0 sends the (16-byte) object through the known-size range path.
-            "uri_optimized" => s3dlio::s3_utils::get_object_uri_optimized_async(&uri).await,
             other => panic!("unknown case {other}"),
         }
     });
@@ -100,6 +112,12 @@ fn child_run_case() {
             // Rejected before any range was requested.
             let gets = state.counts_for(&key_path(BUCKET, &key)).get_calls;
             assert_eq!(gets, 0, "no GET may be sent for a rejected setting");
+        }
+        None if expect == "ok-empty" => {
+            // Valid settings: an empty object, or a range at or past the end, is still an empty
+            // success (the validation added by #235 must not turn it into an error).
+            let body = result.expect("valid settings must still succeed");
+            assert!(body.is_empty(), "expected no bytes, got {}", body.len());
         }
         None => {
             assert_eq!(expect, "ok");
@@ -430,5 +448,80 @@ fn range_concurrency_env_above_the_semaphore_limit_is_rejected_by_name() {
                 ("S3DLIO_RANGE_CONCURRENCY", &too_many),
             ],
         ),
+    );
+}
+
+// ───────────── empty objects and ranges at or past the end (stage B follow-up F1) ─────────────
+//
+// An empty object, or a range that starts at or after the end, returns an empty success before
+// any range is built.  That shortcut used to run BEFORE the environment-derived chunk size and
+// concurrency were resolved, so a zero setting escaped the validation for exactly those calls.
+// The validation must not depend on the object's size or the offset.
+
+/// One reject case per (entry path, shape of the call, variable).
+fn assert_zero_rejected_for(case: &str, shape: &str) {
+    let threshold: &[(&str, &str)] = if case.starts_with("uri_optimized") {
+        &[("S3DLIO_RANGE_THRESHOLD_MB", "0")]
+    } else {
+        &[]
+    };
+    for variable in ["S3DLIO_CHUNK_SIZE", "S3DLIO_RANGE_CONCURRENCY"] {
+        let mut env: Vec<(&str, &str)> = threshold.to_vec();
+        env.push((variable, "0"));
+        assert_verified(
+            &format!("{variable}=0, {shape}, {case}"),
+            run_case(case, &format!("reject:{variable}"), &env),
+        );
+    }
+}
+
+#[test]
+fn zero_env_settings_are_rejected_for_an_empty_object_on_the_concurrent_range_path() {
+    assert_zero_rejected_for("concurrent_range_empty", "empty object");
+}
+
+#[test]
+fn zero_env_settings_are_rejected_for_an_empty_object_on_the_known_size_path() {
+    assert_zero_rejected_for("uri_optimized_empty", "empty object");
+}
+
+#[test]
+fn zero_env_settings_are_rejected_for_an_offset_at_the_end_on_the_concurrent_range_path() {
+    assert_zero_rejected_for("concurrent_range_at_eof", "offset at the end");
+}
+
+#[test]
+fn zero_env_settings_are_rejected_for_an_offset_past_the_end_on_the_concurrent_range_path() {
+    assert_zero_rejected_for("concurrent_range_past_eof", "offset past the end");
+}
+
+/// Controls: valid settings (and the defaults) still give an empty success for the same calls,
+/// so the validation added above is not a blanket refusal.
+#[test]
+fn valid_settings_still_give_an_empty_success_for_an_empty_object_and_for_offsets_at_and_past_the_end(
+) {
+    let valid = [
+        ("S3DLIO_CHUNK_SIZE", "4"),
+        ("S3DLIO_RANGE_CONCURRENCY", "2"),
+    ];
+    for case in [
+        "concurrent_range_empty",
+        "concurrent_range_at_eof",
+        "concurrent_range_past_eof",
+    ] {
+        assert_verified(
+            &format!("valid settings, {case}"),
+            run_case(case, "ok-empty", &valid),
+        );
+        assert_verified(
+            &format!("default settings, {case}"),
+            run_case(case, "ok-empty", &[]),
+        );
+    }
+    let mut known_size = vec![("S3DLIO_RANGE_THRESHOLD_MB", "0")];
+    known_size.extend(valid);
+    assert_verified(
+        "valid settings, uri_optimized_empty",
+        run_case("uri_optimized_empty", "ok-empty", &known_size),
     );
 }
