@@ -1750,6 +1750,7 @@ mod caller_buffer {
     use google_cloud_storage::model::Object;
     use google_cloud_storage::object_descriptor::ObjectDescriptor;
     use google_cloud_storage::read_object::ReadObjectResponse;
+    use google_cloud_storage::read_resume_policy::NeverResume;
 
     /// What an opened read says about the object it is reading.
     pub(super) struct ObjectFacts {
@@ -1789,6 +1790,14 @@ mod caller_buffer {
         async fn describe(&self, generation: Option<i64>) -> Result<Object, GaxError>;
     }
 
+    /// Most repairs one caller-buffer read may use in TOTAL, whatever progress they make.  It is
+    /// four times the no-progress limit (`GCS_FULL_READ_REPAIR_MAX_ATTEMPTS`), so a read that
+    /// keeps advancing may survive several interruptions, yet the work (reconnections, backoff,
+    /// the time the caller's allocation stays in use) is finite and independent of the object
+    /// size.  Without it, one byte followed by a failure could cost one reconnection per object
+    /// byte.  With the backoff capped at 2 s the worst case adds about 25 s of waiting.
+    const GCS_FULL_READ_TOTAL_REPAIR_MAX_ATTEMPTS: usize = 4 * GCS_FULL_READ_REPAIR_MAX_ATTEMPTS;
+
     /// Retry and repair limits, and the one behavioural switch (`rapid`).
     pub(super) struct ReceiveConfig {
         /// A Rapid bucket: a zero-length destination reads the descriptor, and an
@@ -1802,9 +1811,15 @@ mod caller_buffer {
         pub max_open_attempts: usize,
         /// Consecutive repairs allowed after some bytes were written (pinned reads only) without
         /// the cursor advancing past the previous repair point.  A repair that advances the
-        /// cursor starts the count again, so a large read with many advancing repairs is not
-        /// failed by this bound; a read that keeps failing without progress is.
+        /// cursor starts THIS count again; it does not extend `max_total_repairs`.
         pub max_repairs: usize,
+        /// Repairs allowed in TOTAL for the whole logical read (pinned reads only).  Progress
+        /// never refills it, and the backoff delay is taken from it, so it never restarts either.
+        /// Together with the no-progress bound above it makes the repair work finite for any
+        /// object size.  The real HTTP and Rapid openers disable the SDK's own read-resume layer
+        /// (`NeverResume`), so every reconnection is a repair counted here: one read sends at
+        /// most `max_open_attempts + max_total_repairs` data requests.
+        pub max_total_repairs: usize,
     }
 
     impl ReceiveConfig {
@@ -1815,6 +1830,7 @@ mod caller_buffer {
                 retry_delay: gcs_retry_backoff_delay,
                 max_open_attempts: GCS_FULL_READ_RETRY_MAX_ATTEMPTS,
                 max_repairs: GCS_FULL_READ_REPAIR_MAX_ATTEMPTS,
+                max_total_repairs: GCS_FULL_READ_TOTAL_REPAIR_MAX_ATTEMPTS,
             }
         }
     }
@@ -1897,8 +1913,10 @@ mod caller_buffer {
     #[derive(Default)]
     struct Budget {
         failures_before_data: usize,
-        /// Repairs used since the cursor last advanced past the previous repair point.
+        /// Repairs used in total for this read.  Progress never refills it.
         repairs: usize,
+        /// Repairs used since the cursor last advanced past the previous repair point.
+        stalled: usize,
         /// Where the cursor stood at the most recent repair.
         last_repair_at: Option<usize>,
     }
@@ -1937,21 +1955,28 @@ mod caller_buffer {
 
         /// Use one repair at `cursor`, returning its delay, or `None` when none are left.
         ///
-        /// The bound is on repairs that make no progress: when `cursor` is past where the
-        /// previous repair began, the repair did advance the read and the count starts again.
-        /// A read that advances is therefore never failed by the count, however many
-        /// repairs its size needs; one that stalls at the same place is.
+        /// Two bounds apply and either one ends the repairs:
+        ///
+        /// * a TOTAL (`max_total_repairs`) for the whole logical read, which progress never
+        ///   refills.  A read that advances one byte per request is therefore failed after a
+        ///   fixed number of repairs, not one reconnection per object byte, and the caller's
+        ///   allocation is not held for a time that grows with the object size;
+        /// * a NO-PROGRESS limit (`max_repairs`): when `cursor` is past where the previous repair
+        ///   began, the repair did advance the read and only this count starts again.
+        ///
+        /// The backoff delay is taken from the total count, so progress does not reset it.
         fn take_repair(&mut self, cfg: &ReceiveConfig, cursor: usize) -> Option<Duration> {
             if self
                 .last_repair_at
                 .is_some_and(|previous| cursor > previous)
             {
-                self.repairs = 0;
+                self.stalled = 0;
             }
-            if self.repairs >= cfg.max_repairs {
+            if self.repairs >= cfg.max_total_repairs || self.stalled >= cfg.max_repairs {
                 return None;
             }
             self.repairs = self.repairs.saturating_add(1);
+            self.stalled = self.stalled.saturating_add(1);
             self.last_repair_at = Some(cursor);
             Some((cfg.retry_delay)(self.repairs))
         }
@@ -1975,6 +2000,11 @@ mod caller_buffer {
     ///   count must equal it exactly.  A chunk that would pass the end of `dst` is refused
     ///   whole; nothing is ever written beyond `dst`.
     /// * Retries use only [`gcs_typed_retry_verdict`].
+    /// * Repair work is finite whatever the object size: at most `cfg.max_total_repairs` repairs in
+    ///   all (progress never refills them), and at most `cfg.max_repairs` in a row without the
+    ///   cursor advancing.  The openers disable the SDK's own read-resume layer, so these bounds
+    ///   are the only reconnections.  On exhaustion the typed failure is returned and `progress`
+    ///   keeps what was received.
     pub(super) async fn receive_into<O: ReadOpener + ?Sized>(
         opener: &O,
         what: &str,
@@ -2243,7 +2273,17 @@ mod caller_buffer {
         /// object, as it does for the first request.  The generation is `x-goog-generation`.
         async fn open(&self, request: &OpenRequest) -> Result<Opened, GaxError> {
             let object = http_media_object_name(self.object);
-            let mut builder = self.storage.read_object(self.bucket_name, object.as_ref());
+            // The SDK's own read-resume layer is switched off on this path.  Its default
+            // (`Recommended`, fork `storage/common_options.rs:34`) has no attempt limit
+            // (`read_resume_policy.rs:134-140` ignores the resume count), so it could reconnect
+            // once per byte of a slowly advancing body, outside every bound of the receive loop.
+            // With `NeverResume` a broken body surfaces here as its typed error and the bounded
+            // repair loop in `receive_into` owns every reconnection, each pinned to the
+            // generation.  The initial request keeps the client's own retry policy.
+            let mut builder = self
+                .storage
+                .read_object(self.bucket_name, object.as_ref())
+                .with_read_resume_policy(NeverResume);
             if let Some(generation) = request.generation {
                 builder = builder.set_generation(generation);
             }
@@ -2314,7 +2354,11 @@ mod caller_buffer {
             let mut builder = self
                 .storage
                 .open_object(self.bucket_name, self.object)
-                .with_attempt_timeout(self.attempt_timeout);
+                .with_attempt_timeout(self.attempt_timeout)
+                // No SDK-level reconnection of a broken read (fork `bidi/connector.rs`
+                // `reconnect`, which consults this policy, `Recommended` by default and without
+                // an attempt limit): the bounded repair loop in `receive_into` owns it.
+                .with_read_resume_policy(NeverResume);
             if let Some(generation) = request.generation {
                 builder = builder.set_generation(generation);
             }
@@ -2386,8 +2430,10 @@ mod caller_buffer {
         }
 
         /// Typed HEAD (plan §4.3, §4.5 A8): size, ETag if any, and the generation as
-        /// `version_id`.  `Ok(None)` only for a typed NotFound; GCS gives the same status for a
-        /// missing bucket, so the two are not told apart.  Every other failure is an error.
+        /// `version_id`.  `Ok(None)` only for a typed NotFound.  GCS answers a missing bucket and a
+        /// missing object with the same NotFound, so `None` can mean either: the two are not told
+        /// apart, and no extra probe is made to manufacture the distinction.  403 and every other
+        /// failure are errors.
         pub async fn head_typed(&self, bucket: &str, object: &str) -> Result<Option<HeadMetadata>> {
             Ok(self
                 .stat_object_with_generation(bucket, object)

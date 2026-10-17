@@ -13,9 +13,11 @@
 // `x-goog-generation`, `x-goog-stored-content-length` carrying the FULL object size on ranged
 // responses too, `content-range` on 206).  Local only: loopback, anonymous credentials.
 //
-// The client is built with `NeverResume`, so the SDK's own read-resume layer does not hide a
-// failed body from the receive loop: what these tests observe is the opener's and the loop's own
-// requests.
+// The client is the PRODUCTION one: it keeps the pinned SDK's default read-resume policy
+// (`Recommended`, which has no attempt limit).  The opener itself disables the SDK's resume
+// layer for the requests it makes (`NeverResume`, plan C-F3), so a failed body reaches the
+// receive loop and what these tests observe is the opener's and the loop's own requests.  A test
+// that removes that per-request policy sees the SDK add requests and fails.
 //
 // The Rapid opener has no counterpart here.  It speaks BidiReadObject over gRPC and the pinned
 // fork has no local bidi server to point it at, so its `set_generation`, range mapping and
@@ -28,7 +30,6 @@ use super::*;
 use crate::object_error::{object_error, ObjectErrorKind};
 use crate::receive_progress::ReceiveProgress;
 use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
-use google_cloud_storage::read_resume_policy::NeverResume;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Mutex;
@@ -88,6 +89,20 @@ impl Reply {
             .header("x-goog-generation", generation)
             .header("x-goog-stored-content-length", TOTAL)
             .header("content-range", format!("bytes {start}-{end}/{TOTAL}"))
+    }
+
+    /// A ranged 206 for the whole remainder `start..TOTAL` (the `content-range` and the
+    /// `content-length` both say so) whose body carries only `bytes`, then closes: the body
+    /// breaks mid-stream, which the SDK sees as an I/O failure of a read that is still owed bytes.
+    fn broken_ranged(generation: i64, start: usize, bytes: &[u8]) -> Self {
+        Reply::new(206, bytes)
+            .header("x-goog-generation", generation)
+            .header("x-goog-stored-content-length", TOTAL)
+            .header(
+                "content-range",
+                format!("bytes {start}-{}/{TOTAL}", TOTAL - 1),
+            )
+            .announcing(TOTAL - start)
     }
 
     /// Announce `announced` bytes but send only the body, then close (or hold open).
@@ -174,7 +189,6 @@ impl Server {
         Storage::builder()
             .with_endpoint(format!("http://{}", self.addr))
             .with_credentials(Anonymous::new().build())
-            .with_read_resume_policy(NeverResume)
             .build()
             .await
             .expect("client")
@@ -261,6 +275,7 @@ fn config() -> ReceiveConfig {
         retry_delay: |_| Duration::ZERO,
         max_open_attempts: 3,
         max_repairs: 4,
+        max_total_repairs: 16,
     }
 }
 
@@ -508,6 +523,106 @@ async fn a_404_on_a_pinned_repair_is_a_version_change() {
 }
 
 // ---------------------------------------------------------------------------
+// The repair budget over the real opener and the production resume policy (plan C-F3)
+// ---------------------------------------------------------------------------
+
+/// The scripted replies of a body that breaks after ONE byte on every request: the first is an
+/// unranged 200, each later one a 206 of the whole remainder that carries a single byte.
+fn one_byte_per_request(data: &[u8], replies: usize) -> Vec<Reply> {
+    (0..replies)
+        .map(|k| {
+            if k == 0 {
+                Reply::whole(GEN, &data[..1]).announcing(TOTAL)
+            } else {
+                Reply::broken_ranged(GEN, k, &data[k..=k])
+            }
+        })
+        .collect()
+}
+
+/// Positive control: the pinned SDK, left on its default policy, DOES resume a broken body by
+/// itself, on its own and without any limit.  This is why the opener must set a policy: without
+/// one, the requests below would be invisible to the receive loop's budget.
+#[tokio::test]
+async fn the_sdk_default_policy_resumes_a_broken_body_by_itself() {
+    let data = object_bytes();
+    let server = Server::start([
+        Reply::whole(GEN, &data[..4]).announcing(TOTAL),
+        Reply::ranged(GEN, 4, &data[4..]),
+    ])
+    .await;
+    let storage = server.client().await;
+    let mut response = storage
+        .read_object(BUCKET, OBJECT)
+        .send()
+        .await
+        .expect("open");
+    let mut got = Vec::new();
+    while let Some(chunk) = response.next().await {
+        got.extend_from_slice(&chunk.expect("the SDK resumed"));
+    }
+    assert_eq!(got, data);
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "the SDK reconnected without the receive loop"
+    );
+}
+
+/// One byte, then a broken body, on every request: with the PRODUCTION resume policy of the real
+/// opener the read stops after exactly the budgeted number of requests.  Total budget 3 means
+/// the first request plus 3 repairs = 4 requests at the server, whatever the SDK would have
+/// done; the SDK layer adds none.  Every repair names the pinned generation and asks for the
+/// exact suffix; the four bytes received stay in the buffer and are counted; the failure is the
+/// typed Transport error; the read has returned.
+#[tokio::test]
+async fn one_byte_then_failure_makes_exactly_the_budgeted_requests() {
+    let data = object_bytes();
+    let server = Server::start(one_byte_per_request(&data, 12)).await;
+    let storage = server.client().await;
+    let mut cfg = config();
+    cfg.max_total_repairs = 3;
+    let mut dst = vec![0u8; TOTAL];
+    let progress = ReceiveProgress::new();
+    let err = receive_into(
+        &opener(&storage),
+        "gs://bucket/dir/object",
+        &mut dst,
+        &progress,
+        &cfg,
+    )
+    .await
+    .expect_err("the budget is exhausted");
+    assert_eq!(
+        object_error(&err).expect("typed").kind,
+        ObjectErrorKind::Transport
+    );
+
+    let seen = server.requests();
+    assert_eq!(
+        seen.len(),
+        4,
+        "1 request + 3 budgeted repairs; an SDK-level resume would add more: {seen:?}"
+    );
+    assert_eq!(server.unused_replies(), 8, "no further request was made");
+    assert_eq!(seen[0].query("generation"), None);
+    assert_eq!(seen[0].header("range"), None);
+    for (index, request) in seen.iter().enumerate().skip(1) {
+        assert_eq!(request.query("generation").as_deref(), Some("77"));
+        assert_eq!(
+            request.header("range"),
+            Some(format!("bytes={index}-15").as_str())
+        );
+    }
+    assert_eq!(progress.filled(), 4);
+    assert_eq!(&dst[..4], &data[..4]);
+    assert!(
+        dst[4..].iter().all(|b| *b == 0),
+        "nothing beyond the cursor"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Literal object names: the URL path segment the opener builds
 // ---------------------------------------------------------------------------
 
@@ -638,4 +753,26 @@ fn the_rapid_route_receives_the_literal_name_unchanged() {
         .find("impl ReadOpener for HttpOpener")
         .expect("HTTP opener impl");
     assert!(calls[1].0 > http_at && calls[1].0 < rapid_at);
+}
+
+/// The Rapid opener has no local server (see the header), so this reads the source: its `open`
+/// disables the SDK's bidi reconnection (`NeverResume`, whose absence would leave the default
+/// unlimited `Recommended` policy in charge, plan C-F3), as the HTTP opener's `open` does.
+#[test]
+fn both_openers_disable_the_sdk_resume_layer_on_the_receive_path() {
+    let src = include_str!("google_gcs_client.rs");
+    for (opener, call) in [
+        ("impl ReadOpener for HttpOpener", "read_object("),
+        ("impl ReadOpener for RapidOpener", "open_object("),
+    ] {
+        let at = src.find(opener).expect("opener impl");
+        let open = &src[at..];
+        let open = &open[open.find("async fn open(").expect("open")..];
+        let open = &open[..open.find("async fn describe(").expect("end of open")];
+        assert!(open.contains(call), "{opener}");
+        assert!(
+            open.contains(".with_read_resume_policy(NeverResume)"),
+            "{opener} must set an explicit resume policy"
+        );
+    }
 }

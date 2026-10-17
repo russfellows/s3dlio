@@ -268,6 +268,7 @@ fn config(rapid: bool) -> ReceiveConfig {
         retry_delay: |_| Duration::ZERO,
         max_open_attempts: 3,
         max_repairs: 4,
+        max_total_repairs: 16,
     }
 }
 
@@ -516,11 +517,12 @@ async fn repairs_without_progress_are_bounded() {
     out.assert_canary_intact();
 }
 
-/// A repair that advances the cursor starts the count again: a large read that needs far more
-/// repairs than `max_repairs` (4 here) still completes, every repair resuming at the cursor
-/// under the pinned generation, and each position counted once.
+/// Advancing repairs restart only the no-progress count and are still counted in the TOTAL: a
+/// read that needs more repairs than `max_repairs` (4 here) but fewer than `max_total_repairs`
+/// (16 here) completes, every repair resuming at the cursor under the pinned generation, and
+/// each position counted once.
 #[tokio::test]
-async fn advancing_repairs_do_not_exhaust_the_budget() {
+async fn advancing_repairs_within_the_total_budget_complete() {
     let data = pattern(100, 3);
     // Ten bytes per request: the first read and nine repairs.
     let fake = Fake::new(data.clone(), 5).script((0..9).map(|_| Step::BreakAfter(10, Fail::Io)));
@@ -556,6 +558,107 @@ async fn the_count_restarts_after_progress_and_then_bounds_the_next_stall() {
     assert_eq!(fake.requests().len(), 9);
     assert_eq!(out.progress.filled(), 20);
     out.assert_canary_intact();
+}
+
+/// The repair TOTAL does not reset with progress (plan C-F3).  A body that delivers one byte
+/// and then fails, request after request, advances the cursor on every repair, so the
+/// no-progress count never fills; only the total ends it.  With a total of 6 the read sends
+/// exactly 1 + 6 requests whatever the object size, every repair is pinned and resumes at the
+/// cursor, the progress made is kept, the typed failure is returned, the backoff index keeps
+/// growing (it is never reset by progress), and nothing is retained after the return.
+#[tokio::test]
+async fn one_byte_then_failure_stops_at_the_total_repair_budget() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Only this test installs this delay function.
+    static DELAY_INDEXES: AtomicUsize = AtomicUsize::new(0);
+    static HIGHEST_DELAY_INDEX: AtomicUsize = AtomicUsize::new(0);
+    let mut cfg = config(false);
+    cfg.max_total_repairs = 6;
+    cfg.retry_delay = |attempt| {
+        DELAY_INDEXES.fetch_add(1, Ordering::SeqCst);
+        HIGHEST_DELAY_INDEX.fetch_max(attempt, Ordering::SeqCst);
+        Duration::ZERO
+    };
+    let data = pattern(1000, 5);
+    // Far more one-byte failures than the budget: the object would need one repair per byte.
+    let fake = Fake::new(data.clone(), 5).script((0..2000).map(|_| Step::BreakAfter(1, Fail::Io)));
+    let out = run(&fake, 1000, &cfg).await;
+    assert_eq!(out.kind(), ObjectErrorKind::Transport);
+    let requests = fake.requests();
+    assert_eq!(
+        requests.len(),
+        7,
+        "the first read plus exactly the 6 budgeted repairs"
+    );
+    assert_eq!(requests[0], (0, None, None));
+    for (index, (start, limit, generation)) in requests.iter().enumerate().skip(1) {
+        let at = u64::try_from(index).expect("offset");
+        assert_eq!(*start, at, "each repair resumes at the cursor");
+        assert_eq!(*limit, Some(1000 - at));
+        assert_eq!(*generation, Some(GEN), "each repair is pinned");
+    }
+    assert_eq!(
+        out.progress.filled(),
+        7,
+        "one byte per request, all retained"
+    );
+    assert_eq!(&out.dst()[..7], &data[..7]);
+    assert!(out.dst()[7..].iter().all(|b| *b == FILL));
+    out.assert_canary_intact();
+    let err = out.result.as_ref().expect_err("failed");
+    assert!(
+        err.downcast_ref::<Gax>().is_some(),
+        "the typed source stays recoverable"
+    );
+    assert_eq!(
+        DELAY_INDEXES.load(Ordering::SeqCst),
+        6,
+        "one backoff per repair"
+    );
+    assert_eq!(
+        HIGHEST_DELAY_INDEX.load(Ordering::SeqCst),
+        6,
+        "the backoff index follows the total and is not reset by progress"
+    );
+    // Released: the read has returned and its streams are gone; only the fake holds its state.
+    assert_eq!(Arc::strong_count(&fake.0), 1);
+}
+
+/// The same total ends repairs of clean-but-short bodies: one byte, a clean end, repeat.
+#[tokio::test]
+async fn one_byte_short_ends_stop_at_the_total_repair_budget() {
+    let mut cfg = config(false);
+    cfg.max_total_repairs = 5;
+    let fake = Fake::new(pattern(1000, 6), 5).script((0..2000).map(|_| Step::EndShort(1)));
+    let out = run(&fake, 1000, &cfg).await;
+    assert_eq!(
+        out.kind(),
+        ObjectErrorKind::LengthMismatch {
+            expected: 1000,
+            actual: Some(6)
+        }
+    );
+    let requests = fake.requests();
+    assert_eq!(
+        requests.len(),
+        6,
+        "the first read plus exactly the 5 budgeted repairs"
+    );
+    assert!(requests.iter().skip(1).all(|r| r.2 == Some(GEN)));
+    assert_eq!(out.progress.filled(), 6);
+    out.assert_canary_intact();
+    assert_eq!(Arc::strong_count(&fake.0), 1);
+}
+
+/// The production total is finite and independent of the object size: the default config's
+/// total is a small fixed multiple of the no-progress limit.
+#[test]
+fn the_default_total_budget_is_finite_and_not_derived_from_the_size() {
+    let small = read_config(false, 1).expect("config");
+    let large = read_config(false, 1 << 30).expect("config");
+    assert_eq!(small.max_total_repairs, large.max_total_repairs);
+    assert_eq!(small.max_total_repairs, 4 * small.max_repairs);
+    assert!(small.max_total_repairs >= small.max_repairs);
 }
 
 /// Opens that keep failing are bounded too.
