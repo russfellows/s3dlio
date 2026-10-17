@@ -29,7 +29,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common::oplog_rows::{ops, read_rows};
 use futures::stream::{self, Stream};
-use s3dlio::object_store::{CompressionConfig, ObjectProperties, ObjectWriter, WriterOptions};
+use s3dlio::object_store::{
+    CompressionConfig, HeadMetadata, ObjectProperties, ObjectWriter, ReceiveProgress, WriterOptions,
+};
 use s3dlio::{
     finalize_op_logger, global_logger, init_op_logger, LoggedObjectStore, ObjectMetadata,
     ObjectStore,
@@ -99,6 +101,10 @@ const METHODS: &[Expectation] = &[
         &["GET_RANGE"],
         &["get_range_optimized"],
     ),
+    // The caller-buffer GET and the typed HEAD: forwarded explicitly and recorded, one row
+    // each (a trait default on the wrapper would make a logged store look unsupported).
+    ("get_into", &["GET"], &["get_into"]),
+    ("head", &["HEAD"], &["head"]),
     // A NATIVE copy / rename: no op name describes it, forwarded, not recorded.
     ("copy", &[], &["copy"]),
     ("rename", &[], &["rename"]),
@@ -270,6 +276,23 @@ impl ObjectStore for CountingStore {
         self.note("load_checkpoint_with_validation");
         Ok(b"abc".to_vec())
     }
+    async fn get_into(
+        &self,
+        _uri: &str,
+        _dst: &mut [u8],
+        _progress: &ReceiveProgress,
+    ) -> Result<()> {
+        self.note("get_into");
+        Ok(())
+    }
+    async fn head(&self, _uri: &str) -> Result<Option<HeadMetadata>> {
+        self.note("head");
+        Ok(Some(HeadMetadata {
+            size: 3,
+            etag: None,
+            version_id: None,
+        }))
+    }
     async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
         self.note("copy");
         Ok(())
@@ -394,6 +417,22 @@ async fn call(store: &dyn ObjectStore, method: &str) {
                 .get_range_optimized(uri, 0, Some(2), None, None)
                 .await
                 .unwrap(),
+        ),
+        "get_into" => {
+            let mut dst = [0u8; 3];
+            store
+                .get_into(uri, &mut dst, &ReceiveProgress::new())
+                .await
+                .unwrap();
+        }
+        "head" => assert_eq!(
+            store.head(uri).await.unwrap(),
+            Some(HeadMetadata {
+                size: 3,
+                etag: None,
+                version_id: None
+            }),
+            "answered by the inner store"
         ),
         "copy" => store.copy(uri, "file:///data/copy").await.unwrap(),
         "rename" => store.rename(uri, "file:///data/renamed").await.unwrap(),

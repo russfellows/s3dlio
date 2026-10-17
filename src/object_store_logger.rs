@@ -17,7 +17,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::object_store::{ObjectMetadata, ObjectStore, ObjectWriter, WriterOptions};
+use crate::object_store::{
+    HeadMetadata, ObjectMetadata, ObjectStore, ObjectWriter, ReceiveProgress, WriterOptions,
+};
 use crate::s3_logger::{LogEntry, Logger};
 
 /// Extract the scheme and container/bucket from a URI for endpoint logging.
@@ -255,6 +257,118 @@ pub(crate) fn record_call(
     logger.log(entry);
 }
 
+/// One call row that is written exactly once, whichever way the call ends.
+///
+/// Created when a call starts and consumed by [`CallRow::finish_get`] or
+/// [`CallRow::finish_head`] when it returns. If it is dropped first, the call never
+/// completed: the future was dropped (cancellation) or the inner future panicked and the
+/// stack unwound. Its `Drop` then writes the row as `error = "cancelled"`, so every
+/// call that started is one row, never zero and never two. The row goes through
+/// [`record_call`], the same builder as every other row; no column is added.
+///
+/// `recorded` is set before the row is built, so a failure while writing it can never lead to
+/// a second row.
+struct CallRow<'a> {
+    logger: &'a Logger,
+    operation: &'static str,
+    uri: &'a str,
+    start: SystemTime,
+    /// The receive progress of a GET; `None` for a HEAD, which has no payload.
+    progress: Option<&'a ReceiveProgress>,
+    recorded: bool,
+}
+
+impl<'a> CallRow<'a> {
+    /// The row of a caller-buffer GET on `uri`: its byte count is `progress.filled()`.
+    fn get(logger: &'a Logger, uri: &'a str, progress: &'a ReceiveProgress) -> Self {
+        Self {
+            logger,
+            operation: "GET",
+            uri,
+            start: SystemTime::now(),
+            progress: Some(progress),
+            recorded: false,
+        }
+    }
+
+    /// The row of a typed HEAD on `uri`: metadata only, so no first byte on any outcome.
+    fn head(logger: &'a Logger, uri: &'a str) -> Self {
+        Self {
+            logger,
+            operation: "HEAD",
+            uri,
+            start: SystemTime::now(),
+            progress: None,
+            recorded: false,
+        }
+    }
+
+    fn record(
+        &mut self,
+        bytes: u64,
+        first_byte: Option<SystemTime>,
+        end: SystemTime,
+        error: Option<String>,
+    ) {
+        self.recorded = true;
+        record_call(
+            self.logger,
+            self.operation,
+            self.uri,
+            bytes,
+            1,
+            self.start,
+            first_byte,
+            end,
+            error,
+        );
+    }
+
+    /// Record the outcome of a GET that returned: `bytes` is what the receive filled, which
+    /// can be non-zero with an error. The first byte is the receive's own, or the end time
+    /// when none was recorded (as for every other GET row).
+    fn finish_get<T>(mut self, result: &Result<T>) {
+        let end = SystemTime::now();
+        let (bytes, first_byte) = self
+            .progress
+            .map_or((0, None), |p| (p.filled(), p.first_byte()));
+        let error = result.as_ref().err().map(|e| e.to_string());
+        self.record(bytes, Some(first_byte.unwrap_or(end)), end, error);
+    }
+
+    /// Record the outcome of a HEAD that returned: success is the size, absence is a
+    /// successful row with 0 bytes, an error is an error row with 0 bytes.
+    fn finish_head(mut self, result: &Result<Option<HeadMetadata>>) {
+        let end = SystemTime::now();
+        let bytes = result
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or(0, |m| m.size);
+        let error = result.as_ref().err().map(|e| e.to_string());
+        self.record(bytes, None, end, error);
+    }
+}
+
+impl Drop for CallRow<'_> {
+    fn drop(&mut self) {
+        if self.recorded {
+            return;
+        }
+        // The call did not complete. A GET keeps what was filled and its first byte when one
+        // arrived; a HEAD has neither.
+        let (bytes, first_byte) = self
+            .progress
+            .map_or((0, None), |p| (p.filled(), p.first_byte()));
+        self.record(
+            bytes,
+            first_byte,
+            SystemTime::now(),
+            Some("cancelled".to_string()),
+        );
+    }
+}
+
 #[async_trait]
 impl ObjectStore for LoggedObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
@@ -402,6 +516,23 @@ impl ObjectStore for LoggedObjectStore {
         // STAT/HEAD is metadata-only, first_byte not applicable
         self.log_operation("HEAD", uri, bytes, 1, start, None, end, error);
 
+        result
+    }
+
+    // The caller-buffer GET and the typed HEAD are forwarded explicitly, so the trait
+    // default can never make a logged store look unsupported or skip the log. Each call
+    // is exactly one row (see `CallRow`), whether it returns, fails or is dropped.
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        let row = CallRow::get(&self.logger, uri, progress);
+        let result = self.inner.get_into(uri, dst, progress).await;
+        row.finish_get(&result);
+        result
+    }
+
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        let row = CallRow::head(&self.logger, uri);
+        let result = self.inner.head(uri).await;
+        row.finish_head(&result);
         result
     }
 

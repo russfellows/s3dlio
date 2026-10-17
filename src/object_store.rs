@@ -91,6 +91,24 @@ async fn get_global_gcs_client() -> Result<GcsClient> {
 /// Provider-neutral object metadata. For now this aliases S3's metadata.
 pub type ObjectMetadata = S3ObjectStat;
 
+/// Progress of one caller-buffer receive; see [`ObjectStore::get_into`].
+pub use crate::receive_progress::ReceiveProgress;
+
+/// Metadata from a typed HEAD ([`ObjectStore::head`]).
+///
+/// The Rust name differs from the [`ObjectMetadata`] alias, which is the provider-neutral result
+/// of [`ObjectStore::stat`]. Only what a HEAD establishes safely is here: the size, and the
+/// opaque identity (ETag, version) of the object it described.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadMetadata {
+    /// The object size in bytes.
+    pub size: u64,
+    /// The entity tag, exactly as the provider reports it. Opaque: not assumed to be an MD5.
+    pub etag: Option<String>,
+    /// The provider's version identifier (S3 version id, GCS generation), when it reports one.
+    pub version_id: Option<String>,
+}
+
 // -----------------------------------------------------------------------------
 // Performance Configuration Helpers
 // -----------------------------------------------------------------------------
@@ -347,6 +365,30 @@ pub fn infer_scheme(uri: &str) -> Scheme {
     }
 }
 
+/// The provider name the URI's scheme implies, as [`crate::object_error::ObjectError`] and
+/// [`crate::capabilities::Capabilities`] spell it.
+fn provider_for_uri(uri: &str) -> &'static str {
+    match infer_scheme(uri) {
+        Scheme::S3 => "s3",
+        Scheme::Azure => "az",
+        Scheme::Gcs => "gs",
+        Scheme::File => "file",
+        Scheme::Direct => "direct",
+        Scheme::Unknown => "unknown",
+    }
+}
+
+/// The error the default [`ObjectStore::get_into`] and [`ObjectStore::head`] return: kind
+/// [`ObjectErrorKind::Unsupported`], attached over a plain description.
+fn unsupported_operation(uri: &str, operation: &str) -> anyhow::Error {
+    crate::object_error::attach_object_error(
+        anyhow!("this store does not implement {operation}"),
+        crate::object_error::ObjectErrorKind::Unsupported,
+        provider_for_uri(uri),
+        format!("{operation} is not supported by this store"),
+    )
+}
+
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Get entire object into memory.
@@ -461,6 +503,42 @@ pub trait ObjectStore: Send + Sync {
     /// Check existence via `stat()`. Backends can override for efficiency.
     async fn exists(&self, uri: &str) -> Result<bool> {
         Ok(self.stat(uri).await.is_ok())
+    }
+
+    /// Read the whole object into the caller's buffer.
+    ///
+    /// `dst.len()` is the expected length. `Ok(())` means exactly `dst.len()` bytes were
+    /// written and the whole-object size equals it; any other outcome is an error, with
+    /// the typed classification [`crate::object_error::object_error`] reports.
+    /// `progress` reports the distinct destination positions filled, while the read runs
+    /// and after it fails or is cancelled. It says which positions were touched, never
+    /// that their data is valid.
+    ///
+    /// Every write into `dst` happens inside the returned future, so dropping it stops
+    /// every writer.
+    ///
+    /// The default returns an error of kind
+    /// [`ObjectErrorKind::Unsupported`](crate::object_error::ObjectErrorKind::Unsupported).
+    /// It never falls back to a temporary download plus a copy. A store that supports the
+    /// operation overrides it, and so must any wrapper that should forward it.
+    async fn get_into(
+        &self,
+        uri: &str,
+        _dst: &mut [u8],
+        _progress: &ReceiveProgress,
+    ) -> Result<()> {
+        Err(unsupported_operation(uri, "get_into"))
+    }
+
+    /// Typed HEAD: the size and identity of an object, or `None` when it does not exist.
+    ///
+    /// Absence is `Ok(None)`. Every other failure, including a missing bucket or container,
+    /// a refusal and a transport failure, is an error.
+    ///
+    /// The default returns an error of kind
+    /// [`ObjectErrorKind::Unsupported`](crate::object_error::ObjectErrorKind::Unsupported).
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        Err(unsupported_operation(uri, "head"))
     }
 
     /// Get object with integrity validation.
