@@ -336,7 +336,7 @@ async fn a_blob_replaced_between_attempts_is_a_version_change() {
         AfterFault::Replace(pattern(len, 8), "\"etag-B\"".to_string()),
     );
     let before = mark(&state);
-    let (_buf, progress, result) = read(&client, "swap", len).await;
+    let (_, progress, result) = read(&client, "swap", len).await;
     let err = result.expect_err("the blob changed under the read");
     assert_eq!(kind(&err), ObjectErrorKind::VersionChanged);
     assert_eq!(progress.filled(), 10_000, "partial progress is kept");
@@ -353,7 +353,7 @@ async fn a_pinned_404_is_a_version_change_not_absence() {
     let len = 32 * 1024;
     set_blob(&state, "gone", pattern(len, 7));
     push_get_fault(&state, 5_000, AfterFault::Delete);
-    let (_buf, progress, result) = read(&client, "gone", len).await;
+    let (_, progress, result) = read(&client, "gone", len).await;
     let err = result.expect_err("deleted after the first response");
     assert_eq!(kind(&err), ObjectErrorKind::VersionChanged);
     assert!(!s3dlio::delete_contract::is_not_found(&err));
@@ -370,7 +370,7 @@ async fn without_a_usable_etag_a_partial_receive_fails_instead_of_retrying() {
     state.lock().unwrap().omit_etag = true;
     push_get_fault(&state, 5_000, AfterFault::Nothing);
     let before = mark(&state);
-    let (_buf, progress, result) = read(&client, "noetag", len).await;
+    let (_, progress, result) = read(&client, "noetag", len).await;
     let err = result.expect_err("cut body, no ETag");
     assert_eq!(kind(&err), ObjectErrorKind::Transport);
     assert_eq!(progress.filled(), 5_000, "progress survives the failure");
@@ -383,7 +383,7 @@ async fn without_a_usable_etag_a_partial_receive_fails_instead_of_retrying() {
     set_etag(&state, "weak", "W/\"weak-1\"");
     push_get_fault(&state, 5_000, AfterFault::Nothing);
     let before = mark(&state);
-    let (_buf, progress, result) = read(&client, "weak", len).await;
+    let (_, progress, result) = read(&client, "weak", len).await;
     assert_eq!(
         kind(&result.expect_err("weak ETag")),
         ObjectErrorKind::Transport
@@ -480,7 +480,7 @@ async fn a_retry_reply_without_an_etag_cannot_confirm_the_pinned_version() {
 async fn blob_not_found_versus_container_not_found() {
     let (_guard, state, client) = setup().await;
     let before = mark(&state);
-    let (_buf, progress, result) = read(&client, "no-such-blob", 10).await;
+    let (_, progress, result) = read(&client, "no-such-blob", 10).await;
     let err = result.expect_err("missing blob");
     assert_eq!(kind(&err), ObjectErrorKind::NotFound);
     assert!(s3dlio::delete_contract::is_not_found(&err));
@@ -497,7 +497,7 @@ async fn blob_not_found_versus_container_not_found() {
         .missing_containers
         .insert("acct/ctr".to_string());
     let before = mark(&state);
-    let (_buf, _progress, result) = read(&client, "anything", 10).await;
+    let (_, _, result) = read(&client, "anything", 10).await;
     let err = result.expect_err("missing container");
     assert_eq!(kind(&err), ObjectErrorKind::Other);
     assert!(!s3dlio::delete_contract::is_not_found(&err));
@@ -520,7 +520,7 @@ async fn forbidden_names_the_credential_mode_and_redacts_the_sas() {
         .forbidden_accounts
         .insert("acct".into());
     let before = mark(&state);
-    let (_buf, _progress, result) = read(&client, "k", 10).await;
+    let (_, _, result) = read(&client, "k", 10).await;
     let err = result.expect_err("403");
     assert_eq!(kind(&err), ObjectErrorKind::Forbidden);
     assert!(
@@ -540,7 +540,7 @@ async fn forbidden_names_the_credential_mode_and_redacts_the_sas() {
         "sv=2024-11-04&sig=SECRETSIGNATURE123",
     );
     let client = AzureBlob::with_default_credential("acct", "ctr").expect("sas client");
-    let (_buf, _progress, result) = read(&client, "k", 10).await;
+    let (_, _, result) = read(&client, "k", 10).await;
     let err = result.expect_err("403 with SAS");
     assert_eq!(kind(&err), ObjectErrorKind::Forbidden);
     for text in [format!("{err:#}"), format!("{err:?}"), err.to_string()] {
@@ -563,7 +563,7 @@ async fn a_body_stream_error_is_a_redacted_transport_error() {
     set_blob(&state, "cutsas", pattern(20_000, 1));
     state.lock().unwrap().omit_etag = true;
     push_get_fault(&state, 100, AfterFault::Nothing);
-    let (_buf, progress, result) = read(&client2, "cutsas", 20_000).await;
+    let (_, progress, result) = read(&client2, "cutsas", 20_000).await;
     let err = result.expect_err("cut");
     assert_eq!(kind(&err), ObjectErrorKind::Transport);
     assert_eq!(progress.filled(), 100);
@@ -664,4 +664,24 @@ async fn head_forbidden_is_a_typed_error_naming_the_mode() {
         format!("{err:#}").contains("Azure credential mode none"),
         "{err:#}"
     );
+}
+
+/// The two futures are `Send`: the trait methods that will call them are `#[async_trait]`, and a
+/// future that holds the destination must be able to move between threads with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_entry_point_futures_are_send() {
+    fn is_send<T: Send>(value: T) -> T {
+        value
+    }
+    let (_guard, state, client) = setup().await;
+    set_blob(&state, "s", pattern(100, 1));
+    let mut dst = vec![0u8; 100];
+    let progress = ReceiveProgress::new();
+    is_send(client.get_into("s", &mut dst, &progress))
+        .await
+        .expect("get_into");
+    assert!(is_send(client.head_typed("s"))
+        .await
+        .expect("head")
+        .is_some());
 }
