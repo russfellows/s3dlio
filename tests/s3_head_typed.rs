@@ -89,6 +89,47 @@ async fn typed_absence_is_none() {
         .is_none());
 }
 
+/// A HEAD 404 has no body, so the service's `NoSuchBucket` code never reaches the client: a
+/// mistyped bucket looks exactly like a missing key and is `Ok(None)`.  The GET of the same
+/// missing bucket carries the XML error code and IS told apart (`Other`, not `NotFound`).
+/// This pins the documented limit; it is not a promise that HEAD can detect a missing bucket.
+#[tokio::test]
+async fn a_head_on_a_missing_bucket_cannot_tell_it_from_a_missing_key() {
+    let (ops, state) = setup().await;
+    let missing_bucket = "gi-no-such-bucket";
+    let key = key("no-bucket");
+    // The wire answer for a missing bucket on HEAD: 404 with an empty body.
+    state.put_object(missing_bucket, &key, MockObject::missing());
+    let outcome = ops
+        .head_typed(missing_bucket, &key)
+        .await
+        .expect("a HEAD 404 is absence, not an error");
+    assert!(outcome.is_none(), "{outcome:?}");
+
+    // The same bucket on GET: the 404 body names the bucket.
+    let get_key = key.clone() + "-get";
+    state.put_object(
+        missing_bucket,
+        &get_key,
+        MockObject::new(pattern(4, 10)).with_fault(
+            None,
+            1,
+            s3_get_into_support::mock::ObjectFault::Status(404, "NoSuchBucket"),
+        ),
+    );
+    let mut dst = [0u8; 4];
+    let err = ops
+        .get_into(
+            missing_bucket,
+            &get_key,
+            &mut dst,
+            &s3dlio::receive_progress::ReceiveProgress::new(),
+        )
+        .await
+        .expect_err("a GET names the missing bucket");
+    assert_eq!(kind_of(&err), ObjectErrorKind::Other);
+}
+
 /// Everything that is not typed absence is an error, with its own kind.
 #[tokio::test]
 async fn refusals_and_server_failures_are_errors_never_none() {
@@ -136,7 +177,7 @@ async fn every_call_takes_its_own_head_and_sees_the_current_object() {
 
 #[tokio::test]
 async fn the_head_goes_to_the_clients_endpoint_and_never_to_the_global_one() {
-    let (_port, global) = init(&[]);
+    let global = init(&[]).1;
     let (other_port, other) = s3_get_into_support::mock::start_isolated_mock_s3_server();
     let ops = ops(client_for(other_port).await);
     let key = key("routing");

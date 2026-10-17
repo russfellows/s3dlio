@@ -345,12 +345,21 @@ fn get_range_opt_enabled() -> bool {
 fn get_range_threshold_bytes() -> u64 {
     *RANGE_THRESHOLD_BYTES.get_or_init(|| {
         crate::dotenv::apply(); // latched for the process: the policy first (#243)
-        let mb = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(32);
-        mb.saturating_mul(1024 * 1024)
+        threshold_from_mb(std::env::var("S3DLIO_RANGE_THRESHOLD_MB").ok().as_deref())
     })
+}
+
+/// The default range-split threshold, in megabytes.
+const DEFAULT_RANGE_THRESHOLD_MB: u64 = 32;
+
+/// The range-split threshold in bytes for a `S3DLIO_RANGE_THRESHOLD_MB` setting: an unset or
+/// unparseable value is the default, and a value too large for 64 bits of bytes saturates at
+/// `u64::MAX` (a threshold nothing reaches) instead of wrapping to a small one.
+fn threshold_from_mb(setting: Option<&str>) -> u64 {
+    setting
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RANGE_THRESHOLD_MB)
+        .saturating_mul(1024 * 1024)
 }
 
 /// Process-global object size cache.
@@ -1359,14 +1368,15 @@ pub(crate) async fn get_object_concurrent_range_with_client(
     // which then tripped the `start_offset >= object_size` guard below
     // and returned an empty Bytes with Ok status for an object that
     // actually has data. Surface the anomaly instead.
-    let object_size = head_resp.content_length().ok_or_else(|| {
-        anyhow::anyhow!(
-            "HEAD for s3://{}/{} succeeded but returned no Content-Length header \
-             — cannot determine object size for a range GET",
-            bucket,
-            key
-        )
-    })? as u64;
+    let object_size =
+        checked_content_length(head_resp.content_length(), bucket, key)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "HEAD for s3://{}/{} succeeded but returned no Content-Length header \
+                 — cannot determine object size for a range GET",
+                bucket,
+                key
+            )
+        })?;
 
     // Calculate actual range.  `saturating_add` and `saturating_sub` keep an offset or a
     // length near `u64::MAX` from overflowing, and a range that starts at or past the end of
@@ -2465,7 +2475,9 @@ pub(crate) async fn get_object_uri_rows(uri: &str, rows: Rows) -> Result<Bytes> 
 // The single GET pins itself: the ETag of its first response is sent as `If-Match` on every
 // retry.  A response with no usable ETag cannot be pinned, so a partially received request
 // then fails instead of being retried (pieces of unknown versions are never combined); it is
-// retried only before any byte was written.
+// retried only before any byte was written.  On a pinned read (every range, every retry) a
+// response with NO ETag fails too: it cannot confirm the version.  A protocol violation (a
+// missing or wrong Content-Range, a bad Content-Length, a long body) is final, never retried.
 
 /// A typed error that did not come from an SDK failure.  The detail goes in the retained
 /// source, the `ObjectError` message stays empty (it never carries a key or a URL).
@@ -2490,6 +2502,23 @@ fn length_mismatch_error(
         ),
     };
     typed_s3_error(ObjectErrorKind::LengthMismatch { expected, actual }, detail)
+}
+
+/// A body longer than the destination, detected while streaming.  The stream is not read to
+/// its end, so `at_least` is a LOWER BOUND on the object's size (`actual` of the
+/// `LengthMismatch` carries it, and the message says so).
+fn length_exceeded_error(bucket: &str, key: &str, expected: u64, at_least: usize) -> anyhow::Error {
+    let at_least = u64::try_from(at_least).unwrap_or(u64::MAX);
+    typed_s3_error(
+        ObjectErrorKind::LengthMismatch {
+            expected,
+            actual: Some(at_least),
+        },
+        format!(
+            "S3 object s3://{bucket}/{key} is longer than the destination: at least {at_least} \
+             bytes against {expected}"
+        ),
+    )
 }
 
 /// The pinned version is no longer the one the service returns.
@@ -2525,14 +2554,46 @@ fn usable_etag(etag: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// A response `Content-Length`, checked: a negative value is a protocol error.
+/// A response `Content-Length` (of a GET or a HEAD), checked: a negative value is a protocol
+/// error (`Other`, not retried).
 fn checked_content_length(raw: Option<i64>, bucket: &str, key: &str) -> Result<Option<u64>> {
     match raw {
         None => Ok(None),
-        Some(v) => u64::try_from(v)
-            .map(Some)
-            .map_err(|_| protocol_error(bucket, key, "negative Content-Length")),
+        Some(v) => u64::try_from(v).map(Some).map_err(|_| {
+            typed_s3_error(
+                ObjectErrorKind::Other,
+                format!("S3 response for s3://{bucket}/{key}: negative Content-Length"),
+            )
+        }),
     }
+}
+
+/// A short range body: the stream ended cleanly before the requested bytes all arrived.  It
+/// is a failure of delivery, not a malformed answer, so it is `Transport` and stays retryable
+/// (the retry is pinned to the same version by `If-Match`).
+fn short_range_body_error(bucket: &str, key: &str) -> anyhow::Error {
+    typed_s3_error(
+        ObjectErrorKind::Transport,
+        format!("S3 GET for s3://{bucket}/{key}: range body shorter than requested"),
+    )
+}
+
+/// Is a failed attempt worth repeating?  The typed verdict ([`RetryClassify`]), except that a
+/// protocol violation is final: a typed `Other` that carries no SDK failure is an answer that
+/// broke the protocol (a missing or wrong `Content-Range`, a bad `Content-Length`, a body
+/// longer than asked, a response that cannot confirm the pinned version).  A server that
+/// answers that way will answer that way again, and each repeat is a full ranged attempt.
+/// An `Other` that does come from the SDK keeps the SDK verdict.
+fn attempt_is_retryable(e: &anyhow::Error) -> bool {
+    let protocol_violation = e.downcast_ref::<crate::retry::SdkFailure>().is_none()
+        && object_error(e).is_some_and(|o| o.kind == ObjectErrorKind::Other);
+    !protocol_violation && RetryClassify::is_retryable(e)
+}
+
+/// A range-setting error (a zero or oversized limit) as a typed `Other`, so the receive path
+/// reports only typed errors.  The message that names the setting stays in the chain.
+fn range_setting_error(e: anyhow::Error) -> anyhow::Error {
+    attach_object_error(e, ObjectErrorKind::Other, "s3", "invalid range setting")
 }
 
 /// Parse `bytes <first>-<last>/<total>`.  An unknown total (`*`) is not accepted.
@@ -2587,8 +2648,10 @@ fn validate_content_range(
     Ok(())
 }
 
-/// A response whose ETag differs from the pinned one is a different version, whatever the
-/// service did with `If-Match`.  An absent ETag cannot be compared and is accepted.
+/// A response to a read pinned to `pinned` must carry that ETag.  A different ETag is another
+/// version (`VersionChanged`), whatever the service did with `If-Match`.  An absent or empty
+/// ETag cannot confirm the version, so it fails closed (`Other`, not retried): a service that
+/// ignores `If-Match` and sends no ETag would otherwise slip another version into the buffer.
 fn check_response_etag(
     response: Option<&str>,
     pinned: &str,
@@ -2596,12 +2659,19 @@ fn check_response_etag(
     key: &str,
 ) -> Result<()> {
     match response {
-        Some(e) if !e.is_empty() && e != pinned => Err(version_changed_error(
+        Some(e) if e == pinned => Ok(()),
+        Some(e) if !e.is_empty() => Err(version_changed_error(
             bucket,
             key,
             "no longer has the ETag the read pinned",
         )),
-        _ => Ok(()),
+        _ => Err(typed_s3_error(
+            ObjectErrorKind::Other,
+            format!(
+                "S3 GET for s3://{bucket}/{key}: the response carries no ETag, so it cannot \
+                 confirm the pinned version"
+            ),
+        )),
     }
 }
 
@@ -2681,8 +2751,15 @@ async fn get_into_single_attempt(
             .checked_add(chunk.len())
             .filter(|end| *end <= dst.len())
         else {
-            // More bytes than the destination holds: nothing is written past its end.
-            return Err(length_mismatch_error(bucket, key, expected, length));
+            // More bytes than the destination holds: nothing is written past its end.  The
+            // true length is unknown (the stream is not read further), so `actual` is the
+            // count received so far including this chunk: a lower bound, saturating.
+            return Err(length_exceeded_error(
+                bucket,
+                key,
+                expected,
+                written.saturating_add(chunk.len()),
+            ));
         };
         let Some(slot) = dst.get_mut(written..end) else {
             return Err(protocol_error(bucket, key, "destination bounds"));
@@ -2733,7 +2810,7 @@ async fn get_into_single(
                         "a partially received response with no usable ETag is not retried",
                     ));
                 }
-                if !RetryClassify::is_retryable(&e) {
+                if !attempt_is_retryable(&e) {
                     return Err(e);
                 }
                 last = Some(e);
@@ -2772,7 +2849,8 @@ pub(crate) struct PinnedRead<'a> {
 /// Split `dst` into parts of `chunk_size` bytes (the last one may be shorter), lazily, so a
 /// small chunk size never builds a vector with one entry per part.
 fn range_parts(dst: &mut [u8], chunk_size: usize) -> Result<impl Iterator<Item = RangePart<'_>>> {
-    let chunk_size = require_effective_chunk_size("chunk_size", chunk_size)?;
+    let chunk_size =
+        require_effective_chunk_size("chunk_size", chunk_size).map_err(range_setting_error)?;
     Ok(dst.chunks_mut(chunk_size).scan(0u64, |offset, buf| {
         let part = RangePart {
             offset: *offset,
@@ -2861,11 +2939,7 @@ pub(crate) async fn attempt_range_part_into(
         written = end;
     }
     if written != part.buf.len() {
-        return Err(protocol_error(
-            bucket,
-            key,
-            "range body shorter than requested",
-        ));
+        return Err(short_range_body_error(bucket, key));
     }
     Ok(())
 }
@@ -2884,7 +2958,7 @@ async fn range_part_with_retries(
         match attempt_range_part_into(read, &mut part, &mut span).await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if !RetryClassify::is_retryable(&e) {
+                if !attempt_is_retryable(&e) {
                     return Err(e);
                 }
                 last = Some(e);
@@ -2916,7 +2990,8 @@ pub(crate) async fn concurrent_range_get_into<'a, I>(
 where
     I: IntoIterator<Item = RangePart<'a>>,
 {
-    let max_concurrency = require_effective_concurrency("max_concurrency", max_concurrency)?;
+    let max_concurrency = require_effective_concurrency("max_concurrency", max_concurrency)
+        .map_err(range_setting_error)?;
     let mut pending = parts.into_iter();
     let mut in_flight = FuturesUnordered::new();
     loop {
@@ -2953,8 +3028,8 @@ async fn get_into_fanout(
 ) -> Result<()> {
     let expected = len_to_u64(dst.len())?;
     // Both limits are validated before any request (#235), exactly as the allocating path.
-    let chunk_size = resolve_range_chunk_size(None, expected)?;
-    let concurrency = resolve_range_concurrency(None, expected)?;
+    let chunk_size = resolve_range_chunk_size(None, expected).map_err(range_setting_error)?;
+    let concurrency = resolve_range_concurrency(None, expected).map_err(range_setting_error)?;
 
     let head = client.head_object().bucket(bucket).key(key).send().await;
     let (size, etag) = match &head {
@@ -3032,8 +3107,10 @@ pub(crate) async fn get_into_global(
         .await
 }
 
-/// Typed HEAD on `client`: `Ok(None)` only for typed absence (`NotFound`); a refusal, a
-/// missing bucket, throttling or a transport failure is an error.  A response with no usable
+/// Typed HEAD on `client`: `Ok(None)` only for typed absence (`NotFound`); a refusal,
+/// throttling or a transport failure is an error.  A HEAD 404 has no body, so a missing
+/// BUCKET (`NoSuchBucket`) cannot be told from a missing key: both are `Ok(None)` (a GET,
+/// whose 404 carries the XML error code, does tell them apart).  A response with no usable
 /// `Content-Length` is an error (a size is never assumed to be 0).  The ETag is opaque.
 pub(crate) async fn head_typed_with_client(
     client: &aws_sdk_s3::Client,
@@ -4225,5 +4302,139 @@ mod range_limit_resolution_tests {
             .await
             .expect_err("an explicit zero concurrency is rejected by name");
         assert!(format!("{err:#}").contains("max_concurrency"), "{err:#}");
+    }
+}
+
+/// Pure helpers of the caller-buffer receive path (plan §4.5 A2, A8).
+#[cfg(test)]
+mod receive_path_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_range_threshold_defaults_parses_and_saturates() {
+        assert_eq!(threshold_from_mb(None), 32 * MIB, "unset is the default");
+        assert_eq!(threshold_from_mb(Some("not-a-number")), 32 * MIB);
+        assert_eq!(
+            threshold_from_mb(Some("-1")),
+            32 * MIB,
+            "negative is unparseable"
+        );
+        assert_eq!(threshold_from_mb(Some("0")), 0, "zero forces the fan-out");
+        assert_eq!(threshold_from_mb(Some("1")), MIB);
+        // The largest value whose byte count fits is exact; one more saturates, never wraps
+        // to a small threshold (which would send every read down the fan-out).
+        let largest = u64::MAX / MIB;
+        assert_eq!(threshold_from_mb(Some(&largest.to_string())), largest * MIB);
+        assert_eq!(
+            threshold_from_mb(Some(&(largest + 1).to_string())),
+            u64::MAX
+        );
+        assert_eq!(threshold_from_mb(Some(&u64::MAX.to_string())), u64::MAX);
+    }
+
+    #[test]
+    fn a_negative_content_length_is_a_typed_non_retried_protocol_error() {
+        assert_eq!(checked_content_length(None, "b", "k").expect("none"), None);
+        assert_eq!(
+            checked_content_length(Some(0), "b", "k").expect("zero"),
+            Some(0)
+        );
+        assert_eq!(
+            checked_content_length(Some(i64::MAX), "b", "k").expect("max"),
+            u64::try_from(i64::MAX).ok()
+        );
+        let err = checked_content_length(Some(-1), "b", "k").expect_err("negative");
+        assert_eq!(
+            object_error(&err).map(|o| o.kind),
+            Some(ObjectErrorKind::Other)
+        );
+        assert!(!attempt_is_retryable(&err), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("negative Content-Length"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn the_response_etag_must_equal_the_pin_and_an_absent_one_fails_closed() {
+        check_response_etag(Some("\"a\""), "\"a\"", "b", "k").expect("equal");
+        let other = check_response_etag(Some("\"b\""), "\"a\"", "b", "k").expect_err("differs");
+        assert_eq!(
+            object_error(&other).map(|o| o.kind),
+            Some(ObjectErrorKind::VersionChanged)
+        );
+        for (what, response) in [("absent", None), ("empty", Some(""))] {
+            let err = check_response_etag(response, "\"a\"", "b", "k").expect_err(what);
+            assert_eq!(
+                object_error(&err).map(|o| o.kind),
+                Some(ObjectErrorKind::Other),
+                "{what}"
+            );
+            assert!(
+                format!("{err:#}").contains("cannot confirm"),
+                "{what}: {err:#}"
+            );
+            assert!(!attempt_is_retryable(&err), "{what}: not retried");
+        }
+    }
+
+    /// Protocol violations are final; delivery failures and SDK verdicts are not touched.
+    #[test]
+    fn only_protocol_violations_are_final_for_the_attempt_loops() {
+        assert!(!attempt_is_retryable(&protocol_error("b", "k", "bad")));
+        assert!(!attempt_is_retryable(&typed_s3_error(
+            ObjectErrorKind::Other,
+            "x".to_string()
+        )));
+        assert!(
+            attempt_is_retryable(&short_range_body_error("b", "k")),
+            "a short body is a delivery failure"
+        );
+        assert!(attempt_is_retryable(&typed_s3_error(
+            ObjectErrorKind::Transport,
+            "x".to_string()
+        )));
+        // The existing verdicts for the definite kinds are unchanged.
+        assert!(!attempt_is_retryable(&version_changed_error("b", "k", "x")));
+        assert!(!attempt_is_retryable(&length_mismatch_error(
+            "b",
+            "k",
+            1,
+            Some(2)
+        )));
+    }
+
+    #[test]
+    fn a_body_past_the_end_reports_a_lower_bound_not_a_wrong_size() {
+        let err = length_exceeded_error("b", "k", 16, 20);
+        assert_eq!(
+            object_error(&err).map(|o| o.kind),
+            Some(ObjectErrorKind::LengthMismatch {
+                expected: 16,
+                actual: Some(20)
+            })
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains("at least 20"), "{text}");
+        assert!(text.contains("16"), "{text}");
+    }
+
+    #[test]
+    fn range_setting_errors_are_typed_and_keep_the_setting_name() {
+        let err = range_setting_error(
+            require_effective_chunk_size("S3DLIO_CHUNK_SIZE", 0).expect_err("zero"),
+        );
+        assert_eq!(
+            object_error(&err).map(|o| o.kind),
+            Some(ObjectErrorKind::Other)
+        );
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("S3DLIO_CHUNK_SIZE") && text.contains(">= 1"),
+            "{text}"
+        );
+        assert!(!attempt_is_retryable(&err));
     }
 }

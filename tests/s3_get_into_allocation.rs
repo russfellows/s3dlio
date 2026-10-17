@@ -81,41 +81,38 @@ async fn largest_allocation<T>(fut: impl std::future::Future<Output = T>) -> (T,
     (out, LARGEST.with(Cell::get))
 }
 
-async fn setup() -> (
-    s3dlio::s3_ops::S3Ops,
-    aws_sdk_s3::Client,
-    s3_get_into_support::mock::MockS3State,
-) {
+async fn setup() -> (aws_sdk_s3::Client, s3_get_into_support::mock::MockS3State) {
     // Below 8 MiB a read is one GET; at or above it, ranges of 4 MiB.
     let (port, state) = init(&[
         ("S3DLIO_RANGE_THRESHOLD_MB", "8"),
         ("S3DLIO_CHUNK_SIZE", "4194304"),
         ("S3DLIO_RANGE_CONCURRENCY", "2"),
     ]);
-    let client = client_for(port).await;
-    (ops(client.clone()), client, state)
+    (client_for(port).await, state)
 }
 
-#[tokio::test]
+// Both tests run on a CURRENT-THREAD runtime, explicitly (`#[tokio::test]` already defaults to
+// one, but the measurement depends on it): the counter is per thread, so the client side of
+// the read (request future, transport tasks, body chunks) must all run on the test's thread.
+// A multi-thread runtime would move that work to worker threads the counter does not see,
+// and the assertions below would pass for nothing.
+#[tokio::test(flavor = "current_thread")]
 async fn the_single_get_streams_into_the_buffer_without_a_whole_object_allocation() {
-    let (ops, client, state) = setup().await;
+    let (client, state) = setup().await;
+    let ops = ops(client.clone());
     let n = 3 * MIB;
     let key = key("single");
     let data = pattern(n, 1);
     state.put_object(BUCKET, &key, MockObject::new(data.clone()));
     let mut dst = Dst::new(n);
-    let addr = dst.addr();
 
     let (result, largest) =
         largest_allocation(async { read(&ops, &key, &mut dst, &ReceiveProgress::new()).await })
             .await;
 
     result.expect("read");
-    assert_eq!(
-        dst.addr(),
-        addr,
-        "the bytes landed in the caller's allocation"
-    );
+    // The destination is one fixed allocation made before the read, so the bytes can only have
+    // landed there; the content check is what shows they arrived.
     assert!(dst.bytes() == &data[..], "content");
     dst.assert_canaries();
     assert!(
@@ -147,22 +144,21 @@ async fn the_single_get_streams_into_the_buffer_without_a_whole_object_allocatio
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn the_ranged_fan_out_streams_into_disjoint_parts_without_part_or_object_allocations() {
-    let (ops, _client, state) = setup().await;
+    let (client, state) = setup().await;
+    let ops = ops(client);
     let n = 24 * MIB;
     let key = key("fanout");
     let data = pattern(n, 2);
     state.put_object(BUCKET, &key, MockObject::new(data.clone()));
     let mut dst = Dst::new(n);
-    let addr = dst.addr();
     let progress = ReceiveProgress::new();
 
     let (result, largest) =
         largest_allocation(async { read(&ops, &key, &mut dst, &progress).await }).await;
 
     result.expect("read");
-    assert_eq!(dst.addr(), addr);
     assert!(dst.bytes() == &data[..], "content");
     dst.assert_canaries();
     assert_eq!(progress.filled(), n as u64);

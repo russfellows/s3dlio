@@ -35,13 +35,13 @@
 )]
 mod mock_s3_server;
 
+#[path = "common/child_case.rs"]
+mod child_case;
+
 use mock_s3_server::{
     ensure_mock_s3_server, key_path, unique_test_key, SIZED_OBJECT_BODY, SIZED_OBJECT_MARKER,
 };
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const BUCKET: &str = "mock-bucket";
 
@@ -87,8 +87,32 @@ fn child_run_case() {
         let ranged = |offset: u64| {
             s3dlio::s3_utils::get_object_concurrent_range_async(&uri, offset, None, None, None)
         };
+        // `get_object_concurrent_range_async` is `get_object_concurrent_range_with_client` on
+        // the process-wide client, so these reach the per-endpoint entry point's own checks.
+        let ranged_with = |offset: u64,
+                           length: Option<u64>,
+                           chunk_size: Option<usize>,
+                           max_concurrency: Option<usize>| {
+            s3dlio::s3_utils::get_object_concurrent_range_async(
+                &uri,
+                offset,
+                length,
+                chunk_size,
+                max_concurrency,
+            )
+        };
         match case.as_str() {
             "concurrent_range" | "concurrent_range_empty" => ranged(0).await,
+            // An offset and a length at `u64::MAX`: `offset + length` must saturate (not wrap
+            // or panic), the range is empty, and the limits are still validated first.
+            "max_offset_max_length" => ranged_with(u64::MAX, Some(u64::MAX), None, None).await,
+            // The same call with explicit, valid limits: an explicit argument wins over a zero
+            // in the environment.
+            "max_offset_max_length_explicit" => {
+                ranged_with(u64::MAX, Some(u64::MAX), Some(4), Some(2)).await
+            }
+            // A length at `u64::MAX` from offset 8 saturates to "the rest": the last 8 bytes.
+            "tail_max_length" => ranged_with(8, Some(u64::MAX), None, None).await,
             // Exactly at the end of the 16-byte object, and well beyond it.
             "concurrent_range_at_eof" => ranged(SIZED_OBJECT_BODY.len() as u64).await,
             "concurrent_range_past_eof" => ranged(1000).await,
@@ -142,6 +166,10 @@ fn child_run_case() {
             let body = result.expect("valid settings must still succeed");
             assert!(body.is_empty(), "expected no bytes, got {}", body.len());
         }
+        None if expect == "ok-tail" => {
+            let body = result.expect("valid settings must download the tail");
+            assert_eq!(&body[..], &SIZED_OBJECT_BODY[8..], "the last 8 bytes");
+        }
         None => {
             assert_eq!(expect, "ok");
             let body = result.expect("valid settings must still download the object");
@@ -153,181 +181,23 @@ fn child_run_case() {
 
 // ─────────────────────────────── parent side ───────────────────────────────
 
-struct ChildOutcome {
-    timed_out: bool,
-    /// Set when the child was still alive after the whole SIGTERM ladder.
-    survivor_pid: Option<u32>,
-    status: Option<std::process::ExitStatus>,
-    output: String,
+/// How this binary's children are run (the harness is shared: `tests/common/child_case.rs`).
+const SPEC: child_case::ChildSpec = child_case::ChildSpec {
+    case_var: CHILD_CASE,
+    expect_var: CHILD_EXPECT,
+    sentinel: SENTINEL,
+    child_test: "child_run_case",
+    hard_timeout: HARD_TIMEOUT,
+    address_space_kib: CHILD_ADDRESS_SPACE_KIB,
+    failure_hint: "a crash here is the unbounded range vector hitting the address-space limit",
+};
+
+fn run_case(case: &str, expect: &str, env: &[(&str, &str)]) -> child_case::ChildOutcome {
+    child_case::run_case(&SPEC, case, expect, env)
 }
 
-/// The most output kept from one child stream; the rest is read and discarded.
-const KEEP_OUTPUT_BYTES: usize = 1 << 20;
-/// How long to wait for a reader thread to see end-of-file after the child exited.
-const READER_GRACE: Duration = Duration::from_secs(5);
-
-/// Drain `stream` on its own thread, so a chatty child can never fill a pipe and block.
-/// The kept text (at most [`KEEP_OUTPUT_BYTES`]) is sent when the stream ends.
-fn drain<R: Read + Send + 'static>(mut stream: R) -> mpsc::Receiver<String> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let room = KEEP_OUTPUT_BYTES.saturating_sub(kept.len());
-                    kept.extend_from_slice(&buf[..n.min(room)]);
-                }
-            }
-        }
-        // The receiver may be gone (the parent gave up); nothing else to do then.
-        tx.send(String::from_utf8_lossy(&kept).into_owned()).ok();
-    });
-    rx
-}
-
-/// A two-step SIGTERM ladder with the default disposition (the child installs no handler).
-/// Returns whether the child exited.  There is no SIGKILL: a child that outlives the ladder
-/// is reported to the caller, which must not wait on it.
-fn terminate(child: &mut std::process::Child) -> bool {
-    for _ in 0..2 {
-        Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status()
-            .ok();
-        let until = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < until {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-    false
-}
-
-/// Variables from a developer or CI shell that would change which server the child talks
-/// to, which credentials or profile it resolves, or how it retries and times out.  Every
-/// endpoint, profile and transport variable `s3_client.rs` and the AWS SDK honour is here.
-const SCRUBBED_ENV: &[&str] = &[
-    "S3DLIO_CHUNK_SIZE",
-    "S3DLIO_RANGE_CONCURRENCY",
-    "S3DLIO_RANGE_THRESHOLD_MB",
-    "S3DLIO_SKIP_HEAD",
-    "S3DLIO_FOLLOW_REDIRECTS",
-    "S3DLIO_OPERATION_TIMEOUT_SECS",
-    "S3DLIO_CONNECT_TIMEOUT_SECS",
-    "S3DLIO_MAX_RETRY_ATTEMPTS",
-    "S3DLIO_EXTRA_TRANSIENT_CODES",
-    "S3DLIO_RT_THREADS",
-    "S3DLIO_RT_THREADS_UNSAFE",
-    "AWS_ENDPOINT_URL_S3",
-    "AWS_ENDPOINT_URL",
-    "AWS_PROFILE",
-    "AWS_DEFAULT_PROFILE",
-    "AWS_CONFIG_FILE",
-    "AWS_SHARED_CREDENTIALS_FILE",
-    "AWS_SESSION_TOKEN",
-    "AWS_CA_BUNDLE",
-    "AWS_DEFAULT_REGION",
-    "AWS_ROLE_ARN",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-];
-
-fn run_case(case: &str, expect: &str, env: &[(&str, &str)]) -> ChildOutcome {
-    let exe = std::env::current_exe().expect("test executable path");
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(format!(
-            "ulimit -v {CHILD_ADDRESS_SPACE_KIB} && exec \"$0\" \"$@\""
-        ))
-        .arg(exe)
-        .args([
-            "--exact",
-            "child_run_case",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD_CASE, case)
-        .env(CHILD_EXPECT, expect)
-        // Fewer malloc arenas keep the address-space limit about real memory.
-        .env("MALLOC_ARENA_MAX", "2")
-        .env("S3DLIO_ENABLE_RANGE_OPTIMIZATION", "1")
-        .env("S3DLIO_LOAD_DOTENV", "0")
-        // No instance-metadata lookups if credentials were somehow missing.
-        .env("AWS_EC2_METADATA_DISABLED", "true")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Values inherited from a developer shell must not change the outcome.
-    for name in SCRUBBED_ENV {
-        cmd.env_remove(name);
-    }
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let mut child = cmd.spawn().expect("spawn the child test process");
-    let stdout = child.stdout.take().map(drain);
-    let stderr = child.stderr.take().map(drain);
-
-    let deadline = Instant::now() + HARD_TIMEOUT;
-    let mut timed_out = false;
-    let mut survivor_pid = None;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) if Instant::now() >= deadline => {
-                timed_out = true;
-                if !terminate(&mut child) {
-                    survivor_pid = Some(child.id());
-                }
-                break child.try_wait().ok().flatten();
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => break None,
-        }
-    };
-
-    // A surviving child still holds its pipes open: waiting for end-of-file would block.
-    let collect = |rx: Option<mpsc::Receiver<String>>| match (rx, survivor_pid) {
-        (Some(rx), None) => rx
-            .recv_timeout(READER_GRACE)
-            .unwrap_or_else(|_| "(output incomplete)".to_string()),
-        (Some(_), Some(_)) => "(child still running; output not collected)".to_string(),
-        (None, _) => "(no output stream)".to_string(),
-    };
-    let output = format!("{}\n{}", collect(stdout), collect(stderr));
-    ChildOutcome {
-        timed_out,
-        survivor_pid,
-        status,
-        output,
-    }
-}
-
-fn assert_verified(what: &str, o: ChildOutcome) {
-    if let Some(pid) = o.survivor_pid {
-        panic!(
-            "{what}: the child (pid {pid}) is STILL RUNNING after the SIGTERM ladder; it was not \
-             killed and not waited for, and needs to be stopped by hand"
-        );
-    }
-    assert!(
-        !o.timed_out,
-        "{what}: HUNG past {HARD_TIMEOUT:?} (the setting was not validated)\n{}",
-        o.output
-    );
-    assert!(
-        o.status.is_some_and(|s| s.success()) && o.output.contains(SENTINEL),
-        "{what}: the child did not verify the contract (exit {:?}; a crash here is the \
-         unbounded range vector hitting the address-space limit)\n{}",
-        o.status,
-        o.output
-    );
+fn assert_verified(what: &str, outcome: child_case::ChildOutcome) {
+    child_case::assert_verified(&SPEC, what, outcome)
 }
 
 #[test]
@@ -574,6 +444,71 @@ fn valid_settings_still_fill_the_caller_buffer_on_the_get_into_path() {
             "ok",
             &[
                 ("S3DLIO_RANGE_THRESHOLD_MB", "0"),
+                ("S3DLIO_CHUNK_SIZE", "4"),
+                ("S3DLIO_RANGE_CONCURRENCY", "2"),
+            ],
+        ),
+    );
+}
+
+// ───────────── an offset and a length at `u64::MAX` on the per-endpoint entry point ─────────────
+//
+// `get_object_concurrent_range_async` runs `get_object_concurrent_range_with_client` (the entry
+// point of a per-endpoint store).  `offset + length` there saturates, the limits are resolved
+// before the empty-range shortcut, and an explicit argument beats the environment.
+
+#[test]
+fn zero_env_settings_are_rejected_by_name_for_offset_and_length_at_u64_max() {
+    for variable in ["S3DLIO_CHUNK_SIZE", "S3DLIO_RANGE_CONCURRENCY"] {
+        assert_verified(
+            &format!("{variable}=0, offset and length u64::MAX"),
+            run_case(
+                "max_offset_max_length",
+                &format!("reject:{variable}"),
+                &[(variable, "0")],
+            ),
+        );
+    }
+}
+
+#[test]
+fn valid_settings_give_an_empty_success_for_offset_and_length_at_u64_max() {
+    assert_verified(
+        "valid settings, offset and length u64::MAX",
+        run_case(
+            "max_offset_max_length",
+            "ok-empty",
+            &[
+                ("S3DLIO_CHUNK_SIZE", "4"),
+                ("S3DLIO_RANGE_CONCURRENCY", "2"),
+            ],
+        ),
+    );
+}
+
+#[test]
+fn explicit_valid_arguments_win_over_a_zero_environment_for_offset_and_length_at_u64_max() {
+    assert_verified(
+        "explicit arguments over a zero environment, offset and length u64::MAX",
+        run_case(
+            "max_offset_max_length_explicit",
+            "ok-empty",
+            &[
+                ("S3DLIO_CHUNK_SIZE", "0"),
+                ("S3DLIO_RANGE_CONCURRENCY", "0"),
+            ],
+        ),
+    );
+}
+
+#[test]
+fn a_length_at_u64_max_saturates_to_the_rest_of_the_object() {
+    assert_verified(
+        "offset 8, length u64::MAX",
+        run_case(
+            "tail_max_length",
+            "ok-tail",
+            &[
                 ("S3DLIO_CHUNK_SIZE", "4"),
                 ("S3DLIO_RANGE_CONCURRENCY", "2"),
             ],

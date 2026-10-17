@@ -267,7 +267,7 @@ impl S3Ops {
     ///
     /// `dst.len()` is the expected length; `Ok(())` means exactly that many bytes were
     /// written and the whole-object size equals it (see
-    /// [`crate::s3_utils::get_into_with_client`] for the contract and the routes).  The request
+    /// `s3_utils::get_into_with_client` for the contract and the routes).  The request
     /// goes to THIS handler's client only.
     ///
     /// With a logger the call writes exactly ONE `GET` row, whichever way it ends: the byte
@@ -290,7 +290,10 @@ impl S3Ops {
     }
 
     /// Typed HEAD of an object: `Ok(None)` only for typed absence (see
-    /// [`crate::s3_utils::head_typed_with_client`]).
+    /// `s3_utils::head_typed_with_client`).
+    ///
+    /// A HEAD 404 has no body, so a missing bucket (`NoSuchBucket`) cannot be told from a
+    /// missing key: both are `Ok(None)`.  The service's own answer is not visible here.
     ///
     /// With a logger the call writes exactly ONE `HEAD` row: `bytes` is the size on success
     /// and 0 for absence, an error and a cancelled call, and the first-byte column is empty on

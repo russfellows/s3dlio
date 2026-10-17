@@ -114,11 +114,6 @@ impl Dst {
         &self.buf[..self.len]
     }
 
-    /// The address of the destination's first byte.
-    pub fn addr(&self) -> usize {
-        self.buf.as_ptr() as usize
-    }
-
     /// Nothing past the destination was written.
     pub fn assert_canaries(&self) {
         assert!(
@@ -164,6 +159,21 @@ pub fn gets(state: &MockS3State, key: &str) -> Vec<mock::RecordedRequest> {
         .collect()
 }
 
+/// How many GETs the server saw for `key` that asked for exactly `range` (`bytes=a-b`).
+pub fn gets_of_range(state: &MockS3State, key: &str, range: &str) -> usize {
+    gets(state, key)
+        .iter()
+        .filter(|r| r.range.as_deref() == Some(range))
+        .count()
+}
+
+/// The attempts one request (or one range part) gets: `S3DLIO_MAX_RETRY_ATTEMPTS`, pinned to 3
+/// by [`init`], read back through the code under test so the tests follow its real default.
+pub fn attempts() -> usize {
+    let configured = s3dlio::constants::max_retry_attempts();
+    usize::try_from(configured).expect("the attempt budget fits in usize")
+}
+
 /// The HEAD requests the server saw for `key`.
 pub fn heads(state: &MockS3State, key: &str) -> usize {
     state
@@ -171,4 +181,30 @@ pub fn heads(state: &MockS3State, key: &str) -> usize {
         .iter()
         .filter(|r| r.method == "HEAD")
         .count()
+}
+
+/// Drive `read` until `progress` reports at least `filled` positions, then DROP it.  The read
+/// is expected to stall (a stalled body), so it finishing is a failure, and so is not reaching
+/// `filled` within `bound`.  Returns with the read dropped and its borrows released.
+pub async fn drive_then_drop<F: std::future::Future>(
+    read: F,
+    progress: &ReceiveProgress,
+    filled: u64,
+    bound: std::time::Duration,
+) {
+    let mut read = Box::pin(read);
+    let watch = async {
+        while progress.filled() < filled {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        _ = &mut read => panic!("the read finished; it should have stalled"),
+        reached = tokio::time::timeout(bound, watch) => {
+            reached.unwrap_or_else(|_| {
+                panic!("fewer than {filled} positions within {bound:?} (filled {})", progress.filled())
+            });
+        }
+    }
+    drop(read);
 }

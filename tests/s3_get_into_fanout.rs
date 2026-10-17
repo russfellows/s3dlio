@@ -334,7 +334,205 @@ async fn the_content_range_of_every_response_is_validated() {
             .await
             .expect_err("a bad Content-Range");
         assert_eq!(kind_of(&err), expected, "{tag}");
+        // A malformed answer repeats exactly: it is final, not retried.
+        assert_eq!(gets_of_range(&state, &key, "bytes=4-7"), 1, "{tag}");
     }
+}
+
+// ───────────── retries, protocol violations and the pin (per range part) ─────────────
+//
+// Every case here faults ONE range (`bytes=4-7`) so the count of GETs for it is exact: the
+// other parts are served honestly.  The SDK retries a 5xx on its own, so the counts below use
+// faults the SDK cannot see (a body that breaks after the headers, a clean short body, a
+// well-formed answer that breaks the protocol): they measure the s3dlio loop and nothing else.
+
+/// The faulted range of the cases below.
+const FAULTED: &str = "bytes=4-7";
+
+/// A server that ignores `Range` answers 200 with the whole object and no `Content-Range`.
+/// That is the same answer on every attempt, so the part costs ONE request.
+#[tokio::test]
+async fn a_server_that_ignores_range_is_one_get_for_the_part_not_the_retry_budget() {
+    let (ops, state) = setup().await;
+    let key = key("ignores-range");
+    state.put_object(
+        BUCKET,
+        &key,
+        MockObject::new(pattern(N, 14)).with_fault(Some(4), 1000, ObjectFault::IgnoreRange),
+    );
+
+    let err = read(&ops, &key, &mut Dst::new(N), &ReceiveProgress::new())
+        .await
+        .expect_err("no Content-Range");
+
+    assert_eq!(kind_of(&err), ObjectErrorKind::Other);
+    assert_eq!(gets_of_range(&state, &key, FAULTED), 1);
+}
+
+/// The length of the range body is checked against the range asked for.  A Content-Length that
+/// disagrees, or a body that runs long, is a protocol violation (final, one GET).  A body that
+/// ends clean but short is a delivery failure (`Transport`): retried, with the budget, pinned.
+#[tokio::test]
+async fn the_range_body_length_is_checked_and_only_a_short_body_is_retried() {
+    let (ops, state) = setup().await;
+    // (tag, delta, Content-Length sent?, expected kind, GETs for the faulted range, text)
+    let cases = [
+        (
+            "cl-long",
+            1isize,
+            true,
+            ObjectErrorKind::Other,
+            1,
+            "Content-Length",
+        ),
+        (
+            "cl-short",
+            -1,
+            true,
+            ObjectErrorKind::Other,
+            1,
+            "Content-Length",
+        ),
+        (
+            "body-long",
+            1,
+            false,
+            ObjectErrorKind::Other,
+            1,
+            "longer than requested",
+        ),
+        (
+            "body-short",
+            -1,
+            false,
+            ObjectErrorKind::Transport,
+            attempts(),
+            "shorter than requested",
+        ),
+    ];
+    for (tag, delta, with_length, expected, count, text) in cases {
+        let key = key(tag);
+        let mut object = MockObject::new(pattern(N, 15)).with_fault(
+            Some(4),
+            1000,
+            ObjectFault::BodyLength { delta },
+        );
+        object.get_content_length = with_length;
+        let etag = object.etag.clone().expect("etag");
+        state.put_object(BUCKET, &key, object);
+
+        let err = read(&ops, &key, &mut Dst::new(N), &ReceiveProgress::new())
+            .await
+            .expect_err(tag);
+
+        assert_eq!(kind_of(&err), expected, "{tag}: {err:#}");
+        assert!(format!("{err:#}").contains(text), "{tag}: {err:#}");
+        assert_eq!(gets_of_range(&state, &key, FAULTED), count, "{tag}");
+        assert!(
+            gets(&state, &key)
+                .iter()
+                .all(|r| r.if_match.as_deref() == Some(etag.as_str())),
+            "{tag}: every attempt is pinned"
+        );
+    }
+}
+
+/// A short range body that comes right on the next attempt: the part is retried, the data is
+/// whole, and each position is counted once.
+#[tokio::test]
+async fn a_short_range_body_is_retried_to_success() {
+    let (ops, state) = setup().await;
+    let key = key("short-once");
+    let data = pattern(N, 16);
+    let mut object =
+        MockObject::new(data.clone()).with_fault(Some(4), 1, ObjectFault::BodyLength { delta: -1 });
+    object.get_content_length = false;
+    state.put_object(BUCKET, &key, object);
+    let mut dst = Dst::new(N);
+    let progress = ReceiveProgress::new();
+
+    read(&ops, &key, &mut dst, &progress)
+        .await
+        .expect("retried");
+
+    assert_eq!(dst.bytes(), &data[..]);
+    assert_eq!(progress.filled(), N as u64);
+    assert_eq!(gets_of_range(&state, &key, FAULTED), 2);
+}
+
+/// A body that breaks mid-stream on every attempt: exactly the retry budget of GETs for that
+/// range, each pinned, then a `Transport` error.
+#[tokio::test]
+async fn a_persistently_broken_range_makes_exactly_the_retry_budget_of_gets() {
+    let (ops, state) = setup().await;
+    let key = key("always-broken");
+    let object = MockObject::new(pattern(N, 17)).with_fault(
+        Some(4),
+        1000,
+        ObjectFault::TruncateBody { send: 2 },
+    );
+    let etag = object.etag.clone().expect("etag");
+    state.put_object(BUCKET, &key, object);
+
+    let err = read(&ops, &key, &mut Dst::new(N), &ReceiveProgress::new())
+        .await
+        .expect_err("every attempt breaks");
+
+    assert_eq!(kind_of(&err), ObjectErrorKind::Transport);
+    assert_eq!(gets_of_range(&state, &key, FAULTED), attempts());
+    assert!(
+        gets(&state, &key)
+            .iter()
+            .all(|r| r.if_match.as_deref() == Some(etag.as_str())),
+        "every attempt of every range is pinned"
+    );
+    assert_eq!(heads(&state, &key), 1, "no retry takes a new HEAD");
+}
+
+/// A pinned range answered without an ETag cannot confirm the version, even when the bytes
+/// are honest: the read fails (`Other`) and the range is not asked for again.
+#[tokio::test]
+async fn a_range_response_with_no_etag_cannot_confirm_the_pin() {
+    let (ops, state) = setup().await;
+    let key = key("range-no-etag");
+    state.put_object(
+        BUCKET,
+        &key,
+        MockObject::new(pattern(N, 18)).with_fault(Some(4), 1000, ObjectFault::OmitEtag),
+    );
+
+    let err = read(&ops, &key, &mut Dst::new(N), &ReceiveProgress::new())
+        .await
+        .expect_err("unconfirmable");
+
+    assert_eq!(kind_of(&err), ObjectErrorKind::Other);
+    assert!(format!("{err:#}").contains("cannot confirm"), "{err:#}");
+    assert_eq!(gets_of_range(&state, &key, FAULTED), 1);
+}
+
+/// The dangerous shape: the object is replaced between the HEAD and a range, the server
+/// ignores `If-Match` AND sends no ETag.  Two versions would be mixed in the buffer; the read
+/// must be an error, never `Ok`.
+#[tokio::test]
+async fn a_replaced_object_answered_without_an_etag_is_an_error_never_mixed_data() {
+    let (ops, state) = setup().await;
+    let key = key("replaced-no-etag");
+    let mut object = MockObject::new(pattern(N, 19)).with_fault(
+        Some(4),
+        1,
+        ObjectFault::OverwriteFirst {
+            body: pattern(N, 96),
+            etag: None,
+        },
+    );
+    object.honour_if_match = false;
+    state.put_object(BUCKET, &key, object);
+
+    let err = read(&ops, &key, &mut Dst::new(N), &ReceiveProgress::new())
+        .await
+        .expect_err("another version that cannot be confirmed");
+
+    assert_eq!(kind_of(&err), ObjectErrorKind::Other);
 }
 
 #[tokio::test]
@@ -357,7 +555,7 @@ async fn a_zero_length_destination_never_sends_a_head_or_a_range() {
 /// holds other bytes under the same key, sees nothing.
 #[tokio::test]
 async fn the_head_and_the_ranges_go_to_the_clients_endpoint_only() {
-    let (_port, global) = setup_env();
+    let global = setup_env().1;
     let (other_port, other) = s3_get_into_support::mock::start_isolated_mock_s3_server();
     let ops = ops(client_for(other_port).await);
     let key = key("routing");
@@ -388,14 +586,15 @@ async fn dropping_a_fan_out_read_stops_every_writer_and_keeps_the_progress() {
     let mut dst = Dst::new(N);
     let progress = ReceiveProgress::new();
 
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(800),
+    // Part 0 is complete (4 bytes) and part 4 delivered 2 before it stalled: 6 positions.
+    drive_then_drop(
         read(&ops, &key, &mut dst, &progress),
+        &progress,
+        6,
+        std::time::Duration::from_secs(10),
     )
     .await;
 
-    assert!(outcome.is_err(), "the stalled range cannot finish");
-    // Part 0 is complete (4 bytes) and part 4 delivered 2 before it stalled.
     assert!(progress.filled() >= 6, "filled {}", progress.filled());
     let after_drop = dst.bytes().to_vec();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;

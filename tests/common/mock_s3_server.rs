@@ -370,8 +370,19 @@ pub enum ObjectFault {
     /// Serve a correct header and `send` bytes of the body, then stall for ever: a read that
     /// never finishes (for cancellation tests).
     StallBody { send: usize },
-    /// Serve a 206 whose `Content-Range` is `bytes first-last/total`, whatever was asked.
+    /// Serve a `Content-Range` of `bytes first-last/total`, whatever was asked (a 206 for a
+    /// ranged GET; the header is added to the 200 of an unranged GET too).
     ContentRange { first: u64, last: u64, total: u64 },
+    /// Answer without an `ETag` header (the object is otherwise served honestly).
+    OmitEtag,
+    /// Ignore the `Range` header: a 200 with the whole object and no `Content-Range`.
+    IgnoreRange,
+    /// Serve a body `delta` bytes longer (zero padding) or shorter than the answer should be,
+    /// with the `Content-Length` of the body actually sent (none when `get_content_length` is
+    /// false).  `Content-Range` is unchanged.  With a length header this is a
+    /// Content-Length that disagrees with the range; without one, a body that ends clean but
+    /// short, or runs long.
+    BodyLength { delta: isize },
     /// Serve a 206 with no `Content-Range` header.
     NoContentRange,
     /// Replace the object's body and ETag BEFORE answering this request, as a concurrent
@@ -601,7 +612,7 @@ fn serve_object(req: Request<Incoming>, state: MockS3State) -> Response<MockBody
         host: header("host"),
         if_match: if_match.clone(),
     });
-    let range = range_header.as_deref().and_then(parse_range_header);
+    let mut range = range_header.as_deref().and_then(parse_range_header);
 
     if method == Method::HEAD {
         state.record(&path, |c| c.head_calls += 1);
@@ -643,6 +654,8 @@ fn serve_object(req: Request<Incoming>, state: MockS3State) -> Response<MockBody
     // GET. Scripted faults first (the first rule that still has uses and matches).
     let mut truncate: Option<(usize, BodyEnd)> = None;
     let mut forced_range: Option<Option<(u64, u64, u64)>> = None;
+    let mut omit_etag = false;
+    let mut body_delta: isize = 0;
     let start = range.map(|(a, _)| a);
     let mut action: Option<ObjectFault> = None;
     for rule in obj.faults.iter_mut() {
@@ -661,6 +674,9 @@ fn serve_object(req: Request<Incoming>, state: MockS3State) -> Response<MockBody
                 forced_range = Some(Some((first, last, total)))
             }
             ObjectFault::NoContentRange => forced_range = Some(None),
+            ObjectFault::OmitEtag => omit_etag = true,
+            ObjectFault::IgnoreRange => range = None,
+            ObjectFault::BodyLength { delta } => body_delta = delta,
             ObjectFault::OverwriteFirst { body, etag } => {
                 obj.body = body;
                 obj.etag = etag;
@@ -679,15 +695,21 @@ fn serve_object(req: Request<Incoming>, state: MockS3State) -> Response<MockBody
 
     let len = obj.body.len() as u64;
     let mut b = Response::builder();
-    if let Some(e) = &obj.etag {
+    if let (false, Some(e)) = (omit_etag, &obj.etag) {
         b = b.header("ETag", e.as_str());
     }
     if let Some(v) = &obj.version_id {
         b = b.header("x-amz-version-id", v.as_str());
     }
 
-    let (status, slice, content_range) = match range {
-        None => (StatusCode::OK, obj.body.clone(), None),
+    let (status, mut slice, content_range) = match range {
+        None => (
+            StatusCode::OK,
+            obj.body.clone(),
+            forced_range
+                .flatten()
+                .map(|(f, l, t)| format!("bytes {f}-{l}/{t}")),
+        ),
         Some((first, last)) => {
             if len == 0 || first >= len {
                 return plain_error(416, "InvalidRange");
@@ -709,6 +731,9 @@ fn serve_object(req: Request<Incoming>, state: MockS3State) -> Response<MockBody
     }
     b = b.status(status);
 
+    // `BodyLength`: send a body that is not the length the answer describes.
+    let new_len = slice.len().saturating_add_signed(body_delta);
+    slice.resize(new_len, 0);
     let slice_len = slice.len();
     if let Some((send, end)) = truncate {
         let head = Bytes::copy_from_slice(&slice[..send.min(slice_len)]);

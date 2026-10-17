@@ -121,13 +121,22 @@ async fn without_a_content_length_the_stream_is_still_held_to_the_exact_length()
     let err = read(&ops, &long, &mut dst, &progress)
         .await
         .expect_err("long");
-    assert_eq!(
-        kind_of(&err),
+    // The stream is not read to its end, so `actual` is a LOWER BOUND: the bytes received
+    // when the first chunk past the end arrived (more than the destination, at most the body).
+    match kind_of(&err) {
         ObjectErrorKind::LengthMismatch {
-            expected: N as u64,
-            actual: None
+            expected,
+            actual: Some(at_least),
+        } => {
+            assert_eq!(expected, N as u64);
+            assert!(
+                at_least > N as u64 && at_least <= 20,
+                "a lower bound past the end, not the declared size: {at_least}"
+            );
         }
-    );
+        other => panic!("expected a length mismatch with a lower bound, got {other:?}"),
+    }
+    assert!(format!("{err:#}").contains("at least"), "{err:#}");
     dst.assert_untouched();
 
     let short = key("nolen-short");
@@ -503,7 +512,7 @@ async fn with_no_etag_a_failure_before_the_first_byte_is_retried_unpinned() {
 /// reached only through the process-wide client, sees nothing.
 #[tokio::test]
 async fn the_request_goes_to_the_clients_endpoint_and_never_to_the_global_one() {
-    let (_global_port, global) = init(&[]);
+    let global = init(&[]).1;
     let (other_port, other) = mock::start_isolated_mock_s3_server();
     let ops = ops(client_for(other_port).await);
     let key = key("routing");
@@ -543,14 +552,15 @@ async fn dropping_the_read_stops_the_writer_and_keeps_the_progress() {
     let mut dst = Dst::new(N);
     let progress = ReceiveProgress::new();
 
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(600),
+    drive_then_drop(
         read(&ops, &key, &mut dst, &progress),
+        &progress,
+        6,
+        std::time::Duration::from_secs(10),
     )
     .await;
 
-    assert!(outcome.is_err(), "the read cannot finish: the body stalls");
-    assert_eq!(progress.filled(), 6);
+    assert_eq!(progress.filled(), 6, "the positions written stay reported");
     let after_drop = dst.bytes().to_vec();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(
@@ -561,12 +571,136 @@ async fn dropping_the_read_stops_the_writer_and_keeps_the_progress() {
     dst.assert_canaries();
 }
 
+// ───────────── the s3dlio retry loop itself (the SDK does not retry a broken body) ─────────────
+//
+// The AWS SDK retries a 5xx inside one `send()`, so a 500 fault exercises the SDK's loop (and
+// its count is the SDK's budget times s3dlio's).  A body that breaks AFTER the headers is
+// invisible to the SDK: only the loop under test retries it, so these counts are exactly its
+// budget (`S3DLIO_MAX_RETRY_ATTEMPTS`).
+
+/// A body that breaks after 6 bytes on every attempt: exactly the retry budget of GETs, the
+/// first unpinned and every retry pinned, the positions counted once, and the failure typed
+/// `Transport` (a delivery failure, not a refusal).
+#[tokio::test]
+async fn a_persistently_broken_body_makes_exactly_the_retry_budget_of_gets() {
+    let (ops, state) = setup().await;
+    let key = key("always-broken");
+    let object = MockObject::new(pattern(N, 20)).with_fault(
+        None,
+        1000,
+        ObjectFault::TruncateBody { send: 6 },
+    );
+    let etag = object.etag.clone().expect("etag");
+    state.put_object(BUCKET, &key, object);
+    let progress = ReceiveProgress::new();
+
+    let err = read(&ops, &key, &mut Dst::new(N), &progress)
+        .await
+        .expect_err("every attempt breaks");
+
+    assert_eq!(kind_of(&err), ObjectErrorKind::Transport);
+    let gets = gets(&state, &key);
+    assert_eq!(gets.len(), attempts(), "exactly the retry budget");
+    assert_eq!(gets[0].if_match, None);
+    assert!(
+        gets[1..]
+            .iter()
+            .all(|r| r.if_match.as_deref() == Some(etag.as_str())),
+        "every retry is pinned: {gets:?}"
+    );
+    assert_eq!(progress.filled(), 6, "each position is counted once");
+}
+
+/// A protocol violation is final: a missing or wrong `Content-Range` is answered the same way
+/// again, so it costs ONE request, not the retry budget.  A delivery failure (above) is retried.
+#[tokio::test]
+async fn a_protocol_violation_is_one_get_not_the_retry_budget() {
+    let (ops, state) = setup().await;
+    let key = key("protocol");
+    // A Content-Range on an unranged GET that does not describe the whole object.
+    state.put_object(
+        BUCKET,
+        &key,
+        MockObject::new(pattern(N, 21)).with_fault(
+            None,
+            1000,
+            ObjectFault::ContentRange {
+                first: 5,
+                last: 8,
+                total: N as u64,
+            },
+        ),
+    );
+    let mut dst = Dst::new(N);
+
+    let err = read(&ops, &key, &mut dst, &ReceiveProgress::new())
+        .await
+        .expect_err("a wrong Content-Range");
+
+    assert_eq!(kind_of(&err), ObjectErrorKind::Other);
+    assert_eq!(gets(&state, &key).len(), 1, "a protocol violation is final");
+    dst.assert_untouched();
+}
+
+/// Once pinned, a retry reply with no ETag cannot confirm the version: it fails (`Other`),
+/// whatever the server did with `If-Match`.  The first response is partial, so without the
+/// check the retry would be accepted and the read would report another version as success.
+#[tokio::test]
+async fn a_retry_response_with_no_etag_cannot_confirm_the_pin() {
+    let (ops, state) = setup().await;
+    let key = key("retry-no-etag");
+    let object = MockObject::new(pattern(N, 22))
+        .with_fault(None, 1, ObjectFault::TruncateBody { send: 6 })
+        .with_fault(None, 1000, ObjectFault::OmitEtag);
+    state.put_object(BUCKET, &key, object);
+
+    let err = read(&ops, &key, &mut Dst::new(N), &ReceiveProgress::new())
+        .await
+        .expect_err("the retry cannot confirm the version");
+
+    assert_eq!(kind_of(&err), ObjectErrorKind::Other);
+    assert!(format!("{err:#}").contains("cannot confirm"), "{err:#}");
+    assert_eq!(gets(&state, &key).len(), 2, "not retried again");
+}
+
+/// The dangerous shape: the object is replaced between the attempts, the server ignores
+/// `If-Match` AND sends no ETag.  The retry must not be read: nothing of the new version is
+/// written, and the call is an error, never `Ok` with the other version's bytes.
+#[tokio::test]
+async fn a_replaced_object_answered_without_an_etag_is_never_read() {
+    let (ops, state) = setup().await;
+    let key = key("retry-replaced-no-etag");
+    let mut object = MockObject::new(pattern(N, 23))
+        .with_fault(None, 1, ObjectFault::TruncateBody { send: 6 })
+        .with_fault(
+            None,
+            1,
+            ObjectFault::OverwriteFirst {
+                body: pattern(N, 97),
+                etag: None,
+            },
+        );
+    object.honour_if_match = false;
+    state.put_object(BUCKET, &key, object);
+    let mut dst = Dst::new(N);
+
+    let err = read(&ops, &key, &mut dst, &ReceiveProgress::new())
+        .await
+        .expect_err("another version, unconfirmable");
+
+    assert_eq!(kind_of(&err), ObjectErrorKind::Other);
+    assert!(
+        dst.bytes()[6..].iter().all(|b| *b == FILL),
+        "the unconfirmed body was never read into the buffer"
+    );
+    dst.assert_canaries();
+}
 /// The trait method that wraps these futures is `Send` (`#[async_trait]`), so the futures of
 /// both the single route and the fan-out entry points must be.
 #[tokio::test]
 async fn the_read_and_head_futures_are_send() {
     fn assert_send<T: Send>(_: &T) {}
-    let (ops, _state) = setup().await;
+    let ops = setup().await.0;
     let mut dst = Dst::new(N);
     let progress = ReceiveProgress::new();
     let get = ops.get_into(BUCKET, "never-polled", dst.slice(), &progress);
