@@ -55,6 +55,7 @@ use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
 
 use crate::constants::max_retry_attempts;
+use crate::object_error::ObjectErrorKind;
 
 /// The throttling error codes the AWS SDK's own retry classifier recognises:
 /// `aws_runtime::retries::classifiers::THROTTLING_ERRORS`, copied from **aws-runtime
@@ -151,6 +152,91 @@ where
     }
 }
 
+/// Classify an S3 failure from its HTTP `status` and service error `code`
+/// (plan §4.5 A2).  Pure: no I/O, no environment.
+///
+/// `pinned` is true once the read has pinned an ETag; the pinned-read override
+/// then takes precedence over the table below: a 404 (or `NoSuchKey` /
+/// `NotFound`) or a 412 on a pinned read means the pinned version is gone, so
+/// it is [`ObjectErrorKind::VersionChanged`], never absence.
+///
+/// Otherwise the table is code-first, preserving [`status_is_retryable`]'s
+/// order for ordinary failures:
+///
+/// 1. a code [`is_transient_error_code`] accepts (the AWS throttling and
+///    transient tables plus `S3DLIO_EXTRA_TRANSIENT_CODES`, including
+///    `ExpiredToken` and `RequestExpired`) is retryable even on a 403: a
+///    throttling-table code is `Throttled`, any other transient code `Server`;
+/// 2. 404, `NoSuchKey` or `NotFound` is `NotFound`;
+/// 3. 412 is `VersionChanged`;
+/// 4. any remaining 403 (e.g. `AccessDenied`) is `Forbidden`;
+/// 5. 429 or 503 is `Throttled`; 408 or any other 5xx is `Server`;
+/// 6. a failure with no HTTP response (connect, timeout, body stream) is
+///    `Transport`;
+/// 7. anything else is `Other`.
+pub fn classify_s3_failure(
+    status: Option<u16>,
+    code: Option<&str>,
+    pinned: bool,
+) -> ObjectErrorKind {
+    if pinned {
+        let gone = status == Some(404)
+            || status == Some(412)
+            || matches!(code, Some("NoSuchKey" | "NotFound" | "PreconditionFailed"));
+        if gone {
+            return ObjectErrorKind::VersionChanged;
+        }
+    }
+    if let Some(code) = code {
+        if is_transient_error_code(code) {
+            return if AWS_RUNTIME_THROTTLING_ERROR_CODES.contains(&code) {
+                ObjectErrorKind::Throttled
+            } else {
+                ObjectErrorKind::Server
+            };
+        }
+        if matches!(code, "NoSuchKey" | "NotFound") {
+            return ObjectErrorKind::NotFound;
+        }
+    }
+    match status {
+        Some(404) => ObjectErrorKind::NotFound,
+        Some(412) => ObjectErrorKind::VersionChanged,
+        Some(403) => ObjectErrorKind::Forbidden,
+        Some(429 | 503) => ObjectErrorKind::Throttled,
+        Some(408 | 500..=599) => ObjectErrorKind::Server,
+        None => ObjectErrorKind::Transport,
+        Some(_) => ObjectErrorKind::Other,
+    }
+}
+
+/// Attach the S3 classification of `err` as an
+/// [`ObjectError`](crate::object_error::ObjectError) context.
+///
+/// The status and code come from the [`SdkFailure`] `err` carries (a failure
+/// from the AWS SDK).  An error with no `SdkFailure`, e.g. a body-stream
+/// error, had no HTTP response and is therefore `Transport` (step 6).  An
+/// error that already carries an `ObjectError` is returned unchanged: the
+/// existing classification is the more specific one.  The attached message
+/// names the status and code only; the SDK text stays in the source below it.
+pub fn attach_s3_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
+    if crate::object_error::object_error(&err).is_some() {
+        return err;
+    }
+    let (status, code) = match err.downcast_ref::<SdkFailure>() {
+        Some(f) => (f.status(), f.code().map(str::to_owned)),
+        None => (None, None),
+    };
+    let kind = classify_s3_failure(status, code.as_deref(), pinned);
+    let message = match (status, code.as_deref()) {
+        (Some(s), Some(c)) => format!("status {s}, code {c}"),
+        (Some(s), None) => format!("status {s}"),
+        (None, Some(c)) => format!("code {c}"),
+        (None, None) => "no HTTP response".to_string(),
+    };
+    crate::object_error::attach_object_error(err, kind, "s3", message)
+}
+
 /// The anyhow error that [`crate::s3_utils`]'s `sdk_context` / `sdk_anyhow`
 /// produce for a failed S3 request. Its `Display` is the same flattened
 /// `"<ctx>: <formatted SdkError>"` text as before; the extra field keeps the
@@ -158,15 +244,42 @@ where
 /// decision after the typed `SdkError` has been flattened into a message.
 /// Recover it with `anyhow::Error::downcast_ref::<SdkFailure>()`; it survives
 /// any number of `.context(..)` layers.
+///
+/// It also keeps the HTTP `status` and the service error `code` of the failed
+/// request (both `None` when the failure carried no HTTP response, or the
+/// response carried no S3 error code), so a typed classification
+/// ([`classify_s3_failure`]) can be made after the SDK error was flattened.
 #[derive(Debug)]
 pub(crate) struct SdkFailure {
     message: String,
     retryable: bool,
+    status: Option<u16>,
+    code: Option<String>,
 }
 
 impl SdkFailure {
-    pub(crate) fn new(message: String, retryable: bool) -> Self {
-        Self { message, retryable }
+    pub(crate) fn new(
+        message: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+    ) -> Self {
+        Self {
+            message,
+            retryable,
+            status,
+            code,
+        }
+    }
+
+    /// The HTTP status of the failed request, if a response was received.
+    pub(crate) fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    /// The service error code of the failed request, if the response had one.
+    pub(crate) fn code(&self) -> Option<&str> {
+        self.code.as_deref()
     }
 }
 
@@ -194,7 +307,27 @@ impl RetryClassify for anyhow::Error {
     /// [`SdkFailure`]). Anything else -- a body-transfer error from
     /// `ByteStream::collect`, an I/O error, any error we cannot classify --
     /// is retried: retrying an unknown failure is the conservative choice.
+    ///
+    /// A typed [`ObjectError`](crate::object_error::ObjectError) is read first
+    /// (plan §4.5 A2): NotFound, VersionChanged, Forbidden, LengthMismatch and
+    /// Unsupported are never retried, and a generic retryable source below
+    /// them cannot override that.  Every other kind (Throttled, Transport,
+    /// Server, Other), and an error with no `ObjectError`, keeps the verdict
+    /// described above.
     fn is_retryable(&self) -> bool {
+        if let Some(o) = crate::object_error::object_error(self) {
+            match o.kind {
+                ObjectErrorKind::NotFound
+                | ObjectErrorKind::VersionChanged
+                | ObjectErrorKind::Forbidden
+                | ObjectErrorKind::LengthMismatch { .. }
+                | ObjectErrorKind::Unsupported => return false,
+                ObjectErrorKind::Throttled
+                | ObjectErrorKind::Transport
+                | ObjectErrorKind::Server
+                | ObjectErrorKind::Other => {}
+            }
+        }
         match self.downcast_ref::<SdkFailure>() {
             Some(f) => f.retryable,
             None => true,
@@ -619,5 +752,233 @@ mod tests {
              elapsed = {:?}. If this is much lower, the backoff isn't firing.",
             elapsed
         );
+    }
+
+    // ── Plan §4.5 A2: typed S3 classification and the ObjectError-first verdict ──
+
+    use crate::object_error::{attach_object_error, object_error};
+
+    fn kind_of(err: &anyhow::Error) -> ObjectErrorKind {
+        object_error(err).expect("classified").kind
+    }
+
+    fn classified(status: u16, code: &str, pinned: bool) -> anyhow::Error {
+        attach_s3_classification(service_failure(status, code), pinned)
+    }
+
+    /// `sdk_anyhow` keeps the HTTP status and the service code next to the verdict.
+    #[test]
+    fn sdk_failure_carries_status_and_code() {
+        let e = service_failure(403, "ExpiredToken");
+        let f = e.downcast_ref::<SdkFailure>().expect("SdkFailure");
+        assert_eq!(f.status(), Some(403));
+        assert_eq!(f.code(), Some("ExpiredToken"));
+        // A failure with no HTTP response has neither.
+        let dispatch: SdkError<GetObjectError, HttpResponse> = SdkError::dispatch_failure(
+            aws_smithy_runtime_api::client::result::ConnectorError::io("reset".into()),
+        );
+        let e = crate::s3_utils::sdk_anyhow("S3 GET failed", dispatch);
+        let f = e.downcast_ref::<SdkFailure>().expect("SdkFailure");
+        assert_eq!((f.status(), f.code()), (None, None));
+        assert!(e.is_retryable());
+    }
+
+    /// The seven-step table, one row per step, in order.
+    #[test]
+    fn s3_table_steps_in_order() {
+        use ObjectErrorKind::*;
+        let c = |s, code, pinned| classify_s3_failure(s, code, pinned);
+        // 1. a transient code wins even on a 403: throttling table -> Throttled, other -> Server.
+        assert_eq!(c(Some(403), Some("ExpiredToken"), false), Server);
+        assert_eq!(c(Some(403), Some("RequestExpired"), false), Server);
+        assert_eq!(c(Some(400), Some("SlowDown"), false), Throttled);
+        assert_eq!(
+            c(Some(403), Some("RequestThrottledException"), false),
+            Throttled
+        );
+        assert_eq!(c(Some(400), Some("RequestTimeout"), false), Server);
+        assert_eq!(c(Some(409), Some("OperationAborted"), false), Server);
+        // 2. absence by status or by code.
+        assert_eq!(c(Some(404), Some("NoSuchKey"), false), NotFound);
+        assert_eq!(c(Some(404), None, false), NotFound);
+        assert_eq!(c(Some(400), Some("NotFound"), false), NotFound);
+        // 3. 412.
+        assert_eq!(
+            c(Some(412), Some("PreconditionFailed"), false),
+            VersionChanged
+        );
+        // 4. any remaining 403.
+        assert_eq!(c(Some(403), Some("AccessDenied"), false), Forbidden);
+        assert_eq!(c(Some(403), None, false), Forbidden);
+        // 5. 429/503 throttled; 408 and other 5xx server.
+        assert_eq!(c(Some(429), None, false), Throttled);
+        assert_eq!(c(Some(503), None, false), Throttled);
+        assert_eq!(c(Some(408), None, false), Server);
+        assert_eq!(c(Some(500), Some("InternalError"), false), Server);
+        assert_eq!(c(Some(502), None, false), Server);
+        // 6. no HTTP response.
+        assert_eq!(c(None, None, false), Transport);
+        // 7. the rest.
+        assert_eq!(c(Some(400), Some("InvalidArgument"), false), Other);
+        assert_eq!(c(Some(416), Some("InvalidRange"), false), Other);
+        assert_eq!(c(Some(301), None, false), Other);
+    }
+
+    /// The pinned override takes precedence over the table; other statuses are unaffected.
+    #[test]
+    fn s3_pinned_404_and_412_are_version_changed() {
+        use ObjectErrorKind::*;
+        assert_eq!(
+            classify_s3_failure(Some(404), Some("NoSuchKey"), true),
+            VersionChanged
+        );
+        assert_eq!(classify_s3_failure(Some(404), None, true), VersionChanged);
+        assert_eq!(classify_s3_failure(Some(412), None, true), VersionChanged);
+        // Over a transient code, the override still wins.
+        assert_eq!(
+            classify_s3_failure(Some(404), Some("SlowDown"), true),
+            VersionChanged
+        );
+        // Not-found by code alone is also absence of the pinned version.
+        assert_eq!(
+            classify_s3_failure(None, Some("NoSuchKey"), true),
+            VersionChanged
+        );
+        // Ordinary failures are classified as without a pin.
+        assert_eq!(
+            classify_s3_failure(Some(403), Some("AccessDenied"), true),
+            Forbidden
+        );
+        assert_eq!(classify_s3_failure(Some(503), None, true), Throttled);
+        assert_eq!(classify_s3_failure(None, None, true), Transport);
+        // End to end, with the verdict.
+        let e = classified(404, "NoSuchKey", true);
+        assert_eq!(kind_of(&e), VersionChanged);
+        assert!(!e.is_retryable());
+        let e = classified(412, "PreconditionFailed", true);
+        assert_eq!(kind_of(&e), VersionChanged);
+        assert!(!e.is_retryable());
+        // Unpinned (the first request): absence.
+        assert_eq!(kind_of(&classified(404, "NoSuchKey", false)), NotFound);
+    }
+
+    /// 403 `ExpiredToken` and `RequestExpired` stay retryable; an ordinary 403 is Forbidden
+    /// and is not retried.
+    #[test]
+    fn s3_expired_credentials_retry_but_ordinary_403_does_not() {
+        for code in ["ExpiredToken", "RequestExpired"] {
+            let e = classified(403, code, false);
+            assert!(e.is_retryable(), "403 {code} must stay retryable");
+            assert_ne!(kind_of(&e), ObjectErrorKind::Forbidden);
+        }
+        let e = classified(403, "AccessDenied", false);
+        assert_eq!(kind_of(&e), ObjectErrorKind::Forbidden);
+        assert!(!e.is_retryable());
+    }
+
+    /// An `Other`-tagged definite 400 keeps today's `SdkFailure` verdict: not retried.
+    /// Transient kinds keep today's verdict too (retried).
+    #[test]
+    fn other_and_transient_kinds_fall_through_to_todays_verdict() {
+        let e = classified(400, "InvalidArgument", false);
+        assert_eq!(kind_of(&e), ObjectErrorKind::Other);
+        assert!(!e.is_retryable(), "a definite 400 is not retried");
+        for (status, code) in [
+            (503, "SlowDown"),
+            (500, "InternalError"),
+            (408, "RequestTimeout"),
+        ] {
+            let e = classified(status, code, false);
+            assert!(e.is_retryable(), "{status} {code}");
+        }
+        // No SdkFailure and no ObjectError: today's conservative default.
+        assert!(anyhow::anyhow!("body stream failed").is_retryable());
+        // A body-stream error has no HTTP response: Transport, and still retried.
+        let body = attach_s3_classification(anyhow::anyhow!("body stream failed"), false);
+        assert_eq!(kind_of(&body), ObjectErrorKind::Transport);
+        assert!(body.is_retryable());
+        // Other over a source with no verdict also falls through to "retry".
+        let untyped = attach_object_error(anyhow::anyhow!("x"), ObjectErrorKind::Other, "s3", "");
+        assert!(untyped.is_retryable());
+    }
+
+    /// Length errors, absence, version changes, forbidden and unsupported are never retried,
+    /// even over a source that would be retried on its own.
+    #[test]
+    fn non_retryable_kinds_override_a_retryable_source() {
+        for kind in [
+            ObjectErrorKind::NotFound,
+            ObjectErrorKind::VersionChanged,
+            ObjectErrorKind::Forbidden,
+            ObjectErrorKind::Unsupported,
+            ObjectErrorKind::LengthMismatch {
+                expected: 8,
+                actual: Some(4),
+            },
+            ObjectErrorKind::LengthMismatch {
+                expected: 8,
+                actual: None,
+            },
+        ] {
+            // A retryable SdkFailure (503) below the typed context.
+            let over_sdk = attach_object_error(service_failure(503, "SlowDown"), kind, "s3", "");
+            assert!(!over_sdk.is_retryable(), "{kind:?} over a 503");
+            // An untyped source (default "retry") below it.
+            let over_plain = attach_object_error(anyhow::anyhow!("reset"), kind, "s3", "");
+            assert!(!over_plain.is_retryable(), "{kind:?} over a plain error");
+            // And through further string contexts.
+            let nested = {
+                use anyhow::Context;
+                Err::<(), _>(over_plain)
+                    .context("a")
+                    .context("b")
+                    .unwrap_err()
+            };
+            assert!(!nested.is_retryable(), "{kind:?} nested");
+        }
+        // Throttled / Transport / Server over a plain source are retried (unchanged default).
+        for kind in [
+            ObjectErrorKind::Throttled,
+            ObjectErrorKind::Transport,
+            ObjectErrorKind::Server,
+        ] {
+            let e = attach_object_error(anyhow::anyhow!("x"), kind, "s3", "");
+            assert!(e.is_retryable(), "{kind:?}");
+        }
+    }
+
+    /// A definite typed error ends `retry_get_body` after ONE attempt, with no backoff.
+    #[tokio::test]
+    async fn typed_forbidden_and_length_errors_use_one_attempt() {
+        let _guard = crate::test_env::lock_async().await;
+        let _env =
+            crate::test_env::EnvRestore::capture(&[crate::constants::ENV_MAX_RETRY_ATTEMPTS]);
+        std::env::set_var(crate::constants::ENV_MAX_RETRY_ATTEMPTS, "5");
+        for kind in [
+            ObjectErrorKind::Forbidden,
+            ObjectErrorKind::LengthMismatch {
+                expected: 2,
+                actual: Some(1),
+            },
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let op = {
+                let calls = Arc::clone(&calls);
+                move || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        Err::<(), anyhow::Error>(attach_object_error(
+                            anyhow::anyhow!("reset"),
+                            kind,
+                            "s3",
+                            "",
+                        ))
+                    }
+                }
+            };
+            retry_get_body(op).await.expect_err("fails");
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "{kind:?}");
+        }
     }
 }

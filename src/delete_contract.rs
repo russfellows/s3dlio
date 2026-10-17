@@ -96,9 +96,18 @@ async fn refuse_directory(uri: &str) -> Result<()> {
 ///   service gives the same status for a missing bucket, so a missing bucket
 ///   is not told apart from a missing object there.
 ///
+/// A typed [`ObjectError`](crate::object_error::ObjectError), when the error
+/// carries one, decides (plan §4.5 A2): true only for `NotFound`, so a
+/// `VersionChanged` attached over a GCS or Azure 404 is not "not found".  The
+/// outermost classification is authoritative.  Without one, the typed chain
+/// check above runs unchanged.
+///
 /// Message text is never inspected.  S3 needs no entry: its DELETE succeeds for
 /// a missing key.
 pub fn is_not_found(err: &anyhow::Error) -> bool {
+    if let Some(typed) = crate::object_error::object_error(err) {
+        return typed.kind == crate::object_error::ObjectErrorKind::NotFound;
+    }
     err.chain().any(|cause| {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
             return io.kind() == std::io::ErrorKind::NotFound;
@@ -661,6 +670,82 @@ mod tests {
         assert!(is_not_found(&http(404)));
         assert!(!is_not_found(&http(403)));
         assert!(!is_not_found(&http(500)));
+    }
+
+    /// The outer typed classification decides: only `NotFound` is absence.
+    #[test]
+    fn is_not_found_follows_a_typed_object_error() {
+        use crate::object_error::{attach_object_error, ObjectErrorKind};
+        let plain = || anyhow::anyhow!("something else");
+        assert!(is_not_found(&attach_object_error(
+            plain(),
+            ObjectErrorKind::NotFound,
+            "s3",
+            ""
+        )));
+        // Even over a source the chain check would call "not found".
+        assert!(!is_not_found(&attach_object_error(
+            io_not_found(),
+            ObjectErrorKind::Forbidden,
+            "s3",
+            ""
+        )));
+        for kind in [
+            ObjectErrorKind::VersionChanged,
+            ObjectErrorKind::Throttled,
+            ObjectErrorKind::Transport,
+            ObjectErrorKind::Server,
+            ObjectErrorKind::Other,
+            ObjectErrorKind::Unsupported,
+        ] {
+            assert!(!is_not_found(&attach_object_error(
+                io_not_found(),
+                kind,
+                "s3",
+                ""
+            )));
+        }
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn is_not_found_is_false_for_a_version_change_over_an_azure_blob_not_found() {
+        use crate::object_error::{attach_object_error, ObjectErrorKind};
+        use azure_core::error::ErrorKind;
+        let sdk = azure_core::Error::with_message(
+            ErrorKind::HttpResponse {
+                status: azure_core::http::StatusCode::NotFound,
+                error_code: Some("BlobNotFound".to_string()),
+                raw_response: None,
+            },
+            "azure",
+        );
+        let source = crate::azure_client::request_error_for_test(sdk);
+        // The source alone is absence, by the unchanged chain check.
+        assert!(is_not_found(&source));
+        let changed = attach_object_error(source, ObjectErrorKind::VersionChanged, "az", "pinned");
+        assert!(!is_not_found(&changed));
+        // The SDK error stays recoverable below the classification.
+        assert!(changed
+            .downcast_ref::<crate::azure_client::AzureRequestError>()
+            .is_some_and(|az| az.is_blob_not_found()));
+    }
+
+    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    #[test]
+    fn is_not_found_is_false_for_a_version_change_over_a_gcs_404() {
+        use crate::object_error::{attach_object_error, ObjectErrorKind};
+        let source = anyhow::Error::new(google_cloud_gax::error::Error::http(
+            404,
+            http::HeaderMap::new(),
+            Bytes::from_static(b"body"),
+        ));
+        assert!(is_not_found(&source));
+        let changed = attach_object_error(source, ObjectErrorKind::VersionChanged, "gs", "pinned");
+        assert!(!is_not_found(&changed));
+        assert!(changed
+            .downcast_ref::<google_cloud_gax::error::Error>()
+            .is_some());
     }
 
     #[tokio::test]

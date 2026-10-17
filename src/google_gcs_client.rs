@@ -14,6 +14,8 @@ use crate::gcs_constants::{
     DEFAULT_WINDOW_MIB, ENV_GCS_GRPC_CHANNELS, ENV_GRPC_INITIAL_WINDOW_MIB,
     GCS_MAX_CONCURRENT_DELETES, GCS_MIN_CHANNELS,
 };
+#[cfg(not(feature = "gcs-community"))]
+use crate::object_error::ObjectErrorKind;
 use crate::read_buffer::ReadBuffer;
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
@@ -1477,6 +1479,88 @@ fn is_retryable_gcs_read_error(message: &str) -> bool {
         || normalized.contains("resource_exhausted")
 }
 
+/// Classify a GCS failure from the typed `google_cloud_gax` error (plan §4.5 A2).
+///
+/// Only typed accessors are used; message text is never inspected.
+///
+/// * HTTP 404 or gRPC `NotFound` is `NotFound`.  GCS gives the same status for a missing
+///   bucket, so absence of the bucket is not told apart from absence of the object;
+/// * 412 or `FailedPrecondition` is `VersionChanged`;
+/// * 403 or `PermissionDenied` is `Forbidden`;
+/// * `Unavailable` or `ResourceExhausted`, or HTTP 503 or 429, is `Throttled`;
+/// * a typed transport failure (timeout, connect, I/O, or a transport error without an
+///   HTTP status) is `Transport`;
+/// * any other HTTP 5xx is `Server`;
+/// * everything else is `Other`.
+#[cfg(not(feature = "gcs-community"))]
+pub fn classify_gcs_failure(e: &google_cloud_gax::error::Error) -> ObjectErrorKind {
+    use google_cloud_gax::error::rpc::Code;
+    let http = e.http_status_code();
+    let code = e.status().map(|s| s.code);
+    if http == Some(404) || code == Some(Code::NotFound) {
+        ObjectErrorKind::NotFound
+    } else if http == Some(412) || code == Some(Code::FailedPrecondition) {
+        ObjectErrorKind::VersionChanged
+    } else if http == Some(403) || code == Some(Code::PermissionDenied) {
+        ObjectErrorKind::Forbidden
+    } else if matches!(code, Some(Code::Unavailable | Code::ResourceExhausted))
+        || matches!(http, Some(503 | 429))
+    {
+        ObjectErrorKind::Throttled
+    } else if http.is_none() && (e.is_timeout() || e.is_connect() || e.is_transport()) {
+        ObjectErrorKind::Transport
+    } else if matches!(http, Some(500..=599)) {
+        ObjectErrorKind::Server
+    } else {
+        ObjectErrorKind::Other
+    }
+}
+
+/// Attach the GCS classification of `err` as an
+/// [`ObjectError`](crate::object_error::ObjectError) context.
+///
+/// `err` must carry a `google_cloud_gax` error (found through any context layers).  An error
+/// that does not, or that already carries an `ObjectError`, is returned unchanged: an
+/// unclassified error stays unclassified, and the typed-only retry rule
+/// ([`gcs_typed_retry_verdict`]) then never retries it.  The attached message names the HTTP
+/// status and gRPC code only.
+#[cfg(not(feature = "gcs-community"))]
+pub fn attach_gcs_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
+    if crate::object_error::object_error(&err).is_some() {
+        return err;
+    }
+    let Some(g) = err.downcast_ref::<google_cloud_gax::error::Error>() else {
+        return err;
+    };
+    let kind = classify_gcs_failure(g);
+    let message = match (g.http_status_code(), g.status()) {
+        (Some(h), Some(s)) => format!("status {h}, code {:?}", s.code),
+        (Some(h), None) => format!("status {h}"),
+        (None, Some(s)) => format!("code {:?}", s.code),
+        (None, None) => "no status".to_string(),
+    };
+    if pinned {
+        crate::object_error::attach_pinned_read_error(err, kind, "gs", message)
+    } else {
+        crate::object_error::attach_object_error(err, kind, "gs", message)
+    }
+}
+
+/// The retry predicate for the new GCS receive and repair loop: **typed only**.
+///
+/// Only an outer `Throttled`, `Transport` or `Server` classification is retryable.  An
+/// unclassified error (no `ObjectError`), `Other`, `Forbidden`, `NotFound`, `VersionChanged`,
+/// a length error, and any message text that merely contains a status number are not.  This
+/// is not [`is_retryable_gcs_read_error`] (message text) and not the generic conservative
+/// fallback of `RetryClassify`; it never authorizes combining unpinned responses either.
+#[cfg(not(feature = "gcs-community"))]
+pub fn gcs_typed_retry_verdict(err: &anyhow::Error) -> bool {
+    matches!(
+        crate::object_error::object_error(err).map(|o| o.kind),
+        Some(ObjectErrorKind::Throttled | ObjectErrorKind::Transport | ObjectErrorKind::Server)
+    )
+}
+
 /// How many bytes an HTTP read will return, for sizing its destination buffer once (#252).
 ///
 /// `object_size` is the object's size from the response; `window` is the requested
@@ -2709,5 +2793,164 @@ mod zero_copy_tests {
             objects.is_empty(),
             "empty slice must trigger early return in delete_objects"
         );
+    }
+}
+
+/// Typed classification and the typed-only retry rule of the new GCS receive loop (plan §4.5
+/// A2). Every error here is built from the gax error's typed constructors; no test relies on
+/// message text.
+#[cfg(all(test, not(feature = "gcs-community")))]
+mod object_error_tests {
+    use super::*;
+    use crate::object_error::object_error;
+    use anyhow::Context;
+    use google_cloud_gax::error::rpc::{Code, Status};
+    use google_cloud_gax::error::Error as Gax;
+
+    fn http(code: u16) -> Gax {
+        Gax::http(code, http::HeaderMap::new(), Bytes::from_static(b"body"))
+    }
+
+    fn grpc(code: Code) -> Gax {
+        Gax::service(Status::default().set_code(code).set_message("injected"))
+    }
+
+    /// Classify as the loop's attachment site does: keep the typed gax error as the source and
+    /// wrap it in string contexts.
+    fn classified(e: Gax, pinned: bool) -> anyhow::Error {
+        let wrapped = Err::<(), _>(anyhow::Error::new(e))
+            .context("GCS ranged read")
+            .unwrap_err();
+        attach_gcs_classification(wrapped, pinned)
+    }
+
+    fn kind_of(err: &anyhow::Error) -> ObjectErrorKind {
+        object_error(err).expect("classified").kind
+    }
+
+    #[test]
+    fn classification_follows_the_typed_status() {
+        use ObjectErrorKind::*;
+        assert_eq!(classify_gcs_failure(&http(404)), NotFound);
+        assert_eq!(classify_gcs_failure(&grpc(Code::NotFound)), NotFound);
+        assert_eq!(classify_gcs_failure(&http(412)), VersionChanged);
+        assert_eq!(
+            classify_gcs_failure(&grpc(Code::FailedPrecondition)),
+            VersionChanged
+        );
+        assert_eq!(classify_gcs_failure(&http(403)), Forbidden);
+        assert_eq!(
+            classify_gcs_failure(&grpc(Code::PermissionDenied)),
+            Forbidden
+        );
+        assert_eq!(classify_gcs_failure(&http(503)), Throttled);
+        assert_eq!(classify_gcs_failure(&http(429)), Throttled);
+        assert_eq!(classify_gcs_failure(&grpc(Code::Unavailable)), Throttled);
+        assert_eq!(
+            classify_gcs_failure(&grpc(Code::ResourceExhausted)),
+            Throttled
+        );
+        assert_eq!(classify_gcs_failure(&http(500)), Server);
+        assert_eq!(classify_gcs_failure(&http(502)), Server);
+        assert_eq!(classify_gcs_failure(&Gax::io("reset")), Transport);
+        assert_eq!(classify_gcs_failure(&Gax::timeout("deadline")), Transport);
+        assert_eq!(classify_gcs_failure(&Gax::connect("refused")), Transport);
+        assert_eq!(classify_gcs_failure(&http(400)), Other);
+        assert_eq!(classify_gcs_failure(&grpc(Code::InvalidArgument)), Other);
+        assert_eq!(classify_gcs_failure(&Gax::deser("bad body")), Other);
+    }
+
+    /// The typed-only predicate retries typed transient and transport errors, including 503.
+    #[test]
+    fn typed_transient_and_transport_errors_are_retried() {
+        for e in [
+            http(503),
+            http(429),
+            http(500),
+            grpc(Code::Unavailable),
+            grpc(Code::ResourceExhausted),
+            Gax::io("connection reset"),
+            Gax::timeout("deadline"),
+            Gax::connect("refused"),
+        ] {
+            let err = classified(e, false);
+            assert!(
+                gcs_typed_retry_verdict(&err),
+                "{:?} must be retried",
+                kind_of(&err)
+            );
+        }
+    }
+
+    /// Nothing else retries: not an unclassified error whose message merely contains "503",
+    /// not an `Other`, not HTTP 403, not gRPC PermissionDenied, not absence or a version change.
+    #[test]
+    fn unclassified_other_forbidden_and_definite_errors_are_not_retried() {
+        let text_503 = anyhow::anyhow!("upstream answered 503 Service Unavailable, try later");
+        assert!(object_error(&text_503).is_none());
+        assert!(!gcs_typed_retry_verdict(&text_503));
+        // Attaching to an error with no gax source leaves it unclassified.
+        let still = attach_gcs_classification(text_503, false);
+        assert!(object_error(&still).is_none());
+        assert!(!gcs_typed_retry_verdict(&still));
+
+        // An `Other` whose message contains a retry-looking number.
+        let other = Gax::http(
+            400,
+            http::HeaderMap::new(),
+            Bytes::from_static(b"503 timeout"),
+        );
+        let other = classified(other, false);
+        assert_eq!(kind_of(&other), ObjectErrorKind::Other);
+        assert!(!gcs_typed_retry_verdict(&other));
+
+        for e in [
+            http(403),
+            grpc(Code::PermissionDenied),
+            http(404),
+            grpc(Code::NotFound),
+            http(412),
+            grpc(Code::FailedPrecondition),
+        ] {
+            let err = classified(e, false);
+            assert!(!gcs_typed_retry_verdict(&err), "{:?}", kind_of(&err));
+        }
+        // The old message-text helper would have retried this text; the typed rule does not.
+        assert!(is_retryable_gcs_read_error("UNAVAILABLE: upstream reset"));
+        let text_only = anyhow::anyhow!("UNAVAILABLE: upstream reset");
+        assert!(!gcs_typed_retry_verdict(&text_only));
+    }
+
+    /// A pinned read never reports absence: a 404 or NOT_FOUND on a retry or repair is a
+    /// version change, which is not retried and is not "not found".
+    #[test]
+    fn pinned_404_is_a_version_change() {
+        for e in [http(404), grpc(Code::NotFound)] {
+            let err = classified(e, true);
+            assert_eq!(kind_of(&err), ObjectErrorKind::VersionChanged);
+            assert!(!gcs_typed_retry_verdict(&err));
+            assert!(!crate::delete_contract::is_not_found(&err));
+        }
+        // Unpinned (first request): absence.
+        let first = classified(http(404), false);
+        assert_eq!(kind_of(&first), ObjectErrorKind::NotFound);
+        assert!(crate::delete_contract::is_not_found(&first));
+    }
+
+    /// The attached message names status and code only.
+    #[test]
+    fn attached_message_has_status_and_code_but_not_the_payload() {
+        let err = classified(
+            Gax::http(
+                503,
+                http::HeaderMap::new(),
+                Bytes::from_static(b"SECRET-PAYLOAD"),
+            ),
+            false,
+        );
+        let o = object_error(&err).expect("typed");
+        let text = o.to_string();
+        assert!(text.contains("status 503"), "{text}");
+        assert!(!text.contains("SECRET-PAYLOAD"), "{text}");
     }
 }

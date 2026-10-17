@@ -213,9 +213,18 @@ where
     // transient/definite verdict along (issue #240): `retry_get_body` needs
     // it and could not recover it from the message.
     let retryable = crate::retry::sdk_error_is_retryable(&e);
+    // The HTTP status and the service code travel with the verdict, so a typed
+    // classification (plan §4.5 A2) can be made after the flattening.
+    let status = e.raw_response().map(|r| r.status().as_u16());
+    let code = match &e {
+        SdkError::ServiceError(s) => s.err().code().map(str::to_owned),
+        _ => None,
+    };
     anyhow::Error::new(crate::retry::SdkFailure::new(
         format!("{}: {}", ctx, format_sdk_error(&e)),
         retryable,
+        status,
+        code,
     ))
 }
 
@@ -1598,7 +1607,7 @@ pub(crate) async fn get_object_concurrent_range_with_client(
     let total_bytes = end_offset - start_offset;
 
     // Determine optimal strategy based on size
-    let effective_chunk_size = chunk_size.unwrap_or_else(|| get_optimal_chunk_size(total_bytes));
+    let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
 
     // Use single request for small objects
     if total_bytes <= effective_chunk_size as u64 {
@@ -1611,8 +1620,7 @@ pub(crate) async fn get_object_concurrent_range_with_client(
     }
 
     // Use concurrent ranges for large objects
-    let effective_concurrency =
-        max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
+    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
 
     debug!(
         "Using concurrent range GET: {} bytes, chunk_size={}, concurrency={}",
@@ -1673,6 +1681,11 @@ async fn concurrent_range_get_impl(
     chunk_size: usize,
     max_concurrency: usize,
 ) -> Result<Bytes> {
+    // Last line of defence (issue #235): every route resolves its limits through
+    // `resolve_range_*` first, but a zero here would build ranges forever or a semaphore with
+    // no permits, so the engine refuses it before allocating or awaiting anything.
+    require_effective_chunk_size("chunk_size", chunk_size)?;
+    require_effective_concurrency("max_concurrency", max_concurrency)?;
     let total_bytes = (end_offset - start_offset) as usize;
 
     // Build (range_start, range_end) tuples in ascending offset order.
@@ -1871,48 +1884,108 @@ async fn attempt_range_chunk_fill(
     Ok(())
 }
 
-/// Get optimal chunk size based on total transfer size
-fn get_optimal_chunk_size(total_bytes: u64) -> usize {
-    // The `.env` policy first (#243, review R9): `S3DLIO_CHUNK_SIZE` may come from the file.
-    crate::dotenv::apply();
-    std::env::var("S3DLIO_CHUNK_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or({
-            // Intelligent defaults based on object size
-            if total_bytes < 16 * 1024 * 1024 {
-                // < 16MB: Use 1MB chunks
-                1024 * 1024
-            } else if total_bytes < 256 * 1024 * 1024 {
-                // 16MB - 256MB: Use 4MB chunks
-                4 * 1024 * 1024
-            } else {
-                // > 256MB: Use 8MB chunks for optimal throughput
-                8 * 1024 * 1024
-            }
-        })
+/// The environment variable that sets the range chunk size.
+const ENV_RANGE_CHUNK_SIZE: &str = "S3DLIO_CHUNK_SIZE";
+/// The environment variable that sets the range concurrency.
+const ENV_RANGE_CONCURRENCY: &str = "S3DLIO_RANGE_CONCURRENCY";
+
+/// Issue #235: a range chunk size of 0 can never cover a range.  `name` is the setting as the
+/// user spells it (the environment variable, or the parameter).
+fn require_effective_chunk_size(name: &str, value: usize) -> Result<usize> {
+    if value == 0 {
+        bail!(
+            "{name} must be an integer >= 1 (valid range: 1 or more), got 0: \
+             a chunk of 0 bytes can never cover the requested range"
+        );
+    }
+    Ok(value)
 }
 
-/// Get optimal concurrency based on total transfer size
-fn get_optimal_concurrency(total_bytes: u64) -> usize {
-    // The `.env` policy first (#243, review R9): `S3DLIO_RANGE_CONCURRENCY` may come from the file.
+/// Issue #235: a range concurrency of 0 builds a semaphore with no permits.
+fn require_effective_concurrency(name: &str, value: usize) -> Result<usize> {
+    crate::concurrency::require_concurrency_at_least_one(name, value)?;
+    Ok(value)
+}
+
+/// The chunk size a range GET will really use, after the caller's argument and the
+/// environment have been resolved (issue #235).
+///
+/// An explicit argument wins; otherwise `S3DLIO_CHUNK_SIZE`, otherwise the size-based
+/// default.  The EFFECTIVE value must be at least 1: a zero is an error naming the variable
+/// (or the parameter, when the caller passed it), returned before any range is allocated.
+/// The range receive path reuses this one check.
+pub(crate) fn resolve_range_chunk_size(
+    chunk_size: Option<usize>,
+    total_bytes: u64,
+) -> Result<usize> {
+    match chunk_size {
+        Some(n) => require_effective_chunk_size("chunk_size", n),
+        None => get_optimal_chunk_size(total_bytes),
+    }
+}
+
+/// The concurrency a range GET will really use (issue #235): an explicit argument,
+/// otherwise `S3DLIO_RANGE_CONCURRENCY`, otherwise the size-based default.  The EFFECTIVE
+/// value must be at least 1: a zero is an error naming the variable (or the parameter),
+/// returned before any semaphore is built.  The range receive path reuses this check.
+pub(crate) fn resolve_range_concurrency(
+    max_concurrency: Option<usize>,
+    total_bytes: u64,
+) -> Result<usize> {
+    match max_concurrency {
+        Some(n) => require_effective_concurrency("max_concurrency", n),
+        None => get_optimal_concurrency(total_bytes),
+    }
+}
+
+/// Get optimal chunk size based on total transfer size.
+///
+/// A zero from `S3DLIO_CHUNK_SIZE` is an error naming the variable (issue #235).
+fn get_optimal_chunk_size(total_bytes: u64) -> Result<usize> {
+    // The `.env` policy first (#243, review R9): `S3DLIO_CHUNK_SIZE` may come from the file.
     crate::dotenv::apply();
-    std::env::var("S3DLIO_RANGE_CONCURRENCY")
+    if let Some(n) = std::env::var(ENV_RANGE_CHUNK_SIZE)
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            let cores = num_cpus::get();
-            if total_bytes < 32 * 1024 * 1024 {
-                // < 32MB: Limited concurrency
-                std::cmp::max(2, cores / 2)
-            } else if total_bytes < 512 * 1024 * 1024 {
-                // 32MB - 512MB: Moderate concurrency
-                std::cmp::max(4, cores)
-            } else {
-                // > 512MB: High concurrency for large transfers
-                std::cmp::max(8, cores * 2)
-            }
-        })
+    {
+        return require_effective_chunk_size(ENV_RANGE_CHUNK_SIZE, n);
+    }
+    // Intelligent defaults based on object size
+    Ok(if total_bytes < 16 * 1024 * 1024 {
+        // < 16MB: Use 1MB chunks
+        1024 * 1024
+    } else if total_bytes < 256 * 1024 * 1024 {
+        // 16MB - 256MB: Use 4MB chunks
+        4 * 1024 * 1024
+    } else {
+        // > 256MB: Use 8MB chunks for optimal throughput
+        8 * 1024 * 1024
+    })
+}
+
+/// Get optimal concurrency based on total transfer size.
+///
+/// A zero from `S3DLIO_RANGE_CONCURRENCY` is an error naming the variable (issue #235).
+fn get_optimal_concurrency(total_bytes: u64) -> Result<usize> {
+    // The `.env` policy first (#243, review R9): `S3DLIO_RANGE_CONCURRENCY` may come from the file.
+    crate::dotenv::apply();
+    if let Some(n) = std::env::var(ENV_RANGE_CONCURRENCY)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        return require_effective_concurrency(ENV_RANGE_CONCURRENCY, n);
+    }
+    let cores = num_cpus::get();
+    Ok(if total_bytes < 32 * 1024 * 1024 {
+        // < 32MB: Limited concurrency
+        std::cmp::max(2, cores / 2)
+    } else if total_bytes < 512 * 1024 * 1024 {
+        // 32MB - 512MB: Moderate concurrency
+        std::cmp::max(4, cores)
+    } else {
+        // > 512MB: High concurrency for large transfers
+        std::cmp::max(8, cores * 2)
+    })
 }
 
 /// Synchronous wrapper for concurrent range GET
@@ -2543,7 +2616,7 @@ async fn get_object_with_known_size_async(
     }
 
     let total_bytes = end_offset - start_offset;
-    let effective_chunk_size = chunk_size.unwrap_or_else(|| get_optimal_chunk_size(total_bytes));
+    let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
 
     // If total fits in one chunk, use a single range request (no concurrency overhead).
     if total_bytes <= effective_chunk_size as u64 {
@@ -2553,8 +2626,7 @@ async fn get_object_with_known_size_async(
         return get_object_range_async(bucket, key, start_offset, Some(total_bytes)).await;
     }
 
-    let effective_concurrency =
-        max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
+    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
     let client = aws_s3_client_async().await?;
     concurrent_range_get_impl(
         &client,
@@ -3554,5 +3626,74 @@ mod tests {
     fn concurrent_range_limits_accept_none_and_positive() {
         assert!(require_concurrent_range_limits(None, None).is_ok());
         assert!(require_concurrent_range_limits(Some(1), Some(1)).is_ok());
+    }
+}
+
+/// Issue #235: the effective range limits are validated after the environment is resolved.
+#[cfg(test)]
+mod range_limit_resolution_tests {
+    use super::*;
+
+    const VARS: &[&str] = &[ENV_RANGE_CHUNK_SIZE, ENV_RANGE_CONCURRENCY];
+
+    #[test]
+    fn zero_from_the_environment_is_rejected_naming_the_variable() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "0");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "0");
+        let chunk = resolve_range_chunk_size(None, 64).expect_err("zero chunk size");
+        assert!(
+            format!("{chunk:#}").contains("S3DLIO_CHUNK_SIZE"),
+            "{chunk:#}"
+        );
+        assert!(format!("{chunk:#}").contains(">= 1"), "{chunk:#}");
+        let conc = resolve_range_concurrency(None, 64).expect_err("zero concurrency");
+        assert!(
+            format!("{conc:#}").contains("S3DLIO_RANGE_CONCURRENCY"),
+            "{conc:#}"
+        );
+        assert!(format!("{conc:#}").contains(">= 1"), "{conc:#}");
+    }
+
+    #[test]
+    fn an_explicit_argument_wins_over_the_environment_and_zero_names_the_parameter() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "0");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "0");
+        assert_eq!(
+            resolve_range_chunk_size(Some(4096), 64).expect("explicit"),
+            4096
+        );
+        assert_eq!(resolve_range_concurrency(Some(3), 64).expect("explicit"), 3);
+        let chunk = resolve_range_chunk_size(Some(0), 64).expect_err("zero argument");
+        assert!(format!("{chunk:#}").contains("chunk_size"), "{chunk:#}");
+        let conc = resolve_range_concurrency(Some(0), 64).expect_err("zero argument");
+        assert!(format!("{conc:#}").contains("max_concurrency"), "{conc:#}");
+    }
+
+    #[test]
+    fn valid_and_unparseable_settings_are_unchanged() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "8192");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "5");
+        assert_eq!(resolve_range_chunk_size(None, 64).expect("env"), 8192);
+        assert_eq!(resolve_range_concurrency(None, 64).expect("env"), 5);
+        // An unparseable value still falls back to the size-based default, as before.
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "not-a-number");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "-1");
+        assert_eq!(
+            resolve_range_chunk_size(None, 64).expect("default"),
+            1024 * 1024
+        );
+        assert!(resolve_range_concurrency(None, 64).expect("default") >= 2);
+        std::env::remove_var(ENV_RANGE_CHUNK_SIZE);
+        std::env::remove_var(ENV_RANGE_CONCURRENCY);
+        assert_eq!(
+            resolve_range_chunk_size(None, 300 * 1024 * 1024).expect("default"),
+            8 * 1024 * 1024
+        );
     }
 }

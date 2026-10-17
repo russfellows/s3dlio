@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::azure_credential::{self, CredentialMode};
 use crate::data_loader::parallel_fetch::DropCancel;
+use crate::object_error::ObjectErrorKind;
 use crate::read_buffer::ReadBuffer;
 
 use azure_core::http::{NoFormat, RequestContent, Url, XmlFormat};
@@ -186,6 +187,92 @@ impl AzureRequestError {
     /// The HTTP status of the failed request, if there was a response.
     pub fn http_status(&self) -> Option<azure_core::http::StatusCode> {
         self.inner.http_status()
+    }
+
+    /// The service error code of the failed request (`BlobNotFound`, ...), from the
+    /// SDK error's `ErrorKind::HttpResponse`.  `None` when there was no HTTP response or
+    /// the response carried no code.
+    pub(crate) fn error_code(&self) -> Option<&str> {
+        azure_error_code(&self.inner)
+    }
+
+    /// The typed classification of this failure (plan §4.5 A2), see
+    /// [`classify_azure_failure`].
+    pub fn object_error_kind(&self) -> ObjectErrorKind {
+        classify_azure_failure(
+            self.inner.http_status().map(u16::from),
+            self.error_code(),
+            azure_error_is_transport(&self.inner),
+        )
+    }
+}
+
+/// The service error code of an SDK error that is an HTTP response error.
+fn azure_error_code(e: &azure_core::Error) -> Option<&str> {
+    match e.kind() {
+        azure_core::error::ErrorKind::HttpResponse { error_code, .. } => error_code.as_deref(),
+        _ => None,
+    }
+}
+
+/// Whether an SDK error is a failure to get any response: a connection that could not be
+/// made, or an I/O failure while sending or reading.
+fn azure_error_is_transport(e: &azure_core::Error) -> bool {
+    matches!(
+        e.kind(),
+        azure_core::error::ErrorKind::Connection | azure_core::error::ErrorKind::Io
+    )
+}
+
+/// Classify an Azure failure from its HTTP `status`, service error `code` and whether it was
+/// a transport failure (plan §4.5 A2).  Pure.
+///
+/// * `BlobNotFound` is `NotFound` (404 with that code); a missing container
+///   (`ContainerNotFound`) is `Other`, never object absence;
+/// * 412 is `VersionChanged`; 403 is `Forbidden`;
+/// * 429 and 503 are `Throttled`; any other 5xx is `Server`;
+/// * a failure with no response (connection, I/O) is `Transport`;
+/// * anything else, including every other 404, is `Other`.
+pub fn classify_azure_failure(
+    status: Option<u16>,
+    code: Option<&str>,
+    transport: bool,
+) -> ObjectErrorKind {
+    match (status, code) {
+        (Some(404), Some("BlobNotFound")) => ObjectErrorKind::NotFound,
+        (Some(404), Some("ContainerNotFound")) => ObjectErrorKind::Other,
+        (Some(412), _) => ObjectErrorKind::VersionChanged,
+        (Some(403), _) => ObjectErrorKind::Forbidden,
+        (Some(429 | 503), _) => ObjectErrorKind::Throttled,
+        (Some(500..=599), _) => ObjectErrorKind::Server,
+        (None, _) if transport => ObjectErrorKind::Transport,
+        _ => ObjectErrorKind::Other,
+    }
+}
+
+/// Attach the Azure classification of `err` as an
+/// [`ObjectError`](crate::object_error::ObjectError) context.  `err` must carry an
+/// [`AzureRequestError`]; one that does not, or that already carries an `ObjectError`, is
+/// returned unchanged.  The attached message names the status and code only, so the SAS
+/// redaction of the source text is not at risk.
+pub fn attach_azure_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
+    if crate::object_error::object_error(&err).is_some() {
+        return err;
+    }
+    let Some(az) = err.downcast_ref::<AzureRequestError>() else {
+        return err;
+    };
+    let kind = az.object_error_kind();
+    let message = match (az.http_status(), az.error_code()) {
+        (Some(s), Some(c)) => format!("status {}, code {c}", u16::from(s)),
+        (Some(s), None) => format!("status {}", u16::from(s)),
+        (None, Some(c)) => format!("code {c}"),
+        (None, None) => "no HTTP response".to_string(),
+    };
+    if pinned {
+        crate::object_error::attach_pinned_read_error(err, kind, "az", message)
+    } else {
+        crate::object_error::attach_object_error(err, kind, "az", message)
     }
 }
 
@@ -1672,5 +1759,105 @@ mod tests {
         // Cleanup
         std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
+    }
+}
+
+/// Typed classification of Azure failures (plan §4.5 A2), built from the SDK's typed
+/// `ErrorKind`; no test relies on message text.
+#[cfg(test)]
+mod object_error_tests {
+    use super::*;
+    use crate::object_error::object_error;
+    use crate::retry::RetryClassify;
+    use azure_core::error::ErrorKind;
+    use azure_core::http::StatusCode;
+
+    fn http_error(status: u16, code: Option<&str>) -> anyhow::Error {
+        let sdk = azure_core::Error::with_message(
+            ErrorKind::HttpResponse {
+                status: StatusCode::from(status),
+                error_code: code.map(str::to_string),
+                raw_response: None,
+            },
+            "azure",
+        );
+        request_error_for_test(sdk)
+    }
+
+    fn kind_of(err: &anyhow::Error) -> ObjectErrorKind {
+        object_error(err).expect("classified").kind
+    }
+
+    #[test]
+    fn error_code_comes_from_the_http_response_kind() {
+        let e = http_error(404, Some("BlobNotFound"));
+        let az = e.downcast_ref::<AzureRequestError>().expect("typed");
+        assert_eq!(az.error_code(), Some("BlobNotFound"));
+        let e = http_error(500, None);
+        let az = e.downcast_ref::<AzureRequestError>().expect("typed");
+        assert_eq!(az.error_code(), None);
+        let other = request_error_for_test(azure_core::Error::with_message(ErrorKind::Io, "reset"));
+        let az = other.downcast_ref::<AzureRequestError>().expect("typed");
+        assert_eq!(az.error_code(), None);
+    }
+
+    #[test]
+    fn mapping_follows_the_plan() {
+        use ObjectErrorKind::*;
+        let k = |s, c| kind_of(&attach_azure_classification(http_error(s, c), false));
+        assert_eq!(k(404, Some("BlobNotFound")), NotFound);
+        assert_eq!(k(404, Some("ContainerNotFound")), Other);
+        assert_eq!(k(404, None), Other);
+        assert_eq!(k(412, Some("ConditionNotMet")), VersionChanged);
+        assert_eq!(k(403, Some("AuthorizationFailure")), Forbidden);
+        assert_eq!(k(429, None), Throttled);
+        assert_eq!(k(503, Some("ServerBusy")), Throttled);
+        assert_eq!(k(500, Some("InternalError")), Server);
+        assert_eq!(k(502, None), Server);
+        assert_eq!(k(400, Some("InvalidInput")), Other);
+        // Transport: no HTTP response at all.
+        for kind in [ErrorKind::Io, ErrorKind::Connection] {
+            let e = request_error_for_test(azure_core::Error::with_message(kind, "reset"));
+            assert_eq!(kind_of(&attach_azure_classification(e, false)), Transport);
+        }
+        // A credential or data-conversion failure is not transport.
+        for kind in [
+            ErrorKind::Credential,
+            ErrorKind::DataConversion,
+            ErrorKind::Other,
+        ] {
+            let e = request_error_for_test(azure_core::Error::with_message(kind, "x"));
+            assert_eq!(kind_of(&attach_azure_classification(e, false)), Other);
+        }
+    }
+
+    /// A pinned read never reports absence, and a missing container is not absence.
+    #[test]
+    fn pinned_blob_not_found_is_a_version_change() {
+        let first = attach_azure_classification(http_error(404, Some("BlobNotFound")), false);
+        assert_eq!(kind_of(&first), ObjectErrorKind::NotFound);
+        let pinned = attach_azure_classification(http_error(404, Some("BlobNotFound")), true);
+        assert_eq!(kind_of(&pinned), ObjectErrorKind::VersionChanged);
+        assert!(!pinned.is_retryable());
+        assert!(!crate::delete_contract::is_not_found(&pinned));
+        let container =
+            attach_azure_classification(http_error(404, Some("ContainerNotFound")), false);
+        assert!(!crate::delete_contract::is_not_found(&container));
+    }
+
+    /// The attached message names status and code only, and the redacted source text is
+    /// unchanged below it.
+    #[test]
+    fn classification_keeps_the_typed_source_and_adds_no_source_text() {
+        let e = attach_azure_classification(http_error(503, Some("ServerBusy")), false);
+        let text = object_error(&e).expect("typed").to_string();
+        assert!(
+            text.contains("status 503") && text.contains("ServerBusy"),
+            "{text}"
+        );
+        assert!(e.downcast_ref::<AzureRequestError>().is_some());
+        // Not an Azure error: returned unchanged.
+        let plain = attach_azure_classification(anyhow::anyhow!("x"), false);
+        assert!(object_error(&plain).is_none());
     }
 }
