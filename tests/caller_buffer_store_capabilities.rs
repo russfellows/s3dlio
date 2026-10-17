@@ -21,7 +21,6 @@
 mod s3_get_into_support;
 
 #[cfg(feature = "backend-azure")]
-#[allow(dead_code)] // the fake serves several test binaries; each uses a subset
 #[path = "common/azure_fake.rs"]
 mod azure_fake;
 

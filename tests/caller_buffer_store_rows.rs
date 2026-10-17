@@ -15,17 +15,17 @@
 
 #![cfg(all(feature = "native-backends", not(feature = "arrow-backend")))]
 
-#[allow(dead_code)] // shared helpers; each test binary uses a subset
-mod common;
+#[path = "common/oplog_rows.rs"]
+#[allow(dead_code)] // the row reader serves several test binaries; each uses a subset
+mod oplog_rows;
 #[allow(dead_code)] // shared helpers; each test binary uses a subset
 mod s3_get_into_support;
 
 #[cfg(feature = "backend-azure")]
-#[allow(dead_code)] // the fake serves several test binaries; each uses a subset
 #[path = "common/azure_fake.rs"]
 mod azure_fake;
 
-use common::oplog_rows::{read_rows, Row, COL_BYTES, COL_ERROR, COL_FILE, COL_OP};
+use oplog_rows::{read_rows, Row, COL_BYTES, COL_ERROR, COL_FILE, COL_OP};
 use s3_get_into_support::mock::{start_isolated_mock_s3_server, MockObject};
 use s3_get_into_support::{init, key, pattern, BUCKET};
 use s3dlio::object_store::store_for_uri_with_logger;
