@@ -562,27 +562,8 @@ impl GcsClient {
 /// assert_eq!(object, "");
 /// ```
 pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
-    // Strip gs:// or gcs:// prefix
-    let path = uri
-        .strip_prefix("gs://")
-        .or_else(|| uri.strip_prefix("gcs://"))
-        .ok_or_else(|| anyhow!("Invalid GCS URI (expected gs:// or gcs:// prefix): {}", uri))?;
-
-    // Split into bucket and object path
-    let mut parts = path.splitn(2, '/');
-    let bucket = parts
-        .next()
-        .ok_or_else(|| anyhow!("Invalid GCS URI (missing bucket): {}", uri))?
-        .to_string();
-
-    // Object path is optional (empty for bucket-only URIs like gs://bucket/ for listings)
-    let object_path = parts.next().unwrap_or("").to_string();
-
-    if bucket.is_empty() {
-        bail!("Invalid GCS URI (empty bucket name): {}", uri);
-    }
-
-    Ok((bucket, object_path))
+    // The structure of a gs:// URI is parsed in one place, by the environment-free parser.
+    crate::capabilities::parse_gs_uri_pure(uri)
 }
 
 // ============================================================================

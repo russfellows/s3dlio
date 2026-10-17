@@ -13,9 +13,21 @@
 //! - no probe of whether a GCS bucket is an ordinary or a Rapid bucket: that is resolved during
 //!   real I/O, never here.
 //!
-//! The URI is checked with the structural parsers in this module ([`parse_s3_uri_pure`],
-//! [`parse_azure_uri_pure`], [`parse_gs_uri_pure`]), which read nothing but their argument. A
-//! malformed URI is an error; an unknown scheme is not (it reports `"unknown"` with no support).
+//! The URI is checked with the crate-internal structural parsers in this module
+//! (`parse_s3_uri_pure`, `parse_azure_uri_pure`, `parse_gs_uri_pure`), which read nothing but
+//! their argument. They are the single structural implementation: the community GCS parser
+//! (`gcs_client::parse_gcs_uri`) already delegates to `parse_gs_uri_pure`, and the S3 wrapper in
+//! `s3_utils` and the official GCS parser in `google_gcs_client` will delegate to the S3 and GS
+//! parsers in a following step of the same work (#264); until then those two are kept in step by
+//! tests that compare them with the pure parsers. A malformed URI is an error; an unknown scheme
+//! is not (it reports `"unknown"` with no support).
+//!
+//! # Purity is structural
+//!
+//! Nothing here takes anything but `&str`. The call graph is the parsers above and
+//! `object_store::infer_scheme` (string matching): there is no environment read, no `.env`
+//! handling, no store or client construction and no async runtime anywhere in it. The unit tests
+//! therefore need not (and do not) manipulate the process environment to show it.
 //!
 //! # Structural validation, not full parity
 //!
@@ -27,11 +39,12 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::object_store::{infer_scheme, Scheme};
+use crate::object_store::{infer_scheme, is_azure_blob_host, Scheme};
 use crate::s3_utils::{S3FirstSegment, S3UriComponents};
 
 /// What this build can do for an object URI. See [`object_capabilities`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// The provider named by the URI: `"s3"`, `"az"`, `"gs"` (for `gs://` and `gcs://`),
     /// `"file"`, `"direct"` or `"unknown"`.
@@ -79,8 +92,17 @@ const GCS_OFFICIAL_COMPILED: bool =
 ///
 /// # Errors
 ///
-/// A malformed URI for a known object scheme (for example `az://account//key`, which has an empty
-/// container). An unknown scheme is not an error.
+/// `Err` means the URI is **malformed** for a known object scheme (for example `az://account//key`,
+/// which has an empty container): a structural fault that no environment can repair. An unknown
+/// scheme is not an error.
+///
+/// # What `Ok` does not promise
+///
+/// This is structural validation only. `Ok` with `true` says that this build has the operations
+/// for the scheme and that the URI is well formed; it does **not** guarantee that a store will
+/// accept the URI. Rules that depend on the environment are applied only when a store is built
+/// (for example Azure account-name canonicalisation and length, which depend on the configured
+/// endpoint), so a store can still refuse a URI this function accepts.
 pub fn object_capabilities(uri: &str) -> Result<Capabilities> {
     match infer_scheme(uri) {
         Scheme::S3 => {
@@ -196,7 +218,7 @@ fn validate_s3_server_host(host: &str, segment: &str) -> Result<()> {
 ///
 /// An empty segment, a URL, userinfo, an ARN, a portless IP literal, or a malformed host, port
 /// or bracket.
-pub fn classify_s3_first_segment_pure(segment: &str) -> Result<S3FirstSegment<'_>> {
+pub(crate) fn classify_s3_first_segment_pure(segment: &str) -> Result<S3FirstSegment<'_>> {
     if segment.is_empty() {
         bail!(
             "empty first segment in the S3 URI: expected a bucket name (s3://bucket/key) or a \
@@ -303,7 +325,7 @@ fn missing_bucket_after_server(endpoint: &str, uri: &str) -> anyhow::Error {
 ///
 /// A URI that does not start with `s3://`, has no `/` after the bucket, or whose first segment
 /// is rejected by [`classify_s3_first_segment_pure`]; a server with no bucket after it.
-pub fn parse_s3_uri_pure(uri: &str) -> Result<S3UriComponents> {
+pub(crate) fn parse_s3_uri_pure(uri: &str) -> Result<S3UriComponents> {
     let trimmed = uri
         .strip_prefix("s3://")
         .context("URI must start with s3://")?;
@@ -350,23 +372,6 @@ pub fn parse_s3_uri_pure(uri: &str) -> Result<S3UriComponents> {
 // Azure
 // ============================================================================
 
-/// True when the URI's authority (`host[:port]`, userinfo stripped) is, or ends with, an Azure
-/// Blob Storage host name (`*.blob.core.windows.net`, case-insensitive). Only the authority is
-/// examined, so a key that mentions the host name does not match.
-///
-/// This mirrors the private `object_store::is_azure_blob_host`; the two are meant to be merged
-/// once that file is next opened for this work.
-fn is_azure_blob_host_pure(uri: &str) -> bool {
-    let Some((_, after_scheme)) = uri.split_once("://") else {
-        return false;
-    };
-    let authority = after_scheme.split('/').next().unwrap_or("");
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host);
-    host.to_ascii_lowercase()
-        .ends_with(".blob.core.windows.net")
-}
-
 /// Why an Azure account name could redirect a request or is not a usable name, whatever the
 /// configured endpoint. The environment-dependent rules (lower-casing, the 3 to 24 character
 /// length of a real account) stay in the gated canonicalisation.
@@ -408,7 +413,7 @@ fn check_azure_account_pure(account: &str) -> Result<()> {
 /// # Errors
 ///
 /// As above, and a URI that is neither an `az://` URI nor an Azure blob host URL.
-pub fn parse_azure_uri_pure(uri: &str) -> Result<(String, String, String)> {
+pub(crate) fn parse_azure_uri_pure(uri: &str) -> Result<(String, String, String)> {
     if let Some(rest) = uri.strip_prefix("az://") {
         let mut it = rest.splitn(3, '/');
         let account = it.next().unwrap_or("");
@@ -423,14 +428,28 @@ pub fn parse_azure_uri_pure(uri: &str) -> Result<(String, String, String)> {
         return Ok((account.to_string(), container.to_string(), key.to_string()));
     }
 
-    if is_azure_blob_host_pure(uri) {
+    if is_azure_blob_host(uri) {
         // The scheme (http or https) does not change which account, container and key the URL
         // names.
         let after_scheme = uri
             .split_once("://")
             .map(|(_, rest)| rest)
             .ok_or_else(|| anyhow!("expected a scheme (http:// or https://) for Azure URL"))?;
-        let (host, path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+        let (authority, path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+        // The account comes from the host and from nothing else, so the authority must be a
+        // plain `host[:port]`. Userinfo (`@`) lets `abc.def@real.blob...` name the account `abc`
+        // while the request goes to `real.blob...`; a backslash (read as `/` by URL parsers for
+        // http and https), `?`, `#`, `%` and whitespace end or rewrite the authority so the host
+        // we would read is not the host a request reaches.
+        if authority.chars().any(|c| {
+            matches!(c, '@' | '\\' | '?' | '#' | '%') || c.is_whitespace() || c.is_control()
+        }) {
+            bail!(
+                "invalid Azure URL authority {authority:?}: it must be a plain host[:port] \
+                 (no userinfo '@', backslash, '?', '#', '%' or whitespace)"
+            );
+        }
+        let host = authority.split(':').next().unwrap_or(authority);
         let account = host.split('.').next().unwrap_or("");
         // The first path segment is the container; the single `/` after it is the separator,
         // and the rest is the key exactly as written (issue #198).
@@ -458,7 +477,7 @@ pub fn parse_azure_uri_pure(uri: &str) -> Result<(String, String, String)> {
 /// # Errors
 ///
 /// A URI without a `gs://` or `gcs://` prefix, or with an empty bucket.
-pub fn parse_gs_uri_pure(uri: &str) -> Result<(String, String)> {
+pub(crate) fn parse_gs_uri_pure(uri: &str) -> Result<(String, String)> {
     let path = uri
         .strip_prefix("gs://")
         .or_else(|| uri.strip_prefix("gcs://"))
@@ -474,28 +493,6 @@ pub fn parse_gs_uri_pure(uri: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{lock, EnvRestore};
-
-    /// Every environment variable that credential discovery, endpoint routing or `.env` handling
-    /// could read for any provider.
-    const CREDENTIAL_AND_ENDPOINT_VARS: &[&str] = &[
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_PROFILE",
-        "AWS_ENDPOINT_URL",
-        "AWS_REGION",
-        "AZURE_STORAGE_ACCOUNT",
-        "AZURE_STORAGE_KEY",
-        "AZURE_STORAGE_ENDPOINT",
-        "AZURE_BLOB_ENDPOINT_URL",
-        "AZURE_CLIENT_ID",
-        "AZURE_CLIENT_SECRET",
-        "AZURE_TENANT_ID",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "GCS_ENDPOINT_URL",
-        "STORAGE_EMULATOR_HOST",
-    ];
 
     // ---- results per build -------------------------------------------------------------
 
@@ -727,6 +724,55 @@ mod tests {
         }
     }
 
+    // ---- Azure authority smuggling (review finding) ----------------------------------------
+
+    /// In the http(s) form the account must come from the host and nothing else. Userinfo,
+    /// a backslash (which URL parsers treat as a `/` for http and https), and the `?` and `#`
+    /// delimiters all end or rewrite the authority, so the "host" this parser sees would not be
+    /// the host a request goes to. Every one of these is refused, never reduced to an account.
+    #[test]
+    fn azure_https_authority_cannot_smuggle_an_account() {
+        for uri in [
+            "https://abc.def@real.blob.core.windows.net/c/k",
+            "https://abc@real.blob.core.windows.net/c/k",
+            "http://user:pw@real.blob.core.windows.net/c/k",
+            "https://evil.com\\@real.blob.core.windows.net/c/k",
+            "https://evil.com\\.blob.core.windows.net/c/k",
+            "https://evil.com?.blob.core.windows.net/c/k",
+            "https://evil.com#.blob.core.windows.net/c/k",
+            "https://evil.com%2f.blob.core.windows.net/c/k",
+            "https://evil.com .blob.core.windows.net/c/k",
+        ] {
+            let err = parse_azure_uri_pure(uri)
+                .expect_err(&format!("{uri}: must be refused, not parsed to an account"));
+            assert!(format!("{err:#}").contains("authority"), "{uri}: {err:#}");
+            // The same refusal reaches the capability answer: it is not "unknown".
+            assert!(object_capabilities(uri).is_err(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn azure_https_plain_hosts_still_parse() {
+        for (uri, want) in [
+            ("https://acct.blob.core.windows.net/c/k", ("acct", "c", "k")),
+            (
+                "http://acct.blob.core.windows.net:10000/c/k/n",
+                ("acct", "c", "k/n"),
+            ),
+            (
+                "https://MyAcct.Blob.Core.Windows.NET/c/k",
+                ("MyAcct", "c", "k"),
+            ),
+        ] {
+            let (a, c, k) = parse_azure_uri_pure(uri).expect(uri);
+            assert_eq!((a.as_str(), c.as_str(), k.as_str()), want, "{uri}");
+        }
+        // A key may contain the characters the authority may not.
+        let (_, _, key) =
+            parse_azure_uri_pure("https://acct.blob.core.windows.net/c/a@b\\c?d#e").expect("key");
+        assert_eq!(key, "a@b\\c?d#e");
+    }
+
     #[test]
     fn azure_key_mentioning_the_host_does_not_make_an_s3_uri_azure() {
         let c = caps("s3://backups/mirror/acct.blob.core.windows.net/file.dat");
@@ -839,43 +885,51 @@ mod tests {
         }
     }
 
+    // The community parser delegates to the pure one, so this pins what both return rather than
+    // comparing a function with itself.
     #[cfg(feature = "gcs-community")]
     #[test]
-    fn gs_pure_parser_matches_the_community_gated_one() {
-        for uri in [
-            "gs://bucket/path/to/object",
-            "gcs://bucket/o",
-            "gs://bucket/",
-            "gs://bucket",
-            "gs://",
-            "gs:///o",
-            "s3://bucket/o",
-            "",
+    fn community_gcs_parser_delegates_to_the_pure_one() {
+        for (uri, want) in [
+            (
+                "gs://bucket/path/to/object",
+                Some(("bucket", "path/to/object")),
+            ),
+            ("gcs://bucket/o", Some(("bucket", "o"))),
+            ("gs://bucket/", Some(("bucket", ""))),
+            ("gs://bucket", Some(("bucket", ""))),
+            ("gs://", None),
+            ("gs:///o", None),
+            ("s3://bucket/o", None),
+            ("", None),
         ] {
             let pure = parse_gs_uri_pure(uri);
-            let existing = crate::gcs_client::parse_gcs_uri(uri);
-            match (pure, existing) {
-                (Ok(p), Ok(e)) => assert_eq!(p, e, "{uri:?}"),
-                (Err(p), Err(e)) => assert_eq!(format!("{p:#}"), format!("{e:#}"), "{uri:?}"),
-                (p, e) => panic!("{uri:?}: pure={p:?} existing={e:?}"),
+            let community = crate::gcs_client::parse_gcs_uri(uri);
+            match (pure, community, want) {
+                (Ok(p), Ok(c), Some((b, o))) => {
+                    assert_eq!(p, c, "{uri:?}");
+                    assert_eq!((p.0.as_str(), p.1.as_str()), (b, o), "{uri:?}");
+                }
+                (Err(p), Err(c), None) => {
+                    assert_eq!(format!("{p:#}"), format!("{c:#}"), "{uri:?}");
+                }
+                (p, c, w) => panic!("{uri:?}: pure={p:?} community={c:?} want={w:?}"),
             }
         }
     }
 
     // ---- purity ------------------------------------------------------------------------
+    //
+    // Purity is structural, not demonstrated by manipulating the environment: the functions
+    // take only `&str`, and their call graph (the parsers in this module and
+    // `object_store::infer_scheme`) has no environment read, `.env` handling, store, client or
+    // runtime in it. These tests therefore never set or remove a variable (which would also race
+    // other tests in the process).
 
-    /// `object_capabilities` answers with every credential and endpoint variable absent and
-    /// outside any async runtime. It is a plain synchronous function whose only callees are the
-    /// pure parsers above and `infer_scheme` (string matching): none of them can construct a
-    /// store, spawn a runtime, or read the environment, so there is nothing for an absent
-    /// credential to fail.
+    /// `object_capabilities` is a plain synchronous function: it answers outside any async
+    /// runtime and leaves none entered.
     #[test]
-    fn answers_with_no_credentials_and_no_runtime() {
-        let _guard = lock();
-        let _env = EnvRestore::capture(CREDENTIAL_AND_ENDPOINT_VARS);
-        for var in CREDENTIAL_AND_ENDPOINT_VARS {
-            std::env::remove_var(var);
-        }
+    fn answers_with_no_runtime() {
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "this test must run outside any runtime"
@@ -896,36 +950,43 @@ mod tests {
         );
     }
 
-    /// The answer does not depend on the environment: setting every variable (to values that
-    /// would make a client build fail or route elsewhere) changes nothing, and the pure Azure
-    /// parser neither lower-cases the account nor applies the real-account length rule that the
-    /// gated canonicalisation applies for a default endpoint.
+    /// The pure Azure parser returns the account as written: it neither lower-cases it nor
+    /// applies the real-account length rule that the gated canonicalisation applies for a
+    /// default endpoint (both depend on the configured endpoint).
     #[test]
-    fn answer_is_independent_of_the_environment() {
-        let _guard = lock();
-        let _env = EnvRestore::capture(CREDENTIAL_AND_ENDPOINT_VARS);
-        let uris = [
-            "s3://bucket/key",
-            "s3://host:9000/bucket/key",
-            "az://MyAcct/container/key",
-            "az://ab/container/key",
-            "gs://bucket/key",
-            "file:///tmp/x",
-        ];
-        for var in CREDENTIAL_AND_ENDPOINT_VARS {
-            std::env::remove_var(var);
-        }
-        let absent: Vec<_> = uris.iter().map(|u| caps(u)).collect();
-        let account_absent = parse_azure_uri_pure("az://MyAcct/c/k").expect("az").0;
+    fn pure_azure_parser_keeps_the_account_as_written() {
+        assert_eq!(
+            parse_azure_uri_pure("az://MyAcct/c/k").expect("az").0,
+            "MyAcct"
+        );
+        assert_eq!(parse_azure_uri_pure("az://ab/c/k").expect("az").0, "ab");
+        assert_eq!(caps("az://MyAcct/container/key").provider, "az");
+    }
 
-        for var in CREDENTIAL_AND_ENDPOINT_VARS {
-            std::env::set_var(var, "http://127.0.0.1:1");
-        }
-        let present: Vec<_> = uris.iter().map(|u| caps(u)).collect();
-        let account_present = parse_azure_uri_pure("az://MyAcct/c/k").expect("az").0;
+    // ---- literal values in the default build -------------------------------------------
 
-        assert_eq!(absent, present);
-        assert_eq!(account_absent, "MyAcct");
-        assert_eq!(account_present, "MyAcct");
+    /// The literal table for the build with no Azure, no GCS and no Arrow backend (Cargo's
+    /// default features), written without reference to the `cfg!` constants the
+    /// implementation uses, so a wrong constant cannot hide behind a mirrored expectation.
+    #[cfg(all(
+        feature = "native-backends",
+        not(feature = "backend-azure"),
+        not(feature = "backend-gcs"),
+        not(feature = "arrow-backend")
+    ))]
+    #[test]
+    fn default_build_reports_these_literal_values() {
+        for (uri, provider, supported) in [
+            ("s3://bucket/key", "s3", true),
+            ("az://account/container/key", "az", false),
+            ("gs://bucket/key", "gs", false),
+            ("file:///tmp/x", "file", false),
+            ("ftp://host/x", "unknown", false),
+        ] {
+            let c = caps(uri);
+            assert_eq!(c.provider, provider, "{uri}");
+            assert_eq!(c.get_into, supported, "{uri}");
+            assert_eq!(c.head, supported, "{uri}");
+        }
     }
 }

@@ -309,7 +309,14 @@ pub struct ObjectProperties {
 /// blob path, `s3://backups/mirror/acct.blob.core.windows.net/file.dat` --
 /// misrouting it to the Azure backend. Restrict the check to the authority
 /// component only, and require it as a suffix rather than a substring.
-fn is_azure_blob_host(uri: &str) -> bool {
+///
+/// This is only the classifier behind [`infer_scheme`] and the pure Azure parser
+/// (`capabilities::parse_azure_uri_pure`); both call this one function, so they cannot disagree
+/// about what is an Azure host URL. It deliberately does NOT refuse userinfo or a backslash in
+/// the authority: such a URI is still an Azure URL, so it is classified Azure and the parser then
+/// refuses it with a clear error. Classifying it as "not Azure" instead would turn a smuggling
+/// attempt into a silent `"unknown"` scheme. The account is never taken from this function.
+pub(crate) fn is_azure_blob_host(uri: &str) -> bool {
     let Some(after_scheme_idx) = uri.find("://") else {
         return false;
     };
@@ -5449,6 +5456,22 @@ mod s3_object_store_tests {
         ));
         let (account, _, _) = parse_azure_uri("https://MyAcct.Blob.Core.Windows.NET/c/k").unwrap();
         assert_eq!(account, "myacct", "the host's account is lowercased");
+    }
+
+    // A URI that carries userinfo or a backslash in its authority is still classified Azure (so
+    // it reaches the parser, which refuses it) and is never read as an account.
+    #[test]
+    fn azure_host_urls_with_a_smuggling_authority_are_classified_azure_and_refused() {
+        for uri in [
+            "https://abc.def@real.blob.core.windows.net/c/k",
+            "https://evil.example\\@real.blob.core.windows.net/c/k",
+        ] {
+            assert_eq!(infer_scheme(uri), Scheme::Azure, "{uri}");
+            assert!(
+                crate::capabilities::parse_azure_uri_pure(uri).is_err(),
+                "{uri}"
+            );
+        }
     }
 
     #[cfg(feature = "backend-azure")]

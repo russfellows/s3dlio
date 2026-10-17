@@ -37,15 +37,10 @@ fn every_scheme_reports_what_this_build_compiled() {
         ("ftp://host/x", "unknown", false),
     ];
     for (uri, provider, supported) in table {
-        assert_eq!(
-            caps(uri),
-            Capabilities {
-                provider,
-                get_into: supported,
-                head: supported
-            },
-            "{uri}"
-        );
+        let c = caps(uri);
+        assert_eq!(c.provider, provider, "{uri}");
+        assert_eq!(c.get_into, supported, "{uri}");
+        assert_eq!(c.head, supported, "{uri}");
     }
 }
 
@@ -71,5 +66,39 @@ fn percent_containing_keys_are_accepted_and_literal() {
         "gs://bucket/a%2Fb",
     ] {
         assert!(object_capabilities(uri).is_ok(), "{uri}");
+    }
+}
+
+#[test]
+fn azure_authority_with_userinfo_or_backslash_is_malformed() {
+    // The account must come from the host alone; these name one host and read as another.
+    for uri in [
+        "https://abc.def@real.blob.core.windows.net/c/k",
+        "https://evil.example\\@real.blob.core.windows.net/c/k",
+    ] {
+        assert!(object_capabilities(uri).is_err(), "{uri}");
+    }
+}
+
+// Literal expectations for Cargo's default build (no Azure, no GCS, no Arrow backend), written
+// without the `cfg!` constants above.
+#[cfg(all(
+    feature = "native-backends",
+    not(feature = "backend-azure"),
+    not(feature = "backend-gcs"),
+    not(feature = "arrow-backend")
+))]
+#[test]
+fn default_build_literal_values() {
+    for (uri, provider, supported) in [
+        ("s3://bucket/key", "s3", true),
+        ("az://account/container/key", "az", false),
+        ("gs://bucket/key", "gs", false),
+        ("file:///tmp/x", "file", false),
+        ("ftp://host/x", "unknown", false),
+    ] {
+        let c = caps(uri);
+        assert_eq!(c.provider, provider, "{uri}");
+        assert_eq!((c.get_into, c.head), (supported, supported), "{uri}");
     }
 }

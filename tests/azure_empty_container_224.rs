@@ -65,3 +65,28 @@ async fn valid_roots_and_percent_keys_still_parse() {
             .unwrap_or_else(|e| panic!("{uri} must still parse: {e:#}"));
     }
 }
+
+/// The https form must take its account from the host alone. Userinfo, a backslash and the `?`
+/// and `#` delimiters change which host a URL parser reaches, so a URI that carries one in the
+/// authority is refused before any client is built (it must never be reduced to the account
+/// that happens to precede the delimiter).
+#[tokio::test]
+async fn https_authority_cannot_smuggle_an_account() {
+    let store = AzureObjectStore::new();
+    for uri in [
+        "https://abc.def@real.blob.core.windows.net/c/k",
+        "https://evil.example\\@real.blob.core.windows.net/c/k",
+        "https://evil.example?.blob.core.windows.net/c/k",
+        "https://evil.example#.blob.core.windows.net/c/k",
+    ] {
+        let err = store
+            .mkdir(uri)
+            .await
+            .expect_err(&format!("{uri}: the authority must be refused"));
+        assert!(format!("{err:#}").contains("authority"), "{uri}: {err:#}");
+    }
+    store
+        .mkdir("https://real.blob.core.windows.net/c/k")
+        .await
+        .expect("a plain host must still parse");
+}
