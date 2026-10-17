@@ -11,6 +11,8 @@
 
 #[path = "common/azure_fake.rs"]
 mod azure_fake;
+#[path = "caller_buffer_store_support/mod.rs"]
+mod support;
 
 use azure_fake::*;
 use s3dlio::object_error::{object_error, ObjectErrorKind};
@@ -25,11 +27,15 @@ async fn setup() -> (
     State,
     Box<dyn ObjectStore>,
 ) {
+    // The environment and the fake are set up once per binary (see `support`); a test holds the
+    // lock because it may change the fake's shared state, and starts from a clean one.
     let guard = ENV_LOCK.lock().await;
-    clear_azure_env();
-    std::env::set_var("S3DLIO_MAX_RETRY_ATTEMPTS", "3");
-    let (state, port) = start().await;
-    std::env::set_var("AZURE_STORAGE_ENDPOINT", format!("http://127.0.0.1:{port}"));
+    let state = support::azure().clone();
+    {
+        let mut fake = state.lock().unwrap();
+        fake.forbidden_accounts.clear();
+        fake.missing_containers.clear();
+    }
     let store = store_for_uri("az://acct/ctr/").expect("an Azure store");
     (guard, state, store)
 }
@@ -156,4 +162,74 @@ async fn an_empty_container_is_refused_before_any_request() {
         .expect_err("empty container");
     store.head(bad).await.expect_err("empty container");
     assert!(requests_since(&state, before).is_empty());
+}
+
+/// A URI that names a container but no blob is refused with a typed `Other` error before any
+/// client is built or request is sent. Without the refusal the request addressed the container
+/// path, and a 404 from `head` came back as `Ok(None)`: absence of an object never asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_key_is_refused_before_any_request() {
+    let (_guard, state, store) = setup().await;
+    let before = mark(&state);
+    for bad in [
+        "az://acct/ctr",
+        "az://acct/ctr/",
+        "https://acct.blob.core.windows.net/ctr",
+        "https://acct.blob.core.windows.net/ctr/",
+    ] {
+        let mut dst = [CANARY; 4];
+        let err = store
+            .get_into(bad, &mut dst, &ReceiveProgress::new())
+            .await
+            .expect_err(bad);
+        assert_eq!(kind(&err), ObjectErrorKind::Other, "{bad}: {err:#}");
+        assert!(format!("{err:#}").contains("no key specified"), "{bad}");
+        assert_eq!(dst, [CANARY; 4], "{bad}: nothing was written");
+
+        let err = store
+            .head(bad)
+            .await
+            .expect_err("an empty key is an error, never typed absence");
+        assert_eq!(kind(&err), ObjectErrorKind::Other, "{bad}: {err:#}");
+        assert!(format!("{err:#}").contains("no key specified"), "{bad}");
+    }
+    assert!(
+        requests_since(&state, before).is_empty(),
+        "a request reached the fake: {:?}",
+        requests_since(&state, before)
+    );
+}
+
+/// The Azure host form (`https://<account>.blob.core.windows.net/<container>/<key>`) goes
+/// through the same parser and reaches the same blob as the `az://` form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_azure_host_form_reads_and_heads_the_same_blob() {
+    let (_guard, state, _store) = setup().await;
+    set_blob(&state, "host-form", pattern(300, 9));
+    set_etag(&state, "host-form", "\"etag-host\"");
+    let host_uri = "https://acct.blob.core.windows.net/ctr/host-form";
+    let store = store_for_uri(host_uri).expect("an Azure store for the host form");
+
+    let before = mark(&state);
+    let mut dst = vec![CANARY; 300];
+    let progress = ReceiveProgress::new();
+    store
+        .get_into(host_uri, &mut dst, &progress)
+        .await
+        .expect("get_into");
+    assert!(dst == pattern(300, 9));
+    assert_eq!(progress.filled(), 300);
+    let meta = store.head(host_uri).await.expect("head").expect("present");
+    assert_eq!(meta.size, 300);
+    assert_eq!(meta.etag.as_deref(), Some("\"etag-host\""));
+
+    let seen = requests_since(&state, before);
+    assert!(
+        seen.iter().all(|r| r.path == "acct/ctr/host-form"),
+        "every request addressed the blob: {seen:?}"
+    );
+    assert!(
+        count(&seen, "GET") >= 1 && count(&seen, "HEAD") == 1,
+        "{seen:?}"
+    );
 }

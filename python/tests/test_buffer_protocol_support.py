@@ -2,10 +2,13 @@
 """
 Test buffer protocol support in s3dlio.put_bytes() and s3dlio.put_bytes_async()
 
-Verifies that s3dlio is as permissive as boto3/minio/s3torch in accepting
-various buffer-like objects without type errors.
+Verifies that s3dlio accepts every buffer-like object (any C-contiguous or strided
+buffer-protocol object, and objects that only provide __bytes__()) and optimizes based on
+what it gets.
 
-Design philosophy: Be liberal in what you accept, optimize based on what you get.
+Contract (issue #261): the payload is strict. bytes, buffer-protocol objects and objects with
+__bytes__() are accepted; an int, a bool or an arbitrary iterable is refused with a TypeError
+before anything is submitted.
 """
 
 import os

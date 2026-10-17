@@ -24,16 +24,49 @@ mod s3_get_into_support;
 #[cfg(feature = "backend-azure")]
 #[path = "common/azure_fake.rs"]
 mod azure_fake;
+#[cfg(feature = "backend-azure")]
+#[path = "caller_buffer_store_support/mod.rs"]
+mod support;
 
-use oplog_rows::{read_rows, Row, COL_BYTES, COL_ERROR, COL_FILE, COL_OP};
+use oplog_rows::{read_rows, Row, COL_BYTES, COL_ERROR, COL_FILE, COL_OP, HEADER_LINE};
 use s3_get_into_support::mock::{start_isolated_mock_s3_server, MockObject};
 use s3_get_into_support::{init, key, pattern, BUCKET};
 use s3dlio::object_store::store_for_uri_with_logger;
 use s3dlio::receive_progress::ReceiveProgress;
 use s3dlio::{finalize_op_logger, global_logger, init_op_logger};
+use std::sync::Once;
 
 const MIB: usize = 1024 * 1024;
-const COL_FIRST_BYTE: usize = 10;
+
+/// Every read of 1 MiB or more is a ranged fan-out: a HEAD and several ranges per call.
+const KNOBS: &[(&str, &str)] = &[
+    ("S3DLIO_RANGE_THRESHOLD_MB", "1"),
+    ("S3DLIO_CHUNK_SIZE", "262144"),
+    ("S3DLIO_RANGE_CONCURRENCY", "2"),
+];
+
+static ENV: Once = Once::new();
+
+/// The process environment, set ONCE before the test touches the network: the op-log knobs the
+/// default must not inherit, the S3 mock and its knobs, and the Azure fake with its endpoint.
+fn prepare_env() {
+    ENV.call_once(|| {
+        for name in ["S3DLIO_OPLOG_BUF", "S3DLIO_OPLOG_LOSSLESS"] {
+            std::env::remove_var(name);
+        }
+        init(KNOBS);
+        #[cfg(feature = "backend-azure")]
+        support::azure();
+    });
+}
+
+/// The index of the `first_byte` column, taken from the header the shared reader checks.
+fn col_first_byte() -> usize {
+    HEADER_LINE
+        .split('\t')
+        .position(|name| name == "first_byte")
+        .expect("the op-log header has a first_byte column")
+}
 
 /// The rows whose `file` column names `key`.
 fn rows_of<'r>(rows: &'r [Row], key: &str) -> Vec<&'r Row> {
@@ -50,23 +83,9 @@ fn only<'r>(rows: &'r [Row], key: &str, op: &str) -> &'r Row {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_logged_real_store_writes_exactly_one_row_per_call() {
-    for name in ["S3DLIO_OPLOG_BUF", "S3DLIO_OPLOG_LOSSLESS"] {
-        std::env::remove_var(name);
-    }
-    // Every read of 1 MiB or more is a ranged fan-out: a HEAD and several ranges per call.
-    let (_port, global) = init(&[
-        ("S3DLIO_RANGE_THRESHOLD_MB", "1"),
-        ("S3DLIO_CHUNK_SIZE", "262144"),
-        ("S3DLIO_RANGE_CONCURRENCY", "2"),
-    ]);
+    prepare_env();
+    let (_, global) = init(KNOBS);
     let (endpoint_port, endpoint) = start_isolated_mock_s3_server();
-    #[cfg(feature = "backend-azure")]
-    let (azure_state, azure_port) = {
-        azure_fake::clear_azure_env();
-        let (state, port) = azure_fake::start().await;
-        std::env::set_var("AZURE_STORAGE_ENDPOINT", format!("http://127.0.0.1:{port}"));
-        (state, port)
-    };
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oplog = dir.path().join("ops.tsv.zst");
@@ -154,9 +173,10 @@ async fn a_logged_real_store_writes_exactly_one_row_per_call() {
     #[cfg(feature = "backend-azure")]
     {
         use azure_fake::{pattern as az_pattern, set_blob, uri as az_uri};
+        let azure_state = support::azure();
         let store = store_for_uri_with_logger(&az_uri("x"), global_logger()).expect("az store");
 
-        set_blob(&azure_state, "rows-az-get", az_pattern(900, 6));
+        set_blob(azure_state, "rows-az-get", az_pattern(900, 6));
         store
             .get_into(
                 &az_uri("rows-az-get"),
@@ -177,7 +197,7 @@ async fn a_logged_real_store_writes_exactly_one_row_per_call() {
             .expect_err("absent");
         expected.push(("rows-az-absent".into(), "GET", 0, true));
 
-        set_blob(&azure_state, "rows-az-head", az_pattern(66, 7));
+        set_blob(azure_state, "rows-az-head", az_pattern(66, 7));
         store
             .head(&az_uri("rows-az-head"))
             .await
@@ -191,23 +211,20 @@ async fn a_logged_real_store_writes_exactly_one_row_per_call() {
             .expect("head")
             .is_none());
         expected.push(("rows-az-nohead".into(), "HEAD", 0, false));
-        assert!(azure_port != 0);
     }
 
     finalize_op_logger();
     let rows = read_rows(&oplog);
+    let first_byte = col_first_byte();
 
     for (key, op, bytes, errored) in &expected {
         let row = only(&rows, key, op);
         assert_eq!(row[COL_BYTES], bytes.to_string(), "{key}");
         assert_eq!(!row[COL_ERROR].is_empty(), *errored, "{key}: {row:?}");
         if *op == "HEAD" {
-            assert_eq!(
-                row[COL_FIRST_BYTE], "",
-                "{key}: a HEAD row has no first byte"
-            );
+            assert_eq!(row[first_byte], "", "{key}: a HEAD row has no first byte");
         } else if !*errored {
-            assert!(!row[COL_FIRST_BYTE].is_empty(), "{key}: a GET row has one");
+            assert!(!row[first_byte].is_empty(), "{key}: a GET row has one");
         }
     }
     // Nothing else: no helper row, no row per range, retry or fan-out HEAD.

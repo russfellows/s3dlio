@@ -389,6 +389,24 @@ fn unsupported_operation(uri: &str, operation: &str) -> anyhow::Error {
     )
 }
 
+/// The error a caller-buffer `get_into` or `head` returns for an `az://` or `gs://` URI that
+/// names a container or bucket but no object: kind [`ObjectErrorKind::Other`], returned before
+/// any client is built or any request is sent (the S3 store refuses the same way). Without
+/// it an empty key would address the container or bucket path itself, and a 404 from a `head`
+/// would surface as typed absence of an object that was never asked for.
+#[cfg(any(
+    feature = "backend-azure",
+    all(feature = "backend-gcs", not(feature = "gcs-community"))
+))]
+fn empty_key_error(uri: &str, operation: &str) -> anyhow::Error {
+    crate::object_error::attach_object_error(
+        anyhow!("Cannot {operation}: no key specified in URI: {uri}"),
+        crate::object_error::ObjectErrorKind::Other,
+        provider_for_uri(uri),
+        format!("{operation} names no object"),
+    )
+}
+
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Get entire object into memory.
@@ -2930,6 +2948,19 @@ impl AzureObjectStore {
         Self::client_for_uri(uri_prefix)
     }
 
+    /// The client and key of a URI that must name ONE object, for the caller-buffer
+    /// `get_into` and `head`. An empty key (`az://acct/ctr`, `az://acct/ctr/`) is refused with a
+    /// typed `Other` error BEFORE the client is built, so no request can reach the container
+    /// path. `operation` is `"GET"` or `"HEAD"`, for the message.
+    fn client_for_object(uri: &str, operation: &str) -> Result<(AzureBlob, String)> {
+        let (account, container, key) = parse_azure_uri(uri)?;
+        if key.is_empty() {
+            return Err(empty_key_error(uri, operation));
+        }
+        let cli = AzureBlob::with_default_credential(&account, &container)?;
+        Ok((cli, key))
+    }
+
     /// Download using RangeEngine for concurrent range requests
     ///
     /// This method uses the generic RangeEngine to split large Azure blobs into
@@ -3055,7 +3086,7 @@ impl ObjectStore for AzureObjectStore {
     /// Caller-buffer GET (plan §4.5 A1, A8): the URI goes through the same parser as every
     /// other Azure operation. The row, if any, is the `LoggedObjectStore` wrapper's.
     async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
-        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
+        let (cli, key) = Self::client_for_object(uri, "GET")?;
         debug!(
             "AzureObjectStore::get_into uri='{}', expected_len={}",
             uri,
@@ -3066,7 +3097,7 @@ impl ObjectStore for AzureObjectStore {
 
     /// Typed HEAD: `Ok(None)` only for a typed missing blob (a missing container is an error).
     async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
-        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
+        let (cli, key) = Self::client_for_object(uri, "HEAD")?;
         debug!("AzureObjectStore::head uri='{}'", uri);
         cli.head_typed(&key).await
     }
@@ -3757,6 +3788,10 @@ impl ObjectStore for GcsObjectStore {
     #[cfg(not(feature = "gcs-community"))]
     async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
+        // An empty object (`gs://bucket/`) is refused before the client is built.
+        if object.is_empty() {
+            return Err(empty_key_error(uri, "GET"));
+        }
         debug!(
             "GcsObjectStore::get_into uri='{}', expected_len={}",
             uri,
@@ -3773,6 +3808,10 @@ impl ObjectStore for GcsObjectStore {
     #[cfg(not(feature = "gcs-community"))]
     async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
         let (bucket, object) = parse_gcs_uri(uri)?;
+        // An empty object (`gs://bucket/`) is refused before the client is built.
+        if object.is_empty() {
+            return Err(empty_key_error(uri, "HEAD"));
+        }
         debug!("GcsObjectStore::head uri='{}'", uri);
         let client = self.get_client().await?;
         client.head_typed(&bucket, &object).await
@@ -5448,7 +5487,7 @@ mod s3_object_store_tests {
     use super::*;
 
     /// Mutex to serialize tests that manipulate AWS credential env vars.
-    static CRED_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static CRED_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     // ── Tests that need NO credentials / NO network ──────────────────────────
 
@@ -6589,6 +6628,162 @@ mod gcs_size_cache_hygiene_tests {
         assert!(
             get.contains("fresh_object_size(uri)"),
             "no fresh-size retry"
+        );
+    }
+}
+
+/// The unit-test mock S3 server is the one the integration tests use (`tests/common`), included
+/// by path: the helper-row tests below must reach `pub(crate)` items, which an integration
+/// test cannot, and need a real HTTP server behind the process-wide client.
+#[cfg(test)]
+#[path = "../tests/common/mock_s3_server.rs"]
+#[allow(dead_code)] // the shared mock serves many test binaries; this one uses a subset
+mod unit_test_mock_s3;
+
+/// `get_into` and `head` on a store built with `with_helper_rows()` (the endpoint stores of a
+/// `MultiEndpointStore` on bucket-form S3 URIs, which no `LoggedObjectStore` wraps): each call
+/// writes exactly ONE S3 helper row, and a store without the flag writes none. The process-wide
+/// client, the mock server and the op-log are process-global; this is the only lib test that
+/// touches them, and it holds the credential lock for its whole run.
+#[cfg(test)]
+mod helper_row_tests {
+    use super::unit_test_mock_s3::{ensure_mock_s3_server, unique_test_key, MockObject};
+    use super::*;
+
+    const BUCKET: &str = "helper-row-bucket";
+
+    /// The `(op, file)` columns of every row of a finalized op-log.
+    fn rows_of(path: &std::path::Path) -> Vec<(String, String)> {
+        let raw = std::fs::read(path).expect("the op-log file exists");
+        let text = String::from_utf8(
+            zstd::decode_all(raw.as_slice()).expect("the op-log is a complete zstd stream"),
+        )
+        .expect("the op-log is UTF-8");
+        text.lines()
+            .skip(1)
+            .map(|line| {
+                let cols: Vec<&str> = line.split('\t').collect();
+                assert_eq!(cols.len(), 13, "a 13-column row: {line}");
+                (cols[2].to_string(), cols[7].to_string())
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_helper_row_store_writes_one_row_per_get_into_and_per_head() {
+        let _guard = s3_object_store_tests::CRED_LOCK.lock().await;
+        for name in ["S3DLIO_OPLOG_BUF", "S3DLIO_OPLOG_LOSSLESS"] {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("S3DLIO_LOAD_DOTENV", "0");
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+        let (_, server) = ensure_mock_s3_server();
+
+        let helper_key = unique_test_key("helper-rows");
+        let plain_key = unique_test_key("plain-rows");
+        for (key, seed) in [(&helper_key, 3u8), (&plain_key, 5u8)] {
+            let body: Vec<u8> = (0..700usize)
+                .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+                .collect();
+            server.put_object(BUCKET, key, MockObject::new(body));
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.tsv.zst");
+        crate::s3_logger::init_op_logger(oplog.to_str().expect("utf-8 path"))
+            .expect("init the op-log");
+
+        let with_rows = S3ObjectStore::new().with_helper_rows();
+        let uri = format!("s3://{BUCKET}/{helper_key}");
+        let mut dst = vec![0u8; 700];
+        with_rows
+            .get_into(&uri, &mut dst, &ReceiveProgress::new())
+            .await
+            .expect("get_into");
+        let meta = with_rows
+            .head(&uri)
+            .await
+            .expect("head")
+            .expect("the object is present");
+        assert_eq!(meta.size, 700);
+
+        // The same two calls on a store without the flag: the caller's wrapper would write the
+        // row, so the store itself writes none.
+        let without_rows = S3ObjectStore::new();
+        let plain_uri = format!("s3://{BUCKET}/{plain_key}");
+        without_rows
+            .get_into(&plain_uri, &mut dst, &ReceiveProgress::new())
+            .await
+            .expect("get_into");
+        without_rows
+            .head(&plain_uri)
+            .await
+            .expect("head")
+            .expect("the object is present");
+
+        crate::s3_logger::finalize_op_logger();
+        let rows = rows_of(&oplog);
+
+        let of = |key: &str, op: &str| {
+            rows.iter()
+                .filter(|(o, file)| o == op && file.contains(key))
+                .count()
+        };
+        assert_eq!(of(&helper_key, "GET"), 1, "one GET row: {rows:?}");
+        assert_eq!(of(&helper_key, "HEAD"), 1, "one HEAD row: {rows:?}");
+        assert_eq!(
+            rows.iter().filter(|(_, f)| f.contains(&plain_key)).count(),
+            0,
+            "a store without helper rows writes none: {rows:?}"
+        );
+        assert_eq!(rows.len(), 2, "nothing else is recorded: {rows:?}");
+
+        // Each row stands for one request: no hidden retry or extra HEAD.
+        let seen = |key: &str, method: &str| {
+            server
+                .requests_for(BUCKET, key)
+                .iter()
+                .filter(|r| r.method == method)
+                .count()
+        };
+        assert_eq!(seen(&helper_key, "GET"), 1);
+        assert_eq!(seen(&helper_key, "HEAD"), 1);
+    }
+}
+
+/// A `gs://` URI that names a bucket but no object is refused before the client is built (no
+/// credentials, no network), with a typed `Other` error: it must never address the bucket path.
+#[cfg(all(test, feature = "backend-gcs", not(feature = "gcs-community")))]
+mod gcs_empty_object_tests {
+    use super::*;
+    use crate::object_error::{object_error, ObjectErrorKind};
+
+    fn assert_refused(err: &anyhow::Error, uri: &str) {
+        let typed = object_error(err).unwrap_or_else(|| panic!("{uri}: an untyped error: {err:#}"));
+        assert_eq!(typed.kind, ObjectErrorKind::Other, "{uri}");
+        assert!(
+            format!("{err:#}").contains("no key specified"),
+            "{uri}: the refusal says why: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bucket_with_no_object_is_refused_before_the_client_is_built() {
+        let store = GcsObjectStore::new();
+        for uri in ["gs://bucket/", "gcs://bucket/", "gs://bucket"] {
+            let mut dst = [0u8; 4];
+            let err = store
+                .get_into(uri, &mut dst, &ReceiveProgress::new())
+                .await
+                .expect_err(uri);
+            assert_refused(&err, uri);
+            assert_eq!(dst, [0u8; 4], "{uri}: nothing was written");
+            let err = store.head(uri).await.expect_err(uri);
+            assert_refused(&err, uri);
+        }
+        assert!(
+            store.client.get().is_none(),
+            "a client was built for a URI that names no object"
         );
     }
 }

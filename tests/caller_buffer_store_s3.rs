@@ -47,7 +47,7 @@ fn store(uri: &str) -> Box<dyn ObjectStore> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn global_client_store_reads_into_the_callers_slice() {
-    let (_port, state) = setup();
+    let (_, state) = setup();
     let key = key("global-small");
     let body = pattern(700, 1);
     state.put_object(BUCKET, &key, MockObject::new(body.clone()));
@@ -74,7 +74,7 @@ async fn global_client_store_reads_into_the_callers_slice() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn global_client_store_reaches_the_pinned_range_fan_out() {
-    let (_port, state) = setup();
+    let (_, state) = setup();
     let key = key("global-fanout");
     let body = pattern(MIB + 17, 2);
     state.put_object(BUCKET, &key, MockObject::new(body.clone()));
@@ -106,7 +106,7 @@ async fn global_client_store_reaches_the_pinned_range_fan_out() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_length_that_differs_from_the_object_is_a_typed_length_mismatch() {
-    let (_port, state) = setup();
+    let (_, state) = setup();
     let key = key("global-length");
     state.put_object(BUCKET, &key, MockObject::new(pattern(100, 3)));
     let uri = format!("s3://{BUCKET}/{key}");
@@ -132,7 +132,7 @@ async fn a_length_that_differs_from_the_object_is_a_typed_length_mismatch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_absent_object_is_a_typed_not_found_and_leaves_the_slice_alone() {
-    let (_port, state) = setup();
+    let (_, state) = setup();
     let key = key("global-absent");
     state.put_object(BUCKET, &key, MockObject::missing());
     let uri = format!("s3://{BUCKET}/{key}");
@@ -150,7 +150,7 @@ async fn an_absent_object_is_a_typed_not_found_and_leaves_the_slice_alone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn head_reports_size_and_identity_absence_as_none_and_a_refusal_as_an_error() {
-    let (_port, state) = setup();
+    let (_, state) = setup();
     let present = key("head-present");
     let body = pattern(321, 4);
     state.put_object(BUCKET, &present, MockObject::new(body.clone()));
@@ -191,7 +191,7 @@ async fn head_reports_size_and_identity_absence_as_none_and_a_refusal_as_an_erro
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_form_store_reaches_its_own_endpoint_and_never_the_global_one() {
-    let (_global_port, global) = setup();
+    let (_, global) = setup();
     let (port, endpoint) = start_isolated_mock_s3_server();
     let key = key("endpoint");
     let body = pattern(500, 6);
@@ -299,13 +299,57 @@ async fn a_uri_naming_another_server_is_refused_before_any_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bucket_or_empty_key_is_an_error_never_an_object() {
-    setup();
+    let (_, state) = setup();
     let store = store(&format!("s3://{BUCKET}/x"));
     for uri in [format!("s3://{BUCKET}"), format!("s3://{BUCKET}/")] {
+        let mut dst = Dst::new(4);
         store
-            .get_into(&uri, Dst::new(4).slice(), &ReceiveProgress::new())
+            .get_into(&uri, dst.slice(), &ReceiveProgress::new())
             .await
             .expect_err(&uri);
+        dst.assert_untouched();
         store.head(&uri).await.expect_err(&uri);
+    }
+    // The refusal comes before any request: nothing addressed the bucket path.
+    let bucket_requests: Vec<_> = state
+        .all_requests()
+        .into_iter()
+        .filter(|r| r.path == format!("/{BUCKET}") || r.path == format!("/{BUCKET}/"))
+        .collect();
+    assert!(
+        bucket_requests.is_empty(),
+        "a request addressed the bucket: {bucket_requests:?}"
+    );
+}
+
+/// A `%` in a key is a key character, not an escape: `a%2Fb` is the key of those five bytes
+/// (never `a/b`, never left raw), and a lone `%` is a `%`. On the wire the SDK writes `%` as
+/// `%25`, so the mock holds each object under its wire path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_percent_in_a_key_is_a_literal_key_character() {
+    let (_, state) = setup();
+    for (suffix, wire_suffix) in [("-a%2Fb", "-a%252Fb"), ("-50%", "-50%25")] {
+        let base = key("pct");
+        let wire_key = format!("{base}{wire_suffix}");
+        let body = pattern(64, 9);
+        state.put_object(BUCKET, &wire_key, MockObject::new(body.clone()));
+        let uri = format!("s3://{BUCKET}/{base}{suffix}");
+        let store = store(&uri);
+
+        let mut dst = Dst::new(64);
+        store
+            .get_into(&uri, dst.slice(), &ReceiveProgress::new())
+            .await
+            .unwrap_or_else(|e| panic!("{uri}: {e:#}"));
+        assert_eq!(dst.bytes(), &body[..], "{uri}");
+        dst.assert_canaries();
+        let meta = store
+            .head(&uri)
+            .await
+            .unwrap_or_else(|e| panic!("{uri}: {e:#}"))
+            .unwrap_or_else(|| panic!("{uri}: the object is absent"));
+        assert_eq!(meta.size, 64, "{uri}");
+        assert_eq!(gets(&state, &wire_key).len(), 1, "{uri}");
+        assert_eq!(heads(&state, &wire_key), 1, "{uri}");
     }
 }

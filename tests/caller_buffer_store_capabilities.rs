@@ -23,6 +23,9 @@ mod s3_get_into_support;
 #[cfg(feature = "backend-azure")]
 #[path = "common/azure_fake.rs"]
 mod azure_fake;
+#[cfg(feature = "backend-azure")]
+#[path = "caller_buffer_store_support/mod.rs"]
+mod support;
 
 use s3_get_into_support::mock::MockObject;
 use s3_get_into_support::{init, key, pattern, BUCKET};
@@ -30,6 +33,26 @@ use s3dlio::capabilities::object_capabilities;
 use s3dlio::object_error::{object_error, ObjectErrorKind};
 use s3dlio::object_store::{store_for_uri, ObjectStore};
 use s3dlio::receive_progress::ReceiveProgress;
+use std::sync::Once;
+
+static ENV: Once = Once::new();
+
+/// The process environment of this binary, set ONCE before any test touches the network or
+/// builds a store: the S3 mock (and its environment), the Azure fake (and its environment) and a
+/// credentials file for the official GCS client that does not exist. Every test begins here and
+/// no test changes the environment itself, so none changes it under another test's I/O.
+fn prepare() -> (u16, s3_get_into_support::mock::MockS3State) {
+    ENV.call_once(|| {
+        init(&[]);
+        std::env::set_var(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "/nonexistent/s3dlio-caller-buffer-capabilities.json",
+        );
+        #[cfg(feature = "backend-azure")]
+        support::azure();
+    });
+    init(&[])
+}
 
 fn is_unsupported(result: &anyhow::Result<()>) -> bool {
     result
@@ -74,7 +97,7 @@ async fn assert_agree(uri: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s3_capability_matches_the_store_for_both_uri_forms() {
-    let (port, state) = init(&[]);
+    let (port, state) = prepare();
     let bucket_form = key("cap-global");
     let host_form = key("cap-host");
     for k in [&bucket_form, &host_form] {
@@ -100,24 +123,15 @@ async fn s3_capability_matches_the_store_for_both_uri_forms() {
 #[cfg(feature = "backend-azure")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn azure_capability_matches_the_store() {
-    use azure_fake::*;
-    let _guard = ENV_LOCK.lock().await;
-    clear_azure_env();
-    let (state, port) = start().await;
-    std::env::set_var("AZURE_STORAGE_ENDPOINT", format!("http://127.0.0.1:{port}"));
-    set_blob(&state, "cap", pattern(4, 2));
+    use azure_fake::{pattern, set_blob, uri};
+    prepare();
+    set_blob(support::azure(), "cap", pattern(4, 2));
     assert_agree(&uri("cap")).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gcs_capability_matches_the_store() {
-    // The environment is set before the first GCS client could be built, and no test in this
-    // binary builds one otherwise.
-    std::env::set_var("S3DLIO_LOAD_DOTENV", "0");
-    std::env::set_var(
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "/nonexistent/s3dlio-caller-buffer-capabilities.json",
-    );
+    prepare();
     for uri in ["gs://bucket/key", "gcs://bucket/key"] {
         assert_agree(uri).await;
     }
@@ -125,6 +139,7 @@ async fn gcs_capability_matches_the_store() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn file_and_direct_are_unsupported_in_both_places() {
+    prepare();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("object.bin");
     std::fs::write(&path, [1u8; 4]).expect("write");
@@ -138,6 +153,7 @@ async fn file_and_direct_are_unsupported_in_both_places() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unknown_scheme_has_no_store_and_no_capability() {
+    prepare();
     let caps = object_capabilities("ftp://host/x").expect("caps");
     assert_eq!(caps.provider, "unknown");
     assert!(!caps.get_into && !caps.head);
@@ -148,6 +164,7 @@ async fn an_unknown_scheme_has_no_store_and_no_capability() {
 #[cfg(not(feature = "backend-azure"))]
 #[test]
 fn a_compiled_out_azure_is_false_and_has_no_store() {
+    prepare();
     let caps = object_capabilities("az://account/container/key").expect("caps");
     assert_eq!(caps.provider, "az");
     assert!(!caps.get_into && !caps.head);
@@ -157,6 +174,7 @@ fn a_compiled_out_azure_is_false_and_has_no_store() {
 #[cfg(not(feature = "backend-gcs"))]
 #[test]
 fn a_compiled_out_gcs_is_false_and_has_no_store() {
+    prepare();
     let caps = object_capabilities("gs://bucket/key").expect("caps");
     assert!(!caps.get_into && !caps.head);
     assert!(store_for_uri("gs://bucket/key").is_err());

@@ -1504,9 +1504,15 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 /// the calling thread (no Future or Task can rewrite it), the buffer stays pinned and must not
 /// be reused, and `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it.
 ///
+/// Accepted payloads (issue #261): `bytes`, any buffer-protocol object, and any object with
+/// `__bytes__()`. An int, a bool or an arbitrary iterable is refused with a `TypeError`
+/// before anything is submitted (`bytes(5)` used to write five zero bytes).
+///
 /// # Arguments
 /// * `uri` - Full URI including scheme (s3://, az://, gs://, file://, direct://)
-/// * `data` - Python bytes, bytearray, or any object supporting the buffer protocol
+/// * `data` - Python bytes, a buffer-protocol object (bytearray, memoryview, array.array, numpy
+///   array, ...) or an object with `__bytes__()`. An int, a bool or an arbitrary iterable is
+///   refused (see "Accepted payloads").
 ///
 /// # Examples
 /// ```python
@@ -5407,10 +5413,10 @@ async def scn_error_then_settle(start):
         token_completions: 0,
     };
 
-    /// Watches the instant the native future of a fake store call is dropped. The store holds a
-    /// [`NativeFutureGuard`] as a local of its `get_into` / `head` future, so its `Drop` runs
-    /// exactly when that future is dropped: on completion, on cancellation and on a panic
-    /// unwind. The probe reads the call's latch (and HEAD token) at that moment, and again after
+    /// Watches the instant the native future of a fake store call is dropped. The future the
+    /// store returns (a [`ProbedRequest`]) owns a [`NativeFutureGuard`] as a field, so its `Drop`
+    /// runs exactly when that future is dropped, not when the request body ends: after a
+    /// completion, on cancellation and on a panic unwind. The probe reads the call's latch (and HEAD token) at that moment, and again after
     /// a deliberately slow `Drop`, so a test can prove that nothing was marked before the native
     /// future was really gone.
     struct DropProbe {
@@ -5418,6 +5424,8 @@ async def scn_error_then_settle(start):
         /// `Drop` sleeps, widening any window in which the latch could be marked too early.
         slow: bool,
         token_baseline: usize,
+        /// The request future's completion (its final poll returned `Ready`), when it completed.
+        at_completion: Mutex<Option<ProbeSample>>,
         at_drop: Mutex<Option<ProbeSample>>,
         after_slow_drop: Mutex<Option<ProbeSample>>,
         /// `Drop` ran to its end.
@@ -5430,6 +5438,7 @@ async def scn_error_then_settle(start):
                 latch: Arc::clone(latch),
                 slow,
                 token_baseline: head_token_tests::completions(latch),
+                at_completion: Mutex::new(None),
                 at_drop: Mutex::new(None),
                 after_slow_drop: Mutex::new(None),
                 finished: AtomicBool::new(false),
@@ -5442,6 +5451,19 @@ async def scn_error_then_settle(start):
                 latch_released: self.latch.is_released(),
                 token_completions: head_token_tests::completions(&self.latch) - self.token_baseline,
             }
+        }
+
+        /// The request future just completed: record the latch and token as they stand.
+        fn note_completion(&self) {
+            *self.at_completion.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.sample());
+        }
+
+        /// The request future completed (it did not panic, and was not dropped unfinished).
+        fn completed(&self) -> bool {
+            self.at_completion
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
         }
 
         fn enter(self: &Arc<Self>) -> NativeFutureGuard {
@@ -5461,6 +5483,15 @@ async def scn_error_then_settle(start):
                 at, UNMARKED,
                 "{what}: marked before the native future was dropped"
             );
+            // A request that completed was unmarked at that moment too: the latch is marked by
+            // the owner of the export, after the request future is gone, never by completion.
+            let done = *self.at_completion.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(done) = done {
+                assert_eq!(
+                    done, UNMARKED,
+                    "{what}: marked when the request completed, before it was dropped"
+                );
+            }
             if self.slow {
                 let after = *self
                     .after_slow_drop
@@ -5573,6 +5604,9 @@ async def scn_error_then_settle(start):
         error_probe: Mutex<Option<(usize, bool)>>,
         /// Reports the drop of the native future (see [`DropProbe`]).
         drop_probe: Option<Arc<DropProbe>>,
+        /// Negative control only: finished requests park their guard here (see
+        /// [`FakeStore::keeping_finished_requests`]).
+        kept: Option<Arc<Mutex<Vec<NativeFutureGuard>>>>,
     }
 
     impl FakeStore {
@@ -5594,12 +5628,40 @@ async def scn_error_then_settle(start):
                 seen: Mutex::new(Vec::new()),
                 error_probe: Mutex::new(None),
                 drop_probe: None,
+                kept: None,
             }
         }
 
         fn probing(mut self, probe: &Arc<DropProbe>) -> Self {
             self.drop_probe = Some(Arc::clone(probe));
             self
+        }
+
+        /// Negative control: a finished request hands its guard to the store instead of
+        /// destroying it with the request future, as a caller that keeps the completed future
+        /// alive would. The guard is destroyed only by [`FakeStore::release_kept`].
+        fn keeping_finished_requests(mut self) -> Self {
+            self.kept = Some(Arc::new(Mutex::new(Vec::new())));
+            self
+        }
+
+        /// Destroy the guards [`FakeStore::keeping_finished_requests`] parked.
+        fn release_kept(&self) {
+            if let Some(kept) = &self.kept {
+                kept.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
+        }
+
+        /// Wrap a scripted request in the hand-written future that owns the probe guard.
+        fn probed<'a, T>(
+            &self,
+            request: impl std::future::Future<Output = anyhow::Result<T>> + Send + 'a,
+        ) -> ProbedRequest<'a, T> {
+            ProbedRequest {
+                request: Box::pin(request),
+                guard: self.drop_probe.as_ref().map(DropProbe::enter),
+                keep: self.kept.clone(),
+            }
         }
 
         fn filling(mut self, fill: Vec<u8>) -> Self {
@@ -5644,76 +5706,129 @@ async def scn_error_then_settle(start):
         }
     }
 
+    /// The request future the fake store returns, written by hand. It OWNS the probe guard as a
+    /// field, so the guard is destroyed exactly when this future is dropped (which is what the
+    /// caller of `get_into` / `head` does with the future it was handed) and not when the
+    /// request's body finishes: a guard that was a local of an `async fn` body would be destroyed
+    /// in the final poll whether the body dropped it explicitly or let it go out of scope, and
+    /// the test could not tell the two apart, nor see a caller that keeps the finished future.
+    struct ProbedRequest<'a, T> {
+        /// The scripted request itself.
+        request: Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>,
+        /// Reports the moment this future is dropped (see [`DropProbe`]).
+        guard: Option<NativeFutureGuard>,
+        /// Where a completed request moves its guard instead of leaving it to this future's
+        /// `Drop`. Only the negative control uses it (see [`FakeStore::keeping_finished_requests`]).
+        keep: Option<Arc<Mutex<Vec<NativeFutureGuard>>>>,
+    }
+
+    impl<T> std::future::Future for ProbedRequest<'_, T> {
+        type Output = anyhow::Result<T>;
+
+        fn poll(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let this = &mut *self;
+            let polled = this.request.as_mut().poll(cx);
+            if polled.is_ready() {
+                // The request finished; this future is still alive, and so is its guard.
+                if let Some(guard) = &this.guard {
+                    guard.0.note_completion();
+                }
+                assert!(
+                    this.guard.as_ref().is_none_or(|guard| !guard.0.finished()),
+                    "the native future guard was dropped before the call returned"
+                );
+                // Only the negative control takes the guard out; otherwise it stays a field and
+                // is destroyed with this future.
+                if let Some(keep) = &this.keep {
+                    if let Some(guard) = this.guard.take() {
+                        keep.lock().unwrap_or_else(|e| e.into_inner()).push(guard);
+                    }
+                }
+            }
+            polled
+        }
+    }
+
+    // `get_into` and `head` return a hand-written future, so they are written in the desugared
+    // form `#[async_trait]` expands an `async fn` to (it leaves a method that is not `async`
+    // alone).
     #[async_trait]
     impl ObjectStore for FakeStore {
-        async fn get_into(
-            &self,
-            _: &str,
-            dst: &mut [u8],
-            progress: &ReceiveProgress,
-        ) -> anyhow::Result<()> {
-            // A local of THIS future: its `Drop` reports the moment the future is dropped.
-            let native_future = self.drop_probe.as_ref().map(DropProbe::enter);
-            self.get_calls.fetch_add(1, Ordering::SeqCst);
-            self.seen
-                .lock()
-                .unwrap()
-                .push((dst.as_ptr() as usize, dst.len()));
-            self.entered.store(true, Ordering::SeqCst);
-            if self.panic {
-                panic!("fake store panics inside the native future");
-            }
-            if self.block {
-                // Held until the test adds a permit; a dropped future just stops here.
-                let permit = self.gate.acquire().await?;
-                drop(permit);
-            }
-            let n = self.fill.len().min(dst.len());
-            // A failure first writes half of what it would have: partial progress.
-            let written = if self.failure.is_some() { n / 2 } else { n };
-            dst[..written].copy_from_slice(&self.fill[..written]);
-            crate::receive_progress::SpanMark::new(progress).record_copy(0, written as u64)?;
-            let outcome = match self.failure {
-                Some(failure) => Err(failure_error(failure)),
-                None => Ok(()),
+        fn get_into<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+            &'life0 self,
+            _: &'life1 str,
+            dst: &'life2 mut [u8],
+            progress: &'life3 ReceiveProgress,
+        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            'life3: 'async_trait,
+            Self: 'async_trait,
+        {
+            let request = async move {
+                self.get_calls.fetch_add(1, Ordering::SeqCst);
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((dst.as_ptr() as usize, dst.len()));
+                self.entered.store(true, Ordering::SeqCst);
+                if self.panic {
+                    panic!("fake store panics inside the native future");
+                }
+                if self.block {
+                    // Held until the test adds a permit; a dropped future just stops here.
+                    let permit = self.gate.acquire().await?;
+                    drop(permit);
+                }
+                let n = self.fill.len().min(dst.len());
+                // A failure first writes half of what it would have: partial progress.
+                let written = if self.failure.is_some() { n / 2 } else { n };
+                dst[..written].copy_from_slice(&self.fill[..written]);
+                crate::receive_progress::SpanMark::new(progress).record_copy(0, written as u64)?;
+                match self.failure {
+                    Some(failure) => Err(failure_error(failure)),
+                    None => Ok(()),
+                }
             };
-            // NOT dropped here: the guard is destroyed implicitly, with the rest of this future's
-            // locals, as a normally completed request future is. The check reads it (so it is
-            // used) and proves it is still alive at this point.
-            assert!(
-                native_future
-                    .as_ref()
-                    .is_none_or(|guard| !guard.0.finished()),
-                "the native future guard was dropped before the call returned"
-            );
-            outcome
+            Box::pin(self.probed(request))
         }
 
-        async fn head(&self, _: &str) -> anyhow::Result<Option<HeadMetadata>> {
-            let native_future = self.drop_probe.as_ref().map(DropProbe::enter);
-            self.head_calls.fetch_add(1, Ordering::SeqCst);
-            self.entered.store(true, Ordering::SeqCst);
-            if self.panic {
-                panic!("fake store panics inside the native future");
-            }
-            if self.block {
-                let permit = self.gate.acquire().await?;
-                drop(permit);
-            }
-            let outcome = match self.failure {
-                Some(failure) => Err(failure_error(failure)),
-                None => Ok(self.head_result.clone()),
+        fn head<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _: &'life1 str,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<Option<HeadMetadata>>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            let request = async move {
+                self.head_calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.store(true, Ordering::SeqCst);
+                if self.panic {
+                    panic!("fake store panics inside the native future");
+                }
+                if self.block {
+                    let permit = self.gate.acquire().await?;
+                    drop(permit);
+                }
+                match self.failure {
+                    Some(failure) => Err(failure_error(failure)),
+                    None => Ok(self.head_result.clone()),
+                }
             };
-            // NOT dropped here: the guard is destroyed implicitly, with the rest of this future's
-            // locals, as a normally completed request future is. The check reads it (so it is
-            // used) and proves it is still alive at this point.
-            assert!(
-                native_future
-                    .as_ref()
-                    .is_none_or(|guard| !guard.0.finished()),
-                "the native future guard was dropped before the call returned"
-            );
-            outcome
+            Box::pin(self.probed(request))
         }
 
         async fn get(&self, _: &str) -> anyhow::Result<Bytes> {
@@ -6682,9 +6797,10 @@ async def scn_error_then_settle(start):
         });
     }
 
-    /// Normal completion, with the native future destroyed IMPLICITLY (the fake store does not
-    /// drop its guard itself; it asserts the guard is still alive when the call returns, so an
-    /// explicit early drop would fail the call). Repeated, with a plain and a slow `Drop`, so the
+    /// Normal completion, with the native future destroyed IMPLICITLY: the guard is a FIELD of the
+    /// request future the fake returns, so it is destroyed only when that future is dropped. The
+    /// probe also samples the latch when the request completes (it must be unmarked then) and
+    /// the future asserts the guard is still alive at that point. Repeated, with a plain and a slow `Drop`, so the
     /// order is not one lucky schedule: the guard is gone before the latch is marked, the export
     /// is released once, and the call returned its value.
     #[test]
@@ -6697,12 +6813,36 @@ async def scn_error_then_settle(start):
                     let what = format!("GET completion round {round}, slow drop {slow}");
                     let (probe, latch, ex) =
                         run_get_with_probe(py, &driver, Ending::Completion, slow);
+                    assert!(probe.completed(), "{what}: the request never completed");
                     assert!(probe.finished(), "{what}: the guard never ran its Drop");
                     probe.assert_dropped_before_any_marking(&what);
                     assert_eq!(latch_state(&latch), (true, true), "{what}");
                     assert_eq!(attr_usize(&ex, "releases"), 1, "{what}");
                 }
             }
+        });
+    }
+
+    /// Negative control for the implicit-destruction tests: a caller that KEEPS the finished
+    /// request past the latch mark is caught. The fake parks the guard instead of destroying it
+    /// with the request future; it is destroyed only after the call ended and the latch was
+    /// marked, and the probe must report that.
+    #[test]
+    #[should_panic(expected = "marked before the native future was dropped")]
+    fn get_a_finished_request_kept_past_the_latch_mark_is_detected() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let latch = Latch::new();
+            let probe = DropProbe::new(&latch, false);
+            let store = Arc::new(FakeStore::new().probing(&probe).keeping_finished_requests());
+            let start = get_start(py, TestSeams::default(), &store, &ex, 8, &latch);
+            driver.run("scn_await", start, vec![]).unwrap();
+            assert_eq!(latch_state(&latch), (true, true));
+            assert!(probe.completed() && !probe.finished());
+            store.release_kept();
+            probe.assert_dropped_before_any_marking("GET kept past the latch mark");
         });
     }
 
@@ -7310,6 +7450,7 @@ async def scn_error_then_settle(start):
                 for slow in [false, true] {
                     let what = format!("HEAD completion round {round}, slow drop {slow}");
                     let (probe, latch) = run_head_with_probe(py, &driver, Ending::Completion, slow);
+                    assert!(probe.completed(), "{what}: the request never completed");
                     assert!(probe.finished(), "{what}: the guard never ran its Drop");
                     probe.assert_dropped_before_any_marking(&what);
                     assert_head_quiesced(py, &latch, probe.token_baseline);
@@ -7318,6 +7459,24 @@ async def scn_error_then_settle(start):
         });
     }
 
+    /// HEAD twin of `get_a_finished_request_kept_past_the_latch_mark_is_detected`.
+    #[test]
+    #[should_panic(expected = "marked before the native future was dropped")]
+    fn head_a_finished_request_kept_past_the_token_completion_is_detected() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let latch = Latch::new();
+            let probe = DropProbe::new(&latch, false);
+            let store = Arc::new(FakeStore::new().probing(&probe).keeping_finished_requests());
+            let start = head_start(py, TestSeams::default(), &store, &latch);
+            driver.run("scn_await", start, vec![]).unwrap();
+            assert_head_quiesced(py, &latch, probe.token_baseline);
+            assert!(probe.completed() && !probe.finished());
+            store.release_kept();
+            probe.assert_dropped_before_any_marking("HEAD kept past the token completion");
+        });
+    }
     #[test]
     fn head_latch_stays_unmarked_while_a_blocked_request_is_in_flight() {
         init();
@@ -7876,6 +8035,7 @@ mod put_strict_payload_and_mkdir_tests {
 
     const SCENARIO_PY: &std::ffi::CStr = c_str!(
         "
+import array
 import asyncio
 
 class B:
@@ -7895,6 +8055,9 @@ good = {
     'bytes': (b'abc', b'abc'),
     'bytearray': (bytearray(b'abc'), b'abc'),
     'memoryview': (memoryview(b'abc'), b'abc'),
+    'array_bytes': (array.array('B', b'abc'), b'abc'),
+    'array_typed': (array.array('H', [1, 2, 515]), array.array('H', [1, 2, 515]).tobytes()),
+    'strided_memoryview': (memoryview(b'abcdef')[::2], b'ace'),
     'dunder_bytes': (B(), b'xyz'),
 }
 
