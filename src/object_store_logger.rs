@@ -350,22 +350,21 @@ impl<'a> CallRow<'a> {
     }
 }
 
+// This Drop writes through the same (possibly blocking, in lossless mode) logger path as a
+// normal row, via `record_call`.
 impl Drop for CallRow<'_> {
     fn drop(&mut self) {
         if self.recorded {
             return;
         }
         // The call did not complete. A GET keeps what was filled and its first byte when one
-        // arrived; a HEAD has neither.
-        let (bytes, first_byte) = self
-            .progress
-            .map_or((0, None), |p| (p.filled(), p.first_byte()));
-        self.record(
-            bytes,
-            first_byte,
-            SystemTime::now(),
-            Some("cancelled".to_string()),
-        );
+        // arrived, else the end time (as `finish_get` does, so a GET row's column is never
+        // empty); a HEAD has neither.
+        let now = SystemTime::now();
+        let (bytes, first_byte) = self.progress.map_or((0, None), |p| {
+            (p.filled(), Some(p.first_byte().unwrap_or(now)))
+        });
+        self.record(bytes, first_byte, now, Some("cancelled".to_string()));
     }
 }
 

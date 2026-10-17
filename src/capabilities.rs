@@ -830,6 +830,13 @@ mod tests {
             ("s3://bucket/", None, "bucket", ""),
             ("s3://bucket//k", None, "bucket", "/k"),
             ("s3://bucket/a%2Fb/c", None, "bucket", "a%2Fb/c"),
+            // A ':' after the first '/' is key text, not a port: the bucket is just "ho".
+            (
+                "s3://ho/st:9000/bucket/key",
+                None,
+                "ho",
+                "st:9000/bucket/key",
+            ),
             (
                 "s3://data.example.com/dir/file.bin",
                 None,
@@ -888,6 +895,12 @@ mod tests {
             ("s3://", "URI must contain '/' after bucket"),
             ("s3:///key", "empty first segment"),
             ("s3://host:9000", "missing bucket after server 'host:9000'"),
+            // An IPv6 server with no slash after it is a server with no bucket, like
+            // `s3://host:9000` (not the single-segment `s3://bucket` refusal).
+            (
+                "s3://[::1]:9000",
+                "missing bucket after server '[::1]:9000'",
+            ),
             ("s3://host:9000/", "missing bucket after server 'host:9000'"),
             (
                 "s3://host:9000//key",
@@ -929,6 +942,12 @@ mod tests {
                 "{uri:?}: {fragment:?} not in {err:?}"
             );
         }
+        // The whole message of the IPv6-server-without-slash shape, not just a fragment.
+        assert_eq!(
+            format!("{:#}", parse_s3_uri_pure("s3://[::1]:9000").unwrap_err()),
+            "missing bucket after server '[::1]:9000' in S3 URI 's3://[::1]:9000': the bucket name \
+             cannot be empty; write s3://[::1]:9000/bucket/key"
+        );
     }
 
     #[test]
@@ -1020,14 +1039,18 @@ mod tests {
         assert_eq!(azure_account_redirect_problem("myacct"), None);
         assert_eq!(azure_account_redirect_problem("My_Acct-1"), None);
         assert_eq!(azure_account_redirect_problem(""), Some("it is empty"));
+        const REDIRECT: &str =
+            "it contains a character that could redirect the request (/ ? # @ \\ % or whitespace)";
+        // U+00A0 is Unicode whitespace and U+0007 (BEL) is a control character: both refused.
         for bad in [
-            "a/b", "a?b", "a#b", "a@b", "a\\b", "a%b", "a b", "a\tb", "a\nb",
+            "a/b", "a?b", "a#b", "a@b", "a\\b", "a%b", "a b", "a\tb", "a\nb", "a\u{a0}b", "a\u{7}b",
         ] {
-            assert!(
-                azure_account_redirect_problem(bad)
-                    .is_some_and(|why| why.contains("could redirect the request")),
+            assert_eq!(
+                azure_account_redirect_problem(bad),
+                Some(REDIRECT),
                 "{bad:?}"
             );
+            assert_eq!(azure_account_problem_pure(bad), Some(REDIRECT), "{bad:?}");
         }
         // A path segment is not a redirect character, but is refused in every environment.
         assert_eq!(azure_account_redirect_problem(".."), None);

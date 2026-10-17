@@ -501,8 +501,8 @@ const RETIRED_HINT_TLDS_WARNING: &str =
 /// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is set: it no longer has any effect
 /// (issue #178).
 ///
-/// The environment is read exactly once, the first time
-/// [`classify_s3_first_segment`] runs; setting the variable later in the same
+/// The environment is read exactly once, the first time an s3:// parse or
+/// first-segment classification runs; setting the variable later in the same
 /// process neither warns nor changes anything. The warning goes to `tracing` AND
 /// to stderr, so it is visible in programs (and CLIs) that never install a
 /// tracing subscriber.

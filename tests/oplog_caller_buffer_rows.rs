@@ -84,6 +84,10 @@ impl ObjectStore for ScriptedStore {
                 std::future::pending::<()>().await;
                 Ok(())
             }
+            "get-cancel-nodata" => {
+                std::future::pending::<()>().await;
+                Ok(())
+            }
             "get-panic" => {
                 Self::fill(progress, 1);
                 panic!("fake inner store panics mid-receive");
@@ -275,6 +279,20 @@ async fn get_into_and_head_write_exactly_one_row_per_call() {
     }
     assert_eq!(cancel_progress.filled(), 2, "progress survives the drop");
 
+    // Cancelled before any byte: polled once (the inner store records nothing, then waits
+    // forever), then dropped.
+    let nodata_progress = ReceiveProgress::new();
+    {
+        let mut buf = [0u8; 8];
+        let target = uri("get-cancel-nodata");
+        let fut = scripted.get_into(&target, &mut buf, &nodata_progress);
+        assert!(
+            fut.now_or_never().is_none(),
+            "the scripted receive must still be pending"
+        );
+    }
+    assert_eq!(nodata_progress.filled(), 0);
+
     // A panic inside the inner future: one cancelled row, not zero and not two.
     let panic_progress = ReceiveProgress::new();
     {
@@ -365,6 +383,15 @@ async fn get_into_and_head_write_exactly_one_row_per_call() {
     );
     assert!(!row[COL_FIRST_BYTE].is_empty(), "bytes arrived: {row:?}");
 
+    let row = only_row(&rows, "get-cancel-nodata");
+    assert_eq!(row[COL_OP], "GET");
+    assert_eq!(row[COL_ERROR], "cancelled");
+    assert_eq!(row[COL_BYTES], "0", "{row:?}");
+    assert_eq!(
+        row[COL_FIRST_BYTE], row[COL_END],
+        "no first byte recorded: first_byte is the end time, as for every other GET row"
+    );
+
     let row = only_row(&rows, "get-panic");
     assert_eq!(row[COL_OP], "GET");
     assert_eq!(
@@ -410,8 +437,8 @@ async fn get_into_and_head_write_exactly_one_row_per_call() {
     assert_eq!(row[COL_FIRST_BYTE], "");
     assert!(row[COL_ERROR].contains("unsupported"), "{row:?}");
 
-    // Nothing else was written: 6 GET rows and 6 HEAD rows.
-    assert_eq!(rows.len(), 12, "{rows:#?}");
+    // Nothing else was written: 7 GET rows and 6 HEAD rows.
+    assert_eq!(rows.len(), 13, "{rows:#?}");
 
     // ---- logging off -----------------------------------------------------------------
     // The op-log is finalized: both methods keep returning the correct results and write no
