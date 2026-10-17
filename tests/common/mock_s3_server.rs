@@ -34,8 +34,9 @@
 //   concurrently (the default `cargo test` behavior) without a Mutex.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -181,6 +182,8 @@ pub struct RecordedRequest {
     pub range: Option<String>,
     /// The `Host` header (`host:port` the client addressed), if one was sent.
     pub host: Option<String>,
+    /// The `If-Match` header, if one was sent.
+    pub if_match: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -189,6 +192,8 @@ pub struct MockS3State {
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     /// Seeded buckets (see [`MockS3State::seed_bucket`]): bucket -> sorted keys.
     catalogs: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Registered objects (see [`MockS3State::put_object`]): raw request path -> object.
+    objects: Arc<Mutex<HashMap<String, MockObject>>>,
 }
 
 impl MockS3State {
@@ -325,32 +330,7 @@ static ENV_INIT: std::sync::Once = std::sync::Once::new();
 /// to call from every test — the server is started and the env vars are
 /// set exactly once per test binary process.
 pub fn ensure_mock_s3_server() -> (u16, MockS3State) {
-    let (port, state) = MOCK_SERVER
-        .get_or_init(|| {
-            let state = MockS3State::default();
-            let server_state = state.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-
-            std::thread::Builder::new()
-                .name("mock-s3-server".to_string())
-                .spawn(move || {
-                    let rt = tokio::runtime::Runtime::new()
-                        .expect("failed to build mock-s3-server runtime");
-                    rt.block_on(async move {
-                        let listener = TcpListener::bind("127.0.0.1:0")
-                            .await
-                            .expect("failed to bind mock S3 server");
-                        let port = listener.local_addr().unwrap().port();
-                        tx.send(port).expect("send mock S3 server port");
-                        serve(listener, server_state).await;
-                    });
-                })
-                .expect("failed to spawn mock-s3-server thread");
-
-            let port = rx.recv().expect("receive mock S3 server port");
-            (port, state)
-        })
-        .clone();
+    let (port, state) = MOCK_SERVER.get_or_init(spawn_mock_server).clone();
 
     ENV_INIT.call_once(|| {
         std::env::set_var("AWS_ACCESS_KEY_ID", "mock-access-key");
@@ -359,6 +339,424 @@ pub fn ensure_mock_s3_server() -> (u16, MockS3State) {
         std::env::set_var("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{port}"));
     });
 
+    (port, state)
+}
+
+// ─────────────────────────── registered objects ───────────────────────────
+//
+// A registered object is served the way an S3 server serves a real one: the true size on
+// HEAD, `Range` answered with 206 and a `Content-Range` that carries the total, 416 for a
+// range that starts at or past the end (and for ANY range on an empty object), `If-Match`
+// answered with 412 when it does not match the current ETag (ranged or not), 404 for an
+// absent key (with or without `If-Match`), and quoted hex ETags. Scripted faults (see
+// [`FaultRule`]) change one answer at a time. Objects are keyed by their raw request path,
+// so a test registers `key_path(bucket, key)` and no marker is needed in the key.
+
+/// The body type every answer of the mock server uses.
+pub type MockBody = BoxBody<Bytes, std::io::Error>;
+
+/// How long a streamed body waits before it aborts, so the bytes before the abort are flushed
+/// to the client first (an abort straight after the first frame would drop buffered data).
+const ABORT_DELAY: Duration = Duration::from_millis(40);
+
+/// One scripted change to an answer.
+#[derive(Clone, Debug)]
+pub enum ObjectFault {
+    /// Answer with this status and S3 error code instead of serving the request.
+    Status(u16, &'static str),
+    /// Serve a correct header (the full `Content-Length`) but only `send` bytes of the body,
+    /// then abort the connection: a body that breaks mid-stream.
+    TruncateBody { send: usize },
+    /// Serve a correct header and `send` bytes of the body, then stall for ever: a read that
+    /// never finishes (for cancellation tests).
+    StallBody { send: usize },
+    /// Serve a 206 whose `Content-Range` is `bytes first-last/total`, whatever was asked.
+    ContentRange { first: u64, last: u64, total: u64 },
+    /// Serve a 206 with no `Content-Range` header.
+    NoContentRange,
+    /// Replace the object's body and ETag BEFORE answering this request, as a concurrent
+    /// writer would. The request is then answered against the new object.
+    OverwriteFirst { body: Vec<u8>, etag: Option<String> },
+}
+
+/// A fault applied to the next `times` GETs that match `range_start`.
+#[derive(Clone, Debug)]
+pub struct FaultRule {
+    /// Only a ranged GET whose first byte is this; `None` matches every GET.
+    pub range_start: Option<u64>,
+    /// How many matching GETs it applies to.
+    pub times: usize,
+    pub fault: ObjectFault,
+}
+
+/// What the mock serves for one registered key.
+#[derive(Clone, Debug)]
+pub struct MockObject {
+    pub body: Vec<u8>,
+    /// The `ETag` header (a quoted string); `None` omits it everywhere.
+    pub etag: Option<String>,
+    /// The `x-amz-version-id` header, if any.
+    pub version_id: Option<String>,
+    /// HEAD carries the ETag (only when `etag` is set).
+    pub head_etag: bool,
+    /// HEAD carries `Content-Length`.
+    pub head_content_length: bool,
+    /// GET carries `Content-Length` (when false the body is chunked and has no length).
+    pub get_content_length: bool,
+    /// HEAD waits this long before it answers (for cancellation tests).
+    pub head_delay: Option<Duration>,
+    /// HEAD fails with this status instead of describing the object.
+    pub head_status: Option<u16>,
+    /// `If-Match` is answered with 412 when it differs from the current ETag.
+    pub honour_if_match: bool,
+    /// The key does not exist: 404 on GET and HEAD, before any `If-Match` is looked at.
+    pub missing: bool,
+    pub faults: Vec<FaultRule>,
+}
+
+/// A deterministic quoted 32-digit hex ETag for `body` (FNV-1a, two lanes).
+pub fn etag_for(body: &[u8]) -> String {
+    let (mut a, mut b) = (0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64);
+    for &byte in body {
+        a = (a ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        b = (b.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("\"{a:016x}{b:016x}\"")
+}
+
+impl MockObject {
+    /// An object holding `body`, with the ETag [`etag_for`] gives, a length on HEAD and GET,
+    /// and `If-Match` honoured.
+    pub fn new(body: impl Into<Vec<u8>>) -> Self {
+        let body = body.into();
+        Self {
+            etag: Some(etag_for(&body)),
+            body,
+            version_id: None,
+            head_etag: true,
+            head_content_length: true,
+            get_content_length: true,
+            head_delay: None,
+            head_status: None,
+            honour_if_match: true,
+            missing: false,
+            faults: Vec::new(),
+        }
+    }
+
+    /// A key that does not exist.
+    pub fn missing() -> Self {
+        Self {
+            missing: true,
+            ..Self::new(Vec::new())
+        }
+    }
+
+    /// Append a scripted fault.
+    pub fn with_fault(
+        mut self,
+        range_start: Option<u64>,
+        times: usize,
+        fault: ObjectFault,
+    ) -> Self {
+        self.faults.push(FaultRule {
+            range_start,
+            times,
+            fault,
+        });
+        self
+    }
+}
+
+impl MockS3State {
+    /// Register (or replace) the object at `bucket`/`key`.
+    pub fn put_object(&self, bucket: &str, key: &str, object: MockObject) {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key_path(bucket, key), object);
+    }
+
+    /// Replace the body and ETag of a registered object, as a concurrent writer would.
+    pub fn overwrite_object(&self, bucket: &str, key: &str, body: Vec<u8>, etag: Option<String>) {
+        if let Some(o) = self.objects.lock().unwrap().get_mut(&key_path(bucket, key)) {
+            o.body = body;
+            o.etag = etag;
+        }
+    }
+
+    /// Add a scripted fault to a registered object.
+    pub fn add_fault(&self, bucket: &str, key: &str, rule: FaultRule) {
+        if let Some(o) = self.objects.lock().unwrap().get_mut(&key_path(bucket, key)) {
+            o.faults.push(rule);
+        }
+    }
+
+    fn is_registered(&self, path: &str) -> bool {
+        self.objects.lock().unwrap().contains_key(path)
+    }
+
+    /// Every request received for `bucket`/`key` so far, in arrival order.
+    pub fn requests_for(&self, bucket: &str, key: &str) -> Vec<RecordedRequest> {
+        let want = key_path(bucket, key);
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == want)
+            .cloned()
+            .collect()
+    }
+
+    /// Every request received at all, in arrival order.
+    pub fn all_requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+/// `bytes=a-b` / `bytes=a-` parsed to `(a, Some(b))` / `(a, None)`.
+fn parse_range_header(header: &str) -> Option<(u64, Option<u64>)> {
+    let spec = header.strip_prefix("bytes=")?;
+    let (a, b) = spec.split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()))
+}
+
+fn full_body(bytes: Bytes) -> MockBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
+}
+
+fn boxed(resp: Response<Full<Bytes>>) -> Response<MockBody> {
+    resp.map(|b| b.map_err(|never| match never {}).boxed())
+}
+
+/// How a streamed body ends after its data frame.
+enum BodyEnd {
+    Complete,
+    /// Wait, then fail the stream (the connection is aborted).
+    Abort,
+    /// Never end.
+    Stall,
+}
+
+/// A body that sends `data` as one frame (with no declared length if the response has none),
+/// then ends as `end` says.
+fn streamed_body(data: Bytes, end: BodyEnd) -> MockBody {
+    let frames = async_stream::stream! {
+        yield Ok::<_, std::io::Error>(Frame::data(data));
+        match end {
+            BodyEnd::Complete => {}
+            BodyEnd::Abort => {
+                tokio::time::sleep(ABORT_DELAY).await;
+                yield Err(std::io::Error::other("mock server injected body abort"));
+            }
+            BodyEnd::Stall => std::future::pending::<()>().await,
+        }
+    };
+    StreamBody::new(frames).boxed()
+}
+
+fn plain_error(status: u16, code: &str) -> Response<MockBody> {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    boxed(error_response(status, code))
+}
+
+/// Route one request: a registered object is served by [`serve_object`], everything else by
+/// the marker-driven [`handle`].
+async fn dispatch(req: Request<Incoming>, state: MockS3State) -> Response<MockBody> {
+    let is_object_verb = req.method() == Method::GET || req.method() == Method::HEAD;
+    let is_list = req.uri().query().is_some_and(|q| q.contains("list-type"));
+    if is_object_verb && !is_list && state.is_registered(req.uri().path()) {
+        if req.method() == Method::HEAD {
+            let delay = state
+                .objects
+                .lock()
+                .unwrap()
+                .get(req.uri().path())
+                .and_then(|o| o.head_delay);
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        return serve_object(req, state);
+    }
+    boxed(handle(req, state).await)
+}
+
+fn serve_object(req: Request<Incoming>, state: MockS3State) -> Response<MockBody> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let range_header = header("range");
+    let if_match = header("if-match");
+    state.log_request(RecordedRequest {
+        method: method.to_string(),
+        path: path.clone(),
+        query: req.uri().query().unwrap_or("").to_string(),
+        range: range_header.clone(),
+        host: header("host"),
+        if_match: if_match.clone(),
+    });
+    let range = range_header.as_deref().and_then(parse_range_header);
+
+    if method == Method::HEAD {
+        state.record(&path, |c| c.head_calls += 1);
+    } else {
+        state.record(&path, |c| c.get_calls += 1);
+    }
+
+    // Decide under the lock, answer outside it.
+    let mut objects = state.objects.lock().unwrap();
+    let Some(obj) = objects.get_mut(&path) else {
+        return plain_error(404, "NoSuchKey");
+    };
+
+    if method == Method::HEAD {
+        if obj.missing {
+            return boxed(
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            );
+        }
+        if let Some(status) = obj.head_status {
+            return plain_error(status, "MockHeadFailure");
+        }
+        let mut b = Response::builder().status(StatusCode::OK);
+        if obj.head_content_length {
+            b = b.header("Content-Length", obj.body.len().to_string());
+        }
+        if let (true, Some(e)) = (obj.head_etag, &obj.etag) {
+            b = b.header("ETag", e.as_str());
+        }
+        if let Some(v) = &obj.version_id {
+            b = b.header("x-amz-version-id", v.as_str());
+        }
+        return boxed(b.body(Full::new(Bytes::new())).unwrap());
+    }
+
+    // GET. Scripted faults first (the first rule that still has uses and matches).
+    let mut truncate: Option<(usize, BodyEnd)> = None;
+    let mut forced_range: Option<Option<(u64, u64, u64)>> = None;
+    let start = range.map(|(a, _)| a);
+    let mut action: Option<ObjectFault> = None;
+    for rule in obj.faults.iter_mut() {
+        if rule.times > 0 && (rule.range_start.is_none() || rule.range_start == start) {
+            rule.times -= 1;
+            action = Some(rule.fault.clone());
+            break;
+        }
+    }
+    if let Some(fault) = action {
+        match fault {
+            ObjectFault::Status(status, code) => return plain_error(status, code),
+            ObjectFault::TruncateBody { send } => truncate = Some((send, BodyEnd::Abort)),
+            ObjectFault::StallBody { send } => truncate = Some((send, BodyEnd::Stall)),
+            ObjectFault::ContentRange { first, last, total } => {
+                forced_range = Some(Some((first, last, total)))
+            }
+            ObjectFault::NoContentRange => forced_range = Some(None),
+            ObjectFault::OverwriteFirst { body, etag } => {
+                obj.body = body;
+                obj.etag = etag;
+            }
+        }
+    }
+
+    if obj.missing {
+        return plain_error(404, "NoSuchKey");
+    }
+    if let (true, Some(wanted), Some(current)) = (obj.honour_if_match, &if_match, &obj.etag) {
+        if wanted != "*" && wanted != current {
+            return plain_error(412, "PreconditionFailed");
+        }
+    }
+
+    let len = obj.body.len() as u64;
+    let mut b = Response::builder();
+    if let Some(e) = &obj.etag {
+        b = b.header("ETag", e.as_str());
+    }
+    if let Some(v) = &obj.version_id {
+        b = b.header("x-amz-version-id", v.as_str());
+    }
+
+    let (status, slice, content_range) = match range {
+        None => (StatusCode::OK, obj.body.clone(), None),
+        Some((first, last)) => {
+            if len == 0 || first >= len {
+                return plain_error(416, "InvalidRange");
+            }
+            let last = last.map_or(len - 1, |l| l.min(len - 1));
+            if last < first {
+                return plain_error(416, "InvalidRange");
+            }
+            let slice = obj.body[first as usize..=last as usize].to_vec();
+            let cr = match forced_range {
+                Some(forced) => forced.map(|(f, l, t)| format!("bytes {f}-{l}/{t}")),
+                None => Some(format!("bytes {first}-{last}/{len}")),
+            };
+            (StatusCode::PARTIAL_CONTENT, slice, cr)
+        }
+    };
+    if let Some(cr) = content_range {
+        b = b.header("Content-Range", cr);
+    }
+    b = b.status(status);
+
+    let slice_len = slice.len();
+    if let Some((send, end)) = truncate {
+        let head = Bytes::copy_from_slice(&slice[..send.min(slice_len)]);
+        let resp = b
+            .header("Content-Length", slice_len.to_string())
+            .body(streamed_body(head, end))
+            .unwrap();
+        return resp;
+    }
+    if !obj.get_content_length {
+        // No Content-Length: a streamed body of unknown size is sent chunked.
+        return b
+            .body(streamed_body(Bytes::from(slice), BodyEnd::Complete))
+            .unwrap();
+    }
+    b.header("Content-Length", slice_len.to_string())
+        .body(full_body(Bytes::from(slice)))
+        .unwrap()
+}
+
+/// Start a SEPARATE mock server (its own port and its own state) without touching the
+/// process environment, for a test that needs a second endpoint.
+pub fn start_isolated_mock_s3_server() -> (u16, MockS3State) {
+    spawn_mock_server()
+}
+
+fn spawn_mock_server() -> (u16, MockS3State) {
+    let state = MockS3State::default();
+    let server_state = state.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::Builder::new()
+        .name("mock-s3-server".to_string())
+        .spawn(move || {
+            let rt =
+                tokio::runtime::Runtime::new().expect("failed to build mock-s3-server runtime");
+            rt.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("failed to bind mock S3 server");
+                let port = listener.local_addr().unwrap().port();
+                tx.send(port).expect("send mock S3 server port");
+                serve(listener, server_state).await;
+            });
+        })
+        .expect("failed to spawn mock-s3-server thread");
+
+    let port = rx.recv().expect("receive mock S3 server port");
     (port, state)
 }
 
@@ -378,7 +776,7 @@ async fn serve(listener: TcpListener, state: MockS3State) {
                     io,
                     service_fn(move |req: Request<Incoming>| {
                         let st = st.clone();
-                        async move { Ok::<_, std::convert::Infallible>(handle(req, st).await) }
+                        async move { Ok::<_, std::convert::Infallible>(dispatch(req, st).await) }
                     }),
                 )
                 .await;
@@ -395,6 +793,11 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         .get("range")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let if_match_header = req
+        .headers()
+        .get("if-match")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let host_header = req
         .headers()
         .get("host")
@@ -407,6 +810,7 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         query: query.clone(),
         range: range_header.clone(),
         host: host_header,
+        if_match: if_match_header,
     });
     // Collect the body — DeleteObjects needs to inspect which keys were
     // requested (see below); every other route just needs it drained so

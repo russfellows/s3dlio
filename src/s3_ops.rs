@@ -8,6 +8,8 @@
 //! This module provides an `S3Ops` struct that wraps the AWS S3 client
 //! to provide simplified, blocking I/O operations with detailed tracing.
 
+use crate::object_store::HeadMetadata;
+use crate::receive_progress::ReceiveProgress;
 use crate::retry::retry_get_body;
 use crate::s3_logger::{LogEntry, Logger};
 use crate::s3_utils::{format_sdk_error, sdk_anyhow, SdkResultExt};
@@ -34,6 +36,65 @@ struct LogContext {
     key: String,
     num_objects: u32,
     start_time: SystemTime,
+}
+
+/// The one row of a call that must be written exactly once, whichever way the call ends
+/// (the helper-row counterpart of the wrapper's call row).  Created when the call starts and
+/// consumed by [`CallRowGuard::finish`]; if it is dropped first, the future was dropped (or the
+/// stack unwound), and `Drop` writes the row as `error = "cancelled"` with what was filled.
+/// Nothing is built when the handler has no logger.
+struct CallRowGuard<'a> {
+    ops: &'a S3Ops,
+    ctx: Option<LogContext>,
+    /// The receive progress of a GET; `None` for a HEAD, which has no payload and no first byte.
+    progress: Option<&'a ReceiveProgress>,
+}
+
+impl<'a> CallRowGuard<'a> {
+    fn start(
+        ops: &'a S3Ops,
+        operation: &'static str,
+        key: &str,
+        progress: Option<&'a ReceiveProgress>,
+    ) -> Self {
+        let ctx = ops.logger.is_some().then(|| LogContext {
+            operation,
+            key: key.to_string(),
+            num_objects: 1,
+            start_time: SystemTime::now(),
+        });
+        Self { ops, ctx, progress }
+    }
+
+    /// Write the row of a call that returned.  A GET's byte count is the progress; a HEAD's is
+    /// `size_of(value)` on success and 0 on failure.
+    fn finish<T>(mut self, result: &Result<T>, size_of: impl Fn(&T) -> u64) {
+        let Some(ctx) = self.ctx.take() else { return };
+        let end = SystemTime::now();
+        let (bytes, first_byte) = match self.progress {
+            Some(p) => (p.filled(), Some(p.first_byte().unwrap_or(end))),
+            None => (result.as_ref().map_or(0, size_of), None),
+        };
+        match result {
+            Ok(_) => self.ops.log_op(ctx, &Ok::<(), &str>(()), bytes, first_byte),
+            Err(e) => self
+                .ops
+                .log_op(ctx, &Err::<(), _>(format!("{e:#}")), bytes, first_byte),
+        }
+    }
+}
+
+impl Drop for CallRowGuard<'_> {
+    fn drop(&mut self) {
+        let Some(ctx) = self.ctx.take() else { return };
+        let now = SystemTime::now();
+        let (bytes, first_byte) = match self.progress {
+            Some(p) => (p.filled(), Some(p.first_byte().unwrap_or(now))),
+            None => (0, None),
+        };
+        self.ops
+            .log_op(ctx, &Err::<(), _>("cancelled"), bytes, first_byte);
+    }
 }
 
 impl S3Ops {
@@ -200,6 +261,45 @@ impl S3Ops {
                 Err(e)
             }
         }
+    }
+
+    /// GET (Download) an object into the caller's buffer (plan §4.5 A6, A8).
+    ///
+    /// `dst.len()` is the expected length; `Ok(())` means exactly that many bytes were
+    /// written and the whole-object size equals it (see
+    /// [`crate::s3_utils::get_into_with_client`] for the contract and the routes).  The request
+    /// goes to THIS handler's client only.
+    ///
+    /// With a logger the call writes exactly ONE `GET` row, whichever way it ends: the byte
+    /// count is `progress.filled()` (which can be non-zero with an error), the first byte is
+    /// the receive's own (else the end time), and a call whose future is dropped writes
+    /// `error = "cancelled"`.  Internal ranges, retries and the fan-out HEAD write no row.
+    /// Without a logger nothing is written.
+    pub async fn get_into(
+        &self,
+        bucket: &str,
+        key: &str,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+    ) -> Result<()> {
+        let row = CallRowGuard::start(self, "GET", key, Some(progress));
+        let result =
+            crate::s3_utils::get_into_with_client(&self.client, bucket, key, dst, progress).await;
+        row.finish(&result, |_| 0);
+        result
+    }
+
+    /// Typed HEAD of an object: `Ok(None)` only for typed absence (see
+    /// [`crate::s3_utils::head_typed_with_client`]).
+    ///
+    /// With a logger the call writes exactly ONE `HEAD` row: `bytes` is the size on success
+    /// and 0 for absence, an error and a cancelled call, and the first-byte column is empty on
+    /// every outcome.
+    pub async fn head_typed(&self, bucket: &str, key: &str) -> Result<Option<HeadMetadata>> {
+        let row = CallRowGuard::start(self, "HEAD", key, None);
+        let result = crate::s3_utils::head_typed_with_client(&self.client, bucket, key).await;
+        row.finish(&result, |m| m.as_ref().map_or(0, |m| m.size));
+        result
     }
 
     /// PUT (Upload) an object.

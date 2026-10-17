@@ -96,6 +96,22 @@ fn child_run_case() {
             "uri_optimized" | "uri_optimized_empty" => {
                 s3dlio::s3_utils::get_object_uri_optimized_async(&uri).await
             }
+            // The caller-buffer receive path (plan §4.5 A8) uses the same validation: a fan-out
+            // read (threshold 0) of the registered 16-byte object, with an ETag to pin to.
+            "get_into" => {
+                state.put_object(
+                    BUCKET,
+                    &key,
+                    mock_s3_server::MockObject::new(SIZED_OBJECT_BODY.to_vec()),
+                );
+                let client = s3dlio::s3_client::aws_s3_client_async().await?;
+                let ops = s3dlio::s3_ops::S3Ops::new(client, None, "", "");
+                let mut dst = vec![0u8; SIZED_OBJECT_BODY.len()];
+                let progress = s3dlio::receive_progress::ReceiveProgress::new();
+                ops.get_into(BUCKET, &key, &mut dst, &progress)
+                    .await
+                    .map(|()| bytes::Bytes::from(dst))
+            }
             other => panic!("unknown case {other}"),
         }
     });
@@ -110,8 +126,15 @@ fn child_run_case() {
                 "error must give the valid range: {msg}"
             );
             // Rejected before any range was requested.
-            let gets = state.counts_for(&key_path(BUCKET, &key)).get_calls;
-            assert_eq!(gets, 0, "no GET may be sent for a rejected setting");
+            let counts = state.counts_for(&key_path(BUCKET, &key));
+            assert_eq!(
+                counts.get_calls, 0,
+                "no GET may be sent for a rejected setting"
+            );
+            if case == "get_into" {
+                // The receive path validates before its HEAD as well.
+                assert_eq!(counts.head_calls, 0, "no HEAD may be sent either");
+            }
         }
         None if expect == "ok-empty" => {
             // Valid settings: an empty object, or a range at or past the end, is still an empty
@@ -523,5 +546,37 @@ fn valid_settings_still_give_an_empty_success_for_an_empty_object_and_for_offset
     assert_verified(
         "valid settings, uri_optimized_empty",
         run_case("uri_optimized_empty", "ok-empty", &known_size),
+    );
+}
+
+// ───────────── the caller-buffer receive path (plan §4.5 A8) uses the same validation ─────────────
+
+#[test]
+fn zero_env_settings_are_rejected_by_name_before_any_request_on_the_get_into_path() {
+    for variable in ["S3DLIO_CHUNK_SIZE", "S3DLIO_RANGE_CONCURRENCY"] {
+        assert_verified(
+            &format!("{variable}=0, get_into fan-out"),
+            run_case(
+                "get_into",
+                &format!("reject:{variable}"),
+                &[("S3DLIO_RANGE_THRESHOLD_MB", "0"), (variable, "0")],
+            ),
+        );
+    }
+}
+
+#[test]
+fn valid_settings_still_fill_the_caller_buffer_on_the_get_into_path() {
+    assert_verified(
+        "valid settings, get_into fan-out",
+        run_case(
+            "get_into",
+            "ok",
+            &[
+                ("S3DLIO_RANGE_THRESHOLD_MB", "0"),
+                ("S3DLIO_CHUNK_SIZE", "4"),
+                ("S3DLIO_RANGE_CONCURRENCY", "2"),
+            ],
+        ),
     );
 }

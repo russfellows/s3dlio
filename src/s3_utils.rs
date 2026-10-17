@@ -38,7 +38,10 @@ use crate::data_gen::generate_object;
 use crate::list_pattern::ListPattern;
 
 // S3 client creation
-use crate::retry::retry_get_body;
+use crate::object_error::{attach_object_error, object_error, ObjectErrorKind};
+use crate::object_store::HeadMetadata;
+use crate::receive_progress::{ReceiveProgress, SpanMark};
+use crate::retry::{attach_s3_classification, retry_get_body, RetryClassify};
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
 
 // S3 operation logging (the public helpers in this module write the S3Ops row)
@@ -346,7 +349,7 @@ fn get_range_threshold_bytes() -> u64 {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(32);
-        mb * 1024 * 1024
+        mb.saturating_mul(1024 * 1024)
     })
 }
 
@@ -2438,6 +2441,660 @@ pub(crate) async fn get_object_uri_rows(uri: &str, rows: Rows) -> Result<Bytes> 
         bail!("Cannot GET: no key specified");
     }
     get_object_rows(&bucket, &key, rows).await
+}
+
+// -----------------------------------------------------------------------------
+// Caller-buffer GET and typed HEAD (plan docs/implementation-plans/
+// v0.10.0-caller-buffer-get-plan.md, §4.3 "S3" and §4.5 A1, A2, A7, A8)
+// -----------------------------------------------------------------------------
+//
+// `dst.len()` is the expected length.  `Ok(())` means exactly `dst.len()` bytes were
+// written and the whole-object size equals it.  Every write into `dst` happens inside the
+// future of the entry point: range parts are `FuturesUnordered` futures in the SAME task,
+// never `tokio::spawn`ed, so dropping the future stops every writer.
+//
+// Two routes, chosen from the expected length alone (no size cache, no extra request):
+//
+// * one unranged GET, streamed straight into `dst` (zero length, below the range
+//   threshold, range optimisation off, or HEAD skipped by `S3DLIO_SKIP_HEAD`);
+// * a ranged fan-out: a FRESH HEAD gives the size and the ETag, then every range is sent
+//   with `If-Match: <that ETag>`, on every attempt, so a version change fails the read
+//   (HTTP 412, `VersionChanged`) instead of mixing two versions.  A HEAD that fails, or
+//   supplies no size or no usable ETag, falls back to the single GET.
+//
+// The single GET pins itself: the ETag of its first response is sent as `If-Match` on every
+// retry.  A response with no usable ETag cannot be pinned, so a partially received request
+// then fails instead of being retried (pieces of unknown versions are never combined); it is
+// retried only before any byte was written.
+
+/// A typed error that did not come from an SDK failure.  The detail goes in the retained
+/// source, the `ObjectError` message stays empty (it never carries a key or a URL).
+fn typed_s3_error(kind: ObjectErrorKind, detail: String) -> anyhow::Error {
+    attach_object_error(anyhow::anyhow!(detail), kind, "s3", "")
+}
+
+/// The whole-object size does not equal the destination length.
+fn length_mismatch_error(
+    bucket: &str,
+    key: &str,
+    expected: u64,
+    actual: Option<u64>,
+) -> anyhow::Error {
+    let detail = match actual {
+        Some(actual) => format!(
+            "S3 object s3://{bucket}/{key} is {actual} bytes but the destination holds {expected}"
+        ),
+        None => format!(
+            "S3 object s3://{bucket}/{key} reported no usable size but the destination holds \
+             {expected}"
+        ),
+    };
+    typed_s3_error(ObjectErrorKind::LengthMismatch { expected, actual }, detail)
+}
+
+/// The pinned version is no longer the one the service returns.
+fn version_changed_error(bucket: &str, key: &str, why: &str) -> anyhow::Error {
+    typed_s3_error(
+        ObjectErrorKind::VersionChanged,
+        format!("S3 object s3://{bucket}/{key} {why}"),
+    )
+}
+
+/// A response that breaks the protocol (wrong range, missing header, wrong body length).
+fn protocol_error(bucket: &str, key: &str, why: &str) -> anyhow::Error {
+    typed_s3_error(
+        ObjectErrorKind::Other,
+        format!("S3 GET for s3://{bucket}/{key}: {why}"),
+    )
+}
+
+/// `usize` to `u64`, checked.
+fn len_to_u64(n: usize) -> Result<u64> {
+    u64::try_from(n).map_err(|_| {
+        typed_s3_error(
+            ObjectErrorKind::Other,
+            format!("a length of {n} does not fit in 64 bits"),
+        )
+    })
+}
+
+/// The ETag a read can pin: non-empty, and not weak (`If-Match` compares strongly, so a weak
+/// tag could never match).  Otherwise opaque, passed to the service exactly as received.
+fn usable_etag(etag: Option<&str>) -> Option<String> {
+    etag.filter(|e| !e.trim().is_empty() && !e.starts_with("W/"))
+        .map(str::to_owned)
+}
+
+/// A response `Content-Length`, checked: a negative value is a protocol error.
+fn checked_content_length(raw: Option<i64>, bucket: &str, key: &str) -> Result<Option<u64>> {
+    match raw {
+        None => Ok(None),
+        Some(v) => u64::try_from(v)
+            .map(Some)
+            .map_err(|_| protocol_error(bucket, key, "negative Content-Length")),
+    }
+}
+
+/// Parse `bytes <first>-<last>/<total>`.  An unknown total (`*`) is not accepted.
+fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
+    let rest = header.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (first, last) = range.split_once('-')?;
+    Some((
+        first.trim().parse().ok()?,
+        last.trim().parse().ok()?,
+        total.trim().parse().ok()?,
+    ))
+}
+
+/// Check a `Content-Range` against what was asked: the whole-object `total` must equal the
+/// destination length (else `LengthMismatch`), and, when `bounds` is given, the returned
+/// first and last byte must be exactly the requested ones.
+fn validate_content_range(
+    header: Option<&str>,
+    bounds: Option<(u64, u64)>,
+    total: u64,
+    bucket: &str,
+    key: &str,
+) -> Result<()> {
+    let Some(header) = header else {
+        return Err(protocol_error(
+            bucket,
+            key,
+            "the response carries no Content-Range",
+        ));
+    };
+    let Some((first, last, actual_total)) = parse_content_range(header) else {
+        return Err(protocol_error(bucket, key, "malformed Content-Range"));
+    };
+    if actual_total != total {
+        return Err(length_mismatch_error(
+            bucket,
+            key,
+            total,
+            Some(actual_total),
+        ));
+    }
+    if let Some((want_first, want_last)) = bounds {
+        if first != want_first || last != want_last {
+            return Err(protocol_error(
+                bucket,
+                key,
+                "Content-Range does not match the requested range",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A response whose ETag differs from the pinned one is a different version, whatever the
+/// service did with `If-Match`.  An absent ETag cannot be compared and is accepted.
+fn check_response_etag(
+    response: Option<&str>,
+    pinned: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<()> {
+    match response {
+        Some(e) if !e.is_empty() && e != pinned => Err(version_changed_error(
+            bucket,
+            key,
+            "no longer has the ETag the read pinned",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// An error from reading a response body: no HTTP response of its own, so `Transport`.
+fn body_stream_error(
+    e: impl std::error::Error + Send + Sync + 'static,
+    pinned: bool,
+) -> anyhow::Error {
+    attach_s3_classification(
+        anyhow::Error::new(e).context("S3 GET body stream failed"),
+        pinned,
+    )
+}
+
+/// Linear backoff between attempts, as `retry_get_body` does.
+fn attempt_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(100u64.saturating_mul(u64::from(attempt)))
+}
+
+/// One attempt of the single, unranged GET into `dst`.
+///
+/// `pin` is the ETag of the first response that had a usable one; once set it is sent as
+/// `If-Match` and every later response is checked against it.  `wrote` is set as soon as a
+/// byte has been written.  The cursor starts at the span start on every attempt.
+async fn get_into_single_attempt(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    span: &mut SpanMark<'_>,
+    pin: &mut Option<String>,
+    wrote: &mut bool,
+) -> Result<()> {
+    let expected = len_to_u64(dst.len())?;
+    let mut request = client.get_object().bucket(bucket).key(key);
+    if let Some(etag) = pin.as_deref() {
+        request = request.if_match(etag);
+    }
+    let mut resp = request
+        .send()
+        .await
+        .sdk_context(format!("S3 GET for s3://{bucket}/{key} failed"))
+        .map_err(|e| attach_s3_classification(e, pin.is_some()))?;
+
+    match pin.as_deref() {
+        Some(pinned) => check_response_etag(resp.e_tag(), pinned, bucket, key)?,
+        None => *pin = usable_etag(resp.e_tag()),
+    }
+
+    let length = checked_content_length(resp.content_length(), bucket, key)?;
+    if let Some(range) = resp.content_range() {
+        // An unranged GET should not be partial; if the service says so, the total must still
+        // be the destination length, and a non-empty read must cover all of it.
+        let bounds = (expected > 0).then(|| (0, expected - 1));
+        validate_content_range(Some(range), bounds, expected, bucket, key)?;
+    }
+    match length {
+        Some(length) if length != expected => {
+            // Dropped unread: the body is never touched.
+            return Err(length_mismatch_error(bucket, key, expected, Some(length)));
+        }
+        None if expected == 0 => {
+            // An empty destination can only be verified from the size header.
+            return Err(length_mismatch_error(bucket, key, expected, None));
+        }
+        _ => {}
+    }
+    if expected == 0 {
+        // The size header is 0: nothing to read, and the body is dropped unread.
+        return Ok(());
+    }
+
+    let mut written: usize = 0;
+    while let Some(chunk) = resp.body.next().await {
+        let chunk = chunk.map_err(|e| body_stream_error(e, pin.is_some()))?;
+        let Some(end) = written
+            .checked_add(chunk.len())
+            .filter(|end| *end <= dst.len())
+        else {
+            // More bytes than the destination holds: nothing is written past its end.
+            return Err(length_mismatch_error(bucket, key, expected, length));
+        };
+        let Some(slot) = dst.get_mut(written..end) else {
+            return Err(protocol_error(bucket, key, "destination bounds"));
+        };
+        slot.copy_from_slice(&chunk);
+        if !chunk.is_empty() {
+            *wrote = true;
+        }
+        span.record_copy(len_to_u64(written)?, len_to_u64(chunk.len())?)
+            .map_err(|e| attach_object_error(e, ObjectErrorKind::Other, "s3", "progress"))?;
+        written = end;
+    }
+    if written != dst.len() {
+        return Err(length_mismatch_error(
+            bucket,
+            key,
+            expected,
+            Some(len_to_u64(written)?),
+        ));
+    }
+    Ok(())
+}
+
+/// The single GET with its retries.  The retry budget is `S3DLIO_MAX_RETRY_ATTEMPTS`, with
+/// linear backoff, as `retry_get_body`; the verdict is the typed one
+/// ([`RetryClassify`]).  One [`SpanMark`] covers the whole object across every retry.
+async fn get_into_single(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    progress: &ReceiveProgress,
+) -> Result<()> {
+    let attempts = crate::constants::max_retry_attempts().max(1);
+    let mut span = SpanMark::new(progress);
+    let mut pin: Option<String> = None;
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts {
+        let mut wrote = false;
+        match get_into_single_attempt(client, bucket, key, dst, &mut span, &mut pin, &mut wrote)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if wrote && pin.is_none() {
+                    // Bytes arrived but the version cannot be pinned: never repaired.
+                    return Err(e.context(
+                        "a partially received response with no usable ETag is not retried",
+                    ));
+                }
+                if !RetryClassify::is_retryable(&e) {
+                    return Err(e);
+                }
+                last = Some(e);
+                if attempt < attempts {
+                    tokio::time::sleep(attempt_backoff(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        typed_s3_error(
+            ObjectErrorKind::Other,
+            "no GET attempt was made".to_string(),
+        )
+    }))
+}
+
+/// One fixed, disjoint part of the destination: `offset` is its position in the object.
+pub(crate) struct RangePart<'a> {
+    pub(crate) offset: u64,
+    pub(crate) buf: &'a mut [u8],
+}
+
+/// Split `dst` into parts of `chunk_size` bytes (the last one may be shorter), lazily, so a
+/// small chunk size never builds a vector with one entry per part.
+fn range_parts(dst: &mut [u8], chunk_size: usize) -> Result<impl Iterator<Item = RangePart<'_>>> {
+    let chunk_size = require_effective_chunk_size("chunk_size", chunk_size)?;
+    Ok(dst.chunks_mut(chunk_size).scan(0u64, |offset, buf| {
+        let part = RangePart {
+            offset: *offset,
+            buf,
+        };
+        // The offsets sum to at most `dst.len()`, so this cannot saturate.
+        *offset = offset.saturating_add(u64::try_from(part.buf.len()).unwrap_or(u64::MAX));
+        Some(part)
+    }))
+}
+
+/// One attempt at one range part: a ranged GET with `If-Match`, streamed into `part`.
+///
+/// The cursor is local to the call, so every retry starts at the part start; `span` is the
+/// part's high-water mark and is kept across retries.  The response must carry the exact
+/// `Content-Range` that was asked for and a total equal to `total`.  Every failure is typed;
+/// as the read is pinned, a 404 is `VersionChanged`, never absence.
+pub(crate) async fn attempt_range_part_into(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    if_match: &str,
+    total: u64,
+    part: &mut RangePart<'_>,
+    span: &mut SpanMark<'_>,
+) -> Result<()> {
+    let len = len_to_u64(part.buf.len())?;
+    let Some(last) = len.checked_sub(1).and_then(|l| part.offset.checked_add(l)) else {
+        // An empty part has no valid range (`bytes=a--1` is never sent) and nothing to read.
+        return Ok(());
+    };
+    let range = format!("bytes={}-{}", part.offset, last);
+    let mut resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(&range)
+        .if_match(if_match)
+        .send()
+        .await
+        .sdk_context(format!(
+            "S3 range GET for s3://{bucket}/{key} {range} failed"
+        ))
+        .map_err(|e| attach_s3_classification(e, true))?;
+
+    check_response_etag(resp.e_tag(), if_match, bucket, key)?;
+    validate_content_range(
+        resp.content_range(),
+        Some((part.offset, last)),
+        total,
+        bucket,
+        key,
+    )?;
+    if let Some(length) = checked_content_length(resp.content_length(), bucket, key)? {
+        if length != len {
+            return Err(protocol_error(
+                bucket,
+                key,
+                "Content-Length does not match the requested range",
+            ));
+        }
+    }
+
+    let mut written: usize = 0;
+    while let Some(chunk) = resp.body.next().await {
+        let chunk = chunk.map_err(|e| body_stream_error(e, true))?;
+        let Some(end) = written
+            .checked_add(chunk.len())
+            .filter(|end| *end <= part.buf.len())
+        else {
+            return Err(protocol_error(
+                bucket,
+                key,
+                "range body longer than requested",
+            ));
+        };
+        let Some(slot) = part.buf.get_mut(written..end) else {
+            return Err(protocol_error(bucket, key, "destination bounds"));
+        };
+        slot.copy_from_slice(&chunk);
+        span.record_copy(len_to_u64(written)?, len_to_u64(chunk.len())?)
+            .map_err(|e| attach_object_error(e, ObjectErrorKind::Other, "s3", "progress"))?;
+        written = end;
+    }
+    if written != part.buf.len() {
+        return Err(protocol_error(
+            bucket,
+            key,
+            "range body shorter than requested",
+        ));
+    }
+    Ok(())
+}
+
+/// One part with its retries: the same budget and backoff as the single GET, and the typed
+/// verdict.  Every attempt carries `If-Match`, so a retry can never read another version.
+async fn range_part_with_retries(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+    total: u64,
+    mut part: RangePart<'_>,
+    progress: &ReceiveProgress,
+) -> Result<()> {
+    let attempts = crate::constants::max_retry_attempts().max(1);
+    let mut span = SpanMark::new(progress);
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts {
+        match attempt_range_part_into(client, bucket, key, etag, total, &mut part, &mut span).await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !RetryClassify::is_retryable(&e) {
+                    return Err(e);
+                }
+                last = Some(e);
+                if attempt < attempts {
+                    tokio::time::sleep(attempt_backoff(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        typed_s3_error(
+            ObjectErrorKind::Other,
+            "no range attempt was made".to_string(),
+        )
+    }))
+}
+
+/// Read all `parts` of one object version, at most `max_concurrency` at a time.
+///
+/// `etag` is the version every range is pinned to and `total` the whole-object size, both
+/// from the fresh HEAD.  The parts are futures of THIS task (a sliding window over
+/// `FuturesUnordered`); on the first error the others are dropped, which stops their
+/// writers before this function returns.
+pub(crate) async fn concurrent_range_get_into<'a, I>(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+    total: u64,
+    parts: I,
+    max_concurrency: usize,
+    progress: &ReceiveProgress,
+) -> Result<()>
+where
+    I: IntoIterator<Item = RangePart<'a>>,
+{
+    let max_concurrency = require_effective_concurrency("max_concurrency", max_concurrency)?;
+    let mut pending = parts.into_iter();
+    let mut in_flight = FuturesUnordered::new();
+    loop {
+        while in_flight.len() < max_concurrency {
+            let Some(part) = pending.next() else { break };
+            in_flight.push(range_part_with_retries(
+                client, bucket, key, etag, total, part, progress,
+            ));
+        }
+        match in_flight.next().await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(e),
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Is the ranged fan-out used for a read of `expected` bytes?  The same switches as the
+/// allocating path: range optimisation on, HEAD not skipped, and at or above the threshold.
+fn get_into_uses_fanout(expected: u64) -> bool {
+    expected > 0
+        && get_range_opt_enabled()
+        && !get_skip_head()
+        && expected >= get_range_threshold_bytes()
+}
+
+/// The ranged fan-out: a fresh HEAD (the size cache is never consulted) for the size and the
+/// ETag, then pinned ranges.  Falls back to the single GET when the HEAD fails or supplies no
+/// usable size or ETag.
+async fn get_into_fanout(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    progress: &ReceiveProgress,
+) -> Result<()> {
+    let expected = len_to_u64(dst.len())?;
+    // Both limits are validated before any request (#235), exactly as the allocating path.
+    let chunk_size = resolve_range_chunk_size(None, expected)?;
+    let concurrency = resolve_range_concurrency(None, expected)?;
+
+    let head = client.head_object().bucket(bucket).key(key).send().await;
+    let (size, etag) = match &head {
+        Ok(h) => (
+            h.content_length().and_then(|l| u64::try_from(l).ok()),
+            usable_etag(h.e_tag()),
+        ),
+        Err(_) => (None, None),
+    };
+    if head.is_err() {
+        debug!("get_into: HEAD failed for s3://{bucket}/{key}; using one pinned GET");
+    }
+    if let Some(size) = size {
+        if size != expected {
+            return Err(length_mismatch_error(bucket, key, expected, Some(size)));
+        }
+    }
+    match (size, etag) {
+        (Some(total), Some(etag)) => {
+            let parts = range_parts(dst, chunk_size)?;
+            concurrent_range_get_into(
+                client,
+                bucket,
+                key,
+                &etag,
+                total,
+                parts,
+                concurrency,
+                progress,
+            )
+            .await
+        }
+        _ => get_into_single(client, bucket, key, dst, progress).await,
+    }
+}
+
+/// Read `s3://bucket/key` into `dst` on `client` (the process-wide client or a per-endpoint
+/// one: the request goes to THIS client's server and to no other).  See the section comment
+/// for the contract and the two routes.  Writes no op-log row; [`S3Ops::get_into`] does when
+/// it has a logger.
+///
+/// [`S3Ops::get_into`]: crate::s3_ops::S3Ops::get_into
+pub(crate) async fn get_into_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    progress: &ReceiveProgress,
+) -> Result<()> {
+    if key.is_empty() {
+        return Err(typed_s3_error(
+            ObjectErrorKind::Other,
+            "Cannot GET: no key specified".to_string(),
+        ));
+    }
+    if get_into_uses_fanout(len_to_u64(dst.len())?) {
+        get_into_fanout(client, bucket, key, dst, progress).await
+    } else {
+        get_into_single(client, bucket, key, dst, progress).await
+    }
+}
+
+/// [`get_into_with_client`] on the process-wide client.  `rows` says whether the call writes
+/// the S3 helper row (one `GET` row, written by [`S3Ops::get_into`]); internal ranges,
+/// retries and the fan-out HEAD never write one.
+///
+/// [`S3Ops::get_into`]: crate::s3_ops::S3Ops::get_into
+#[expect(
+    dead_code,
+    reason = "wired by S3ObjectStore::get_into at the integration step (#264)"
+)]
+pub(crate) async fn get_into_global(
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    progress: &ReceiveProgress,
+    rows: Rows,
+) -> Result<()> {
+    build_ops_for(rows)
+        .await?
+        .get_into(bucket, key, dst, progress)
+        .await
+}
+
+/// Typed HEAD on `client`: `Ok(None)` only for typed absence (`NotFound`); a refusal, a
+/// missing bucket, throttling or a transport failure is an error.  A response with no usable
+/// `Content-Length` is an error (a size is never assumed to be 0).  The ETag is opaque.
+pub(crate) async fn head_typed_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<HeadMetadata>> {
+    if key.is_empty() {
+        return Err(typed_s3_error(
+            ObjectErrorKind::Other,
+            "Cannot HEAD: no key specified".to_string(),
+        ));
+    }
+    match client.head_object().bucket(bucket).key(key).send().await {
+        Ok(resp) => {
+            let size = match checked_content_length(resp.content_length(), bucket, key)? {
+                Some(size) => size,
+                None => {
+                    return Err(typed_s3_error(
+                        ObjectErrorKind::Other,
+                        format!("S3 HEAD for s3://{bucket}/{key} reported no Content-Length"),
+                    ))
+                }
+            };
+            Ok(Some(HeadMetadata {
+                size,
+                etag: resp.e_tag().filter(|e| !e.is_empty()).map(str::to_owned),
+                version_id: resp.version_id().map(str::to_owned),
+            }))
+        }
+        Err(e) => {
+            let err = attach_s3_classification(
+                sdk_anyhow(format!("S3 HEAD for s3://{bucket}/{key} failed"), e),
+                false,
+            );
+            if object_error(&err).is_some_and(|o| o.kind == ObjectErrorKind::NotFound) {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// [`head_typed_with_client`] on the process-wide client; `rows` as for [`get_into_global`]
+/// (one `HEAD` row, written by [`S3Ops::head_typed`]).
+///
+/// [`S3Ops::head_typed`]: crate::s3_ops::S3Ops::head_typed
+#[expect(
+    dead_code,
+    reason = "wired by S3ObjectStore::head at the integration step (#264)"
+)]
+pub(crate) async fn head_typed(
+    bucket: &str,
+    key: &str,
+    rows: Rows,
+) -> Result<Option<HeadMetadata>> {
+    build_ops_for(rows).await?.head_typed(bucket, key).await
 }
 
 // -----------------------------------------------------------------------------

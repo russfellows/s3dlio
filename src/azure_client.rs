@@ -14,7 +14,9 @@ use tokio_util::sync::CancellationToken;
 use crate::azure_credential::{self, CredentialMode};
 use crate::data_loader::parallel_fetch::DropCancel;
 use crate::object_error::ObjectErrorKind;
+use crate::object_store::HeadMetadata;
 use crate::read_buffer::ReadBuffer;
+use crate::receive_progress::{ReceiveProgress, SpanMark};
 
 use azure_core::http::{NoFormat, RequestContent, Url, XmlFormat};
 
@@ -198,13 +200,6 @@ impl AzureRequestError {
 
     /// The typed classification of this failure (plan §4.5 A2), see
     /// [`classify_azure_failure`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called by the stage C provider receive paths (#264)"
-        )
-    )]
     pub(crate) fn object_error_kind(&self) -> ObjectErrorKind {
         classify_azure_failure(
             self.inner.http_status().map(u16::from),
@@ -240,13 +235,6 @@ fn azure_error_is_transport(e: &azure_core::Error) -> bool {
 /// * 429 and 503 are `Throttled`; any other 5xx is `Server`;
 /// * a failure with no response (connection, I/O) is `Transport`;
 /// * anything else, including every other 404, is `Other`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the stage C provider receive paths (#264)"
-    )
-)]
 pub(crate) fn classify_azure_failure(
     status: Option<u16>,
     code: Option<&str>,
@@ -277,13 +265,6 @@ pub(crate) fn classify_azure_failure(
 /// error, reachable through `{:#}`, `{:?}` or the chain, is not redacted by this module; for
 /// Azure it is the [`AzureRequestError`], which `azure_error` already redacted (SAS tokens
 /// removed).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the stage C provider receive paths (#264)"
-    )
-)]
 pub(crate) fn attach_azure_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
     if let Some(existing) = crate::object_error::object_error(&err) {
         if pinned && existing.kind == ObjectErrorKind::NotFound {
@@ -530,6 +511,254 @@ pub struct AzureBlobProperties {
     pub content_length: u64,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Caller-buffer GET and typed HEAD: pure pieces (plan v0.10.0 §4.3, §4.5 A8; #264)
+// ---------------------------------------------------------------------------
+
+/// A typed Azure error that is not an HTTP failure of the service: a response that cannot be
+/// trusted or used (a bad `Content-Range`, a missing size or ETag). Classified
+/// [`ObjectErrorKind::Other`], so it is never retried.
+fn az_other(message: impl std::fmt::Display) -> anyhow::Error {
+    crate::object_error::attach_object_error(
+        anyhow!("{message}"),
+        ObjectErrorKind::Other,
+        "az",
+        "unusable response",
+    )
+}
+
+/// The typed error for a length that is not the expected one. `actual` is `None` when the true
+/// size is not known (a body that ran past the destination).
+fn az_length_mismatch(expected: u64, actual: Option<u64>, detail: &str) -> anyhow::Error {
+    crate::object_error::attach_object_error(
+        anyhow!("Azure blob length mismatch: expected {expected} bytes, {detail}"),
+        ObjectErrorKind::LengthMismatch { expected, actual },
+        "az",
+        "",
+    )
+}
+
+/// A `usize` length as `u64`, checked (never `as`).
+fn len_u64(len: usize) -> Result<u64> {
+    u64::try_from(len).map_err(|_| az_other("a length does not fit in 64 bits"))
+}
+
+/// A parsed `Content-Range` response header (RFC 9110 section 14.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentRangeValue {
+    /// The first and last byte of the part, both inclusive; `None` for `*`.
+    pub(crate) bytes: Option<(u64, u64)>,
+    /// The complete length of the blob; `None` for `*` (unknown).
+    pub(crate) total: Option<u64>,
+}
+
+/// An unsigned decimal: ASCII digits only (no sign, no whitespace), within `u64`.
+fn parse_decimal(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Parse `bytes <first>-<last>/<total>`, `bytes <first>-<last>/*` or `bytes */<total>`.
+///
+/// The SDK has its own parser, but its type is crate-private and it takes `usize`; the reply's
+/// size is checked here, in `u64`, before any byte is copied. Strict: the unit must be `bytes`,
+/// numbers are plain digits, `first <= last`, `last < total` when the total is known, and
+/// `*/*` is refused.
+pub(crate) fn parse_content_range(value: &str) -> Result<ContentRangeValue> {
+    let shown: String = value.chars().take(64).collect();
+    let malformed = || az_other(format!("malformed Content-Range header {shown:?}"));
+    let rest = value.trim().strip_prefix("bytes ").ok_or_else(malformed)?;
+    let (range, total) = rest.split_once('/').ok_or_else(malformed)?;
+    let bytes = if range == "*" {
+        None
+    } else {
+        let (first, last) = range.split_once('-').ok_or_else(malformed)?;
+        let first = parse_decimal(first).ok_or_else(malformed)?;
+        let last = parse_decimal(last).ok_or_else(malformed)?;
+        if first > last {
+            return Err(malformed());
+        }
+        Some((first, last))
+    };
+    let total = if total == "*" {
+        None
+    } else {
+        Some(parse_decimal(total).ok_or_else(malformed)?)
+    };
+    match (bytes, total) {
+        (None, None) => Err(malformed()),
+        (Some((_, last)), Some(total)) if last >= total => Err(malformed()),
+        _ => Ok(ContentRangeValue { bytes, total }),
+    }
+}
+
+/// What a first response says about the blob and about the body it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseLengths {
+    /// The whole blob, in bytes.
+    pub(crate) total: u64,
+    /// How many body bytes this response carries.
+    pub(crate) body_len: u64,
+}
+
+/// The blob size and the body length a download response declares, for a request for bytes
+/// `0..request_len`.
+///
+/// * With a `Content-Range` (a 206): the range must start at 0, the total must be known
+///   (`*` cannot be checked), the range must be exactly `min(total, request_len)` bytes, and a
+///   `Content-Length` must agree with it.
+/// * Without one (a 200: the service ignored the range, or an unranged retry after the 416 that
+///   an empty blob gives): `Content-Length` is the blob size and the body length. The SDK does not
+///   expose the status, so a missing `Content-Range` means a whole-blob reply.
+pub(crate) fn response_lengths(
+    content_range: Option<&str>,
+    content_length: Option<u64>,
+    request_len: u64,
+) -> Result<ResponseLengths> {
+    let Some(header) = content_range else {
+        let length = content_length
+            .ok_or_else(|| az_other("the response has neither Content-Range nor Content-Length"))?;
+        return Ok(ResponseLengths {
+            total: length,
+            body_len: length,
+        });
+    };
+    let parsed = parse_content_range(header)?;
+    let (first, last) = parsed
+        .bytes
+        .ok_or_else(|| az_other("a successful response carries a Content-Range without a range"))?;
+    let total = parsed.total.ok_or_else(|| {
+        az_other("the Content-Range total is unknown (*), so the blob size cannot be checked")
+    })?;
+    if first != 0 {
+        return Err(az_other(format!(
+            "the response range starts at byte {first}, not 0"
+        )));
+    }
+    // `last < total` was checked by the parser, so `last + 1` cannot overflow.
+    let body_len = last
+        .checked_add(1)
+        .ok_or_else(|| az_other("the Content-Range end overflows"))?;
+    if body_len != total.min(request_len) {
+        return Err(az_other(format!(
+            "the response range covers {body_len} bytes, but bytes 0..{request_len} of a \
+             {total}-byte blob were requested"
+        )));
+    }
+    if content_length.is_some_and(|length| length != body_len) {
+        return Err(az_other(
+            "the Content-Length disagrees with the Content-Range",
+        ));
+    }
+    Ok(ResponseLengths { total, body_len })
+}
+
+/// The download options for a caller-buffer GET of `expected_len` bytes (plan §4.3).
+///
+/// One bounded range `0..N` (`N = max(expected_len, 1)`: the `expected_len == 0` probe asks for
+/// one byte), `parallel = 1` and `partition_size = N`. That makes the SDK's first response the
+/// only one it needs: `azure_storage_blob` 1.0.0 `partitioned_transfer/download.rs` computes the
+/// remaining ranges as `(received_end..min(range_end, total))`, which is empty when the first
+/// response already covers the requested range, and then (line 84) returns the first response's
+/// body directly, with no partition buffer and no worker task. `if_match` pins a retry to the
+/// first response's ETag.
+fn get_into_options(
+    expected_len: u64,
+    if_match: Option<&str>,
+) -> Result<BlobClientDownloadOptions<'static>> {
+    let range_len = expected_len.max(1);
+    let partition_size = usize::try_from(range_len)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| az_other("the expected length does not fit in this platform's memory"))?;
+    Ok(BlobClientDownloadOptions {
+        range: Some(HttpRange::new(0, range_len)),
+        parallel: NonZeroUsize::new(1),
+        partition_size: Some(partition_size),
+        if_match: if_match.map(azure_core::http::Etag::from),
+        ..Default::default()
+    })
+}
+
+/// An ETag that can pin a read: present, non-empty and strong (`If-Match` compares strongly, so
+/// a weak `W/"..."` tag cannot match itself).
+fn usable_etag(etag: Option<&azure_core::http::Etag>) -> Option<String> {
+    let text = AsRef::<str>::as_ref(etag?).trim();
+    (!text.is_empty() && !text.starts_with("W/")).then(|| text.to_string())
+}
+
+/// Receive a response body into `dst`, which is the exact expected length.
+///
+/// A checked loop over the public response-body stream (not the SDK's `collect_into`, which
+/// returns early on a mid-stream error and loses the partial count). Each chunk is bounds-checked
+/// BEFORE it is copied, so nothing is ever written past `dst`; the progress is recorded after
+/// each copy, so it survives an error and cancellation (dropping this future). The cursor starts
+/// at 0 for every attempt; `span` keeps the high-water mark across attempts.
+///
+/// * a chunk that would pass the end of `dst`: `LengthMismatch` (the chunk is not copied);
+/// * a stream that ends before `dst` is full: a `Transport` error (a truncated transfer);
+/// * a stream error: an [`AzureRequestError`] (SAS redacted, credential mode named for a 401/403).
+///
+async fn receive_into<S>(
+    mut body: S,
+    dst: &mut [u8],
+    span: &mut SpanMark<'_>,
+    mode: CredentialMode,
+) -> Result<()>
+where
+    S: Stream<Item = azure_core::Result<Bytes>> + Unpin,
+{
+    let expected = len_u64(dst.len())?;
+    let mut cursor: usize = 0;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| azure_error(mode, e))?;
+        if chunk.is_empty() {
+            continue;
+        }
+        let end = cursor
+            .checked_add(chunk.len())
+            .filter(|&end| end <= dst.len())
+            .ok_or_else(|| az_length_mismatch(expected, None, "the body is longer"))?;
+        let window = dst
+            .get_mut(cursor..end)
+            .ok_or_else(|| az_other("a chunk does not fit the destination"))?;
+        window.copy_from_slice(&chunk);
+        span.record_copy(len_u64(cursor)?, len_u64(chunk.len())?)
+            .map_err(|e| az_other(format!("progress accounting failed: {e}")))?;
+        cursor = end;
+    }
+    if cursor != dst.len() {
+        return Err(crate::object_error::attach_object_error(
+            anyhow!(
+                "Azure response body ended after {cursor} of {} bytes",
+                dst.len()
+            ),
+            ObjectErrorKind::Transport,
+            "az",
+            "truncated response body",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a failed `get_into` attempt may be repeated (plan §4.3, §4.5 A2).
+///
+/// Only a typed transient failure (`Throttled`, `Transport`, `Server`) is retried, never a
+/// definite answer or an unclassified error. And only while every byte already received is
+/// bound to one version: a retry is `If-Match`-pinned to the first response's ETag, or nothing
+/// has been written yet. Unpinned responses are never combined.
+fn may_retry_get_into(err: &anyhow::Error, pinned: bool, written: u64) -> bool {
+    let transient = crate::object_error::object_error(err).is_some_and(|o| {
+        matches!(
+            o.kind,
+            ObjectErrorKind::Throttled | ObjectErrorKind::Transport | ObjectErrorKind::Server
+        )
+    });
+    transient && (pinned || written == 0)
 }
 
 /// High-level client bound to one container.
@@ -792,6 +1021,181 @@ impl AzureBlob {
             etag,
             last_modified,
         })
+    }
+
+    /// Typed HEAD (plan §4.3, §4.5 A8): the blob's size, ETag and version id, or `None` when the
+    /// blob does not exist.
+    ///
+    /// Only `BlobNotFound` is absence. A missing container (`ContainerNotFound`) is an error
+    /// (`Other`), as are authorization, throttling, transport and server failures, each typed.
+    /// The size is parsed as an unsigned number by the SDK (a negative or non-numeric
+    /// `Content-Length` is an error), and a response without one is an error: there is no
+    /// default of 0.
+    pub async fn head_typed(&self, key: &str) -> Result<Option<HeadMetadata>> {
+        debug!(
+            "AzureBlob::head_typed container='{}', key='{}'",
+            self.container, key
+        );
+        let blob = self.blob_client(key)?;
+        let resp = match blob
+            .get_properties(Some(BlobClientGetPropertiesOptions::default()))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err = attach_azure_classification(self.auth_err(e), false);
+                return match crate::object_error::object_error(&err).map(|o| o.kind) {
+                    Some(ObjectErrorKind::NotFound) => Ok(None),
+                    _ => Err(err),
+                };
+            }
+        };
+        let header_error = |what: &str, e: azure_core::Error| {
+            attach_azure_classification(
+                self.auth_err(e)
+                    .context(format!("invalid {what} header in a HEAD response")),
+                false,
+            )
+        };
+        let size = resp
+            .content_length()
+            .map_err(|e| header_error("Content-Length", e))?
+            .ok_or_else(|| az_other("the HEAD response has no Content-Length"))?;
+        let etag = resp.etag().map_err(|e| header_error("ETag", e))?;
+        let version_id = resp
+            .version_id()
+            .map_err(|e| header_error("x-ms-version-id", e))?;
+        Ok(Some(HeadMetadata {
+            size,
+            etag: etag.map(|e| e.to_string()),
+            version_id,
+        }))
+    }
+
+    /// Receive the whole blob into `dst` (plan §4.3, §4.5 A8). `dst.len()` is the expected
+    /// length: `Ok(())` means exactly that many bytes were written and the blob is exactly that
+    /// long.
+    ///
+    /// * `dst.len() > 0`: one bounded range `0..dst.len()`, `parallel = 1`,
+    ///   `partition_size = dst.len()` (see [`get_into_options`]), so the SDK returns the first
+    ///   response's body directly, with no partition buffer. The blob size comes from the
+    ///   `Content-Range` total (206) or `Content-Length` (200) and must equal `dst.len()` BEFORE
+    ///   any byte is copied; otherwise `LengthMismatch` (a non-empty oversized or undersized blob
+    ///   is a mismatch, as is an empty one).
+    /// * `dst.len() == 0`: a bounded `0..1` request. An empty blob answers 416, which the SDK
+    ///   retries unranged, giving a 200 of length 0: success. A non-empty blob is a
+    ///   `LengthMismatch`.
+    /// * Retries keep the first response's ETag (`If-Match`). A 412, or a 404 on a pinned retry,
+    ///   is `VersionChanged`. A response without a strong ETag pins nothing: once a byte has
+    ///   been written, a failure is final rather than retried from pieces of unknown versions.
+    ///
+    /// `progress` counts the distinct positions written and survives errors and cancellation.
+    /// Every writer runs inside this future, so dropping it stops all writes. A failure never
+    /// says the bytes written are valid.
+    pub async fn get_into(
+        &self,
+        key: &str,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+    ) -> Result<()> {
+        // The destination length is the expected length, as a checked u64.
+        let expected = len_u64(dst.len())?;
+        debug!(
+            "AzureBlob::get_into container='{}', key='{}', expected_len={}",
+            self.container, key, expected
+        );
+        let blob = self.blob_client(key)?;
+        let mut span = SpanMark::new(progress);
+        let mut pin: Option<String> = None;
+        let attempts = crate::constants::max_retry_attempts();
+        let mut attempt: u32 = 1;
+        loop {
+            let err = match self
+                .get_into_attempt(&blob, expected, dst, &mut span, &mut pin)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => attach_azure_classification(e, pin.is_some()),
+            };
+            // Every failure leaves here typed.
+            let err = if crate::object_error::object_error(&err).is_some() {
+                err
+            } else {
+                crate::object_error::attach_object_error(
+                    err,
+                    ObjectErrorKind::Other,
+                    "az",
+                    "request failed",
+                )
+            };
+            if attempt >= attempts || !may_retry_get_into(&err, pin.is_some(), span.mark()) {
+                return Err(err);
+            }
+            debug!("AzureBlob::get_into attempt {attempt} of {attempts} failed; retrying");
+            tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt))).await;
+            attempt += 1;
+        }
+    }
+
+    /// One request and its checked receive. Pins `pin` from the first response that carries a
+    /// strong ETag, and requires every later response to carry the same one.
+    async fn get_into_attempt(
+        &self,
+        blob: &BlobClient,
+        expected: u64,
+        dst: &mut [u8],
+        span: &mut SpanMark<'_>,
+        pin: &mut Option<String>,
+    ) -> Result<()> {
+        let options = get_into_options(expected, pin.as_deref())?;
+        let resp = blob
+            .download(Some(options))
+            .await
+            .map_err(|e| self.auth_err(e))?;
+
+        let response_etag = usable_etag(resp.properties.etag.as_ref());
+        match (pin.as_deref(), response_etag) {
+            (Some(pinned), Some(seen)) if pinned != seen => {
+                return Err(crate::object_error::attach_object_error(
+                    anyhow!("the blob's ETag changed between attempts"),
+                    ObjectErrorKind::VersionChanged,
+                    "az",
+                    "response ETag differs from the pinned one",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(az_other(
+                    "the response carries no usable ETag to confirm the pinned version",
+                ));
+            }
+            (None, Some(seen)) => *pin = Some(seen),
+            _ => {}
+        }
+
+        let lengths = response_lengths(
+            resp.headers
+                .get_optional_str(&azure_core::http::headers::HeaderName::from_static(
+                    "content-range",
+                )),
+            resp.properties.content_length,
+            expected.max(1),
+        )?;
+        if lengths.total != expected {
+            // The body is dropped unread.
+            return Err(az_length_mismatch(
+                expected,
+                Some(lengths.total),
+                &format!("the blob is {} bytes", lengths.total),
+            ));
+        }
+        if lengths.body_len != expected {
+            return Err(az_length_mismatch(
+                expected,
+                Some(lengths.total),
+                "the response body length differs",
+            ));
+        }
+        receive_into(resp.body, dst, span, self.credential_mode).await
     }
 
     /// Flat list with optional prefix.
@@ -1924,5 +2328,482 @@ mod object_error_tests {
         // Not an Azure error: returned unchanged.
         let plain = attach_azure_classification(anyhow::anyhow!("x"), false);
         assert!(object_error(&plain).is_none());
+    }
+}
+
+/// The caller-buffer GET's pure pieces (plan v0.10.0 §4.3, §4.5 A8; #264): the `Content-Range`
+/// parser, the length plan, the SDK options, the retry rule and the checked receive loop. The
+/// requests themselves are covered against a local fake service in
+/// `tests/azure_get_into_fake.rs`.
+#[cfg(test)]
+mod get_into_tests {
+    use super::*;
+    use crate::object_error::object_error;
+    use crate::retry::RetryClassify;
+    use azure_core::error::ErrorKind;
+
+    const CANARY: u8 = 0xEE;
+
+    fn kind_of(err: &anyhow::Error) -> ObjectErrorKind {
+        object_error(err).expect("typed error").kind
+    }
+
+    fn body(parts: &[&[u8]]) -> impl Stream<Item = azure_core::Result<Bytes>> + Unpin {
+        let items: Vec<azure_core::Result<Bytes>> = parts
+            .iter()
+            .map(|p| Ok(Bytes::copy_from_slice(p)))
+            .collect();
+        futures::stream::iter(items)
+    }
+
+    // ---- Content-Range -------------------------------------------------------------------
+
+    #[test]
+    fn content_range_valid_forms() {
+        let ok = |text: &str| parse_content_range(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(
+            ok("bytes 0-9/100"),
+            ContentRangeValue {
+                bytes: Some((0, 9)),
+                total: Some(100)
+            }
+        );
+        assert_eq!(
+            ok("bytes 0-0/1"),
+            ContentRangeValue {
+                bytes: Some((0, 0)),
+                total: Some(1)
+            }
+        );
+        // The total may be unknown, or the range may be (the 416 form).
+        assert_eq!(ok("bytes 5-9/*").total, None);
+        assert_eq!(ok("bytes 5-9/*").bytes, Some((5, 9)));
+        assert_eq!(ok("bytes */100").bytes, None);
+        assert_eq!(ok("bytes */100").total, Some(100));
+        // Surrounding whitespace is tolerated; u64 extremes parse exactly (no usize, no cast).
+        assert_eq!(ok("  bytes 0-9/100 ").total, Some(100));
+        let max = u64::MAX;
+        let big = ok(&format!("bytes 0-{}/{max}", max - 1));
+        assert_eq!(big.bytes, Some((0, max - 1)));
+        assert_eq!(big.total, Some(max));
+    }
+
+    #[test]
+    fn content_range_malformed_is_a_typed_error() {
+        let max_plus_one = "18446744073709551616";
+        let bad = [
+            "",
+            "bytes",
+            "bytes ",
+            "bytes 0-9",
+            "bytes 0-9/",
+            "bytes -9/100",
+            "bytes 0-/100",
+            "bytes 9-0/100",     // reversed
+            "bytes 0-100/100",   // last byte at or past the total
+            "bytes 0-9/5",       // last byte past the total
+            "bytes 0-99/100x",   // trailing junk
+            "bytes +0-9/100",    // a sign is not a digit
+            "bytes 0-9/-100",    // negative
+            "bytes 0-9/1e2",     // not decimal
+            "items 0-9/100",     // wrong unit
+            "bytes */*",         // nothing known
+            "bytes 0-9/100/200", // extra slash
+            "bytes 0 - 9/100",   // inner whitespace
+            "bytes 0-9 /100",
+            "bytes \u{660}-\u{669}/100", // non-ASCII digits
+            "bytes 0-9/0x64",
+        ];
+        for text in bad {
+            let err = parse_content_range(text).expect_err(text);
+            assert_eq!(kind_of(&err), ObjectErrorKind::Other, "{text:?}");
+        }
+        // Overflow of u64 is malformed, not a wrap.
+        for text in [
+            format!("bytes 0-9/{max_plus_one}"),
+            format!("bytes {max_plus_one}-{max_plus_one}/*"),
+        ] {
+            assert!(parse_content_range(&text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn content_range_error_text_is_bounded() {
+        let hostile = format!("bytes {}\r\nX-Injected: 1", "9".repeat(5000));
+        let text = parse_content_range(&hostile).expect_err("bad").to_string();
+        assert!(text.len() < 200, "{} bytes", text.len());
+        assert!(!text.contains('\n'), "{text:?}");
+    }
+
+    // ---- 200 vs 206 lengths ----------------------------------------------------------------
+
+    #[test]
+    fn response_lengths_for_206_and_200() {
+        let lens = |range: Option<&str>, length: Option<u64>, request: u64| {
+            response_lengths(range, length, request)
+        };
+        let l = |total, body_len| ResponseLengths { total, body_len };
+        // 206, blob exactly as long as asked.
+        assert_eq!(
+            lens(Some("bytes 0-99/100"), Some(100), 100).unwrap(),
+            l(100, 100)
+        );
+        // 206, blob longer than asked: the body is the asked range, the total is the truth.
+        assert_eq!(
+            lens(Some("bytes 0-99/250"), Some(100), 100).unwrap(),
+            l(250, 100)
+        );
+        // 206, blob shorter than asked.
+        assert_eq!(
+            lens(Some("bytes 0-39/40"), Some(40), 100).unwrap(),
+            l(40, 40)
+        );
+        // Content-Length may be absent beside a Content-Range.
+        assert_eq!(
+            lens(Some("bytes 0-99/100"), None, 100).unwrap(),
+            l(100, 100)
+        );
+        // 200: the service ignored the range; Content-Length is the blob.
+        assert_eq!(lens(None, Some(100), 100).unwrap(), l(100, 100));
+        assert_eq!(lens(None, Some(250), 100).unwrap(), l(250, 250));
+        // The empty blob after the 416 retry: 200, length 0.
+        assert_eq!(lens(None, Some(0), 1).unwrap(), l(0, 0));
+        // The zero-length probe (bytes 0..1) against a non-empty blob: 1 byte of 7.
+        assert_eq!(lens(Some("bytes 0-0/7"), Some(1), 1).unwrap(), l(7, 1));
+    }
+
+    #[test]
+    fn response_lengths_refuses_what_it_cannot_check() {
+        let refused = |range: Option<&str>, length: Option<u64>, request: u64| {
+            let err = response_lengths(range, length, request).expect_err("must refuse");
+            assert_eq!(kind_of(&err), ObjectErrorKind::Other);
+        };
+        refused(None, None, 100); // no size at all: not 0
+        refused(Some("bytes 0-99/*"), Some(100), 100); // unknown total
+        refused(Some("bytes */100"), None, 100); // no range
+        refused(Some("bytes 10-19/100"), Some(10), 100); // does not start at 0
+        refused(Some("bytes 0-9/100"), Some(10), 100); // shorter than asked of a longer blob
+        refused(Some("bytes 0-99/100"), Some(50), 100); // Content-Length disagrees
+        refused(Some("garbage"), Some(100), 100);
+    }
+
+    // ---- SDK options: the no-remaining-ranges shape -----------------------------------------
+
+    #[test]
+    fn options_ask_one_bounded_range_with_partition_equal_to_it() {
+        for expected in [1u64, 7, 4 * 1024 * 1024, 4 * 1024 * 1024 + 1, 1 << 33] {
+            let o = get_into_options(expected, None).expect("options");
+            assert_eq!(o.range, Some(HttpRange::new(0, expected)));
+            assert_eq!(o.parallel, NonZeroUsize::new(1));
+            // partition_size == the range length is what leaves the SDK no remaining ranges.
+            assert_eq!(
+                o.partition_size.map(|p| p.get() as u64),
+                Some(expected),
+                "{expected}"
+            );
+            assert!(o.if_match.is_none());
+        }
+        let o = get_into_options(1000, None).expect("options");
+        assert_eq!(o.range.expect("range").to_string(), "bytes=0-999");
+    }
+
+    #[test]
+    fn options_for_a_zero_length_destination_probe_one_byte() {
+        let o = get_into_options(0, None).expect("options");
+        assert_eq!(o.range.expect("range").to_string(), "bytes=0-0");
+        assert_eq!(o.partition_size, NonZeroUsize::new(1));
+        assert_eq!(o.parallel, NonZeroUsize::new(1));
+    }
+
+    #[test]
+    fn options_carry_if_match_on_a_retry() {
+        let o = get_into_options(10, Some("\"0x8DC\"")).expect("options");
+        assert_eq!(
+            o.if_match.as_ref().map(AsRef::<str>::as_ref),
+            Some("\"0x8DC\"")
+        );
+    }
+
+    // ---- ETag pinning and the retry rule -----------------------------------------------------
+
+    #[test]
+    fn only_a_strong_nonempty_etag_pins() {
+        let etag = |s: &str| usable_etag(Some(&azure_core::http::Etag::from(s)));
+        assert_eq!(usable_etag(None), None);
+        assert_eq!(etag(""), None);
+        assert_eq!(etag("   "), None);
+        assert_eq!(etag("W/\"weak\""), None, "If-Match compares strongly");
+        assert_eq!(etag("\"0x8DC\""), Some("\"0x8DC\"".to_string()));
+        assert_eq!(etag("  \"0x8DC\" "), Some("\"0x8DC\"".to_string()));
+    }
+
+    #[test]
+    fn retry_needs_a_transient_typed_error_and_a_pinned_version_or_no_bytes() {
+        use crate::object_error::attach_object_error;
+        let typed = |kind| attach_object_error(anyhow!("x"), kind, "az", "m");
+        let transient = [
+            ObjectErrorKind::Throttled,
+            ObjectErrorKind::Transport,
+            ObjectErrorKind::Server,
+        ];
+        let definite = [
+            ObjectErrorKind::NotFound,
+            ObjectErrorKind::VersionChanged,
+            ObjectErrorKind::Forbidden,
+            ObjectErrorKind::Unsupported,
+            ObjectErrorKind::Other,
+            ObjectErrorKind::LengthMismatch {
+                expected: 1,
+                actual: Some(2),
+            },
+        ];
+        for kind in transient {
+            // Pinned: retried whatever was written. Unpinned: only before the first byte.
+            assert!(may_retry_get_into(&typed(kind), true, 0), "{kind:?}");
+            assert!(may_retry_get_into(&typed(kind), true, 4096), "{kind:?}");
+            assert!(may_retry_get_into(&typed(kind), false, 0), "{kind:?}");
+            assert!(
+                !may_retry_get_into(&typed(kind), false, 1),
+                "unpinned pieces must never be combined: {kind:?}"
+            );
+        }
+        for kind in definite {
+            for (pinned, written) in [(true, 0), (true, 9), (false, 0), (false, 9)] {
+                assert!(
+                    !may_retry_get_into(&typed(kind), pinned, written),
+                    "{kind:?}"
+                );
+            }
+        }
+        // An unclassified error is never retried here (the generic fallback does not apply).
+        assert!(!may_retry_get_into(
+            &anyhow!("transient-looking: 503"),
+            true,
+            0
+        ));
+    }
+
+    // ---- the checked receive loop ------------------------------------------------------------
+
+    /// A destination inside a buffer with canaries before and after it.
+    fn with_canaries(len: usize) -> Vec<u8> {
+        vec![CANARY; len + 16]
+    }
+
+    #[tokio::test]
+    async fn receive_exact_in_chunks_counts_each_position_once() {
+        let progress = ReceiveProgress::new();
+        let mut span = SpanMark::new(&progress);
+        let mut buf = with_canaries(10);
+        let dst = &mut buf[8..18];
+        receive_into(
+            body(&[b"abc", b"", b"defg", b"hij"]),
+            dst,
+            &mut span,
+            CredentialMode::None,
+        )
+        .await
+        .expect("exact body");
+        assert_eq!(&buf[8..18], b"abcdefghij");
+        assert!(buf[..8].iter().chain(&buf[18..]).all(|&b| b == CANARY));
+        assert_eq!(progress.filled(), 10);
+        assert!(progress.first_byte().is_some());
+    }
+
+    #[tokio::test]
+    async fn receive_short_body_is_a_transport_error_with_progress_kept() {
+        let progress = ReceiveProgress::new();
+        let mut span = SpanMark::new(&progress);
+        let mut buf = with_canaries(8);
+        let err = receive_into(
+            body(&[b"abc", b"de"]),
+            &mut buf[8..16],
+            &mut span,
+            CredentialMode::None,
+        )
+        .await
+        .expect_err("5 of 8 bytes");
+        assert_eq!(kind_of(&err), ObjectErrorKind::Transport);
+        assert_eq!(progress.filled(), 5, "the five bytes that arrived");
+        assert_eq!(&buf[8..13], b"abcde");
+        assert!(buf[13..].iter().all(|&b| b == CANARY), "the rest untouched");
+        assert!(buf[..8].iter().all(|&b| b == CANARY));
+    }
+
+    #[tokio::test]
+    async fn receive_overflow_is_a_length_mismatch_and_never_writes_past_dst() {
+        let progress = ReceiveProgress::new();
+        let mut span = SpanMark::new(&progress);
+        let mut buf = with_canaries(6);
+        // 4 + 4 bytes into 6: the second chunk would cross the end.
+        let err = receive_into(
+            body(&[b"abcd", b"efgh"]),
+            &mut buf[8..14],
+            &mut span,
+            CredentialMode::None,
+        )
+        .await
+        .expect_err("overflow");
+        assert_eq!(
+            kind_of(&err),
+            ObjectErrorKind::LengthMismatch {
+                expected: 6,
+                actual: None
+            }
+        );
+        assert!(!err.is_retryable());
+        assert_eq!(
+            &buf[8..12],
+            b"abcd",
+            "the chunk before the overflow is kept"
+        );
+        assert!(
+            buf[12..].iter().all(|&b| b == CANARY),
+            "nothing past dst, no partial chunk"
+        );
+        assert!(buf[..8].iter().all(|&b| b == CANARY));
+        assert_eq!(progress.filled(), 4);
+    }
+
+    #[tokio::test]
+    async fn receive_one_oversized_chunk_writes_nothing() {
+        let progress = ReceiveProgress::new();
+        let mut span = SpanMark::new(&progress);
+        let mut buf = with_canaries(3);
+        let err = receive_into(
+            body(&[b"abcdefgh"]),
+            &mut buf[8..11],
+            &mut span,
+            CredentialMode::None,
+        )
+        .await
+        .expect_err("overflow");
+        assert!(matches!(
+            kind_of(&err),
+            ObjectErrorKind::LengthMismatch { expected: 3, .. }
+        ));
+        assert!(buf.iter().all(|&b| b == CANARY));
+        assert_eq!(progress.filled(), 0);
+        assert!(progress.first_byte().is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_into_an_empty_destination() {
+        let progress = ReceiveProgress::new();
+        let mut span = SpanMark::new(&progress);
+        // Only empty chunks (or none): success, nothing counted.
+        receive_into(body(&[b"", b""]), &mut [], &mut span, CredentialMode::None)
+            .await
+            .expect("empty body");
+        receive_into(body(&[]), &mut [], &mut span, CredentialMode::None)
+            .await
+            .expect("no body");
+        assert_eq!(progress.filled(), 0);
+        // Any byte is an overflow; there is nowhere to put it.
+        let err = receive_into(body(&[b"x"]), &mut [], &mut span, CredentialMode::None)
+            .await
+            .expect_err("one byte into zero");
+        assert!(matches!(
+            kind_of(&err),
+            ObjectErrorKind::LengthMismatch { expected: 0, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_mid_stream_error_keeps_progress_and_redacts_the_sas() {
+        let progress = ReceiveProgress::new();
+        let mut span = SpanMark::new(&progress);
+        let mut buf = with_canaries(8);
+        let failing = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"abcd")),
+            Err(azure_core::Error::with_message(
+                ErrorKind::Io,
+                "connection reset reading https://acct.blob.core.windows.net/c/b?sv=2024-11-04&sig=TOPSECRET%2Fvalue",
+            )),
+            Ok(Bytes::from_static(b"never")),
+        ]);
+        let err = receive_into(failing, &mut buf[8..16], &mut span, CredentialMode::Sas)
+            .await
+            .expect_err("stream error");
+        // The count the collect_into helper would have lost.
+        assert_eq!(progress.filled(), 4);
+        assert_eq!(&buf[8..12], b"abcd");
+        assert!(buf[12..].iter().all(|&b| b == CANARY));
+        let typed = attach_azure_classification(err, false);
+        assert_eq!(kind_of(&typed), ObjectErrorKind::Transport);
+        for text in [format!("{typed:#}"), format!("{typed:?}")] {
+            assert!(!text.contains("TOPSECRET"), "SAS leaked: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_restarts_at_zero_and_counts_each_position_once() {
+        let progress = ReceiveProgress::new();
+        let mut span = SpanMark::new(&progress);
+        let mut buf = with_canaries(8);
+        let first = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"abcde")),
+            Err(azure_core::Error::with_message(ErrorKind::Io, "reset")),
+        ]);
+        receive_into(first, &mut buf[8..16], &mut span, CredentialMode::None)
+            .await
+            .expect_err("first attempt fails");
+        assert_eq!(progress.filled(), 5);
+        // The retry starts over at offset 0 and passes the old mark.
+        receive_into(
+            body(&[b"ab", b"cdefgh"]),
+            &mut buf[8..16],
+            &mut span,
+            CredentialMode::None,
+        )
+        .await
+        .expect("second attempt");
+        assert_eq!(&buf[8..16], b"abcdefgh");
+        assert_eq!(progress.filled(), 8, "5 + 3 new positions, not 5 + 8");
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_what_was_copied() {
+        let progress = ReceiveProgress::new();
+        let mut span = SpanMark::new(&progress);
+        let mut buf = with_canaries(8);
+        // Two chunks arrive, then the stream never yields again.
+        let stalled = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cd")),
+        ])
+        .chain(futures::stream::pending::<azure_core::Result<Bytes>>());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            receive_into(stalled, &mut buf[8..16], &mut span, CredentialMode::None),
+        )
+        .await;
+        assert!(outcome.is_err(), "the receive must still be pending");
+        // The future was dropped by the timeout: the destination is ours again, and the count
+        // says which positions were touched.
+        assert_eq!(progress.filled(), 4);
+        assert_eq!(&buf[8..12], b"abcd");
+        assert!(buf[12..].iter().all(|&b| b == CANARY));
+        assert!(progress.first_byte().is_some());
+    }
+
+    // ---- typed error shapes ------------------------------------------------------------------
+
+    #[test]
+    fn length_mismatch_carries_expected_and_actual_and_is_final() {
+        let e = az_length_mismatch(100, Some(40), "the blob is 40 bytes");
+        assert_eq!(
+            kind_of(&e),
+            ObjectErrorKind::LengthMismatch {
+                expected: 100,
+                actual: Some(40)
+            }
+        );
+        assert!(!e.is_retryable());
+        let e = az_length_mismatch(100, None, "the body is longer");
+        assert!(matches!(
+            kind_of(&e),
+            ObjectErrorKind::LengthMismatch { actual: None, .. }
+        ));
     }
 }
