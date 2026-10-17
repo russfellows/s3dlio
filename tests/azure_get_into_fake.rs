@@ -72,8 +72,9 @@ async fn read(
 
 // ---- exact reads: one bounded request, nothing past the destination -----------------------------
 
-/// An exact blob lands in the destination with one GET for the bounded range `0..len`, no HEAD,
-/// and no write outside the destination. Sizes cross the SDK's 4 MiB default partition.
+/// An exact blob lands in the destination with one GET for the bounded range `0..len + 1` (one
+/// byte more than the destination, review C-F1), no HEAD, and no write outside the destination.
+/// The reply is `len` bytes because the blob ends there. Sizes cross the SDK's 4 MiB default partition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exact_blob_fills_the_destination_with_one_bounded_request() {
     let (env_lock, state, client) = setup().await;
@@ -100,7 +101,7 @@ async fn exact_blob_fills_the_destination_with_one_bounded_request() {
         );
         assert_eq!(
             got[0].range.as_deref(),
-            Some(format!("bytes=0-{}", len - 1).as_str()),
+            Some(format!("bytes=0-{len}").as_str()),
             "{len}"
         );
         assert_eq!(got[0].if_match, None, "the first request pins nothing");
@@ -962,24 +963,74 @@ async fn dropping_get_into_on_a_stalled_body_keeps_what_was_written() {
     drop(env_lock);
 }
 
-// ---- a recorded limit: a 206 that does not say which part it carries ----------------------------------
+// ---- a 206 that does not say which part it carries (review C-F1) ------------------------------------
 
-/// RECORDED LIMIT. The SDK discards the status, so a 206 stripped of `Content-Range` whose
-/// `Content-Length` equals the destination is read as the whole blob, although the blob is
-/// larger. A real Azure service always sends `Content-Range` on a 206, so this is a limit of
-/// the checks (a service or proxy that breaks that rule), not a reachable failure. The request
-/// shape is NOT changed to detect it (asking for one extra byte would change the plan). This test
-/// pins the behaviour so a change to it is deliberate.
+/// REVIEW C-F1. The SDK discards the status, so a 206 stripped of `Content-Range` looks like a
+/// whole-blob reply. The request therefore asks for ONE BYTE MORE than the destination
+/// (`bytes=0-N`), so a larger blob exposes at least N+1 bytes and its `Content-Length` (N+1) can
+/// no longer equal the expected size N. The read is a `LengthMismatch`, refused from the headers
+/// before any copy: no progress, an untouched destination, and the extra byte is never written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn recorded_limit_a_206_without_content_range_reads_as_the_whole_blob() {
+async fn a_206_without_content_range_for_a_larger_blob_is_a_length_mismatch() {
     let (env_lock, state, client) = setup().await;
     state.lock().unwrap().strip_content_range = true;
     set_blob(&state, "no-range-header", pattern(100, 6));
+    let before = mark(&state);
     let (buf, progress, result) = read(&client, "no-range-header", 60).await;
-    result.expect("the reply looks like a whole 60-byte blob");
-    assert!(buf[PAD..PAD + 60] == pattern(100, 6)[..60]);
+    let err = result.expect_err("a 60-byte read of a 100-byte blob must not succeed");
+    assert!(
+        matches!(
+            kind(&err),
+            ObjectErrorKind::LengthMismatch { expected: 60, .. }
+        ),
+        "{err:#}"
+    );
+    assert_eq!(progress.filled(), 0, "refused before any copy");
+    assert!(progress.first_byte().is_none());
+    assert!(
+        untouched(&buf[PAD..PAD + 60]),
+        "the destination is untouched"
+    );
+    assert!(
+        canaries_intact(&buf, 60),
+        "the extra byte was written outside the dst"
+    );
+    let seen = requests_since(&state, before);
+    let got = gets(&seen);
+    assert_eq!(got.len(), 1, "a definite answer is not retried: {seen:?}");
+    assert_eq!(
+        got[0].range.as_deref(),
+        Some("bytes=0-60"),
+        "N + 1 bytes are requested"
+    );
+    drop(env_lock);
+}
+
+/// The same stripped header on a blob of exactly the expected length still succeeds (the reply
+/// is N bytes, which ends the blob), and a blob shorter than expected is a mismatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_206_without_content_range_is_judged_by_the_length_it_carries() {
+    let (env_lock, state, client) = setup().await;
+    state.lock().unwrap().strip_content_range = true;
+    set_blob(&state, "exact", pattern(60, 6));
+    let (buf, progress, result) = read(&client, "exact", 60).await;
+    result.expect("an exact blob ends at N even with the header stripped");
+    assert!(buf[PAD..PAD + 60] == pattern(60, 6)[..]);
     assert!(canaries_intact(&buf, 60));
     assert_eq!(progress.filled(), 60);
+
+    set_blob(&state, "short", pattern(40, 6));
+    let (buf, progress, result) = read(&client, "short", 60).await;
+    let err = result.expect_err("a 40-byte blob into a 60-byte destination");
+    assert_eq!(
+        kind(&err),
+        ObjectErrorKind::LengthMismatch {
+            expected: 60,
+            actual: Some(40)
+        }
+    );
+    assert!(untouched(&buf[PAD..PAD + 60]) && canaries_intact(&buf, 60));
+    assert_eq!(progress.filled(), 0);
     drop(env_lock);
 }
 

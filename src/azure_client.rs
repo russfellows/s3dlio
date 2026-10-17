@@ -606,20 +606,21 @@ pub(crate) struct ResponseLengths {
 }
 
 /// The blob size and the body length a download response declares, for a request for bytes
-/// `0..request_len`.
+/// `0..request_len`. The caller-buffer GET passes `request_len = expected_len + 1` (review C-F1,
+/// see `checked_request_len`).
 ///
 /// * With a `Content-Range` (a 206): the range must start at 0, the total must be known
 ///   (`*` cannot be checked), the range must be exactly `min(total, request_len)` bytes, and a
 ///   `Content-Length` must agree with it.
 /// * Without one (a 200: the service ignored the range, or an unranged retry after the 416 that
 ///   an empty blob gives): `Content-Length` is the blob size and the body length. The SDK does not
-///   expose the status, so a missing `Content-Range` means a whole-blob reply.
+///   expose the status, so a missing `Content-Range` is read as a whole-blob reply.
 ///
-/// Recorded limit: because the status is not visible, a 206 whose `Content-Range` was stripped
-/// (by a broken service or proxy) and whose `Content-Length` equals the request is read as a
-/// whole blob of that length, even when the blob is larger. A real Azure service always sends
-/// `Content-Range` on a 206. The request is not widened (for example to `N + 1` bytes) to detect
-/// this, because the one-bounded-range request shape is fixed by the plan.
+/// A 206 whose `Content-Range` was stripped (by a broken service or proxy) is read the same way,
+/// but it cannot pass for the whole blob: the request is one byte longer than the expected size
+/// `N`, so a blob larger than `N` answers with at least `N + 1` bytes, and the caller, which
+/// requires a total of exactly `N`, refuses it as a `LengthMismatch` before copying anything.
+/// A blob of exactly `N` bytes answers `N` bytes, which is its true size.
 pub(crate) fn response_lengths(
     content_range: Option<&str>,
     content_length: Option<u64>,
@@ -663,15 +664,39 @@ pub(crate) fn response_lengths(
     Ok(ResponseLengths { total, body_len })
 }
 
-/// The download options for a caller-buffer GET of `expected_len` bytes (plan §4.3).
+/// The length of the range a caller-buffer GET of `expected_len` bytes asks for: `expected_len +
+/// 1` (review C-F1), checked. The one extra byte is a probe, never a byte of the result: a blob
+/// of exactly `expected_len` bytes ends inside the range, and a larger one exposes at least
+/// `expected_len + 1` bytes even when the response carries no `Content-Range` (a proxy that
+/// strips it from a 206), which `response_lengths` then refuses before anything is copied. An
+/// `expected_len == 0` request is the one-byte probe `0..1`. A length whose successor overflows
+/// is refused here, before any request is built or sent.
+fn checked_request_len(expected_len: u64) -> Result<u64> {
+    expected_len
+        .checked_add(1)
+        .ok_or_else(|| az_other("the expected length is too large to request one byte beyond it"))
+}
+
+/// The download options for a caller-buffer GET of `expected_len` bytes (plan §4.3, amended by
+/// review C-F1).
 ///
-/// One bounded range `0..N` (`N = max(expected_len, 1)`: the `expected_len == 0` probe asks for
-/// one byte), `parallel = 1` and `partition_size = N`. That makes the SDK's first response the
-/// only one it needs: `azure_storage_blob` 1.0.0 `partitioned_transfer/download.rs` computes the
-/// remaining ranges as `(received_end..min(range_end, total))`, which is empty when the first
-/// response already covers the requested range, and then (line 84) returns the first response's
-/// body directly, with no partition buffer and no worker task. `if_match` pins a retry to the
-/// first response's ETag.
+/// One bounded range `0..N+1` (`N = expected_len`; see `checked_request_len`: the extra byte
+/// detects a blob larger than `N`, and `expected_len == 0` asks for one byte), `parallel = 1` and
+/// `partition_size = N+1`. The destination and the expected blob size stay `N`. That makes the
+/// SDK's first response the only one it needs. In `azure_storage_blob` 1.0.0
+/// `partitioned_transfer/download.rs` (`analyze_initial_response`, line 314) computes
+/// `remainder_end = min(request_end, resource_len)` and the remaining ranges as
+/// `(received_end..remainder_end)`:
+///
+/// * a blob of exactly `N` bytes: `resource_len = N`, so `remainder_end = min(N+1, N) = N`, the
+///   response ended at `received_end = N`, and the remaining ranges are empty;
+/// * a larger blob: the response covers `0..N+1` (`received_end = N+1`) and `remainder_end =
+///   min(N+1, resource_len) = N+1`, so the remaining ranges are empty as well.
+///
+/// When the remaining ranges are empty, `download` (the `remaining_ranges.is_empty()` branch, line 84)
+/// returns the first response's body directly, with no partition buffer and no worker task. So
+/// the exact-size read keeps the no-partition-buffer path, and so does the oversized one, which
+/// is refused from its headers. `if_match` pins a retry to the first response's ETag.
 ///
 /// The no-remaining-ranges path assumes the service honours the range. A reply shorter than the
 /// range asked for (a short 206 that is not the tail of the blob) leaves the SDK with ranges
@@ -684,7 +709,7 @@ fn get_into_options(
     expected_len: u64,
     if_match: Option<&str>,
 ) -> Result<BlobClientDownloadOptions<'static>> {
-    let range_len = expected_len.max(1);
+    let range_len = checked_request_len(expected_len)?;
     let partition_size = usize::try_from(range_len)
         .ok()
         .and_then(NonZeroUsize::new)
@@ -1089,8 +1114,9 @@ impl AzureBlob {
     /// length: `Ok(())` means exactly that many bytes were written and the blob is exactly that
     /// long.
     ///
-    /// * `dst.len() > 0`: one bounded range `0..dst.len()`, `parallel = 1`,
-    ///   `partition_size = dst.len()` (see `get_into_options`), so the SDK returns the first
+    /// * `dst.len() > 0`: one bounded range `0..dst.len() + 1` (one byte more than the
+    ///   destination, review C-F1), `parallel = 1`,
+    ///   `partition_size = dst.len() + 1` (see `get_into_options`), so the SDK returns the first
     ///   response's body directly, with no partition buffer. The blob size comes from the
     ///   `Content-Range` total (206) or `Content-Length` (200) and must equal `dst.len()` BEFORE
     ///   any byte is copied; otherwise `LengthMismatch` (a non-empty oversized or undersized blob
@@ -1109,10 +1135,10 @@ impl AzureBlob {
     ///   so one attempt that keeps failing with a status the SDK retries can send up to nine
     ///   requests.
     ///
-    /// Recorded limit: the SDK hides the HTTP status, so a 206 whose `Content-Range` was stripped
-    /// and whose `Content-Length` equals `dst.len()` is read as a whole blob of that length even
-    /// when the blob is larger (see `response_lengths`). A real Azure service always sends the
-    /// header.
+    /// The SDK hides the HTTP status, so a 206 whose `Content-Range` was stripped cannot be told
+    /// from a 200. The extra requested byte makes that harmless: a blob larger than `dst.len()`
+    /// answers with more than `dst.len()` bytes and is a `LengthMismatch` (see
+    /// `response_lengths`); the extra byte is never written to `dst`.
     ///
     /// `progress` counts the distinct positions written and survives errors and cancellation.
     /// Every writer runs inside this future, so dropping it stops all writes. A failure never
@@ -1203,7 +1229,7 @@ impl AzureBlob {
                     "content-range",
                 )),
             resp.properties.content_length,
-            expected.max(1),
+            checked_request_len(expected)?,
         )?;
         if lengths.total != expected {
             // The body is dropped unread.
@@ -2497,17 +2523,28 @@ mod get_into_tests {
         assert_eq!(lens(Some("bytes 0-0/7"), Some(1), 1).unwrap(), l(7, 1));
     }
 
-    /// Recorded limit: the SDK hides the status, so a 206 stripped of `Content-Range` whose
-    /// `Content-Length` equals the request reads as a whole blob of that length.
+    /// Review C-F1: the SDK hides the status, so a 206 stripped of `Content-Range` reads as a
+    /// whole blob of the length it carries. The request is `N + 1` bytes, so a blob larger than
+    /// `N = 60` carries 61 bytes and reports a total of 61, never 60: the caller's check of the
+    /// total against `N` refuses it. A blob of exactly `N` bytes carries 60.
     #[test]
-    fn recorded_limit_a_206_without_content_range_is_taken_for_a_whole_blob() {
+    fn a_206_without_content_range_for_a_larger_blob_never_reports_the_expected_total() {
+        let expected = 60;
+        let request = checked_request_len(expected).unwrap();
+        assert_eq!(request, 61);
+        // A 100-byte blob, range honoured, header stripped: 61 bytes arrive.
+        let larger = response_lengths(None, Some(61), request).unwrap();
         assert_eq!(
-            response_lengths(None, Some(60), 60).unwrap(),
+            larger,
             ResponseLengths {
-                total: 60,
-                body_len: 60
+                total: 61,
+                body_len: 61
             }
         );
+        assert_ne!(larger.total, expected);
+        // A 60-byte blob: the reply is the whole blob.
+        let exact = response_lengths(None, Some(60), request).unwrap();
+        assert_eq!(exact.total, expected);
     }
 
     #[test]
@@ -2540,18 +2577,29 @@ mod get_into_tests {
         }
         for expected in sizes {
             let o = get_into_options(expected, None).expect("options");
-            assert_eq!(o.range, Some(HttpRange::new(0, expected)));
+            // One byte more than the destination (review C-F1).
+            assert_eq!(o.range, Some(HttpRange::new(0, expected + 1)));
             assert_eq!(o.parallel, NonZeroUsize::new(1));
             // partition_size == the range length is what leaves the SDK no remaining ranges.
             assert_eq!(
                 o.partition_size.and_then(|p| u64::try_from(p.get()).ok()),
-                Some(expected),
+                Some(expected + 1),
                 "{expected}"
             );
             assert!(o.if_match.is_none());
         }
         let o = get_into_options(1000, None).expect("options");
-        assert_eq!(o.range.expect("range").to_string(), "bytes=0-999");
+        assert_eq!(o.range.expect("range").to_string(), "bytes=0-1000");
+    }
+
+    /// `N + 1` overflowing is refused before a request exists, with a typed error.
+    #[test]
+    fn options_refuse_a_length_whose_successor_overflows() {
+        let err = get_into_options(u64::MAX, None).expect_err("N + 1 overflows");
+        assert_eq!(kind_of(&err), ObjectErrorKind::Other);
+        assert!(checked_request_len(u64::MAX).is_err());
+        assert_eq!(checked_request_len(u64::MAX - 1).unwrap(), u64::MAX);
+        assert_eq!(checked_request_len(0).unwrap(), 1);
     }
 
     #[test]

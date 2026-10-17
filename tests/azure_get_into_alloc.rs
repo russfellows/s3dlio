@@ -148,7 +148,7 @@ fn get_into_makes_no_partition_or_whole_object_allocation() {
         );
         assert_eq!(
             seen[0].range.as_deref(),
-            Some(format!("bytes=0-{}", SIZE - 1).as_str())
+            Some(format!("bytes=0-{SIZE}").as_str())
         );
     });
 }
