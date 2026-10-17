@@ -34,3 +34,6 @@ API_COMPATIBILITY_REPORT.md
 # Remote testing results (local analysis only)
 examples/standalone/Loki-3_remote_tests.txt
 docs/LOKI3_TEST_ANALYSIS.md
+
+# Local code-search index (never committed)
+.coderag/
