@@ -194,6 +194,20 @@ pub struct GcsObjectMetadata {
     pub key: String,
 }
 
+/// A GCS object time as an RFC 3339 string (#263).
+///
+/// GCS reports object times as Google's `Timestamp`, whose `Debug` form is a struct dump
+/// (`Timestamp { seconds: .., nanos: .. }`), not a time.  The provider-neutral
+/// `ObjectMetadata::last_modified` and the GCS listing consumers expect RFC 3339, which
+/// Google's `String::from(Timestamp)` produces (UTC, with the fraction kept when there is one).
+/// An absent time stays absent.
+fn object_time_rfc3339<T>(time: Option<T>) -> Option<String>
+where
+    T: Into<String>,
+{
+    time.map(Into::into)
+}
+
 /// RAPID mode configuration.
 ///
 /// Controls whether gRPC BidiReadObject/BidiWriteObject (with appendable=true)
@@ -908,11 +922,7 @@ impl GcsClient {
         let metadata = GcsObjectMetadata {
             size: obj.size as u64,
             etag: Some(obj.etag.clone()),
-            updated: obj.update_time.map(|t| {
-                // Timestamp is google_cloud_wkt::timestamp::Timestamp
-                // Convert to RFC3339 format
-                format!("{:?}", t) // Use debug formatting as fallback
-            }),
+            updated: object_time_rfc3339(obj.update_time),
             key: object.to_string(),
         };
 
@@ -966,7 +976,7 @@ impl GcsClient {
         let metadata = GcsObjectMetadata {
             size: obj.size as u64,
             etag: Some(obj.etag.clone()),
-            updated: obj.update_time.map(|t| format!("{:?}", t)),
+            updated: object_time_rfc3339(obj.update_time),
             key: object.to_string(),
         };
 
@@ -3030,3 +3040,8 @@ mod object_error_tests {
         assert!(!text.contains("SECRET-PAYLOAD"), "{text}");
     }
 }
+
+// Tests for the typed HEAD decision logic and the #263 object-time conversion.
+#[cfg(all(test, not(feature = "gcs-community")))]
+#[path = "gcs_head_typed_tests.rs"]
+mod head_typed_tests;
