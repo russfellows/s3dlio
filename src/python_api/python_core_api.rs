@@ -178,10 +178,16 @@ impl StoreSlot {
         // Send + Sync and uses the global runtime's I/O reactor when its async methods
         // are called. Built without a logger: the cache must stay logger-free.
         #[cfg(test)]
-        STORE_BUILD_LOG
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(uri.to_owned());
+        {
+            STORE_BUILD_LOG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(uri.to_owned());
+            STORE_BUILD_THREADS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((uri.to_owned(), std::thread::current().id()));
+        }
         let built: Arc<dyn ObjectStore> = Arc::from(store_for_uri_with_logger(uri, None)?);
         Ok(Arc::clone(self.store.get_or_init(|| built)))
     }
@@ -201,6 +207,12 @@ static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<StoreSlot>>> = Lazy::new(DashMap:
 /// cache), in order.  Lets a test count the builds for one URI.
 #[cfg(test)]
 static STORE_BUILD_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Test hook: the URI and the BUILDING THREAD of every store build, in order (the same builds
+/// as [`STORE_BUILD_LOG`]). Lets a test prove a store is built on the calling thread (#173).
+#[cfg(test)]
+static STORE_BUILD_THREADS: std::sync::Mutex<Vec<(String, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Get or create a cached ObjectStore instance.
 ///
@@ -2066,11 +2078,21 @@ struct PyHeadMetadata {
 
 #[pymethods]
 impl PyHeadMetadata {
-    fn __repr__(&self) -> String {
-        format!(
-            "ObjectMetadata(size={}, etag={:?}, version_id={:?})",
-            self.size, self.etag, self.version_id
-        )
+    /// Python-style: `ObjectMetadata(size=5, etag='e', version_id=None)`. The strings are
+    /// rendered by Python's own `repr`, so quotes and backslashes are escaped the Python way.
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let optional = |value: &Option<String>| -> PyResult<String> {
+            match value {
+                None => Ok("None".to_owned()),
+                Some(text) => Ok(pyo3::types::PyString::new(py, text).repr()?.to_string()),
+            }
+        };
+        Ok(format!(
+            "ObjectMetadata(size={}, etag={}, version_id={})",
+            self.size,
+            optional(&self.etag)?,
+            optional(&self.version_id)?
+        ))
     }
 }
 
@@ -2091,10 +2113,10 @@ impl From<HeadMetadata> for PyHeadMetadata {
 /// Needs the GIL (`LengthMismatchError` gets `.expected` / `.actual` set), so it runs where the
 /// result is delivered to Python (see [`Outcome`]), never on a runtime worker.
 fn object_py_err(py: Python<'_>, err: &anyhow::Error) -> PyErr {
-    let Some(typed) = object_error(err) else {
-        return py_err(err);
-    };
     let message = error_chain_message(err);
+    let Some(typed) = object_error(err) else {
+        return PyRuntimeError::new_err(message);
+    };
     match typed.kind {
         ObjectErrorKind::NotFound => ObjectNotFoundError::new_err(message),
         ObjectErrorKind::LengthMismatch { expected, actual } => {
@@ -2111,7 +2133,7 @@ fn object_py_err(py: Python<'_>, err: &anyhow::Error) -> PyErr {
             exception
         }
         ObjectErrorKind::Unsupported => UnsupportedOperationError::new_err(message),
-        _ => py_err(err),
+        _ => PyRuntimeError::new_err(message),
     }
 }
 
@@ -2164,21 +2186,34 @@ fn require_capability(uri: &str, operation: Operation) -> PyResult<()> {
 }
 
 /// `expected_len` as a `usize`: an integer (not a bool), non-negative, within `usize`.
+///
+/// Anything with `__index__` is accepted, like `operator.index`. A failure of that conversion is
+/// never replaced by a message that hides it: a non-integer is a `TypeError` and a value beyond
+/// the machine range a `ValueError`, each with the original exception as `__cause__`, and any
+/// other exception raised by `__index__` propagates unchanged.
 fn checked_expected_len(value: &Bound<'_, PyAny>) -> PyResult<usize> {
-    use pyo3::exceptions::PyTypeError;
+    use pyo3::exceptions::{PyOverflowError, PyTypeError};
+    let py = value.py();
     if value.is_instance_of::<pyo3::types::PyBool>() {
         return Err(PyTypeError::new_err(
             "expected_len must be an integer, not a bool",
         ));
     }
-    let n: i128 = value.extract().map_err(|_| {
-        // Not an int, or an int too large even for i128.
-        if value.is_instance_of::<pyo3::types::PyInt>() {
-            PyValueError::new_err("expected_len is too large")
-        } else {
-            PyTypeError::new_err("expected_len must be an integer")
+    let n: i128 = match value.extract() {
+        Ok(n) => n,
+        Err(e) if e.is_instance_of::<PyOverflowError>(py) => {
+            // An `int` (or an `__index__` result) too large even for i128.
+            let wrapped = PyValueError::new_err("expected_len is too large");
+            wrapped.set_cause(py, Some(e));
+            return Err(wrapped);
         }
-    })?;
+        Err(e) if e.is_instance_of::<PyTypeError>(py) => {
+            let wrapped = PyTypeError::new_err("expected_len must be an integer");
+            wrapped.set_cause(py, Some(e));
+            return Err(wrapped);
+        }
+        Err(e) => return Err(e),
+    };
     if n < 0 {
         return Err(PyValueError::new_err(format!(
             "expected_len must not be negative, got {n}"
@@ -2255,6 +2290,25 @@ fn cancel_ignoring_errors(future: &Bound<'_, PyAny>) {
 /// buffer is safe to reuse right after the `await`, including after an error or a cancellation.
 /// After a failure the contents of `dst[:expected_len]` are unspecified. A failure before the
 /// transfer starts (for example, no running event loop) releases the buffer before it raises.
+///
+/// Concurrent receives: two calls that write the same or overlapping memory at the same time are
+/// forbidden (each would hold a mutable view over bytes the other also writes). Give every
+/// in-flight call its own destination, or non-overlapping slices of one buffer.
+///
+/// The awaitable is a `Future` that belongs to s3dlio. Await it directly:
+/// `asyncio.shield(fut)` bypasses the guard (the shield is cancelled at once while the native
+/// read still writes into `dst`), and forcing the future to complete with `set_result` /
+/// `set_exception` (or the base-class methods) is unsupported and ends it at once, so `dst`
+/// would then be reused while a native writer may still run. `cancel()`, `Task.cancel()`
+/// (also repeated), `asyncio.timeout()` and `wait_for()` leave the awaiting task pending until
+/// the native read has stopped and the export is released; the cancellation or timeout is
+/// delivered only after that point.
+///
+/// Every `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (default 30 s) that a native writer remains after
+/// the call finished, a `RuntimeWarning` naming the timeout is emitted,
+/// `s3dlio._put_export_stats()["quiesce_timeouts"]` is incremented and the wait continues: the
+/// awaitable never completes while a native writer remains. A call still running when the
+/// interpreter exits is not waited for.
 #[pyfunction]
 #[pyo3(signature = (uri, dst, *, expected_len))]
 fn get_into_async<'py>(
@@ -2329,9 +2383,12 @@ fn get_into_with_store<'py, S: StartSeams>(
     let guarded = match seams.instantiate(py, guard, inner.clone()) {
         Ok(guarded) => guarded,
         Err(e) => {
-            drop(tx);
+            // Order matters: release the export, cancel the bridged future, and only THEN close
+            // the start channel. Closing it first lets the task finish with "never handed" before
+            // the cancel lands, leaving an exception nobody retrieves (logged at GC).
             owner.release(py);
             cancel_ignoring_errors(&inner);
+            drop(tx);
             return Err(e);
         }
     };
@@ -2372,7 +2429,20 @@ impl Drop for HeadQuiescence {
 /// provider without the operation raises `UnsupportedOperationError` immediately.
 ///
 /// Like `get_into_async` the awaitable never finishes while a native request of the call
-/// remains, so callers can bound outstanding native work; there is no buffer to release.
+/// remains, so callers can bound outstanding native work; there is no buffer to release (and so
+/// no destination to protect: the exclusive-use rules of `get_into_async` do not apply here).
+///
+/// The awaitable is a `Future` that belongs to s3dlio. Await it directly: `asyncio.shield(fut)`
+/// bypasses the guard (the shield is cancelled at once while the request still runs), and
+/// forcing the future to complete with `set_result` / `set_exception` (or the base-class
+/// methods) is unsupported and ends it at once. `cancel()`, `Task.cancel()` (also repeated),
+/// `asyncio.timeout()` and `wait_for()` leave the awaiting task pending until the request has
+/// stopped; the cancellation or timeout is delivered only after that point.
+///
+/// Every `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (default 30 s) that a native request remains after
+/// the call finished, a `RuntimeWarning` naming the timeout is emitted,
+/// `s3dlio._put_export_stats()["quiesce_timeouts"]` is incremented and the wait continues. A
+/// call still running when the interpreter exits is not waited for.
 #[pyfunction]
 fn head_async<'py>(py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
     let uri = uri.to_owned();
@@ -2405,15 +2475,20 @@ fn head_with_store<'py, S: StartSeams>(
     let (tx, rx) = oneshot::channel::<()>();
     let token = HeadQuiescence { latch };
     let task = async move {
-        // First local: dropped last, after any request future (see `HeadQuiescence`).
-        let _quiescence = token;
-        if rx.await.is_err() {
-            return Ok::<_, PyErr>(Outcome(Err(anyhow::anyhow!(
-                "the HEAD request was never started"
-            ))));
+        // First local, so it is dropped last: after any request future, on every path (finish,
+        // cancellation, panic unwind). The explicit `drop` below is the normal-completion
+        // spelling of the same moment.
+        let quiescence = token;
+        let outcome = async {
+            if rx.await.is_err() {
+                return Outcome(Err(anyhow::anyhow!("the HEAD request was never started")));
+            }
+            let result = store.head(&uri).await;
+            Outcome(result.map(|found| found.map(PyHeadMetadata::from)))
         }
-        let result = store.head(&uri).await;
-        Ok(Outcome(result.map(|found| found.map(PyHeadMetadata::from))))
+        .await;
+        drop(quiescence);
+        Ok::<_, PyErr>(outcome)
     };
 
     let inner = match seams.bridge(py, task) {
@@ -2426,8 +2501,9 @@ fn head_with_store<'py, S: StartSeams>(
     let guarded = match seams.instantiate(py, guard, inner.clone()) {
         Ok(guarded) => guarded,
         Err(e) => {
-            drop(tx);
+            // Cancel first, then close the start channel (see `get_into_with_store`).
             cancel_ignoring_errors(&inner);
+            drop(tx);
             return Err(e);
         }
     };
@@ -5142,6 +5218,16 @@ class Exporter:
             return False
         return True
 
+class Indexable:
+    def __init__(self, value):
+        self.value = value
+    def __index__(self):
+        return self.value
+
+class BrokenIndex:
+    def __index__(self):
+        raise KeyError('index exploded')
+
 def run(main, *args):
     loop = asyncio.new_event_loop()
     try:
@@ -5188,6 +5274,32 @@ async def scn_cancel_after(start):
     fut = start()
     value = await fut
     return (value, fut.cancel(), fut.done(), fut.cancelled())
+
+async def scn_blocked_observe(start, entered, observe, release):
+    fut = start()
+    while not entered():
+        await asyncio.sleep(0.002)
+    await asyncio.sleep(0.05)
+    unmarked = observe()
+    pending = not fut.done()
+    release()
+    value = await fut
+    return (unmarked, pending, value)
+
+async def scn_error_then_settle(start):
+    import gc
+    loop = asyncio.get_running_loop()
+    unretrieved = []
+    loop.set_exception_handler(lambda lp, ctx: unretrieved.append(ctx.get('message', '')))
+    error = None
+    try:
+        start()
+    except BaseException as e:
+        error = e
+    for _ in range(3):
+        await asyncio.sleep(0.02)
+        gc.collect()
+    return (error, unretrieved)
 "
     );
 
@@ -5197,6 +5309,14 @@ async def scn_cancel_after(start):
 
     impl<'py> Driver<'py> {
         fn new(py: Python<'py>) -> Self {
+            let version = py.version_info();
+            assert!(
+                (version.major, version.minor) >= (3, 12),
+                "these tests need CPython >= 3.12 for the PEP 688 __buffer__ exporter, \
+                 found {}.{}",
+                version.major,
+                version.minor
+            );
             let module = PyModule::from_code(
                 py,
                 DRIVER_PY,
@@ -5263,6 +5383,115 @@ async def scn_cancel_after(start):
     /// Let tasks that would start native work, if they could, run (GIL released).
     fn let_runtime_settle(py: Python<'_>) {
         py.detach(|| std::thread::sleep(Duration::from_millis(60)));
+    }
+
+    // ---- the drop probe ----
+
+    /// What a [`DropProbe`] reads off the call's latch (and, for HEAD, the quiescence token).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ProbeSample {
+        latch_dropped: bool,
+        latch_released: bool,
+        /// HEAD: completions of the call's `HeadQuiescence` token since the probe was made.
+        token_completions: usize,
+    }
+
+    /// Nothing marked yet: the state the latch and the token must be in while the native future
+    /// is alive and while its `Drop` runs.
+    const UNMARKED: ProbeSample = ProbeSample {
+        latch_dropped: false,
+        latch_released: false,
+        token_completions: 0,
+    };
+
+    /// Watches the instant the native future of a fake store call is dropped. The store holds a
+    /// [`NativeFutureGuard`] as a local of its `get_into` / `head` future, so its `Drop` runs
+    /// exactly when that future is dropped: on completion, on cancellation and on a panic
+    /// unwind. The probe reads the call's latch (and HEAD token) at that moment, and again after
+    /// a deliberately slow `Drop`, so a test can prove that nothing was marked before the native
+    /// future was really gone.
+    struct DropProbe {
+        latch: Arc<Latch>,
+        /// `Drop` sleeps, widening any window in which the latch could be marked too early.
+        slow: bool,
+        token_baseline: usize,
+        at_drop: Mutex<Option<ProbeSample>>,
+        after_slow_drop: Mutex<Option<ProbeSample>>,
+        /// `Drop` ran to its end.
+        finished: AtomicBool,
+    }
+
+    impl DropProbe {
+        fn new(latch: &Arc<Latch>, slow: bool) -> Arc<Self> {
+            Arc::new(Self {
+                latch: Arc::clone(latch),
+                slow,
+                token_baseline: head_token_tests::completions(latch),
+                at_drop: Mutex::new(None),
+                after_slow_drop: Mutex::new(None),
+                finished: AtomicBool::new(false),
+            })
+        }
+
+        fn sample(&self) -> ProbeSample {
+            ProbeSample {
+                latch_dropped: self.latch.is_dropped(),
+                latch_released: self.latch.is_released(),
+                token_completions: head_token_tests::completions(&self.latch) - self.token_baseline,
+            }
+        }
+
+        fn enter(self: &Arc<Self>) -> NativeFutureGuard {
+            NativeFutureGuard(Arc::clone(self))
+        }
+
+        fn finished(&self) -> bool {
+            self.finished.load(Ordering::SeqCst)
+        }
+
+        /// The native future was dropped, and neither the latch nor the HEAD token was marked
+        /// when it was (nor, for a slow `Drop`, while that `Drop` was still running).
+        fn assert_dropped_before_any_marking(&self, what: &str) {
+            let at = *self.at_drop.lock().unwrap_or_else(|e| e.into_inner());
+            let at = at.unwrap_or_else(|| panic!("{what}: the native future was never dropped"));
+            assert_eq!(
+                at, UNMARKED,
+                "{what}: marked before the native future was dropped"
+            );
+            if self.slow {
+                let after = *self
+                    .after_slow_drop
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let after = after.unwrap_or_else(|| panic!("{what}: the slow Drop never finished"));
+                assert_eq!(
+                    after, UNMARKED,
+                    "{what}: marked while the native future's Drop was still running"
+                );
+            }
+            assert!(
+                self.finished(),
+                "{what}: the native future's Drop did not finish"
+            );
+        }
+    }
+
+    /// The local of the fake store's native future that reports its drop to a [`DropProbe`].
+    struct NativeFutureGuard(Arc<DropProbe>);
+
+    impl Drop for NativeFutureGuard {
+        fn drop(&mut self) {
+            let probe = &self.0;
+            *probe.at_drop.lock().unwrap_or_else(|e| e.into_inner()) = Some(probe.sample());
+            if probe.slow {
+                std::thread::sleep(Duration::from_millis(80));
+                *probe
+                    .after_slow_drop
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(probe.sample());
+            }
+            probe.finished.store(true, Ordering::SeqCst);
+        }
     }
 
     // ---- the deterministic fake store ----
@@ -5339,6 +5568,8 @@ async def scn_cancel_after(start):
         /// `(releases, resizable)` of the destination observed INSIDE the start call, at the moment
         /// it returned an error (see `get_start`): proves the release was direct, not queued.
         error_probe: Mutex<Option<(usize, bool)>>,
+        /// Reports the drop of the native future (see [`DropProbe`]).
+        drop_probe: Option<Arc<DropProbe>>,
     }
 
     impl FakeStore {
@@ -5359,7 +5590,13 @@ async def scn_cancel_after(start):
                 entered: AtomicBool::new(false),
                 seen: Mutex::new(Vec::new()),
                 error_probe: Mutex::new(None),
+                drop_probe: None,
             }
+        }
+
+        fn probing(mut self, probe: &Arc<DropProbe>) -> Self {
+            self.drop_probe = Some(Arc::clone(probe));
+            self
         }
 
         fn filling(mut self, fill: Vec<u8>) -> Self {
@@ -5408,10 +5645,12 @@ async def scn_cancel_after(start):
     impl ObjectStore for FakeStore {
         async fn get_into(
             &self,
-            _uri: &str,
+            _: &str,
             dst: &mut [u8],
             progress: &ReceiveProgress,
         ) -> anyhow::Result<()> {
+            // A local of THIS future: its `Drop` reports the moment the future is dropped.
+            let native_future = self.drop_probe.as_ref().map(DropProbe::enter);
             self.get_calls.fetch_add(1, Ordering::SeqCst);
             self.seen
                 .lock()
@@ -5423,85 +5662,82 @@ async def scn_cancel_after(start):
             }
             if self.block {
                 // Held until the test adds a permit; a dropped future just stops here.
-                let _permit = self.gate.acquire().await?;
+                let permit = self.gate.acquire().await?;
+                drop(permit);
             }
             let n = self.fill.len().min(dst.len());
             // A failure first writes half of what it would have: partial progress.
             let written = if self.failure.is_some() { n / 2 } else { n };
             dst[..written].copy_from_slice(&self.fill[..written]);
             crate::receive_progress::SpanMark::new(progress).record_copy(0, written as u64)?;
-            match self.failure {
+            let outcome = match self.failure {
                 Some(failure) => Err(failure_error(failure)),
                 None => Ok(()),
-            }
+            };
+            drop(native_future);
+            outcome
         }
 
-        async fn head(&self, _uri: &str) -> anyhow::Result<Option<HeadMetadata>> {
+        async fn head(&self, _: &str) -> anyhow::Result<Option<HeadMetadata>> {
+            let native_future = self.drop_probe.as_ref().map(DropProbe::enter);
             self.head_calls.fetch_add(1, Ordering::SeqCst);
             self.entered.store(true, Ordering::SeqCst);
             if self.panic {
                 panic!("fake store panics inside the native future");
             }
             if self.block {
-                let _permit = self.gate.acquire().await?;
+                let permit = self.gate.acquire().await?;
+                drop(permit);
             }
-            match self.failure {
+            let outcome = match self.failure {
                 Some(failure) => Err(failure_error(failure)),
                 None => Ok(self.head_result.clone()),
-            }
+            };
+            drop(native_future);
+            outcome
         }
 
-        async fn get(&self, _uri: &str) -> anyhow::Result<Bytes> {
+        async fn get(&self, _: &str) -> anyhow::Result<Bytes> {
             anyhow::bail!("not scripted")
         }
-        async fn get_range(
-            &self,
-            _uri: &str,
-            _offset: u64,
-            _length: Option<u64>,
-        ) -> anyhow::Result<Bytes> {
+        async fn get_range(&self, _: &str, _: u64, _: Option<u64>) -> anyhow::Result<Bytes> {
             anyhow::bail!("not scripted")
         }
-        async fn put(&self, _uri: &str, _data: Bytes) -> anyhow::Result<()> {
+        async fn put(&self, _: &str, _: Bytes) -> anyhow::Result<()> {
             anyhow::bail!("not scripted")
         }
-        async fn put_multipart(
-            &self,
-            _uri: &str,
-            _data: Bytes,
-            _part_size: Option<usize>,
-        ) -> anyhow::Result<()> {
+        async fn put_multipart(&self, _: &str, _: Bytes, _: Option<usize>) -> anyhow::Result<()> {
             anyhow::bail!("not scripted")
         }
-        async fn list(&self, _uri_prefix: &str, _recursive: bool) -> anyhow::Result<Vec<String>> {
+        async fn list(&self, _: &str, _: bool) -> anyhow::Result<Vec<String>> {
             anyhow::bail!("not scripted")
         }
         fn list_stream<'a>(
             &'a self,
-            _uri_prefix: &'a str,
-            _recursive: bool,
+            _: &'a str,
+            _: bool,
         ) -> Pin<Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send + 'a>> {
             Box::pin(futures::stream::empty())
         }
-        async fn stat(&self, _uri: &str) -> anyhow::Result<crate::object_store::ObjectMetadata> {
+        async fn stat(&self, _: &str) -> anyhow::Result<crate::object_store::ObjectMetadata> {
             anyhow::bail!("not scripted")
         }
-        async fn delete(&self, _uri: &str) -> anyhow::Result<()> {
+        async fn delete(&self, _: &str) -> anyhow::Result<()> {
             anyhow::bail!("not scripted")
         }
-        async fn delete_batch(&self, _uris: &[String]) -> anyhow::Result<()> {
+        async fn delete_batch(&self, _: &[String]) -> anyhow::Result<()> {
             anyhow::bail!("not scripted")
         }
-        async fn delete_prefix(&self, _uri_prefix: &str) -> anyhow::Result<()> {
+        async fn delete_prefix(&self, _: &str) -> anyhow::Result<()> {
             anyhow::bail!("not scripted")
         }
-        async fn create_container(&self, _name: &str) -> anyhow::Result<()> {
+        async fn create_container(&self, _: &str) -> anyhow::Result<()> {
             anyhow::bail!("not scripted")
         }
-        async fn delete_container(&self, _name: &str) -> anyhow::Result<()> {
+        async fn delete_container(&self, _: &str) -> anyhow::Result<()> {
             anyhow::bail!("not scripted")
         }
-        async fn get_writer(&self, _uri: &str) -> anyhow::Result<Box<dyn ObjectWriter>> {
+        async fn get_writer(&self, _: &str) -> anyhow::Result<Box<dyn ObjectWriter>> {
             anyhow::bail!("not scripted")
         }
     }
@@ -5517,8 +5753,11 @@ async def scn_cancel_after(start):
         Fail,
         /// The bridge "succeeds" but the Rust future is gone: the start receiver is closed.
         DropFuture,
-        /// The real bridge, but the future is not polled until the test adds a permit to the
-        /// semaphore: a cancellation can then arrive before the future's first poll.
+        /// The real bridge, but the wrapped future is not polled until the test adds a permit to
+        /// the semaphore. It models a task that is DROPPED UNPOLLED (the Rust future never ran a
+        /// single step), the one case in which the export is still in the start channel. It is
+        /// NOT what the live bridge does on a Python cancel: pyo3-async-runtimes polls the task
+        /// once before it looks at the cancellation, so a live cancel can still start the call.
         Gated(Arc<tokio::sync::Semaphore>),
     }
 
@@ -5552,11 +5791,13 @@ async def scn_cancel_after(start):
                 BridgeMode::Gated(gate) => {
                     let gate = Arc::clone(gate);
                     future_into_py(py, async move {
-                        let _permit = gate
+                        let permit = gate
                             .acquire()
                             .await
                             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        fut.await
+                        let result = fut.await;
+                        drop(permit);
+                        result
                     })
                 }
             }
@@ -5626,7 +5867,7 @@ async def scn_cancel_after(start):
             None,
             None,
             move |args: &Bound<'_, pyo3::types::PyTuple>,
-                  _kwargs: Option<&Bound<'_, PyDict>>|
+                  _: Option<&Bound<'_, PyDict>>|
                   -> PyResult<Py<PyAny>> {
                 let py = args.py();
                 let store_dyn: Arc<dyn ObjectStore> = store.clone();
@@ -5665,7 +5906,7 @@ async def scn_cancel_after(start):
             None,
             None,
             move |args: &Bound<'_, pyo3::types::PyTuple>,
-                  _kwargs: Option<&Bound<'_, PyDict>>|
+                  _: Option<&Bound<'_, PyDict>>|
                   -> PyResult<Py<PyAny>> {
                 let store: Arc<dyn ObjectStore> = store.clone();
                 head_with_store(args.py(), &seams, store, URI.to_owned(), latch.clone())
@@ -5683,11 +5924,42 @@ async def scn_cancel_after(start):
             py,
             None,
             None,
-            move |_args: &Bound<'_, pyo3::types::PyTuple>,
-                  _kwargs: Option<&Bound<'_, PyDict>>|
+            move |_: &Bound<'_, pyo3::types::PyTuple>,
+                  _: Option<&Bound<'_, PyDict>>|
                   -> PyResult<bool> { Ok(store.entered.load(Ordering::SeqCst)) },
         )
         .expect("entered closure")
+        .into_any()
+    }
+
+    /// A Python callable `() -> bool` over a Rust closure.
+    fn bool_fn<'py>(py: Python<'py>, f: impl Fn() -> bool + Send + 'static) -> Bound<'py, PyAny> {
+        pyo3::types::PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |_: &Bound<'_, pyo3::types::PyTuple>,
+                  _: Option<&Bound<'_, PyDict>>|
+                  -> PyResult<bool> { Ok(f()) },
+        )
+        .expect("bool closure")
+        .into_any()
+    }
+
+    /// A Python callable `()` that runs a Rust closure and returns `None`.
+    fn action_fn<'py>(py: Python<'py>, f: impl Fn() + Send + 'static) -> Bound<'py, PyAny> {
+        pyo3::types::PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |_: &Bound<'_, pyo3::types::PyTuple>,
+                  _: Option<&Bound<'_, PyDict>>|
+                  -> PyResult<()> {
+                f();
+                Ok(())
+            },
+        )
+        .expect("action closure")
         .into_any()
     }
 
@@ -5803,7 +6075,8 @@ async def scn_cancel_after(start):
         Python::attach(|py| {
             let driver = Driver::new(py);
             let ex = driver.exporter(16);
-            let uri = "s3://bucket/key";
+            // A unique host-form URI: a store built for it would show in the build log.
+            let uri = "s3://127.0.0.1:59265/bucket/expected-len";
             let call = |value: Bound<'_, PyAny>| get_into_async(py, uri, &ex, &value).map(|_| ());
             let int = |v: i64| v.into_pyobject(py).unwrap().into_any();
 
@@ -5823,16 +6096,115 @@ async def scn_cancel_after(start):
                 err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
                 "{err}"
             );
-            // Larger than the buffer: acquire_writable refuses (and releases) it.
-            let err = call(int(17)).expect_err("longer than the buffer");
-            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+            let err = call(1.5f64.into_pyobject(py).unwrap().into_any()).expect_err("float");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                "{err}"
+            );
 
+            // Every refusal above came before the buffer was exported and before any store was
+            // built.
             assert_eq!(
                 attr_usize(&ex, "exports"),
+                0,
+                "a refused length exported the buffer"
+            );
+            assert_eq!(store_builds_for(uri), 0, "a refused length built a store");
+            assert!(method_bool(&ex, "resizable"));
+        });
+    }
+
+    /// The conversion itself, over objects that go through `__index__`.
+    #[test]
+    fn expected_len_goes_through_index_and_keeps_the_original_failure() {
+        init();
+        Python::attach(|py| {
+            use pyo3::exceptions::{PyKeyError, PyOverflowError, PyTypeError};
+            let driver = Driver::new(py);
+            fn indexable<'py>(driver: &Driver<'py>, value: Bound<'py, PyAny>) -> Bound<'py, PyAny> {
+                driver
+                    .module
+                    .getattr("Indexable")
+                    .and_then(|class| class.call1((value,)))
+                    .expect("Indexable")
+            }
+            let int = |v: i64| v.into_pyobject(py).unwrap().into_any();
+            let huge = || py.eval(c_str!("2 ** 200"), None, None).unwrap();
+
+            // An object with `__index__` is an integer.
+            assert_eq!(
+                checked_expected_len(&indexable(&driver, int(4))).unwrap(),
+                4
+            );
+
+            // A float is a TypeError, with the interpreter's own error as the cause.
+            let err = checked_expected_len(&1.5f64.into_pyobject(py).unwrap().into_any())
+                .expect_err("float");
+            assert!(err.is_instance_of::<PyTypeError>(py), "{err}");
+            let cause = err.cause(py).expect("the cause of a float is kept");
+            assert!(cause.is_instance_of::<PyTypeError>(py), "{cause}");
+
+            // An `__index__` beyond the machine range is a ValueError (not a TypeError), with the
+            // OverflowError as the cause.
+            let err =
+                checked_expected_len(&indexable(&driver, huge())).expect_err("huge __index__");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+            assert!(err.to_string().contains("too large"), "{err}");
+            let cause = err.cause(py).expect("the cause of a huge value is kept");
+            assert!(cause.is_instance_of::<PyOverflowError>(py), "{cause}");
+            let err = checked_expected_len(&huge()).expect_err("huge int");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+
+            // A negative `__index__` is a ValueError.
+            let err =
+                checked_expected_len(&indexable(&driver, int(-3))).expect_err("negative __index__");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+
+            // An `__index__` that raises: that exception is what the caller sees, with its message,
+            // not a generic replacement.
+            let broken = driver
+                .module
+                .getattr("BrokenIndex")
+                .and_then(|class| class.call0())
+                .expect("BrokenIndex");
+            let err = checked_expected_len(&broken).expect_err("raising __index__");
+            assert!(err.is_instance_of::<PyKeyError>(py), "{err}");
+            assert!(err.to_string().contains("index exploded"), "{err}");
+        });
+    }
+
+    /// An `expected_len` longer than the buffer is refused by the export (which releases it),
+    /// through the real internal path with a fake store: no store is built, no native call made.
+    #[test]
+    fn expected_len_longer_than_the_buffer_is_refused_and_released() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let store = Arc::new(FakeStore::new());
+            let latch = Latch::new();
+            let store_dyn: Arc<dyn ObjectStore> = store.clone();
+            let err = get_into_with_store(
+                py,
+                &LiveSeams,
+                store_dyn,
+                URI.to_owned(),
+                &ex,
+                17,
+                latch.clone(),
+            )
+            .expect_err("longer than the buffer");
+            assert!(err.is_instance_of::<PyValueError>(py), "{err}");
+            assert_eq!(attr_usize(&ex, "exports"), 1);
+            assert_eq!(
                 attr_usize(&ex, "releases"),
-                "every export was released"
+                1,
+                "the refused export is released"
             );
             assert!(method_bool(&ex, "resizable"));
+            assert_eq!(latch_state(&latch), (true, true));
+            let_runtime_settle(py);
+            assert_eq!(store.get_calls(), 0);
         });
     }
 
@@ -6089,7 +6461,7 @@ async def scn_cancel_after(start):
     // =======================================================================
 
     #[test]
-    fn get_cancel_before_the_first_poll_never_starts_a_native_read() {
+    fn get_task_dropped_unpolled_never_starts_a_native_read() {
         init();
         Python::attach(|py| {
             let started = Instant::now();
@@ -6097,7 +6469,8 @@ async def scn_cancel_after(start):
             let ex = driver.exporter(16);
             let store = Arc::new(FakeStore::new());
             let latch = Latch::new();
-            // The task is not polled until the gate opens, and the gate never opens.
+            // The task is never polled (the gate never opens): it is dropped unpolled with the
+            // export still in the start channel.
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
             let seams = TestSeams::default().bridge(BridgeMode::Gated(gate));
             let start = get_start(py, seams, &store, &ex, 8, &latch);
@@ -6212,12 +6585,202 @@ async def scn_cancel_after(start):
     }
 
     // =======================================================================
+    // GET: the native future is dropped BEFORE the latch is marked or the export released
+    // =======================================================================
+
+    /// How a probed call ends.
+    #[derive(Clone, Copy, Debug)]
+    enum Ending {
+        Completion,
+        CancelDuringTheNativeCall,
+        Panic,
+    }
+
+    const ENDINGS: [Ending; 3] = [
+        Ending::Completion,
+        Ending::CancelDuringTheNativeCall,
+        Ending::Panic,
+    ];
+
+    /// One live GET against a store whose native future carries a [`DropProbe`]; returns once the
+    /// awaitable has ended, with the probe, the call's latch and the destination.
+    fn run_get_with_probe<'py>(
+        py: Python<'py>,
+        driver: &Driver<'py>,
+        ending: Ending,
+        slow: bool,
+    ) -> (Arc<DropProbe>, Arc<Latch>, Bound<'py, PyAny>) {
+        let ex = driver.exporter(16);
+        let latch = Latch::new();
+        let probe = DropProbe::new(&latch, slow);
+        let fake = FakeStore::new().probing(&probe);
+        let store = Arc::new(match ending {
+            Ending::Completion => fake,
+            Ending::CancelDuringTheNativeCall => fake.blocking(),
+            Ending::Panic => fake.panicking(),
+        });
+        let start = get_start(py, TestSeams::default(), &store, &ex, 8, &latch);
+        match ending {
+            Ending::Completion => {
+                let value = driver.run("scn_await", start, vec![]).unwrap();
+                assert_eq!(value.extract::<usize>().unwrap(), 8);
+            }
+            Ending::CancelDuringTheNativeCall => {
+                let entered = entered_fn(py, &store);
+                let outcome = driver.run("scn_cancel_when", start, vec![entered]).unwrap();
+                let (cancel, state): (bool, String) = outcome.extract().unwrap();
+                assert!(cancel, "cancel() is True while the read is pending");
+                assert_eq!(state, "cancelled");
+            }
+            Ending::Panic => {
+                let error = driver.run("scn_error", start, vec![]).unwrap();
+                assert!(error.str().unwrap().to_string().contains("panicked"));
+            }
+        }
+        (probe, latch, ex)
+    }
+
+    /// The load-bearing order of the GET task: the export (whose drop marks the latch) outlives
+    /// the native `get_into` future on every path. The fake store's future reports the latch it
+    /// sees at the moment it is dropped, and again after a slow `Drop`.
+    #[test]
+    fn get_native_future_is_dropped_before_the_latch_is_marked() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for ending in ENDINGS {
+                for slow in [false, true] {
+                    let what = format!("GET {ending:?}, slow drop {slow}");
+                    let (probe, latch, ex) = run_get_with_probe(py, &driver, ending, slow);
+                    probe.assert_dropped_before_any_marking(&what);
+                    // Marked afterwards, and the export released exactly once.
+                    assert_eq!(latch_state(&latch), (true, true), "{what}");
+                    assert_eq!(attr_usize(&ex, "exports"), 1, "{what}");
+                    assert_eq!(attr_usize(&ex, "releases"), 1, "{what}");
+                    assert!(method_bool(&ex, "resizable"), "{what}");
+                }
+            }
+        });
+    }
+
+    /// While a blocked native request is in flight nothing of the call is marked, and the
+    /// awaitable stays pending.
+    #[test]
+    fn get_latch_stays_unmarked_while_a_blocked_request_is_in_flight() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let latch = Latch::new();
+            let probe = DropProbe::new(&latch, false);
+            let store = Arc::new(FakeStore::new().blocking().probing(&probe));
+            let start = get_start(py, TestSeams::default(), &store, &ex, 8, &latch);
+            let entered = entered_fn(py, &store);
+            let observed = Arc::clone(&probe);
+            let observe = bool_fn(py, move || {
+                observed.sample() == UNMARKED && !observed.finished()
+            });
+            let gate_store = Arc::clone(&store);
+            let release = action_fn(py, move || gate_store.gate.add_permits(1));
+            let outcome = driver
+                .run(
+                    "scn_blocked_observe",
+                    start,
+                    vec![entered, observe, release],
+                )
+                .unwrap();
+            let (unmarked, pending, value): (bool, bool, usize) = outcome.extract().unwrap();
+            assert!(
+                unmarked,
+                "the latch was marked while the request was in flight"
+            );
+            assert!(
+                pending,
+                "the awaitable finished while the request was in flight"
+            );
+            assert_eq!(value, 8);
+            probe.assert_dropped_before_any_marking("GET blocked then released");
+            assert_eq!(latch_state(&latch), (true, true));
+            assert_eq!(attr_usize(&ex, "releases"), 1);
+        });
+    }
+
+    /// The LIVE path: pyo3-async-runtimes polls the task once before it checks for a cancel, so
+    /// a Python cancel right after the call may or may not start the request. Either way the
+    /// awaitable ends cancelled, the export is released exactly once, and only after any native
+    /// future was dropped. (That the request is never started is true only for a task dropped
+    /// unpolled; see `get_task_dropped_unpolled_never_starts_a_native_read`.)
+    #[test]
+    fn get_live_cancel_right_after_the_call_releases_once_after_any_native_drop() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for round in 0..20 {
+                let ex = driver.exporter(16);
+                let latch = Latch::new();
+                let probe = DropProbe::new(&latch, round % 2 == 1);
+                let store = Arc::new(FakeStore::new().blocking().probing(&probe));
+                let start = get_start(py, TestSeams::default(), &store, &ex, 8, &latch);
+                let outcome = driver.run("scn_cancel_now", start, vec![]).unwrap();
+                let (cancel, state): (bool, String) = outcome.extract().unwrap();
+                assert!(cancel, "round {round}");
+                assert_eq!(state, "cancelled", "round {round}");
+                assert_eq!(attr_usize(&ex, "exports"), 1, "round {round}");
+                assert_eq!(attr_usize(&ex, "releases"), 1, "round {round}");
+                assert_eq!(latch_state(&latch), (true, true), "round {round}");
+                assert!(method_bool(&ex, "resizable"), "round {round}");
+                if store.get_calls() == 1 {
+                    // The request did start (the task was polled before the cancel landed): its
+                    // future was dropped before the latch was marked.
+                    probe.assert_dropped_before_any_marking(&format!("live round {round}"));
+                } else {
+                    assert_eq!(store.get_calls(), 0, "round {round}");
+                    assert!(!probe.finished(), "round {round}: a native future ran");
+                }
+            }
+        });
+    }
+
+    /// A guard that cannot be built after the task was bridged must not leave an exception for
+    /// nobody to retrieve: the bridged future is cancelled before the start channel is closed.
+    /// (A race detector: the old order lost the race only sometimes, so it runs many rounds.)
+    #[test]
+    fn get_instantiate_failure_leaves_no_unretrieved_exception() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for round in 0..25 {
+                let ex = driver.exporter(16);
+                let store = Arc::new(FakeStore::new());
+                let latch = Latch::new();
+                let seams = TestSeams::default().failing_guard();
+                let start = get_start(py, seams, &store, &ex, 8, &latch);
+                let outcome = driver.run("scn_error_then_settle", start, vec![]).unwrap();
+                let (error, unretrieved): (Bound<'_, PyAny>, Vec<String>) =
+                    outcome.extract().unwrap();
+                assert!(error
+                    .str()
+                    .unwrap()
+                    .to_string()
+                    .contains("injected guard failure"));
+                assert!(
+                    unretrieved.is_empty(),
+                    "round {round}: the loop logged {unretrieved:?}"
+                );
+                assert_eq!(attr_usize(&ex, "releases"), 1, "round {round}");
+                assert_eq!(store.get_calls(), 0, "round {round}");
+            }
+        });
+    }
+
+    // =======================================================================
     // GET and HEAD: error mapping, end to end
     // =======================================================================
 
-    /// `(failure, expected class name, expected, actual)`.
-    #[allow(clippy::type_complexity)] // a test table
-    const MAPPING: &[(Failure, &str, Option<u64>, Option<u64>)] = &[
+    /// One row of [`MAPPING`]: `(failure, expected class name, expected, actual)`.
+    type MappingRow = (Failure, &'static str, Option<u64>, Option<u64>);
+
+    const MAPPING: &[MappingRow] = &[
         (Failure::NotFound, "ObjectNotFoundError", None, None),
         (Failure::Length, "LengthMismatchError", Some(8), Some(5)),
         (Failure::LengthUnknown, "LengthMismatchError", Some(8), None),
@@ -6551,7 +7114,7 @@ async def scn_cancel_after(start):
     }
 
     #[test]
-    fn head_cancel_before_the_first_poll_never_starts_a_request() {
+    fn head_task_never_polled_never_starts_a_request() {
         init();
         Python::attach(|py| {
             let started = Instant::now();
@@ -6633,6 +7196,162 @@ async def scn_cancel_after(start):
     }
 
     // =======================================================================
+    // HEAD: the native future is dropped BEFORE the quiescence token completes
+    // =======================================================================
+
+    /// One live HEAD against a store whose native future carries a [`DropProbe`].
+    fn run_head_with_probe<'py>(
+        py: Python<'py>,
+        driver: &Driver<'py>,
+        ending: Ending,
+        slow: bool,
+    ) -> (Arc<DropProbe>, Arc<Latch>) {
+        let latch = Latch::new();
+        let probe = DropProbe::new(&latch, slow);
+        let fake = FakeStore::new().probing(&probe);
+        let store = Arc::new(match ending {
+            Ending::Completion => fake,
+            Ending::CancelDuringTheNativeCall => fake.blocking(),
+            Ending::Panic => fake.panicking(),
+        });
+        let start = head_start(py, TestSeams::default(), &store, &latch);
+        match ending {
+            Ending::Completion => {
+                let meta = driver.run("scn_await", start, vec![]).unwrap();
+                assert_eq!(attr_usize(&meta, "size"), 8);
+            }
+            Ending::CancelDuringTheNativeCall => {
+                let entered = entered_fn(py, &store);
+                let outcome = driver.run("scn_cancel_when", start, vec![entered]).unwrap();
+                let (cancel, state): (bool, String) = outcome.extract().unwrap();
+                assert!(cancel, "cancel() is True while the request is pending");
+                assert_eq!(state, "cancelled");
+            }
+            Ending::Panic => {
+                let error = driver.run("scn_error", start, vec![]).unwrap();
+                assert!(error.str().unwrap().to_string().contains("panicked"));
+            }
+        }
+        (probe, latch)
+    }
+
+    /// The load-bearing order of the HEAD task: the `HeadQuiescence` token outlives the native
+    /// `head` future on every path, so neither latch signal nor the token's completion is seen
+    /// while that future is alive or while its `Drop` runs.
+    #[test]
+    fn head_native_future_is_dropped_before_the_token_completes() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for ending in ENDINGS {
+                for slow in [false, true] {
+                    let what = format!("HEAD {ending:?}, slow drop {slow}");
+                    let (probe, latch) = run_head_with_probe(py, &driver, ending, slow);
+                    probe.assert_dropped_before_any_marking(&what);
+                    // Completed exactly once afterwards, with both latch signals.
+                    assert_head_quiesced(py, &latch, probe.token_baseline);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn head_latch_stays_unmarked_while_a_blocked_request_is_in_flight() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let latch = Latch::new();
+            let probe = DropProbe::new(&latch, false);
+            let store = Arc::new(FakeStore::new().blocking().probing(&probe));
+            let start = head_start(py, TestSeams::default(), &store, &latch);
+            let entered = entered_fn(py, &store);
+            let observed = Arc::clone(&probe);
+            let observe = bool_fn(py, move || {
+                observed.sample() == UNMARKED && !observed.finished()
+            });
+            let gate_store = Arc::clone(&store);
+            let release = action_fn(py, move || gate_store.gate.add_permits(1));
+            let outcome = driver
+                .run(
+                    "scn_blocked_observe",
+                    start,
+                    vec![entered, observe, release],
+                )
+                .unwrap();
+            let (unmarked, pending, meta): (bool, bool, Bound<'_, PyAny>) =
+                outcome.extract().unwrap();
+            assert!(
+                unmarked,
+                "the token or latch was marked while the request was in flight"
+            );
+            assert!(
+                pending,
+                "the awaitable finished while the request was in flight"
+            );
+            assert_eq!(attr_usize(&meta, "size"), 8);
+            probe.assert_dropped_before_any_marking("HEAD blocked then released");
+            assert_head_quiesced(py, &latch, probe.token_baseline);
+        });
+    }
+
+    /// The LIVE path (see `get_live_cancel_right_after_the_call_releases_once_after_any_native_drop`):
+    /// a cancel right after the call may or may not start the request; the awaitable ends
+    /// cancelled and the token completes once, after any native future was dropped.
+    #[test]
+    fn head_live_cancel_right_after_the_call_completes_the_token_once_after_any_native_drop() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for round in 0..20 {
+                let latch = Latch::new();
+                let probe = DropProbe::new(&latch, round % 2 == 1);
+                let store = Arc::new(FakeStore::new().blocking().probing(&probe));
+                let start = head_start(py, TestSeams::default(), &store, &latch);
+                let outcome = driver.run("scn_cancel_now", start, vec![]).unwrap();
+                let (cancel, state): (bool, String) = outcome.extract().unwrap();
+                assert!(cancel, "round {round}");
+                assert_eq!(state, "cancelled", "round {round}");
+                assert_head_quiesced(py, &latch, probe.token_baseline);
+                if store.head_calls() == 1 {
+                    probe.assert_dropped_before_any_marking(&format!("live round {round}"));
+                } else {
+                    assert_eq!(store.head_calls(), 0, "round {round}");
+                    assert!(!probe.finished(), "round {round}: a native future ran");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn head_instantiate_failure_leaves_no_unretrieved_exception() {
+        init();
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            for round in 0..25 {
+                let store = Arc::new(FakeStore::new());
+                let latch = Latch::new();
+                let before = head_token_tests::completions(&latch);
+                let seams = TestSeams::default().failing_guard();
+                let start = head_start(py, seams, &store, &latch);
+                let outcome = driver.run("scn_error_then_settle", start, vec![]).unwrap();
+                let (error, unretrieved): (Bound<'_, PyAny>, Vec<String>) =
+                    outcome.extract().unwrap();
+                assert!(error
+                    .str()
+                    .unwrap()
+                    .to_string()
+                    .contains("injected guard failure"));
+                assert!(
+                    unretrieved.is_empty(),
+                    "round {round}: the loop logged {unretrieved:?}"
+                );
+                assert_head_quiesced(py, &latch, before);
+                assert_eq!(store.head_calls(), 0, "round {round}");
+            }
+        });
+    }
+
+    // =======================================================================
     // ObjectMetadata
     // =======================================================================
 
@@ -6661,9 +7380,26 @@ async def scn_cancel_after(start):
             assert_eq!(a.hash().unwrap(), b.hash().unwrap());
             assert_eq!(attr_usize(&a, "size"), 5);
             assert!(a.getattr("version_id").unwrap().is_none());
+            // Python's own repr for the strings, never Rust's `Some("e")`.
             assert_eq!(
                 a.repr().unwrap().to_string(),
-                "ObjectMetadata(size=5, etag=Some(\"e\"), version_id=None)"
+                "ObjectMetadata(size=5, etag='e', version_id=None)"
+            );
+            assert_eq!(
+                make(0, None, Some("v1")).repr().unwrap().to_string(),
+                "ObjectMetadata(size=0, etag=None, version_id='v1')"
+            );
+            // Quotes and backslashes are escaped the Python way.
+            assert_eq!(
+                make(5, Some("a'b\"c\\d"), None).repr().unwrap().to_string(),
+                r#"ObjectMetadata(size=5, etag='a\'b"c\\d', version_id=None)"#
+            );
+            assert_eq!(
+                make(5, Some("it's"), Some("say \"x\""))
+                    .repr()
+                    .unwrap()
+                    .to_string(),
+                r#"ObjectMetadata(size=5, etag="it's", version_id='say "x"')"#
             );
             let err = a.setattr("size", 9).expect_err("frozen");
             assert!(
@@ -6672,6 +7408,234 @@ async def scn_cancel_after(start):
             );
             let set = pyo3::types::PySet::new(py, [a.clone(), b, c]).unwrap();
             assert_eq!(set.len(), 2);
+        });
+    }
+
+    // =======================================================================
+    // The Python surface, through the real module registration and pyo3 argument parsing
+    // =======================================================================
+
+    const SURFACE_PY: &std::ffi::CStr = c_str!(
+        "def positional_expected_len_is_refused(core):
+    try:
+        core.get_into_async('file:///x', bytearray(1), 5)
+    except TypeError as e:
+        return str(e)
+    raise AssertionError('a positional expected_len was accepted')
+
+def expected_len_is_required(core):
+    try:
+        core.get_into_async('file:///x', bytearray(1))
+    except TypeError as e:
+        return str(e)
+    raise AssertionError('a missing expected_len was accepted')
+
+def exception_classes(core):
+    assert issubclass(core.ObjectNotFoundError, FileNotFoundError)
+    assert issubclass(core.ObjectNotFoundError, OSError)
+    assert core.ObjectNotFoundError is not FileNotFoundError
+    assert issubclass(core.LengthMismatchError, ValueError)
+    assert issubclass(core.UnsupportedOperationError, NotImplementedError)
+    assert not issubclass(core.UnsupportedOperationError, ValueError)
+    return True
+
+def metadata_is_immutable_and_hashable(a, b, c):
+    assert type(a).__name__ == 'ObjectMetadata'
+    assert a == b and a != c
+    assert hash(a) == hash(b)
+    assert len({a, b, c}) == 2
+    for name, value in (('size', 9), ('etag', 'x'), ('version_id', 'y')):
+        try:
+            setattr(a, name, value)
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError('%s is assignable' % name)
+    try:
+        a.extra = 1
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError('a new attribute can be added')
+    return repr(a)
+
+def capabilities_dict(core):
+    d = core.object_capabilities('file:///x')
+    assert type(d) is dict, type(d)
+    assert d == {'provider': 'file', 'get_into': False, 'head': False}, d
+    return True
+
+def unsupported_is_raised_synchronously(core):
+    buf = bytearray(1)
+    try:
+        core.get_into_async('file:///x', buf, expected_len=1)
+    except core.UnsupportedOperationError as e:
+        assert isinstance(e, NotImplementedError)
+    else:
+        raise AssertionError('get_into_async did not raise UnsupportedOperationError')
+    buf.append(0)  # nothing was exported
+    try:
+        core.head_async('file:///x')
+    except core.UnsupportedOperationError:
+        pass
+    else:
+        raise AssertionError('head_async did not raise UnsupportedOperationError')
+    return True
+"
+    );
+
+    /// A fresh module registered exactly as the extension module registers `_core`, and the
+    /// checks above, so a test calls the functions through Python argument parsing.
+    fn surface<'py>(py: Python<'py>) -> (Bound<'py, PyModule>, Bound<'py, PyModule>) {
+        let core = PyModule::new(py, "s3dlio_surface_test").expect("module");
+        register_core_functions(&core).expect("register_core_functions");
+        let checks = PyModule::from_code(
+            py,
+            SURFACE_PY,
+            c_str!("s3dlio_surface_checks.py"),
+            c_str!("_s3dlio_surface_checks"),
+        )
+        .expect("checks module");
+        (core, checks)
+    }
+
+    #[test]
+    fn python_surface_get_into_async_takes_expected_len_by_keyword_only() {
+        init();
+        Python::attach(|py| {
+            let (core, checks) = surface(py);
+            let message: String = checks
+                .getattr("positional_expected_len_is_refused")
+                .and_then(|f| f.call1((&core,)))
+                .expect("a positional expected_len is a TypeError")
+                .extract()
+                .unwrap();
+            assert!(message.contains("positional"), "{message}");
+            let message: String = checks
+                .getattr("expected_len_is_required")
+                .and_then(|f| f.call1((&core,)))
+                .expect("a missing expected_len is a TypeError")
+                .extract()
+                .unwrap();
+            assert!(message.contains("expected_len"), "{message}");
+        });
+    }
+
+    #[test]
+    fn python_surface_exception_classes_derive_from_the_builtins() {
+        init();
+        Python::attach(|py| {
+            let (core, checks) = surface(py);
+            checks
+                .getattr("exception_classes")
+                .and_then(|f| f.call1((&core,)))
+                .expect("exception hierarchy");
+        });
+    }
+
+    #[test]
+    fn python_surface_object_metadata_is_immutable_and_hashable() {
+        init();
+        Python::attach(|py| {
+            let make = |size: u64| {
+                Py::new(
+                    py,
+                    PyHeadMetadata {
+                        size,
+                        etag: Some("e".to_owned()),
+                        version_id: None,
+                    },
+                )
+                .unwrap()
+            };
+            // The class is registered under the name Python sees.
+            let (core, checks) = surface(py);
+            assert!(core.getattr("ObjectMetadata").is_ok());
+            let repr: String = checks
+                .getattr("metadata_is_immutable_and_hashable")
+                .and_then(|f| f.call1((make(5), make(5), make(6))))
+                .expect("ObjectMetadata behaves as a frozen value")
+                .extract()
+                .unwrap();
+            assert_eq!(repr, "ObjectMetadata(size=5, etag='e', version_id=None)");
+        });
+    }
+
+    #[test]
+    fn python_surface_object_capabilities_returns_a_plain_dict() {
+        init();
+        Python::attach(|py| {
+            let (core, checks) = surface(py);
+            checks
+                .getattr("capabilities_dict")
+                .and_then(|f| f.call1((&core,)))
+                .expect("object_capabilities('file:///x')");
+        });
+    }
+
+    #[test]
+    fn python_surface_unsupported_operation_is_raised_synchronously() {
+        init();
+        Python::attach(|py| {
+            let (core, checks) = surface(py);
+            checks
+                .getattr("unsupported_is_raised_synchronously")
+                .and_then(|f| f.call1((&core,)))
+                .expect("a file:// URI raises UnsupportedOperationError at the call");
+        });
+    }
+
+    // =======================================================================
+    // The store is built once per URI, on the calling thread
+    // =======================================================================
+
+    /// The thread of every build of a store for exactly `uri`.
+    #[cfg(all(feature = "native-backends", not(feature = "arrow-backend")))]
+    fn store_build_threads_for(uri: &str) -> Vec<std::thread::ThreadId> {
+        STORE_BUILD_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(built, _)| built.as_str() == uri)
+            .map(|(_, thread)| *thread)
+            .collect()
+    }
+
+    /// The real `get_into_async` / `head_async`, called twice each on one fresh URI with no
+    /// running event loop (so the bridge fails right after the store was obtained): one store is
+    /// built for the URI, and it is built on the calling thread, not on a runtime worker.
+    #[cfg(all(feature = "native-backends", not(feature = "arrow-backend")))]
+    #[test]
+    fn get_into_async_and_head_async_build_one_store_on_the_calling_thread() {
+        init();
+        // for_endpoint requires credentials to exist; none are ever used (store creation never
+        // connects).
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        let uri = "s3://127.0.0.1:59264/bucket-b3b/store-cache";
+        Python::attach(|py| {
+            let driver = Driver::new(py);
+            let ex = driver.exporter(16);
+            let n = 8i32.into_pyobject(py).unwrap().into_any();
+            assert_eq!(store_builds_for(uri), 0, "the URI must start cold");
+            for call in 0..2 {
+                let err = get_into_async(py, uri, &ex, &n).expect_err("no running event loop");
+                assert!(err.to_string().contains("no running event loop"), "{err}");
+                assert_eq!(store_builds_for(uri), 1, "get_into_async call {call}");
+            }
+            for call in 0..2 {
+                let err = head_async(py, uri).expect_err("no running event loop");
+                assert!(err.to_string().contains("no running event loop"), "{err}");
+                assert_eq!(store_builds_for(uri), 1, "head_async call {call}");
+            }
+            assert_eq!(
+                store_build_threads_for(uri),
+                vec![std::thread::current().id()],
+                "the store was not built on the calling thread"
+            );
+            // The failed starts released the buffer.
+            assert_eq!(attr_usize(&ex, "exports"), attr_usize(&ex, "releases"));
+            assert!(method_bool(&ex, "resizable"));
         });
     }
 
@@ -6760,6 +7724,18 @@ async def scn_cancel_after(start):
         );
         // Every pre-transfer failure releases directly.
         assert!(inner.matches("owner.release(py)").count() >= 3);
+        // A guard failure releases, then cancels the bridged future, and only then closes the
+        // start channel (else the task can finish with an exception nobody retrieves).
+        assert_in_order(
+            &inner,
+            "instantiate failure",
+            &[
+                "seams.instantiate(",
+                "owner.release(py);",
+                "cancel_ignoring_errors(&inner);",
+                "drop(tx);",
+            ],
+        );
     }
 
     #[test]
@@ -6796,9 +7772,20 @@ async def scn_cancel_after(start):
             "future body",
             &[
                 "async move {",
-                "let _quiescence = token;",
+                "let quiescence = token;",
                 "rx.await",
                 "store.head(",
+                "drop(quiescence);",
+            ],
+        );
+        // A guard failure cancels the bridged future BEFORE it closes the start channel.
+        assert_in_order(
+            &inner,
+            "instantiate failure",
+            &[
+                "seams.instantiate(",
+                "cancel_ignoring_errors(&inner);",
+                "drop(tx);",
             ],
         );
         for body in [&entry, &inner] {
