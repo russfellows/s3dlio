@@ -409,19 +409,16 @@ fn custom_endpoint_set() -> bool {
     .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
 }
 
+/// The environment-dependent account rules. The structural part (empty, or a character that
+/// could redirect the request) is shared with the environment-free URI parser, and so is the
+/// path-segment rule used with a custom endpoint; only the real-account length and alphabet
+/// rule of the default endpoint is decided here.
 fn account_name_problem(account: &str, custom_endpoint: bool) -> Option<&'static str> {
-    if account.is_empty() {
-        return Some("it is empty");
-    }
-    if account.chars().any(|c| {
-        matches!(c, '/' | '?' | '#' | '@' | '\\' | '%') || c.is_whitespace() || c.is_control()
-    }) {
-        return Some(
-            "it contains a character that could redirect the request (/ ? # @ \\ % or whitespace)",
-        );
+    if let Some(why) = crate::capabilities::azure_account_redirect_problem(account) {
+        return Some(why);
     }
     if custom_endpoint {
-        return (account == "." || account == "..").then_some("it is a path segment");
+        return crate::capabilities::azure_account_problem_pure(account);
     }
     let well_formed = (3..=24).contains(&account.len())
         && account

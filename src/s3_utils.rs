@@ -490,21 +490,6 @@ pub enum S3FirstSegment<'a> {
     Server(&'a str),
 }
 
-/// True if `s` is a syntactically valid dotted-quad IPv4 address (four
-/// `0..=255` octets separated by dots). S3 bucket names are explicitly
-/// forbidden from being formatted as an IP address, so this check is
-/// unambiguous — it can never misclassify a legal bucket name.
-fn looks_like_ipv4(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-    parts.len() == 4
-        && parts.iter().all(|p| {
-            !p.is_empty()
-                && p.len() <= 3
-                && p.chars().all(|c| c.is_ascii_digit())
-                && p.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
-        })
-}
-
 /// Text of the one-time deprecation warning for the retired
 /// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable.
 const RETIRED_HINT_TLDS_WARNING: &str =
@@ -536,92 +521,17 @@ fn warn_if_retired_hint_tlds_env_set() {
     });
 }
 
-/// Validate the port part of `host:port` / `[ipv6]:port`.
-///
-/// Accepted: plain ASCII decimal digits, no leading zeros, value `1..=65535`.
-/// `u16::from_str` alone is too lax (it accepts a leading `+` and `0`); leading
-/// zeros are rejected because `host:09000` is ambiguous (octal habits) and would
-/// otherwise leave two spellings of one server in configs, URLs and logs.
-fn validate_s3_server_port(port: &str, segment: &str) -> Result<()> {
-    if port.is_empty() {
-        bail!(
-            "empty port in '{segment}': a server must be host:port with a port from 1 to 65535 \
-             (e.g. s3://host:9000/bucket/key)"
-        );
-    }
-    if !port.bytes().all(|b| b.is_ascii_digit()) {
-        bail!(
-            "invalid port '{port}' in '{segment}': a port is 1 to 65535 written as plain decimal \
-             digits (no sign or other characters), e.g. s3://host:9000/bucket/key"
-        );
-    }
-    if port.len() > 1 && port.starts_with('0') {
-        bail!(
-            "invalid port '{port}' in '{segment}': leading zeros are not accepted; write the \
-             port without them (e.g. :9000)"
-        );
-    }
-    match port.parse::<u16>() {
-        Ok(n) if n >= 1 => Ok(()),
-        _ => bail!(
-            "invalid port '{port}' in '{segment}': a port must be from 1 to 65535 \
-             (e.g. s3://host:9000/bucket/key)"
-        ),
-    }
-}
-
-/// Longest host the `host:port` grammar accepts (the DNS name limit).
-const S3_SERVER_HOST_MAX_LEN: usize = 253;
-
-/// The supported host grammar, quoted in every host error.
-const S3_SERVER_HOST_GRAMMAR: &str = "a host is 1 to 253 ASCII letters, digits, '-', '.' and '_', \
-     with no empty labels (no leading or trailing '.', no '..')";
-
-/// Validate the host part of `host:port` (a DNS name, IPv4 literal or
-/// container-style name such as `minio_1`).
-///
-/// Grammar: 1..=253 characters, each an ASCII letter, digit, `-`, `.` or `_`
-/// (`_` is kept for container-style names), with no empty label (no leading or
-/// trailing `.`, no `..`). Anything else - `/`, `\`, whitespace, control
-/// characters, `%`, `?`, `#`, non-ASCII, ... - is an error naming the character.
-/// Enforcing this before any endpoint URI is built means a host can never change
-/// how `s3://host:port/bucket/key` is split (`node/prefix:9000` would otherwise
-/// read back as bucket `node`, routed to the global client).
-fn validate_s3_server_host(host: &str, segment: &str) -> Result<()> {
-    if host.is_empty() {
-        bail!(
-            "missing host before ':' in '{segment}': use host:port, e.g. \
-             s3://host:9000/bucket/key"
-        );
-    }
-    if let Some(bad) = host
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')))
-    {
-        bail!(
-            "invalid character {bad:?} in host '{host}' of '{segment}': {S3_SERVER_HOST_GRAMMAR}"
-        );
-    }
-    // Every character is ASCII here, so byte length is character length.
-    if host.len() > S3_SERVER_HOST_MAX_LEN {
-        bail!(
-            "host of '{segment}' is {} characters, longer than the {S3_SERVER_HOST_MAX_LEN} \
-             allowed: {S3_SERVER_HOST_GRAMMAR}",
-            host.len()
-        );
-    }
-    if host.split('.').any(str::is_empty) {
-        bail!("empty label (a leading or trailing '.', or '..') in host '{host}' of '{segment}': {S3_SERVER_HOST_GRAMMAR}");
-    }
-    Ok(())
-}
-
 /// THE single rule that decides whether the first path segment of an `s3://`
 /// URI is a server or a bucket. The URI parser ([`parse_s3_uri_full`]), the
 /// store factory (`store_for_uri*`), `MultiEndpointStore` and the `s3-cli`
 /// bucket commands and `--endpoints` lists all call this, so those components
 /// cannot disagree (issues #178, #193, #194). Other code paths that handle
 /// `s3://` URIs do not call it yet; see the Changelog for the tracking issues.
+///
+/// The rule is implemented once, in
+/// `crate::capabilities::classify_s3_first_segment_pure`, which never reads the
+/// environment. This function is that rule plus the one-shot warning about the retired
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable, and nothing else.
 ///
 /// - `host:port` or `[ipv6]:port` (explicit port, plain decimal `1..=65535`, no
 ///   leading zeros) → [`S3FirstSegment::Server`]. The bracketed content must be a
@@ -639,105 +549,10 @@ fn validate_s3_server_host(host: &str, segment: &str) -> Result<()> {
 ///   `data.example.com` and `localhost` → [`S3FirstSegment::Bucket`]. Bucket
 ///   names are not otherwise validated here.
 pub fn classify_s3_first_segment(segment: &str) -> Result<S3FirstSegment<'_>> {
+    // The retired-variable warning is the only environment read, and it belongs to this
+    // wrapper; the rule itself is the environment-free `classify_s3_first_segment_pure`.
     warn_if_retired_hint_tlds_env_set();
-
-    if segment.is_empty() {
-        bail!(
-            "empty first segment in the S3 URI: expected a bucket name (s3://bucket/key) or a \
-             server with a port (s3://host:9000/bucket/key)"
-        );
-    }
-    if segment.contains("://") {
-        bail!(
-            "'{segment}' looks like a URL; a server is written host:port without a scheme \
-             or path (e.g. host:9000)"
-        );
-    }
-    if segment.contains('@') {
-        bail!(
-            "'{segment}' contains userinfo ('@'), which is not supported; write the server as \
-             host:port and supply credentials through the environment"
-        );
-    }
-    if segment.starts_with("arn:") && segment.matches(':').count() >= 2 {
-        bail!(
-            "'{segment}' looks like an ARN; ARNs are not supported here — use s3://bucket/key, \
-             or s3://host:port/bucket/key to name a server"
-        );
-    }
-
-    if let Some(rest) = segment.strip_prefix('[') {
-        // Bracketed IPv6: "[addr]:port"
-        let Some((addr, after)) = rest.split_once(']') else {
-            bail!("unterminated '[' in '{segment}': an IPv6 server is written [addr]:port");
-        };
-        if addr.is_empty() {
-            bail!("empty IPv6 address in '{segment}'");
-        }
-        if addr.parse::<std::net::Ipv6Addr>().is_err() {
-            if addr.parse::<std::net::Ipv4Addr>().is_ok() {
-                bail!(
-                    "'{segment}' puts an IPv4 address inside brackets; brackets are for IPv6 \
-                     only — write {addr}:port"
-                );
-            }
-            bail!("invalid IPv6 address '{addr}' in '{segment}'");
-        }
-        if after.is_empty() {
-            bail!(
-                "'{segment}' names an IPv6 address without a port; add :port, \
-                 e.g. s3://{segment}:9000/bucket/key"
-            );
-        }
-        let Some(port) = after.strip_prefix(':') else {
-            bail!(
-                "unexpected text '{after}' after ']' in '{segment}': an IPv6 server is written \
-                 [addr]:port"
-            );
-        };
-        validate_s3_server_port(port, segment)?;
-        return Ok(S3FirstSegment::Server(segment));
-    }
-    if segment.contains(['[', ']']) {
-        bail!(
-            "unexpected bracket in '{segment}': brackets are only for an IPv6 server, [addr]:port"
-        );
-    }
-
-    match segment.matches(':').count() {
-        0 => {
-            if looks_like_ipv4(segment) {
-                bail!(
-                    "'{segment}' is an IP address with no port; add :port to name a server, \
-                     e.g. s3://{segment}:9000/bucket/key (an IP address cannot be an S3 bucket name)"
-                );
-            }
-            Ok(S3FirstSegment::Bucket(segment))
-        }
-        1 => {
-            let (host, port) = segment.split_once(':').unwrap_or((segment, ""));
-            validate_s3_server_host(host, segment)?;
-            validate_s3_server_port(port, segment)?;
-            Ok(S3FirstSegment::Server(segment))
-        }
-        _ if segment.parse::<std::net::Ipv6Addr>().is_ok() => bail!(
-            "'{segment}' is an unbracketed IPv6 address; write it in brackets with a \
-             port, e.g. s3://[{segment}]:9000/bucket/key (add :port)"
-        ),
-        _ => bail!(
-            "'{segment}' contains more than one ':' and is not an IPv6 address; a server is \
-             written host:port or [ipv6]:port"
-        ),
-    }
-}
-
-/// The error for `s3://host:9000`, `s3://host:9000/` and `s3://host:9000//key`:
-/// the server is fine, the bucket after it is missing.
-fn missing_bucket_after_server(endpoint: &str, uri: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "missing bucket after server '{endpoint}' in S3 URI '{uri}': the bucket name cannot be \
-         empty; write s3://{endpoint}/bucket/key"
-    )
+    crate::capabilities::classify_s3_first_segment_pure(segment)
 }
 
 /// Parse S3 URI with optional endpoint support.
@@ -795,57 +610,10 @@ fn missing_bucket_after_server(endpoint: &str, uri: &str) -> anyhow::Error {
 /// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is now ignored (a one-time
 /// deprecation warning is logged if it is set).
 pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
-    let trimmed = uri
-        .strip_prefix("s3://")
-        .context("URI must start with s3://")?;
-
-    // Find the first slash to split host/bucket from key
-    let Some(slash_pos) = trimmed.find('/') else {
-        // `s3://host:9000` is a valid server with no bucket, not a bucket with a
-        // missing slash: say which.
-        if let Ok(S3FirstSegment::Server(endpoint)) = classify_s3_first_segment(trimmed) {
-            return Err(missing_bucket_after_server(endpoint, uri));
-        }
-        bail!("URI must contain '/' after bucket");
-    };
-    let before_slash = &trimmed[..slash_pos];
-    let after_slash = &trimmed[slash_pos + 1..];
-
-    match classify_s3_first_segment(before_slash)
-        .with_context(|| format!("invalid S3 URI '{uri}'"))?
-    {
-        S3FirstSegment::Server(endpoint) => {
-            // Format: s3://host:port/bucket/key
-            let endpoint = endpoint.to_string();
-
-            // Find next slash for bucket/key split
-            let slash_pos2 = after_slash.find('/').unwrap_or(after_slash.len());
-            let bucket = after_slash[..slash_pos2].to_string();
-            let key = if slash_pos2 < after_slash.len() {
-                after_slash[slash_pos2 + 1..].to_string()
-            } else {
-                String::new()
-            };
-
-            if bucket.is_empty() {
-                return Err(missing_bucket_after_server(&endpoint, uri));
-            }
-
-            Ok(S3UriComponents {
-                endpoint: Some(endpoint),
-                bucket,
-                key,
-            })
-        }
-        S3FirstSegment::Bucket(bucket) => {
-            // Format: s3://bucket/key (standard AWS)
-            Ok(S3UriComponents {
-                endpoint: None,
-                bucket: bucket.to_string(),
-                key: after_slash.to_string(),
-            })
-        }
-    }
+    // The retired-variable warning is the only environment read, and it belongs to this
+    // wrapper; the parsing itself is the environment-free `parse_s3_uri_pure`.
+    warn_if_retired_hint_tlds_env_set();
+    crate::capabilities::parse_s3_uri_pure(uri)
 }
 
 /// Split `s3://bucket/key` → (`bucket`, `key`).
@@ -908,7 +676,7 @@ pub fn s3_bucket_target(uri_or_bucket: &str) -> Result<S3BucketTarget> {
         Some(server) => {
             let bucket = segments.next().unwrap_or("");
             if bucket.is_empty() {
-                return Err(missing_bucket_after_server(
+                return Err(crate::capabilities::missing_bucket_after_server(
                     &server.authority,
                     uri_or_bucket,
                 ));

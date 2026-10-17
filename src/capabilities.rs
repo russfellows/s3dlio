@@ -15,12 +15,14 @@
 //!
 //! The URI is checked with the crate-internal structural parsers in this module
 //! (`parse_s3_uri_pure`, `parse_azure_uri_pure`, `parse_gs_uri_pure`), which read nothing but
-//! their argument. They are the single structural implementation: the community GCS parser
-//! (`gcs_client::parse_gcs_uri`) already delegates to `parse_gs_uri_pure`, and the S3 wrapper in
-//! `s3_utils` and the official GCS parser in `google_gcs_client` will delegate to the S3 and GS
-//! parsers in a following step of the same work (#264); until then those two are kept in step by
-//! tests that compare them with the pure parsers. A malformed URI is an error; an unknown scheme
-//! is not (it reports `"unknown"` with no support).
+//! their argument. They are the single structural implementation, and every gated parser
+//! delegates to them: `s3_utils::parse_s3_uri_full` and `classify_s3_first_segment` (which add
+//! only the one-shot warning about a retired environment variable), both `parse_gcs_uri`
+//! functions (`google_gcs_client` and the community `gcs_client`), and `parse_azure_uri` in
+//! `object_store` (which adds the endpoint-dependent account canonicalisation). The Azure
+//! account rules that every environment shares are used by `azure_client` as well. So the
+//! parsers cannot drift from what a store accepts. A malformed URI is an error; an unknown
+//! scheme is not (it reports `"unknown"` with no support).
 //!
 //! # Purity is structural
 //!
@@ -129,7 +131,9 @@ pub fn object_capabilities(uri: &str) -> Result<Capabilities> {
 // S3
 // ============================================================================
 
-/// True if `s` is a dotted-quad IPv4 address (four `0..=255` octets).
+/// True if `s` is a syntactically valid dotted-quad IPv4 address (four `0..=255` octets
+/// separated by dots). S3 bucket names are explicitly forbidden from being formatted as an IP
+/// address, so this check is unambiguous: it can never misclassify a legal bucket name.
 fn looks_like_ipv4(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     parts.len() == 4
@@ -141,8 +145,12 @@ fn looks_like_ipv4(s: &str) -> bool {
         })
 }
 
-/// Validate the port of `host:port` / `[ipv6]:port`: plain ASCII digits, no leading zero,
-/// `1..=65535`.
+/// Validate the port part of `host:port` / `[ipv6]:port`.
+///
+/// Accepted: plain ASCII decimal digits, no leading zeros, value `1..=65535`.
+/// `u16::from_str` alone is too lax (it accepts a leading `+` and `0`); leading zeros are
+/// rejected because `host:09000` is ambiguous (octal habits) and would otherwise leave two
+/// spellings of one server in configs, URLs and logs.
 fn validate_s3_server_port(port: &str, segment: &str) -> Result<()> {
     if port.is_empty() {
         bail!(
@@ -178,7 +186,15 @@ const S3_SERVER_HOST_MAX_LEN: usize = 253;
 const S3_SERVER_HOST_GRAMMAR: &str = "a host is 1 to 253 ASCII letters, digits, '-', '.' and '_', \
      with no empty labels (no leading or trailing '.', no '..')";
 
-/// Validate the host of an unbracketed `host:port`.
+/// Validate the host part of an unbracketed `host:port` (a DNS name, IPv4 literal or
+/// container-style name such as `minio_1`).
+///
+/// Grammar: 1..=253 characters, each an ASCII letter, digit, `-`, `.` or `_` (`_` is kept for
+/// container-style names), with no empty label (no leading or trailing `.`, no `..`). Anything
+/// else - `/`, `\`, whitespace, control characters, `%`, `?`, `#`, non-ASCII, ... - is an error
+/// naming the character. Enforcing this before any endpoint URI is built means a host can never
+/// change how `s3://host:port/bucket/key` is split (`node/prefix:9000` would otherwise read back
+/// as bucket `node`, routed to the global client).
 fn validate_s3_server_host(host: &str, segment: &str) -> Result<()> {
     if host.is_empty() {
         bail!(
@@ -208,11 +224,22 @@ fn validate_s3_server_host(host: &str, segment: &str) -> Result<()> {
     Ok(())
 }
 
-/// The environment-free form of `s3_utils::classify_s3_first_segment`: decides whether the first
-/// path segment of an `s3://` URI is a server (`host:port`, `[ipv6]:port`) or a bucket, by
-/// structure alone. The rules and error messages are the same; the only difference is that this
-/// function never reads the environment (the existing wrapper additionally logs a one-shot
-/// warning when a retired variable is set).
+/// Decides whether the first path segment of an `s3://` URI is a server (`host:port`,
+/// `[ipv6]:port`) or a bucket, by structure alone (issues #178, #193, #194).
+///
+/// This is THE single implementation of the rule: `s3_utils::classify_s3_first_segment` calls
+/// it, adding only the one-shot warning about a retired environment variable. This function
+/// never reads the environment.
+///
+/// - `host:port` or `[ipv6]:port` (explicit port, plain decimal `1..=65535`, no leading zeros)
+///   is [`S3FirstSegment::Server`]. The bracketed content must be a valid IPv6 address; an
+///   unbracketed host must follow the host grammar (1 to 253 ASCII letters, digits, `-`, `.`
+///   and `_`, no empty label).
+/// - A dotted-quad IPv4 literal with no port is an **error**: S3 forbids IP-shaped bucket names,
+///   so it is not a bucket; the caller must add `:port`.
+/// - An IPv6 literal without brackets or without a port is an **error**.
+/// - Anything else, including dotted DNS-looking names such as `data.example.com` and
+///   `localhost`, is [`S3FirstSegment::Bucket`]. Bucket names are not otherwise validated.
 ///
 /// # Errors
 ///
@@ -309,17 +336,20 @@ pub(crate) fn classify_s3_first_segment_pure(segment: &str) -> Result<S3FirstSeg
     }
 }
 
-/// The error for `s3://host:9000`, `s3://host:9000/` and `s3://host:9000//key`.
-fn missing_bucket_after_server(endpoint: &str, uri: &str) -> anyhow::Error {
+/// The error for `s3://host:9000`, `s3://host:9000/` and `s3://host:9000//key`: the server is
+/// fine, the bucket after it is missing. Shared with `s3_utils::s3_bucket_target`.
+pub(crate) fn missing_bucket_after_server(endpoint: &str, uri: &str) -> anyhow::Error {
     anyhow!(
         "missing bucket after server '{endpoint}' in S3 URI '{uri}': the bucket name cannot be \
          empty; write s3://{endpoint}/bucket/key"
     )
 }
 
-/// The environment-free form of `s3_utils::parse_s3_uri_full`: split `s3://bucket/key` or
-/// `s3://host:port/bucket/key` into its parts. The key is exactly as written (`%2F` stays three
-/// characters). Reads nothing but `uri`.
+/// Split `s3://bucket/key` or `s3://host:port/bucket/key` into its parts. The key is exactly as
+/// written (`%2F` stays three characters). Reads nothing but `uri`.
+///
+/// This is THE single implementation: `s3_utils::parse_s3_uri_full` calls it, adding only the
+/// one-shot warning about a retired environment variable.
 ///
 /// # Errors
 ///
@@ -372,21 +402,29 @@ pub(crate) fn parse_s3_uri_pure(uri: &str) -> Result<S3UriComponents> {
 // Azure
 // ============================================================================
 
-/// Why an Azure account name could redirect a request or is not a usable name, whatever the
-/// configured endpoint. The environment-dependent rules (lower-casing, the 3 to 24 character
-/// length of a real account) stay in the gated canonicalisation.
-fn azure_account_problem_pure(account: &str) -> Option<&'static str> {
+/// Why an Azure account name is empty or could redirect a request, whatever the configured
+/// endpoint: the part of the account rules that is shared by every environment. The
+/// environment-dependent rules (lower-casing, the 3 to 24 character length of a real account)
+/// stay with the canonicalisation in `azure_client`, which starts from this function.
+pub(crate) fn azure_account_redirect_problem(account: &str) -> Option<&'static str> {
     if account.is_empty() {
         return Some("it is empty");
     }
-    if account.chars().any(|c| {
-        matches!(c, '/' | '?' | '#' | '@' | '\\' | '%') || c.is_whitespace() || c.is_control()
-    }) {
-        return Some(
+    account
+        .chars()
+        .any(|c| {
+            matches!(c, '/' | '?' | '#' | '@' | '\\' | '%') || c.is_whitespace() || c.is_control()
+        })
+        .then_some(
             "it contains a character that could redirect the request (/ ? # @ \\ % or whitespace)",
-        );
-    }
-    (account == "." || account == "..").then_some("it is a path segment")
+        )
+}
+
+/// Why an Azure account name is not usable in any environment: the redirect problems of
+/// [`azure_account_redirect_problem`], and a name that is a path segment (`.` or `..`).
+pub(crate) fn azure_account_problem_pure(account: &str) -> Option<&'static str> {
+    azure_account_redirect_problem(account)
+        .or_else(|| (account == "." || account == "..").then_some("it is a path segment"))
 }
 
 fn check_azure_account_pure(account: &str) -> Result<()> {
@@ -779,117 +817,159 @@ mod tests {
         assert_eq!(c.provider, "s3");
     }
 
-    // ---- parity with the existing parsers ----------------------------------------------
-
-    const S3_CORPUS: &[&str] = &[
-        "s3://bucket/key",
-        "s3://bucket/",
-        "s3://bucket",
-        "s3://bucket//k",
-        "s3://bucket/a%2Fb/c",
-        "s3://data.example.com/dir/file.bin",
-        "s3://localhost/key",
-        "s3://host:9000/bucket/key",
-        "s3://host:9000/bucket",
-        "s3://host:9000/bucket/",
-        "s3://host:9000/",
-        "s3://host:9000",
-        "s3://host:9000//key",
-        "s3://minio_1:9000/b/k/l",
-        "s3://[::1]:9000/bucket/key",
-        "s3://[::1]/bucket/key",
-        "s3://[::1]:9000",
-        "s3://[::1]x/bucket/key",
-        "s3://[1.2.3.4]:80/bucket/key",
-        "s3://[nope]:80/b/k",
-        "s3://[/b/k",
-        "s3://]/b/k",
-        "s3://::1/bucket/key",
-        "s3://a:b:c/bucket/key",
-        "s3://10.0.0.5/bucket/key",
-        "s3://10.0.0.5:9000/bucket/key",
-        "s3://host:/bucket/key",
-        "s3://host:09000/bucket/key",
-        "s3://host:+80/bucket/key",
-        "s3://host:65536/bucket/key",
-        "s3://host:65535/bucket/key",
-        "s3://:9000/bucket/key",
-        "s3://ho/st:9000/bucket/key",
-        "s3://ho st:9000/bucket/key",
-        "s3://.host:9000/bucket/key",
-        "s3://host..x:9000/bucket/key",
-        "s3://user@host:9000/bucket/key",
-        "s3://arn:aws:s3:::bucket/key",
-        "s3://http://host:9000/b/k",
-        "s3:///key",
-        "s3://",
-        "gs://bucket/key",
-        "",
-    ];
+    // ---- literal results of the single implementation ----------------------------------
+    //
+    // `s3_utils::parse_s3_uri_full` / `classify_s3_first_segment` and both `parse_gcs_uri`
+    // functions delegate to the parsers here, so comparing them with the parsers would compare a
+    // function with itself. These tables pin what the parsers return, written out literally.
 
     #[test]
-    fn s3_pure_parser_matches_the_existing_one() {
-        for uri in S3_CORPUS {
-            let pure = parse_s3_uri_pure(uri);
-            let existing = crate::s3_utils::parse_s3_uri_full(uri);
-            match (pure, existing) {
-                (Ok(p), Ok(e)) => assert_eq!(
-                    (p.endpoint, p.bucket, p.key),
-                    (e.endpoint, e.bucket, e.key),
-                    "{uri:?}"
-                ),
-                (Err(p), Err(e)) => assert_eq!(format!("{p:#}"), format!("{e:#}"), "{uri:?}"),
-                (p, e) => panic!("{uri:?}: pure={p:?} existing={e:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn s3_first_segment_classifier_matches_the_existing_one() {
-        for uri in S3_CORPUS {
-            let segment = uri.strip_prefix("s3://").unwrap_or(uri);
-            let segment = segment.split('/').next().unwrap_or("");
-            let pure = classify_s3_first_segment_pure(segment);
-            let existing = crate::s3_utils::classify_s3_first_segment(segment);
-            match (pure, existing) {
-                (Ok(p), Ok(e)) => assert_eq!(p, e, "{segment:?}"),
-                (Err(p), Err(e)) => assert_eq!(format!("{p:#}"), format!("{e:#}"), "{segment:?}"),
-                (p, e) => panic!("{segment:?}: pure={p:?} existing={e:?}"),
-            }
-        }
-    }
-
-    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
-    #[test]
-    fn gs_pure_parser_matches_the_official_gated_one() {
-        for uri in [
-            "gs://bucket/path/to/object",
-            "gcs://bucket/o",
-            "gs://bucket/",
-            "gs://bucket",
-            "gs://bucket//o",
-            "gs://",
-            "gs:///o",
-            "gcs://",
-            "s3://bucket/o",
-            "bucket/o",
-            "",
+    fn s3_uris_parse_to_these_literal_parts() {
+        for (uri, endpoint, bucket, key) in [
+            ("s3://bucket/key", None, "bucket", "key"),
+            ("s3://bucket/", None, "bucket", ""),
+            ("s3://bucket//k", None, "bucket", "/k"),
+            ("s3://bucket/a%2Fb/c", None, "bucket", "a%2Fb/c"),
+            (
+                "s3://data.example.com/dir/file.bin",
+                None,
+                "data.example.com",
+                "dir/file.bin",
+            ),
+            ("s3://localhost/key", None, "localhost", "key"),
+            (
+                "s3://host:9000/bucket/key",
+                Some("host:9000"),
+                "bucket",
+                "key",
+            ),
+            ("s3://host:9000/bucket", Some("host:9000"), "bucket", ""),
+            ("s3://host:9000/bucket/", Some("host:9000"), "bucket", ""),
+            ("s3://minio_1:9000/b/k/l", Some("minio_1:9000"), "b", "k/l"),
+            (
+                "s3://[::1]:9000/bucket/key",
+                Some("[::1]:9000"),
+                "bucket",
+                "key",
+            ),
+            (
+                "s3://10.0.0.5:9000/bucket/key",
+                Some("10.0.0.5:9000"),
+                "bucket",
+                "key",
+            ),
+            (
+                "s3://host:65535/bucket/key",
+                Some("host:65535"),
+                "bucket",
+                "key",
+            ),
         ] {
-            let pure = parse_gs_uri_pure(uri);
-            let existing = crate::google_gcs_client::parse_gcs_uri(uri);
-            match (pure, existing) {
-                (Ok(p), Ok(e)) => assert_eq!(p, e, "{uri:?}"),
-                (Err(p), Err(e)) => assert_eq!(format!("{p:#}"), format!("{e:#}"), "{uri:?}"),
-                (p, e) => panic!("{uri:?}: pure={p:?} existing={e:?}"),
-            }
+            let parts = parse_s3_uri_pure(uri).unwrap_or_else(|e| panic!("{uri:?}: {e:#}"));
+            assert_eq!(
+                (
+                    parts.endpoint.as_deref(),
+                    parts.bucket.as_str(),
+                    parts.key.as_str()
+                ),
+                (endpoint, bucket, key),
+                "{uri:?}"
+            );
         }
     }
 
-    // The community parser delegates to the pure one, so this pins what both return rather than
-    // comparing a function with itself.
-    #[cfg(feature = "gcs-community")]
+    /// Every rejected shape fails, with a message that names what was wrong.
     #[test]
-    fn community_gcs_parser_delegates_to_the_pure_one() {
+    fn malformed_s3_uris_fail_with_these_messages() {
+        for (uri, fragment) in [
+            ("", "URI must start with s3://"),
+            ("gs://bucket/key", "URI must start with s3://"),
+            ("s3://bucket", "URI must contain '/' after bucket"),
+            ("s3://", "URI must contain '/' after bucket"),
+            ("s3:///key", "empty first segment"),
+            ("s3://host:9000", "missing bucket after server 'host:9000'"),
+            ("s3://host:9000/", "missing bucket after server 'host:9000'"),
+            (
+                "s3://host:9000//key",
+                "missing bucket after server 'host:9000'",
+            ),
+            ("s3://10.0.0.5/bucket/key", "IP address with no port"),
+            ("s3://[::1]/bucket/key", "IPv6 address without a port"),
+            ("s3://[::1]x/bucket/key", "unexpected text 'x' after ']'"),
+            (
+                "s3://[1.2.3.4]:80/bucket/key",
+                "IPv4 address inside brackets",
+            ),
+            ("s3://[nope]:80/b/k", "invalid IPv6 address 'nope'"),
+            ("s3://[/b/k", "unterminated '['"),
+            ("s3://]/b/k", "unexpected bracket"),
+            ("s3://::1/bucket/key", "unbracketed IPv6 address"),
+            ("s3://a:b:c/bucket/key", "more than one ':'"),
+            ("s3://host:/bucket/key", "empty port"),
+            ("s3://host:09000/bucket/key", "leading zeros"),
+            ("s3://host:+80/bucket/key", "plain decimal digits"),
+            ("s3://host:65536/bucket/key", "from 1 to 65535"),
+            ("s3://:9000/bucket/key", "missing host before ':'"),
+            (
+                "s3://ho st:9000/bucket/key",
+                "invalid character ' ' in host",
+            ),
+            ("s3://.host:9000/bucket/key", "empty label"),
+            ("s3://host..x:9000/bucket/key", "empty label"),
+            ("s3://user@host:9000/bucket/key", "userinfo"),
+            ("s3://arn:aws:s3:::bucket/key", "looks like an ARN"),
+            ("s3://http://host:9000/b/k", "empty port in 'http:'"),
+        ] {
+            let err = match parse_s3_uri_pure(uri) {
+                Ok(parts) => panic!("{uri:?} must be rejected, got {parts:?}"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(
+                err.contains(fragment),
+                "{uri:?}: {fragment:?} not in {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_first_segments_classify_to_these_literal_results() {
+        for (segment, server) in [
+            ("bucket", false),
+            ("data.example.com", false),
+            ("localhost", false),
+            ("host:9000", true),
+            ("[::1]:9000", true),
+            ("10.0.0.5:9000", true),
+        ] {
+            let want = if server {
+                S3FirstSegment::Server(segment)
+            } else {
+                S3FirstSegment::Bucket(segment)
+            };
+            assert_eq!(
+                classify_s3_first_segment_pure(segment).unwrap(),
+                want,
+                "{segment:?}"
+            );
+        }
+        for bad in [
+            "",
+            "10.0.0.5",
+            "::1",
+            "user@host:9000",
+            "http://h:1",
+            "host:0",
+        ] {
+            assert!(classify_s3_first_segment_pure(bad).is_err(), "{bad:?}");
+        }
+        let url = classify_s3_first_segment_pure("http://h:1").unwrap_err();
+        assert!(format!("{url:#}").contains("looks like a URL"), "{url:#}");
+    }
+
+    /// The literal results of the `gs://` parser and of the gated `parse_gcs_uri` that
+    /// delegates to it (the official client, or the community one when that is compiled).
+    #[test]
+    fn gs_uris_parse_to_these_literal_parts() {
         for (uri, want) in [
             (
                 "gs://bucket/path/to/object",
@@ -898,24 +978,72 @@ mod tests {
             ("gcs://bucket/o", Some(("bucket", "o"))),
             ("gs://bucket/", Some(("bucket", ""))),
             ("gs://bucket", Some(("bucket", ""))),
+            ("gs://bucket//o", Some(("bucket", "/o"))),
             ("gs://", None),
             ("gs:///o", None),
+            ("gcs://", None),
             ("s3://bucket/o", None),
+            ("bucket/o", None),
             ("", None),
         ] {
             let pure = parse_gs_uri_pure(uri);
-            let community = crate::gcs_client::parse_gcs_uri(uri);
-            match (pure, community, want) {
-                (Ok(p), Ok(c), Some((b, o))) => {
-                    assert_eq!(p, c, "{uri:?}");
-                    assert_eq!((p.0.as_str(), p.1.as_str()), (b, o), "{uri:?}");
+            match (&pure, want) {
+                (Ok((b, o)), Some((wb, wo))) => {
+                    assert_eq!((b.as_str(), o.as_str()), (wb, wo), "{uri:?}")
                 }
-                (Err(p), Err(c), None) => {
-                    assert_eq!(format!("{p:#}"), format!("{c:#}"), "{uri:?}");
-                }
-                (p, c, w) => panic!("{uri:?}: pure={p:?} community={c:?} want={w:?}"),
+                (Err(_), None) => {}
+                _ => panic!("{uri:?}: got {pure:?}, want {want:?}"),
             }
+            // The gated parsers return exactly what the pure one does, error text included.
+            #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+            assert_eq!(
+                format!("{:?}", crate::google_gcs_client::parse_gcs_uri(uri)),
+                format!("{pure:?}"),
+                "{uri:?}"
+            );
+            #[cfg(feature = "gcs-community")]
+            assert_eq!(
+                format!("{:?}", crate::gcs_client::parse_gcs_uri(uri)),
+                format!("{pure:?}"),
+                "{uri:?}"
+            );
         }
+        let err = format!("{:#}", parse_gs_uri_pure("s3://bucket/o").unwrap_err());
+        assert!(err.contains("expected gs:// or gcs:// prefix"), "{err}");
+        let err = format!("{:#}", parse_gs_uri_pure("gs:///o").unwrap_err());
+        assert!(err.contains("empty bucket name"), "{err}");
+    }
+
+    /// The account rules shared with `azure_client`: what every environment refuses.
+    #[test]
+    fn azure_account_rules_have_these_literal_results() {
+        assert_eq!(azure_account_redirect_problem("myacct"), None);
+        assert_eq!(azure_account_redirect_problem("My_Acct-1"), None);
+        assert_eq!(azure_account_redirect_problem(""), Some("it is empty"));
+        for bad in [
+            "a/b", "a?b", "a#b", "a@b", "a\\b", "a%b", "a b", "a\tb", "a\nb",
+        ] {
+            assert!(
+                azure_account_redirect_problem(bad)
+                    .is_some_and(|why| why.contains("could redirect the request")),
+                "{bad:?}"
+            );
+        }
+        // A path segment is not a redirect character, but is refused in every environment.
+        assert_eq!(azure_account_redirect_problem(".."), None);
+        assert_eq!(
+            azure_account_problem_pure(".."),
+            Some("it is a path segment")
+        );
+        assert_eq!(
+            azure_account_problem_pure("."),
+            Some("it is a path segment")
+        );
+        assert_eq!(azure_account_problem_pure("a.b"), None);
+        assert_eq!(
+            azure_account_problem_pure("a/b"),
+            azure_account_redirect_problem("a/b")
+        );
     }
 
     // ---- purity ------------------------------------------------------------------------
