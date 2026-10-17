@@ -1055,9 +1055,9 @@ impl WritableExport {
 
 /// The checks of A4 on a freshly acquired writable `Py_buffer`, as pure functions of the view so
 /// every refusal is one place: not read-only, one-byte items in a plain byte format (none of the
-/// pointer-bearing formats), `expected_len` within the exporter's length (checked conversion),
-/// a non-null pointer when there is data, and (defense behind the `PyBUF_C_CONTIGUOUS` request) no
-/// suboffsets and a really C-contiguous layout.
+/// pointer-bearing formats; one optional byte-order prefix), `expected_len` within the exporter's
+/// length (checked conversion), a non-null pointer when there is data, and (defense behind the
+/// `PyBUF_C_CONTIGUOUS` request) no suboffsets and a really C-contiguous layout.
 fn check_writable_view(view: &ffi::Py_buffer, expected_len: usize) -> PyResult<()> {
     use pyo3::exceptions::{PyBufferError, PyTypeError, PyValueError};
     if view.readonly != 0 {
@@ -1078,10 +1078,15 @@ fn check_writable_view(view: &ffi::Py_buffer, expected_len: usize) -> PyResult<(
         if format_has_pointers(&fmt) {
             return Err(pointer_format_error(&fmt));
         }
-        if !matches!(fmt.as_ref(), "B" | "b" | "c") {
+        // At most ONE leading byte-order/alignment character (`@ = < > !`), then exactly one byte
+        // code: what a ctypes byte array reports (`<B`), and what the borrowed PUT path accepts.
+        let code = fmt
+            .strip_prefix(['@', '=', '<', '>', '!'])
+            .unwrap_or(fmt.as_ref());
+        if !matches!(code, "B" | "b" | "c") {
             return Err(PyTypeError::new_err(format!(
-                "the destination buffer must be a plain byte buffer \
-                 (format 'B', 'b' or 'c'), got format {fmt:?}"
+                "the destination buffer must be a plain byte buffer (format 'B', 'b' or 'c', \
+                 optionally with one byte-order prefix), got format {fmt:?}"
             )));
         }
     }
@@ -2368,7 +2373,7 @@ mod tests {
         let l = ns(
             py,
             c_str!(
-                "import array, mmap\n\
+                "import array, ctypes, mmap\n\
                  objs = [\n\
                    ('bytearray', bytearray(range(64)), 64),\n\
                    ('memoryview', memoryview(bytearray(64)), 64),\n\
@@ -2377,6 +2382,9 @@ mod tests {
                    ('mv_c', memoryview(bytearray(b'x' * 48)).cast('c'), 48),\n\
                    ('mv_3d', memoryview(bytearray(24)).cast('B', (2, 3, 4)), 24),\n\
                    ('mmap', mmap.mmap(-1, 4096), 4096),\n\
+                   ('ctypes_ubyte', (ctypes.c_ubyte * 16)(), 16),\n\
+                   ('ctypes_byte', (ctypes.c_byte * 16)(), 16),\n\
+                   ('ctypes_char', (ctypes.c_char * 16)(), 16),\n\
                  ]"
             ),
         );
@@ -2500,7 +2508,6 @@ mod tests {
                        'array_H': (a_H, 'type', lambda o=a_H: o.append(1)),\n\
                        'array_d': (a_d, 'type', lambda o=a_d: o.append(1.0)),\n\
                        'bool_bytes': (mv_bool, 'type', lambda o=mv_bool: o.release()),\n\
-                       'ctypes_ubyte': ((ctypes.c_ubyte * 8)(), 'type', nop),\n\
                        'c_void_p': ((ctypes.c_void_p * 4)(), 'type', nop),\n\
                        'py_object': ((ctypes.py_object * 2)(), 'type', nop),\n\
                        'not_a_buffer': (object(), 'type', nop),\n\
@@ -2724,6 +2731,54 @@ mod tests {
             owner.release(py);
         });
         assert_eq!(latch_state(&latch), (true, true));
+    }
+
+    /// The format rule of A4 through hand-built `Py_buffer`s: `B`, `b` and `c`, each with at most
+    /// ONE leading byte-order/alignment character (`@ = < > !`), are accepted (what a ctypes byte
+    /// array reports, matching the borrowed PUT path); a bare prefix, two prefixes, and every other
+    /// format are refused with a TypeError.
+    #[test]
+    fn writable_view_checks_format_accepts_one_byte_order_prefix_with_byte_codes() {
+        use pyo3::exceptions::PyTypeError;
+        init();
+        let mut mem = [0u8; 4];
+        let mut shape1: [ffi::Py_ssize_t; 1] = [4];
+        let mut view_with = |format: &'static std::ffi::CStr| -> Box<ffi::Py_buffer> {
+            // SAFETY: an all-zero Py_buffer is a valid empty value; `obj` stays NULL.
+            let mut view: Box<ffi::Py_buffer> = Box::new(unsafe { std::mem::zeroed() });
+            view.buf = mem.as_mut_ptr().cast();
+            view.len = 4;
+            view.itemsize = 1;
+            view.ndim = 1;
+            view.shape = shape1.as_mut_ptr();
+            view.format = format.as_ptr().cast_mut();
+            view
+        };
+        for fmt in [
+            c"B", c"b", c"c", c"@B", c"@b", c"@c", c"=B", c"=b", c"=c", c"<B", c"<b", c"<c", c">B",
+            c">b", c">c", c"!B", c"!b", c"!c",
+        ] {
+            let view = view_with(fmt);
+            check_writable_view(&view, 4)
+                .unwrap_or_else(|e| panic!("format {fmt:?} must be accepted: {e}"));
+        }
+        for fmt in [
+            c"?", c"<?", c"x", c"e", c"i", c"H", c"<<B", c"@<B", c"BB", c"<BB", c"<", c"@", c"!",
+            c"", c"B<", c"<H", c"s", c"<s", c"2B",
+        ] {
+            let view = view_with(fmt);
+            Python::attach(|py| {
+                let err = check_writable_view(&view, 4)
+                    .err()
+                    .unwrap_or_else(|| panic!("format {fmt:?} must be refused"));
+                assert!(err.is_instance_of::<PyTypeError>(py), "{fmt:?}: {err}");
+            });
+        }
+        // A pointer-bearing format keeps its own refusal (also a TypeError), with or without a prefix.
+        for fmt in [c"O", c"<P"] {
+            let view = view_with(fmt);
+            assert!(check_writable_view(&view, 4).is_err(), "{fmt:?}");
+        }
     }
 
     /// `release(py)` is direct: latch released and dropped at once, no queue, and the exporter is
