@@ -560,3 +560,17 @@ async fn dropping_the_read_stops_the_writer_and_keeps_the_progress() {
     );
     dst.assert_canaries();
 }
+
+/// The trait method that wraps these futures is `Send` (`#[async_trait]`), so the futures of
+/// both the single route and the fan-out entry points must be.
+#[tokio::test]
+async fn the_read_and_head_futures_are_send() {
+    fn assert_send<T: Send>(_: &T) {}
+    let (ops, _state) = setup().await;
+    let mut dst = Dst::new(N);
+    let progress = ReceiveProgress::new();
+    let get = ops.get_into(BUCKET, "never-polled", dst.slice(), &progress);
+    assert_send(&get);
+    let head = ops.head_typed(BUCKET, "never-polled");
+    assert_send(&head);
+}
