@@ -727,6 +727,8 @@ STALL_VARIANTS = [
     "asyncio_timeout",
     "task_cancel_repeated",
     "task_cancel_tight",
+    "wait_for_second_task_cancel",
+    "asyncio_timeout_second_task_cancel",
     "stall_released_completes",
     "bytes_land_in_caller_memory_in_flight",
 ]
@@ -755,6 +757,14 @@ def test_cancellation_matrix_for_a_blocked_head(fake_s3, variant):
     fake_s3.put(HEAD_HOLD_KEY, pattern(HEAD_HOLD_SIZE, 4))
     fake_s3.head_hold.add(object_path(HEAD_HOLD_KEY))
     run_ok(fake_s3, "head_cancellation", {"variant": variant})
+
+
+def test_wait_for_contract_of_the_shared_guarded_future(fake_s3):
+    """#278: get_into_async, head_async and put_bytes_async share one guarded future class; its
+    `wait_for` contract (version-specific outcome, never terminal before the barrier) is
+    asserted in the child on the real class."""
+    populate(fake_s3)
+    run_ok(fake_s3, "guard_wait_for_contract")
 
 
 # ---- interpreter shutdown ---------------------------------------------------------------------
@@ -1486,6 +1496,116 @@ async def variant_bytes_land_in_caller_memory_in_flight(case):
     assert not case.problems, f"the event loop logged: {case.problems}"
 
 
+MAX_SECOND_CANCEL_ATTEMPTS = 40
+
+
+async def second_cancel_attempt(case, wrap):
+    """One blocked read; the awaiting task is cancelled, and cancelled AGAIN on the very loop
+    pass after the first cancellation reached the read (the guard future is then still waiting
+    for the native read to stop and the buffer is exported). Returns what was seen when the task
+    ended. The guard future is awaited (never the task) before the buffer is touched. The
+    server's release is NOT used here (it stays set for good): the cancelled read is dropped
+    by the client."""
+    await case.start()
+    fut = case.fut
+    task = asyncio.ensure_future(wrap(fut))
+    await asyncio.sleep(0.2)
+    seen = {}
+
+    def second_cancel(_inner):
+        seen["guard_pending_at_second_cancel"] = not fut.done()
+        task.cancel()
+
+    def task_ended(_task):
+        # Order matters: a guard seen done FIRST implies the export was released before the
+        # buffer is probed (a probe first could see "exported" just before a legitimate end).
+        seen["guard_done_when_task_ended"] = fut.done()
+        seen["pinned_when_task_ended"] = not resizable(case.dst)
+
+    fut._inner.add_done_callback(second_cancel)  # the read's bridged future
+    task.add_done_callback(task_ended)
+    task.cancel()
+    # the safe pattern: wait for the guard future itself, never for the task
+    await case.wait_done_observing()
+    assert fut.cancelled()
+    done, _ = await asyncio.wait({task}, timeout=30)
+    assert task in done and task.cancelled(), repr(task)
+    assert resizable(case.dst)
+    case.dst[:] = bytes([AFTER]) * len(case.dst)
+    return seen
+
+
+async def second_cancel_matrix(case, wrap, limitation):
+    """`limitation`: 3.11's wait_for (#288) - at least one attempt must show the task ending
+    while the guard is pending and the buffer exported. Otherwise every attempt whose second
+    cancellation arrived while the guard was pending must show the task ending only after the
+    guard did. A read can be released by the native side within one loop pass, so attempts that
+    missed the window are repeated (and not counted)."""
+    cases = []
+    valid = early = 0
+    try:
+        for _ in range(MAX_SECOND_CANCEL_ATTEMPTS):
+            attempt = StallCase(case.ctl)
+            attempt.problems = case.problems
+            cases.append(attempt)
+            seen = await second_cancel_attempt(attempt, wrap)
+            if not seen.get("guard_pending_at_second_cancel"):
+                continue
+            valid += 1
+            assert not (
+                seen["pinned_when_task_ended"] and seen["guard_done_when_task_ended"]
+            ), (
+                "the guard future was done while the caller's buffer was still exported: "
+                f"it ended before the export was released: {seen}"
+            )
+            ended_early = (
+                seen["pinned_when_task_ended"]
+                and not seen["guard_done_when_task_ended"]
+            )
+            if ended_early:
+                early += 1
+                assert limitation, (
+                    f"the task ended while the guard was pending and the buffer exported: {seen}"
+                )
+            if (limitation and early) or (not limitation and valid >= 3):
+                break
+        else:
+            raise AssertionError(
+                f"window never hit: valid={valid} early={early} "
+                f"in {MAX_SECOND_CANCEL_ATTEMPTS} attempts"
+            )
+    finally:
+        case.ctl.release()  # lets the held server threads go
+    await asyncio.sleep(0.5)
+    for attempt in cases:
+        assert attempt.dst.count(AFTER) == len(attempt.dst), (
+            "a native write landed in the buffer after the awaitable had finished"
+        )
+    cases.clear()
+    gc.collect()
+    await asyncio.sleep(0.1)
+    assert not case.problems, f"the event loop logged: {case.problems}"
+
+
+async def variant_wait_for_second_task_cancel(case):
+    """#288: 3.12+ keeps the task pending until the guard ends; 3.11's wait_for does not."""
+    await second_cancel_matrix(
+        case,
+        lambda fut: asyncio.wait_for(fut, 30),
+        limitation=sys.version_info < (3, 12),
+    )
+
+
+async def variant_asyncio_timeout_second_task_cancel(case):
+    """The recommended alternative: safe on every version."""
+
+    async def with_timeout(fut):
+        async with asyncio.timeout(30):
+            await fut
+
+    await second_cancel_matrix(case, with_timeout, limitation=False)
+
+
 @scenario
 def cancellation(ctl, params):
     variants = {
@@ -1499,6 +1619,10 @@ def cancellation(ctl, params):
         "asyncio_timeout": variant_asyncio_timeout,
         "task_cancel_repeated": variant_task_cancel_repeated,
         "task_cancel_tight": variant_task_cancel_tight,
+        "wait_for_second_task_cancel": variant_wait_for_second_task_cancel,
+        "asyncio_timeout_second_task_cancel": (
+            variant_asyncio_timeout_second_task_cancel
+        ),
         "stall_released_completes": variant_stall_released_completes,
     }
     body = variants[params["variant"]]
@@ -1650,6 +1774,74 @@ def exit_after_mkdir(ctl, params):
             *[s3dlio.mkdir_async(f"file://{ctl.work}/n{i}/x/y") for i in range(50)]
         )
         assert results == [None] * 50
+
+    asyncio.run(main())
+
+
+@scenario
+def guard_wait_for_contract(ctl, params):
+    """#278: get_into_async, head_async and a borrowed put_bytes_async hand back instances of the
+    SAME guarded future class, so the `wait_for` contract of that class applies to all three.
+
+    The contract: when `wait_for` expires after the operation itself has finished but while
+    its export barrier is still pending, the guard refuses the cancellation (the outcome is
+    fixed) and ends only after the barrier. What `wait_for` then reports is asyncio's own,
+    version-specific behaviour: 3.12+ (built on `asyncio.timeout`) raises TimeoutError; 3.11
+    returns the inner result. On every version nothing is terminal before the barrier.
+    The real operations cannot be held in that state from Python (it needs a native reader that
+    outlives the finished call, which only the put test hooks can produce), so the state is
+    built with stand-in barrier parts on the real class."""
+    size = 4096 + 7
+
+    async def main():
+        dst = bytearray(size)
+        uri = uri_of(f"obj-{size}")
+        get_fut = s3dlio.get_into_async(uri, dst, expected_len=size)
+        head_fut = s3dlio.head_async(uri)
+        put_fut = s3dlio.put_bytes_async(
+            f"file://{ctl.work}/shared.bin", bytearray(b"x" * 10), borrow=True
+        )
+        classes = {type(f) for f in (get_fut, head_fut, put_fut)}
+        assert len(classes) == 1, f"the three awaitables differ in class: {classes}"
+        cls = classes.pop()
+        assert cls.__name__ == "GuardedFuture", cls
+        # wait_for on operations that finish in time: the plain result, on every version
+        assert await asyncio.wait_for(get_fut, 30) == size
+        assert (await asyncio.wait_for(head_fut, 30)).size == size
+        await asyncio.wait_for(put_fut, 30)
+        assert bytes(dst) == pattern(size, size % 251)
+        assert resizable(dst)
+
+        # the finished-but-barrier-pending state, on the real class
+        loop = asyncio.get_running_loop()
+        barrier = loop.create_future()
+        ready = [False]
+        events = []
+
+        def event(kind, detail):
+            events.append((kind, detail))
+            return f"fake {kind}"
+
+        inner = loop.create_future()
+        fut = cls(inner, lambda: ready[0], lambda: barrier, event, lambda: None, 0.02)
+        inner.set_result("finished")
+        waiter = asyncio.ensure_future(asyncio.wait_for(fut, 0.3))
+        await asyncio.sleep(0.8)  # past the wait_for deadline
+        assert not waiter.done(), "wait_for ended before the barrier was satisfied"
+        assert not fut.done(), (
+            "the guarded future ended before the barrier was satisfied"
+        )
+        ready[0] = True
+        barrier.set_result(False)
+        done, _ = await asyncio.wait({waiter}, timeout=10)
+        assert waiter in done, "wait_for never ended after the barrier was satisfied"
+        assert fut.done() and fut.result() == "finished", "the outcome must be kept"
+        if sys.version_info >= (3, 12):
+            assert isinstance(waiter.exception(), TimeoutError), repr(waiter)
+        else:
+            assert waiter.exception() is None and waiter.result() == "finished", repr(
+                waiter
+            )
 
     asyncio.run(main())
 

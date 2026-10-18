@@ -3,10 +3,30 @@ error, OR by cancellation) until every native reader of the caller's buffer is d
 export has really been released (Blue review P1, "a cancelled borrowed put can still read the
 caller's memory").
 
-Run under both supported interpreters, each with its own wheel:
+Run under every supported interpreter (3.11, 3.12, 3.13), each with its own wheel:
     S3DLIO_TEST_DIR=<real fs> uv run --python 3.12 --no-project --isolated --with <cp312 wheel> \
-        --with pytest --with numpy python -m pytest python/tests/test_put_release_barrier.py
-    (same with --python 3.13 and the cp313 wheel)
+        --with pytest --with pytest-timeout --with numpy \
+        python -m pytest --timeout=120 python/tests/test_put_release_barrier.py
+    (same with --python 3.11 / 3.13 and the matching wheel)
+
+Interpreter differences (#278, #288). Ownership and eventual completion are IDENTICAL on every
+interpreter: nothing is terminal while a native reader remains or before the export is released,
+and the guard future itself completes after the release. What differs is asyncio's or CPython's
+behaviour AROUND the guard, not s3dlio's:
+  * `asyncio.wait_for` after the put itself finished but while its barrier is pending: the guard
+    refuses the cancellation (the outcome is fixed). 3.12+ (wait_for is built on asyncio.timeout)
+    then raises TimeoutError once the barrier completes; 3.11 returns the put's result. Each is
+    asserted exactly, per version.
+  * #288, a 3.11 LIMITATION no library change can remove: 3.11's `wait_for` cancels the inner
+    awaitable and then waits for it with `_cancel_and_wait`, which a further cancellation
+    interrupts by design. A task inside `wait_for` that is cancelled a SECOND time, or cancelled
+    once AFTER the deadline fired, therefore ENDS (CancelledError) while the guard future is
+    still pending and the buffer still exported. 3.12+ keeps the task pending until the guard
+    ends. `asyncio.timeout()` is safe on every version (3.11 included). The tests pin both
+    behaviours, and the 3.11 tests then show the safe pattern: await the guard future itself
+    (not the task) and touch the buffer only after it ended.
+  * A Python-level `__buffer__` / `__release_buffer__` exporter (PEP 688) exists from 3.12 only;
+    the finalizer-based exporter tests cover the same release schedule on every version.
 """
 
 import asyncio
@@ -30,6 +50,23 @@ def work_dir():
     base = os.environ.get("S3DLIO_TEST_DIR") or None
     with tempfile.TemporaryDirectory(dir=base) as d:
         yield d
+
+
+@pytest.fixture(autouse=True)
+def no_leftover_retention():
+    """A test that armed `_put_test_retain_next_clone()` and then failed before a put consumed
+    the arming must not make the NEXT test's put retain a clone forever (#278): that put would
+    never complete, because its barrier is never satisfied.
+
+    Newer builds make `_put_test_release_retained()` disarm a pending arming as well; older
+    builds (including the 0.9.128 and 0.10.0 wheels) only drop retained clones. The teardown
+    therefore first CONSUMES a pending arming with a throw-away export (the arming is taken by
+    the next payload that holds a buffer export) and only then releases whatever was retained,
+    which is correct on both. Without a pending arming the throw-away export is simply released
+    at once."""
+    yield
+    s3dlio._put_test_queue_export(bytearray(1))
+    s3dlio._put_test_release_retained()
 
 
 def resizable(ba):
@@ -114,10 +151,14 @@ def nonblocking_drain(path, seconds):
 
 async def finished_with(t, exc_type, seconds=30):
     """Wait for `t` with asyncio.wait - which cannot raise TimeoutError by itself, so a hang is
-    never mistaken for the expected TimeoutError - then check HOW it ended."""
+    never mistaken for the expected TimeoutError - then check HOW it ended. `exc_type=None`
+    means it must have finished normally."""
     done, _ = await asyncio.wait({t}, timeout=seconds)
     assert t in done, f"did not complete within {seconds}s (hang)"
-    if exc_type is asyncio.CancelledError:
+    if exc_type is None:
+        assert not t.cancelled(), f"expected a normal finish, got a cancellation: {t!r}"
+        assert t.exception() is None, f"expected a normal finish, got {t.exception()!r}"
+    elif exc_type is asyncio.CancelledError:
         assert t.cancelled(), f"expected cancellation, got {t!r}"
     else:
         assert not t.cancelled(), f"expected {exc_type.__name__}, got a cancellation"
@@ -151,6 +192,8 @@ def test_cancel_after_the_native_write_started_is_not_observable_until_it_finish
         reader = Reader(fifo)
         reader.start()  # lets the pending write run to completion
         await finished_with(task, asyncio.CancelledError)
+        # Safe to reuse at once: the writer has copied everything it will ever read out of ba.
+        ba[:4] = b"ZZZZ"
         seen["data"] = reader.join()
         seen["released_at_cancel"] = resizable(ba)
 
@@ -403,7 +446,7 @@ def test_cancellation_at_any_moment_leaves_the_buffer_free_and_the_file_whole(wo
             except asyncio.CancelledError:
                 return "cancelled"
 
-        outcome = asyncio.run(go())
+        outcome = run_bounded(go)
         assert resizable(ba), f"export still held after {outcome} (iteration {i})"
         ba[:] = b"Z" * len(ba)  # reuse the buffer right away: must not reach the file
         time.sleep(0.01)
@@ -426,7 +469,7 @@ def test_error_releases_the_export_before_raising(work_dir):
             await s3dlio.put_bytes_async(uri, ba, borrow=True)
         return resizable(ba)
 
-    assert asyncio.run(go()) is True, "async error raised with the export still held"
+    assert run_bounded(go) is True, "async error raised with the export still held"
 
 
 def test_success_releases_the_export_before_resolving(work_dir):
@@ -436,7 +479,7 @@ def test_success_releases_the_export_before_resolving(work_dir):
         await s3dlio.put_bytes_async(f"file://{work_dir}/ok.bin", ba, borrow=True)
         return resizable(ba)
 
-    assert asyncio.run(go()) is True
+    assert run_bounded(go) is True
     s3dlio.put_bytes(f"file://{work_dir}/ok2.bin", ba)
     assert resizable(ba)
 
@@ -449,7 +492,7 @@ def test_no_quiesce_timeouts_on_the_normal_paths(work_dir):
     async def go():
         await s3dlio.put_bytes_async(f"file://{work_dir}/q2.bin", ba, borrow=True)
 
-    asyncio.run(go())
+    run_bounded(go)
     assert s3dlio._put_export_stats()["quiesce_timeouts"] == before
 
 
@@ -585,6 +628,22 @@ def borrowed_put_with_retained_clone(path, ba):
     return fut
 
 
+async def put_is_over(fut, seconds=30):
+    """Wait until the put ITSELF has finished while its export barrier is still pending (the
+    retained clone). The guard's bridged put future (`_inner`) is the one reliable signal: the
+    file being fully written says nothing about the future being done. After this, a
+    `cancel()` of the guard is refused (the outcome is fixed), deterministically."""
+    assert type(fut).__name__ == "GuardedFuture", (
+        f"a borrowed put must return the guard future, got {type(fut)!r}"
+    )
+    inner = fut._inner
+    deadline = time.monotonic() + seconds
+    while not inner.done():
+        assert time.monotonic() < deadline, "the put itself never finished"
+        await asyncio.sleep(0.005)
+    assert not fut.done(), "the guard ended although a native clone is retained"
+
+
 async def assert_pending(awaitables, seconds, what):
     done, _ = await asyncio.wait(set(awaitables), timeout=seconds)
     assert not done, f"{what}: terminal state observed while a native reader remained"
@@ -597,9 +656,14 @@ def short_deadline(monkeypatch):
     s3dlio._put_test_release_retained()  # never leave a retained clone behind
 
 
-def run_past_deadline_case(work_dir, wrapper, expected, cancel_again=True):
+def run_past_deadline_case(
+    work_dir, wrapper, expected, cancel_again=True, deadline_clock=None
+):
     """The inner put finishes at once; the retained clone outlives two quiesce deadlines; the
-    awaiting task is cancelled (twice) / times out; nothing terminal may be seen until release."""
+    awaiting task is cancelled (twice) / times out; nothing terminal may be seen until release.
+    `deadline_clock`: a dict the wrapper fills with `started` (monotonic time) and `deadline`
+    (seconds) when it starts a deadline of its own; the clone is then released only once that
+    deadline has certainly fired, so the version-specific outcome is deterministic."""
     original = b"retained-clone" * 8000
     path = os.path.join(work_dir, "o.bin")
     ba = bytearray(original)
@@ -620,10 +684,21 @@ def run_past_deadline_case(work_dir, wrapper, expected, cancel_again=True):
         if cancel_again:
             task.cancel()  # a further cancellation on top of the first one
             await assert_pending([task, fut], 0.3, "after repeated cancellation")
+        if deadline_clock is not None:
+            assert "started" in deadline_clock, "the wrapper never started its deadline"
+            fires_at = deadline_clock["started"] + deadline_clock["deadline"]
+            wait_more = fires_at + 0.1 - time.monotonic()
+            if wait_more > 0:
+                await assert_pending([task, fut], wait_more, "up to the deadline")
+            seen["deadline_fired_before_release"] = (
+                time.monotonic() >= fires_at + 0.1 and not fut.done()
+            )
         assert s3dlio._put_test_release_retained() >= 1
         await finished_with(task, expected)
         seen["fut_done"] = fut.done()
         seen["released"] = resizable(ba)
+        # The buffer is safe to reuse at once: changing it now cannot reach the written object.
+        ba[:4] = b"ZZZZ"
 
     run_bounded(go)
     assert seen["pinned"] is True
@@ -632,6 +707,10 @@ def run_past_deadline_case(work_dir, wrapper, expected, cancel_again=True):
         "warnings"
     ]
     assert seen["fut_done"] is True
+    if deadline_clock is not None:
+        assert seen["deadline_fired_before_release"] is True, (
+            "wait_for's deadline had not fired when the clone was released"
+        )
     assert seen["released"] is True, "terminal before the export was released"
     with open(path, "rb") as f:
         assert f.read() == original
@@ -663,10 +742,262 @@ def test_asyncio_timeout_after_finishing_is_not_terminal_past_the_deadline(
 def test_wait_for_after_finishing_is_not_terminal_past_the_deadline(
     work_dir, short_deadline
 ):
+    """`wait_for` expires after the put itself finished, so the guard refuses the cancellation
+    (its outcome is fixed) and completes only after the export is released. What `wait_for`
+    then reports is asyncio's own, version-specific contract (#278): 3.12+ (built on
+    `asyncio.timeout`) raises TimeoutError; 3.11 returns the inner result when its
+    cancellation was refused. On every version nothing is terminal before the release."""
+
     async def with_wait_for(fut):
+        # The deadline must fire AFTER the put itself finished, or the cancellation is accepted
+        # (inner not done yet) and 3.11 raises TimeoutError instead of returning the result.
+        # So start the clock only once the inner put future is done.
+        await put_is_over(fut)
+        clock.update(started=time.monotonic(), deadline=0.4)
         await asyncio.wait_for(fut, 0.4)
 
-    run_past_deadline_case(work_dir, with_wait_for, TimeoutError, cancel_again=False)
+    clock = {}
+    expected = TimeoutError if sys.version_info >= (3, 12) else None
+    run_past_deadline_case(
+        work_dir, with_wait_for, expected, cancel_again=False, deadline_clock=clock
+    )
+
+
+# ---- #288: cancelling a task that is INSIDE wait_for ------------------------------------------
+#
+# On 3.11 `wait_for` cancels the inner awaitable and then waits for it with `_cancel_and_wait`,
+# which a further cancellation deliberately interrupts: the task ends (CancelledError) while the
+# guard future is still pending and the buffer is still exported. That is the standard library's
+# behaviour; the guard cannot prevent it. 3.12+ (wait_for = asyncio.timeout + await) keeps the
+# task pending until the guard ends. `asyncio.timeout()` is safe on EVERY version. The safe
+# pattern on 3.11 is to await the guard future itself (never the task) before touching the
+# buffer.
+
+PY311 = sys.version_info < (3, 12)
+
+
+def wait_for_30(fut):
+    return asyncio.wait_for(fut, 30)
+
+
+def wait_for_half_second(fut):
+    return asyncio.wait_for(fut, 0.5)
+
+
+async def timeout_30(fut):
+    async with asyncio.timeout(30):
+        await fut
+
+
+async def timeout_half_second(fut):
+    async with asyncio.timeout(0.5):
+        await fut
+
+
+async def wait_for_guard(fut):
+    """Recovery after a task ended early (3.11 wait_for, #288): keep waiting for the guard
+    future ITSELF until it is done, even if this waiting task is cancelled again. A cancellation
+    received meanwhile is not lost: it is raised once the guard has ended."""
+    cancelled = False
+    while not fut.done():
+        try:
+            await asyncio.wait({fut})
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+def run_cancels_with_a_stuck_writer(work_dir, wrap, early, cancel_at=(0.3, 0.6)):
+    """Stuck native writer; the awaiting task is cancelled at each time of `cancel_at` (seconds
+    after it started). `early`: the task is expected to END while the guard is pending and the
+    buffer exported (3.11 wait_for only); otherwise it must stay pending until the guard has
+    ended."""
+    original = b"stuck-writer-second-cancel" * 6000
+    fifo, ba = stuck_put(work_dir, original)
+    seen = {}
+
+    async def go():
+        fut = s3dlio.put_bytes_async(f"file://{fifo}", ba, borrow=True)
+        task = asyncio.ensure_future(wrap(fut))
+        started = time.monotonic()
+        # The blocking writer is stuck opening the FIFO the whole time.
+        for at in cancel_at:
+            await asyncio.sleep(max(0.0, started + at - time.monotonic()))
+            task.cancel()
+        await asyncio.sleep(0.5)
+        seen["task_done"] = task.done()
+        seen["fut_done"] = fut.done()
+        seen["pinned"] = not resizable(ba)
+        reader = Reader(fifo)
+        reader.start()  # lets the stuck write finish
+        # The safe pattern: wait for the guard future itself, never for the task.
+        await wait_for_guard(fut)
+        await finished_with(fut, asyncio.CancelledError)
+        seen["released"] = resizable(ba)
+        await finished_with(task, asyncio.CancelledError)
+        seen["data"] = reader.join()
+
+    run_bounded(go, fifo)
+    assert seen["fut_done"] is False and seen["pinned"] is True, seen
+    if early:
+        assert seen["task_done"] is True, (
+            "3.11 wait_for was expected to end under the pending guard (#288); "
+            "if this fails the interpreter's behaviour changed: update the docs"
+        )
+    else:
+        assert seen["task_done"] is False, "the task ended under a running native write"
+    assert seen["released"] is True, "the guard ended before the export was released"
+    assert seen["data"] == original, "the write did not read the caller's data"
+
+
+def test_wait_for_second_task_cancel_with_a_stuck_native_writer(work_dir):
+    """#288. 3.12+: the task stays pending until the write finished and the export is released.
+    3.11: the second Task.cancel() ends the task while the guard is pending and the buffer is
+    still exported (documented limitation); awaiting the guard is the safe pattern."""
+    run_cancels_with_a_stuck_writer(work_dir, wait_for_30, early=PY311)
+
+
+def test_asyncio_timeout_second_task_cancel_with_a_stuck_native_writer(work_dir):
+    """The recommended alternative: safe on every version, including 3.11."""
+    run_cancels_with_a_stuck_writer(work_dir, timeout_30, early=False)
+
+
+def test_wait_for_one_task_cancel_before_the_deadline_with_a_stuck_native_writer(
+    work_dir,
+):
+    """ONE Task.cancel() before wait_for's deadline is safe on every version: wait_for cancels
+    the put and waits for it, the task stays pending until the write finished and the export
+    is released."""
+    run_cancels_with_a_stuck_writer(
+        work_dir, wait_for_30, early=False, cancel_at=(0.3,)
+    )
+
+
+def test_wait_for_task_cancel_after_the_deadline_fired_with_a_stuck_native_writer(
+    work_dir,
+):
+    """#288 with a still-running writer: wait_for's 0.5 s deadline fires and cancels the put
+    (accepted, the writer is stuck), then ONE Task.cancel() at 0.7 s. 3.12+: the task stays
+    pending until the write finished and the export is released. 3.11: the cancellation
+    interrupts wait_for's wait, the task ends under the running writer (documented limitation)."""
+    run_cancels_with_a_stuck_writer(
+        work_dir, wait_for_half_second, early=PY311, cancel_at=(0.7,)
+    )
+
+
+def test_asyncio_timeout_task_cancel_after_the_deadline_fired_with_a_stuck_native_writer(
+    work_dir,
+):
+    """The recommended alternative, same schedule: safe on every version, including 3.11."""
+    run_cancels_with_a_stuck_writer(
+        work_dir, timeout_half_second, early=False, cancel_at=(0.7,)
+    )
+
+
+def test_recovery_wait_survives_a_further_cancel_until_the_guard_ends(work_dir):
+    """The recovery helper for a task that ended early on 3.11 (#288): `wait_for_guard` keeps
+    waiting for the guard even when the waiting task is cancelled again (a THIRD cancellation
+    here, and a fourth), and raises that cancellation only after the guard ended."""
+    original = b"recovery-third-cancel" * 6000
+    fifo, ba = stuck_put(work_dir, original)
+    seen = {}
+
+    async def go():
+        fut = s3dlio.put_bytes_async(f"file://{fifo}", ba, borrow=True)
+        task = asyncio.ensure_future(wait_for_30(fut))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        await asyncio.sleep(0.3)
+        task.cancel()  # 3.11: the task ends here with the guard pending
+        await asyncio.sleep(0.3)
+        seen["task_done"] = task.done()
+        recovery = asyncio.ensure_future(wait_for_guard(fut))
+        await asyncio.sleep(0.2)
+        recovery.cancel()  # a further cancellation of the recovery wait
+        await asyncio.sleep(0.2)
+        recovery.cancel()  # and another one
+        await asyncio.sleep(0.3)
+        seen["recovery_done"] = recovery.done()
+        seen["fut_done"] = fut.done()
+        seen["pinned"] = not resizable(ba)
+        reader = Reader(fifo)
+        reader.start()
+        await finished_with(recovery, asyncio.CancelledError)
+        seen["fut_done_at_recovery_end"] = fut.done()
+        seen["released"] = resizable(ba)
+        await finished_with(task, asyncio.CancelledError)
+        seen["data"] = reader.join()
+
+    run_bounded(go, fifo)
+    if PY311:
+        assert seen["task_done"] is True, (
+            "3.11 wait_for was expected to end early (#288)"
+        )
+    assert seen["recovery_done"] is False, "the recovery wait ended before the guard"
+    assert seen["fut_done"] is False and seen["pinned"] is True, seen
+    assert seen["fut_done_at_recovery_end"] is True
+    assert seen["released"] is True, "the recovery ended before the export was released"
+    assert seen["data"] == original
+
+
+def run_cancel_after_the_deadline_fired(work_dir, wrap, early):
+    """The put finished at once, a retained native clone keeps its barrier pending; the 0.5 s
+    deadline of `wrap` fires (the guard refuses the cancellation: the outcome is fixed), then the
+    task is cancelled once at 0.7 s. The user's cancellation wins over the deadline, so the task
+    ends with CancelledError - when the guard ends (3.12+ wait_for, asyncio.timeout on every
+    version) or at once (3.11 wait_for, #288)."""
+    original = b"cancel-after-the-deadline" * 8000
+    path = os.path.join(work_dir, "o.bin")
+    ba = bytearray(original)
+    seen = {}
+
+    async def go():
+        fut = borrowed_put_with_retained_clone(path, ba)
+        await put_is_over(fut)  # the deadline below fires after the put itself finished
+        task = asyncio.ensure_future(wrap(fut))
+        # the 0.5 s deadline has fired; only the barrier is pending
+        await asyncio.sleep(0.7)
+        assert not fut.done()
+        task.cancel()
+        await asyncio.sleep(0.5)
+        seen["task_done"] = task.done()
+        seen["fut_done"] = fut.done()
+        seen["pinned"] = not resizable(ba)
+        assert s3dlio._put_test_release_retained() >= 1
+        # The safe pattern: wait for the guard future itself, never for the task. The put had
+        # finished before any cancellation, so the guard keeps its outcome (a normal finish).
+        await wait_for_guard(fut)
+        await finished_with(fut, None)
+        seen["released"] = resizable(ba)
+        await finished_with(task, asyncio.CancelledError)
+
+    run_bounded(go)
+    assert seen["fut_done"] is False and seen["pinned"] is True, seen
+    if early:
+        assert seen["task_done"] is True, (
+            "3.11 wait_for was expected to end under the pending guard (#288); "
+            "if this fails the interpreter's behaviour changed: update the docs"
+        )
+    else:
+        assert seen["task_done"] is False, "the task ended while the export was held"
+    assert seen["released"] is True, "the guard ended before the export was released"
+    # nothing wrote into the buffer: the object is the original
+    with open(path, "rb") as f:
+        assert f.read() == original
+
+
+def test_wait_for_task_cancel_after_the_deadline_fired(work_dir):
+    """#288. 3.12+: the task stays pending until the export is released, then ends
+    CancelledError. 3.11: the cancellation after the deadline interrupts wait_for's wait for the
+    cancelled inner awaitable, so the task ends while the guard is pending and the buffer is
+    still exported (documented limitation)."""
+    run_cancel_after_the_deadline_fired(work_dir, wait_for_half_second, early=PY311)
+
+
+def test_asyncio_timeout_task_cancel_after_the_deadline_fired(work_dir):
+    """The recommended alternative: safe on every version, including 3.11."""
+    run_cancel_after_the_deadline_fired(work_dir, timeout_half_second, early=False)
 
 
 def test_stuck_native_writer_past_the_deadline_warns_counts_and_keeps_waiting(
@@ -739,6 +1070,15 @@ class SlowRelease:
         view.release()
 
 
+needs_python_buffer_protocol = pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="needs a Python-level buffer exporter (__buffer__ / __release_buffer__, PEP 688), "
+    "which exists only from Python 3.12 (#278); the same schedule is covered on every version "
+    "by the finalizer-based tests below",
+)
+
+
+@needs_python_buffer_protocol
 def test_async_completion_waits_for_the_actual_release_of_a_batched_export(work_dir):
     """R3: exports A and B sit in one drainer's private batch; A's release callback yields the
     GIL. Neither awaitable may complete until its own export is really released."""
@@ -778,6 +1118,7 @@ def test_async_completion_waits_for_the_actual_release_of_a_batched_export(work_
     assert seen["b_released"] is True and seen["a_released"] is True
 
 
+@needs_python_buffer_protocol
 def test_blocking_completion_waits_for_the_actual_release_of_a_batched_export(work_dir):
     """R3 for put_bytes: the second caller finds the public queue empty (another drainer owns the
     private batch) and must wait, GIL released, until its export is really released."""
@@ -823,6 +1164,133 @@ def test_blocking_completion_waits_for_the_actual_release_of_a_batched_export(wo
     assert resizable(b) and resizable(a.data)
 
 
+class FinalizingBuffer(bytearray):
+    """A buffer exporter whose FINALIZER blocks (without the GIL) until told to go on. It works
+    on every supported interpreter (Python 3.11 has no Python-level `__release_buffer__`).
+
+    The export of a native payload holds a reference to its exporter, and releasing the export
+    drops that reference (`PyBuffer_Release` = the exporter's release callback, then the DECREF).
+    When the export holds the LAST reference, the DECREF runs `__del__` inside the release, on the
+    thread that drains the release queue - the same schedule as a release callback that yields
+    the GIL: the drainer sits inside A's release while B's export waits in its private batch.
+    The test must therefore drop every reference of its own before the export is released."""
+
+    def __init__(self, data, entered, proceed):
+        super().__init__(data)
+        self._entered = entered
+        self._proceed = proceed
+
+    def __del__(self):
+        self._entered.set()
+        self._proceed.wait(30)
+
+
+def test_async_completion_waits_for_a_batched_export_whose_release_yields_the_gil(
+    work_dir,
+):
+    """R3 on every interpreter: exports A and B sit in one drainer's private batch; releasing A
+    (its exporter's finalizer runs inside the release) yields the GIL. Neither awaitable may
+    complete until its own export is really released."""
+    entered, proceed = threading.Event(), threading.Event()
+    b = bytearray(b"b" * 50_000)
+    seen = {}
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        a = FinalizingBuffer(b"a" * 50_000, entered, proceed)
+        fa = borrowed_put_with_retained_clone(os.path.join(work_dir, "a.bin"), a)
+        del a  # the export now holds the only reference to A's exporter
+        fb = borrowed_put_with_retained_clone(os.path.join(work_dir, "b.bin"), b)
+        await asyncio.sleep(
+            0.4
+        )  # both writes are over; both barriers wait for the clones
+        assert not fa.done() and not fb.done()
+        assert (
+            s3dlio._put_test_release_retained() == 2
+        )  # queue [A, B], GIL held throughout
+        assert await loop.run_in_executor(None, entered.wait, 15), (
+            "A's exporter was never finalized inside its release"
+        )
+        # a drainer is now blocked inside A's release, B in its private batch
+        await assert_pending([fa, fb], 0.7, "while A's release is blocked")
+        seen["b_pinned"] = not resizable(b)
+        proceed.set()
+        done, _ = await asyncio.wait({fa, fb}, timeout=20)
+        assert len(done) == 2, "never completed after the release finished"
+        seen["b_released"] = resizable(b)
+        for f in (fa, fb):
+            assert f.exception() is None and not f.cancelled()
+
+    try:
+        run_bounded(go)
+    finally:
+        proceed.set()
+    assert seen["b_pinned"] is True
+    assert seen["b_released"] is True
+    with open(os.path.join(work_dir, "a.bin"), "rb") as f:
+        assert f.read() == b"a" * 50_000
+    with open(os.path.join(work_dir, "b.bin"), "rb") as f:
+        assert f.read() == b"b" * 50_000
+
+
+def test_blocking_completion_waits_for_a_batched_export_whose_release_yields_the_gil(
+    work_dir,
+):
+    """R3 for put_bytes on every interpreter. A blocking caller keeps a reference to its own
+    exporter until the call returns, so a finalizer cannot run inside ITS release; export A is
+    therefore an async borrowed put (no reference left in Python) and export B a blocking
+    `put_bytes` from another thread. Queue [A, B]: the drainer blocks inside A's release, and
+    the blocking caller of B (queue empty, another drainer owns the batch) must wait, GIL
+    released, until B's export is really released."""
+    entered, proceed = threading.Event(), threading.Event()
+    b = bytearray(b"b" * 50_000)
+    finished = {}
+    seen = {}
+
+    def call_b():
+        s3dlio.put_bytes(f"file://{work_dir}/b.bin", b)
+        finished["b"] = time.monotonic()
+
+    async def go():
+        a = FinalizingBuffer(b"a" * 50_000, entered, proceed)
+        fa = borrowed_put_with_retained_clone(os.path.join(work_dir, "a.bin"), a)
+        del a
+        s3dlio._put_test_retain_next_clone()
+        tb = threading.Thread(target=call_b, daemon=True)
+        tb.start()
+        deadline = time.monotonic() + 15
+        while s3dlio._put_test_retained() < 2:
+            assert time.monotonic() < deadline, "put_bytes never took its payload"
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.3)  # both are over; both wait for their retained clone
+        assert not finished and not fa.done()
+        assert (
+            s3dlio._put_test_release_retained() == 2
+        )  # queue [A, B], GIL held throughout
+        loop = asyncio.get_running_loop()
+        assert await loop.run_in_executor(None, entered.wait, 15), (
+            "A's exporter was never finalized inside its release"
+        )
+        await asyncio.sleep(0.7)
+        seen["finished_while_blocked"] = dict(finished)
+        seen["b_pinned"] = not resizable(b)
+        proceed.set()
+        await finished_with(fa, None)
+        await loop.run_in_executor(None, tb.join, 20)
+        seen["b_alive"] = tb.is_alive()
+
+    try:
+        run_bounded(go)
+    finally:
+        proceed.set()
+    assert seen["finished_while_blocked"] == {}, (
+        f"put_bytes returned before its export was released: {seen['finished_while_blocked']}"
+    )
+    assert seen["b_pinned"] is True
+    assert seen["b_alive"] is False and "b" in finished
+    assert resizable(b)
+
+
 # ---- GuardedFuture with stand-in barrier parts (internal failures, P3) ----------------------
 
 
@@ -834,7 +1302,8 @@ def guarded_future_class(work_dir):
         await asyncio.wait_for(fut, 30)
         return type(fut)
 
-    return asyncio.run(go())
+    # Bounded: a put that never completes fails this test instead of hanging the run (#278).
+    return run_bounded(go)
 
 
 def make_guard(cls, loop, ready, quiesce, block=None, poll=0.02):
