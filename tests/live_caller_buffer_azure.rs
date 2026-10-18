@@ -50,8 +50,8 @@
 // is derived from the run's prefix (a fixed text and a hash of the prefix), so it is
 // effectively certain not to exist; the test never creates it.
 //
-// Size.  One full run stores about 6.5 MiB and reads about 13 MiB (see the report that came
-// with this file for the per-test request counts).  Run with `--test-threads=1`.
+// Size.  One full run stores about 6.5 MiB and reads about 13 MiB.
+// Run with `--test-threads=1`.
 
 #![cfg(feature = "backend-azure")]
 

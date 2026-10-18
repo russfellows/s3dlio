@@ -125,8 +125,7 @@ LAST_MODIFIED = "Mon, 01 Jan 2024 00:00:00 GMT"
 def same_etag(left, right):
     def normal(value):
         value = value.strip()
-        if value.startswith("W/"):
-            value = value[2:]
+        value = value.removeprefix("W/")
         return value.strip('"')
 
     return normal(left) == normal(right)
@@ -361,7 +360,9 @@ BAD_STDERR = (
 )
 
 
-def child_env(fake, extra=None):
+def scrubbed_env(extra=None):
+    """The real environment minus every AWS_* / S3DLIO_* / proxy variable, plus fake
+    credentials and no config files: nothing of the caller's cloud setup reaches a child."""
     env = {}
     for name, value in os.environ.items():
         upper = name.upper()
@@ -375,7 +376,6 @@ def child_env(fake, extra=None):
         env[name] = value
     env.update(
         {
-            "AWS_ENDPOINT_URL": fake.endpoint,
             "AWS_ACCESS_KEY_ID": "fake-access-key",
             "AWS_SECRET_ACCESS_KEY": "fake-secret-key",
             "AWS_REGION": "us-east-1",
@@ -387,11 +387,47 @@ def child_env(fake, extra=None):
             "S3DLIO_LOAD_DOTENV": "0",
             "S3DLIO_MAX_RETRY_ATTEMPTS": "2",
             "S3DLIO_ENABLE_RANGE_OPTIMIZATION": "1",
-            "CB_FAKE_ENDPOINT": fake.endpoint,
         }
     )
     env.update(extra or {})
     return env
+
+
+def child_env(fake, extra=None):
+    env = scrubbed_env(extra)
+    env.update({"AWS_ENDPOINT_URL": fake.endpoint, "CB_FAKE_ENDPOINT": fake.endpoint})
+    env.update(extra or {})
+    return env
+
+
+def communicate_with_ladder(proc, label, timeout, on_timeout=None):
+    """``proc.communicate`` with the shutdown ladder: after `timeout` seconds ask the child
+    to stop with SIGTERM, then once more; a child that ignores both is reported, never
+    force-killed.  Returns ``(stdout, stderr)`` of a child that finished in time and fails
+    the test (with the captured output) otherwise."""
+    try:
+        return proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    if on_timeout is not None:
+        on_timeout()
+    proc.terminate()
+    try:
+        out, err = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        # a second SIGTERM; a child that ignores both is reported, not force-killed
+        proc.terminate()
+        try:
+            out, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                f"{label} did not finish within {timeout}s and did not exit after two "
+                f"SIGTERMs (pid {proc.pid} left running)"
+            )
+    pytest.fail(
+        f"{label} did not finish within {timeout}s (hang)\n"
+        f"stdout:\n{out[-2000:]}\nstderr:\n{err[-3000:]}"
+    )
 
 
 def run_child(fake, name, params=None, extra_env=None, timeout=CHILD_TIMEOUT):
@@ -415,27 +451,9 @@ def run_child(fake, name, params=None, extra_env=None, timeout=CHILD_TIMEOUT):
             stderr=subprocess.PIPE,
             text=True,
         )
-        try:
-            out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            fake.release.set()
-            proc.terminate()
-            try:
-                out, err = proc.communicate(timeout=15)
-            except subprocess.TimeoutExpired:
-                # a second SIGTERM; a child that ignores both is reported, not force-killed
-                proc.terminate()
-                try:
-                    out, err = proc.communicate(timeout=15)
-                except subprocess.TimeoutExpired:
-                    pytest.fail(
-                        f"scenario {name!r} did not finish within {timeout}s and did not "
-                        f"exit after two SIGTERMs (pid {proc.pid} left running)"
-                    )
-            pytest.fail(
-                f"scenario {name!r} did not finish within {timeout}s (hang)\n"
-                f"stdout:\n{out[-2000:]}\nstderr:\n{err[-3000:]}"
-            )
+        out, err = communicate_with_ladder(
+            proc, f"scenario {name!r}", timeout, on_timeout=fake.release.set
+        )
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return ChildResult(proc.returncode, out, err)
@@ -710,6 +728,7 @@ STALL_VARIANTS = [
     "task_cancel_repeated",
     "task_cancel_tight",
     "stall_released_completes",
+    "bytes_land_in_caller_memory_in_flight",
 ]
 
 
@@ -747,10 +766,8 @@ EXIT_TIMEOUT = 60
 def run_exit_scenario(fake, name, repeats=EXIT_REPEATS):
     """Each run must exit cleanly (rc 0, no fatal error, no abort) within a hard timeout."""
     for i in range(repeats):
-        started = time.monotonic()
         result = run_ok(fake, name, timeout=EXIT_TIMEOUT)
         assert result.returncode == 0, f"exit {i}"
-        assert time.monotonic() - started < EXIT_TIMEOUT, f"exit {i} was slow"
 
 
 def test_exit_with_a_get_into_in_flight_is_clean_and_repeatable(fake_s3):
@@ -832,7 +849,9 @@ async def test_issue_250_reproduction_check_async_calls_under_pytest_asyncio(tmp
     with pytest.raises(s3dlio.UnsupportedOperationError):
         s3dlio.get_into_async(f"file://{tmp_path}/x.bin", bytearray(4), expected_len=4)
     observed = [item for item in reproduced if "no running event loop" in item[1]]
-    print(f"\n#250 observed 'no running event loop': {observed or 'no (does not reproduce)'}")
+    print(
+        f"\n#250 observed 'no running event loop': {observed or 'no (does not reproduce)'}"
+    )
     assert not reproduced, f"#250 reproduces: {reproduced}"
 
 
@@ -843,28 +862,37 @@ def test_issue_250_the_real_async_tests_pass_under_pytest_asyncio():
     pytest.importorskip("pytest_asyncio")
     here = os.path.dirname(os.path.abspath(__file__))
     target = os.path.join(here, "test_buffer_protocol_support.py")
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "-k",
-            "async",
-            target,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=300,
+    # the five put_bytes_async tests, selected by node id (not -k, which would report the
+    # other tests as deselected); the dgen_py one is left out because it skips by design
+    # when dgen_py is not installed, and a skip must not be able to pass this check
+    selected = [
+        f"{target}::TestBufferProtocolSupport::{name}"
+        for name in (
+            "test_put_bytes_async_accepts_regular_bytes",
+            "test_put_bytes_async_accepts_bytearray",
+            "test_put_bytes_async_accepts_memoryview",
+            "test_put_bytes_async_accepts_bytesview",
+            "test_put_bytes_async_accepts_custom_bytes_object",
+        )
+    ]
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *selected],
+        env=scrubbed_env(),
         cwd=here,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
-    output = result.stdout + result.stderr
+    out, err = communicate_with_ladder(proc, "the nested #250 pytest run", 300)
+    output = out + err
     print(f"\n#250: reproduces = {'no running event loop' in output}")
     assert "no running event loop" not in output, output[-3000:]
-    assert result.returncode == 0, output[-3000:]
+    assert proc.returncode == 0, output[-3000:]
+    # a run that skipped or deselected the async tests proves nothing
+    assert re.search(rf"\b{len(selected)} passed\b", output), output[-3000:]
+    assert not re.search(r"\b\d+ (?:skipped|deselected|failed|errors?)\b", output), (
+        output[-3000:]
+    )
 
 
 @needs_asyncio_plugin
@@ -914,7 +942,9 @@ class Ctl:
 async def wait_for_new_stall(ctl, key, baseline, seconds=20):
     deadline = time.monotonic() + seconds
     while ctl.stalled(key) <= baseline:
-        assert time.monotonic() < deadline, f"the server never reached its stall for {key}"
+        assert time.monotonic() < deadline, (
+            f"the server never reached its stall for {key}"
+        )
         await asyncio.sleep(0.02)
 
 
@@ -947,7 +977,9 @@ def roundtrip_sizes(ctl, params):
             )
             assert type(got) is int and got == size, (size, got)
             assert bytes(dst[:size]) == expected, f"content differs at size {size}"
-            assert dst[size:].count(FILL) == CANARY_LEN, f"write past expected_len ({size})"
+            assert dst[size:].count(FILL) == CANARY_LEN, (
+                f"write past expected_len ({size})"
+            )
             assert resizable(dst), f"the export outlived the await at size {size}"
 
     asyncio.run(main())
@@ -984,14 +1016,15 @@ def accepted_buffer_types(ctl, params):
 
         # a slice of a larger buffer: only the slice is written
         base = bytearray([FILL]) * (size + 16)
-        with memoryview(base) as whole:
-            with whole[8 : 8 + size] as piece:
-                await s3dlio.get_into_async(uri, piece, expected_len=size)
+        with memoryview(base) as whole, whole[8 : 8 + size] as piece:
+            await s3dlio.get_into_async(uri, piece, expected_len=size)
         assert bytes(base[8 : 8 + size]) == expected
         assert base[:8].count(FILL) == 8 and base[8 + size :].count(FILL) == 8
         assert resizable(base)
 
-        # address identity: the object passed in is the one filled, in place
+        # content-at-address check (NOT an identity proof: a ctypes object cannot move, and
+        # a staging buffer plus a final memcpy would pass this too; the in-flight variant
+        # `bytes_land_in_caller_memory_in_flight` is what proves bytes land in caller memory)
         ctype_dst = (ctypes.c_ubyte * size)()
         address = ctypes.addressof(ctype_dst)
         await s3dlio.get_into_async(uri, ctype_dst, expected_len=size)
@@ -1246,7 +1279,9 @@ def start_failure_without_loop(ctl, params):
         pass
     else:
         raise AssertionError("get_into_async outside an event loop did not raise")
-    assert resizable(dst), "BufferError right after a get_into_async that failed to start"
+    assert resizable(dst), (
+        "BufferError right after a get_into_async that failed to start"
+    )
     try:
         s3dlio.head_async(uri_of(f"obj-{size}"))
     except RuntimeError:
@@ -1336,7 +1371,9 @@ async def variant_cancel_after_completion(case):
     assert got == STALL_SIZE
     assert case.fut.cancel() is False, "cancel() after completion must return False"
     assert case.fut.done() and not case.fut.cancelled()
-    assert case.fut.result() == STALL_SIZE, "the result must stand after a late cancel()"
+    assert case.fut.result() == STALL_SIZE, (
+        "the result must stand after a late cancel()"
+    )
     assert bytes(case.dst) == pattern(STALL_SIZE, STALL_SEED)
     assert resizable(case.dst)
     case.fut = None
@@ -1400,7 +1437,9 @@ async def variant_stall_released_completes(case):
     await case.start()
     await asyncio.sleep(0.3)
     assert not case.fut.done()
-    assert not resizable(case.dst), "the buffer must stay exported while the read blocks"
+    assert not resizable(case.dst), (
+        "the buffer must stay exported while the read blocks"
+    )
     case.ctl.release()
     got = await asyncio.wait_for(case.fut, 30)
     assert got == STALL_SIZE
@@ -1412,9 +1451,47 @@ async def variant_stall_released_completes(case):
     assert not case.problems, f"the event loop logged: {case.problems}"
 
 
+async def variant_bytes_land_in_caller_memory_in_flight(case):
+    """Proof that the library writes into the caller's buffer as the body arrives, not into
+    a staging buffer copied over at the end: the server holds the body after STALL_AFTER
+    bytes, and those bytes must show up in the caller's buffer while the awaitable is still
+    pending (and nothing beyond them may have been written yet)."""
+    await case.start()
+    expected = pattern(STALL_SIZE, STALL_SEED)
+    deadline = time.monotonic() + 20
+    while True:
+        assert not case.fut.done(), "the blocked read finished"
+        with memoryview(case.dst) as whole, whole[:STALL_AFTER] as head:
+            landed = bytes(head)
+        if landed == expected[:STALL_AFTER]:
+            break
+        assert time.monotonic() < deadline, (
+            "the first STALL_AFTER bytes never reached the caller's buffer while the "
+            "read was in flight (staging buffer?)"
+        )
+        await asyncio.sleep(0.01)
+    assert not case.fut.done(), "the read finished although the server holds the body"
+    assert not resizable(case.dst), "the buffer must stay exported while reading"
+    with memoryview(case.dst) as whole, whole[STALL_AFTER:] as rest:
+        untouched = bytes(rest).count(FILL) == STALL_SIZE - STALL_AFTER
+    assert untouched, "bytes the server has not sent yet were written into the buffer"
+    case.ctl.release()
+    got = await asyncio.wait_for(case.fut, 30)
+    assert got == STALL_SIZE
+    assert bytes(case.dst) == expected
+    assert resizable(case.dst)
+    case.fut = None
+    gc.collect()
+    await asyncio.sleep(0.1)
+    assert not case.problems, f"the event loop logged: {case.problems}"
+
+
 @scenario
 def cancellation(ctl, params):
     variants = {
+        "bytes_land_in_caller_memory_in_flight": (
+            variant_bytes_land_in_caller_memory_in_flight
+        ),
         "cancel_pending": variant_cancel_pending,
         "cancel_before_first_poll": variant_cancel_before_first_poll,
         "cancel_after_completion": variant_cancel_after_completion,
@@ -1451,7 +1528,9 @@ class HeadCase:
     async def wait_done(self, seconds=30):
         deadline = time.monotonic() + seconds
         while not self.fut.done():
-            assert time.monotonic() < deadline, "the HEAD awaitable never finished (hang)"
+            assert time.monotonic() < deadline, (
+                "the HEAD awaitable never finished (hang)"
+            )
             await asyncio.sleep(0.005)
 
     async def finish_clean(self):
@@ -1577,7 +1656,9 @@ def exit_after_mkdir(ctl, params):
 
 def child_main(argv):
     if len(argv) != 3 or argv[0] not in SCENARIOS:
-        print(f"usage: <scenario> <json params> <work dir>; scenarios: {sorted(SCENARIOS)}")
+        print(
+            f"usage: <scenario> <json params> <work dir>; scenarios: {sorted(SCENARIOS)}"
+        )
         return 2
     ctl = Ctl(os.environ["CB_FAKE_ENDPOINT"], argv[2])
     SCENARIOS[argv[0]](ctl, json.loads(argv[1]))
