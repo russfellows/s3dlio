@@ -683,8 +683,8 @@ fn checked_request_len(expected_len: u64) -> Result<u64> {
 /// One bounded range `0..N+1` (`N = expected_len`; see `checked_request_len`: the extra byte
 /// detects a blob larger than `N`, and `expected_len == 0` asks for one byte), `parallel = 1` and
 /// `partition_size = N+1`. The destination and the expected blob size stay `N`. That makes the
-/// SDK's first response the only one it needs. In `azure_storage_blob` 1.0.0
-/// `partitioned_transfer/download.rs` (`analyze_initial_response`, line 314) computes
+/// SDK's first response the only one it needs. In `azure_storage_blob` 1.1.0
+/// `partitioned_transfer/download.rs` (`analyze_initial_response`, line 524) computes
 /// `remainder_end = min(request_end, resource_len)` and the remaining ranges as
 /// `(received_end..remainder_end)`:
 ///

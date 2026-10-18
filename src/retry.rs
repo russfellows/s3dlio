@@ -59,7 +59,7 @@ use crate::object_error::ObjectErrorKind;
 
 /// The throttling error codes the AWS SDK's own retry classifier recognises:
 /// `aws_runtime::retries::classifiers::THROTTLING_ERRORS`, copied from **aws-runtime
-/// 1.7.5** (the version `Cargo.lock` pins; `src/retries/classifiers.rs`).
+/// 1.10.0** (the version `Cargo.lock` pins; `src/retries/classifiers.rs:29`).
 ///
 /// The SDK retries these inside one operation; when its attempts are spent it returns
 /// the final service error, and the OUTER loop in this module must still treat the same
@@ -86,7 +86,7 @@ const AWS_RUNTIME_THROTTLING_ERROR_CODES: &[&str] = &[
 
 /// The transient error codes the AWS SDK's retry classifier recognises:
 /// `aws_runtime::retries::classifiers::TRANSIENT_ERRORS`, copied from **aws-runtime
-/// 1.7.5** (see [`AWS_RUNTIME_THROTTLING_ERROR_CODES`]). `RequestTimeoutException` is
+/// 1.10.0** (`classifiers.rs:47`; see [`AWS_RUNTIME_THROTTLING_ERROR_CODES`]). `RequestTimeoutException` is
 /// the one the first version of this classifier missed.
 const AWS_RUNTIME_TRANSIENT_ERROR_CODES: &[&str] = &["RequestTimeout", "RequestTimeoutException"];
 

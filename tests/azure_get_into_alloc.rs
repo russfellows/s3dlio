@@ -10,8 +10,8 @@
 //! (object-sized) allocations are not counted; the client runs on a current-thread runtime, so
 //! everything the SDK does for the request (its connection task, any spawned partition task)
 //! runs on the flagged thread. The SDK's partitioned path allocates `vec![0u8; partition_size]`
-//! for the first partition (`azure_storage_blob` 1.0.0, `partitioned_transfer/download.rs`,
-//! `start_initial_download_task`), so a get that is not on the no-remaining-ranges path shows an
+//! for the first partition (`azure_storage_blob` 1.1.0, `partitioned_transfer/download.rs`,
+//! `start_initial_download_task_buffer`, line 367), so a get that is not on the no-remaining-ranges path shows an
 //! allocation as large as the partition.
 //!
 //! The positive control reads the same blob through the SDK's partitioned download (a partition
