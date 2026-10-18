@@ -678,7 +678,7 @@ fn case_literal_keys(scope: &Scope) -> CaseFuture<'_> {
             assert_same(&format!("{key}: get vs source"), &independent, &data);
         }
         // A key is literal: the neighbour of a written key is a different, absent blob.
-        for neighbour in ["a/b", "100", "name"] {
+        for neighbour in ["a/b", "100"] {
             assert!(
                 scope.head(neighbour).await?.is_none(),
                 "{neighbour}: HEAD of an unwritten neighbour must be Ok(None)"
@@ -696,6 +696,35 @@ fn case_literal_keys(scope: &Scope) -> CaseFuture<'_> {
             );
             dst.assert_untouched(neighbour);
         }
+        // Azure strips a trailing '.' from a blob name in the URL, so "name." and "name" are the
+        // same blob (Azure naming rules); recorded as a provider limitation.  "name" is NOT
+        // registered as a written key: deleting "name." removes the aliased blob.
+        let alias_len = 32 + "name.".len();
+        let alias_data = content(&scope.uri("name."), alias_len);
+        let written = scope
+            .head("name.")
+            .await?
+            .unwrap_or_else(|| panic!("name.: HEAD says the blob just written is absent"));
+        let alias = scope
+            .head("name")
+            .await?
+            .unwrap_or_else(|| panic!("name: HEAD of the trailing-dot alias says absent"));
+        assert_eq!(alias.size, written.size, "name: alias HEAD size");
+        assert_eq!(alias.etag, written.etag, "name: alias HEAD ETag");
+        let mut alias_dst = Dst::new(alias_len);
+        let (alias_progress, alias_result) = scope.get_into("name", &mut alias_dst).await;
+        alias_result.map_err(|e| e.context("name: get_into of the trailing-dot alias"))?;
+        assert_same(
+            "name: alias get_into vs source",
+            alias_dst.bytes(),
+            &alias_data,
+        );
+        alias_dst.assert_canaries("name");
+        assert_eq!(
+            alias_progress.filled(),
+            alias_len as u64,
+            "name: alias progress.filled()"
+        );
         Ok(())
     })
 }
