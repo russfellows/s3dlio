@@ -10,6 +10,7 @@ python jax_tf_stage0_demo.py --prefix s3://my-bucket/s3dlio-test/tf/ --tf --read
 # JAX sample (first 16 items)
 python jax_tf_stage0_demo.py --prefix s3://my-bucket/s3dlio-test/jax/ --jax --take 16
 """
+
 import argparse, time
 from typing import Dict, Any, Optional, Iterator
 
@@ -20,6 +21,7 @@ from s3dlio import _pymod as _core
 # Minimal copy of the torch-side async bridge (no torch dependency).
 import asyncio, threading, queue
 
+
 class _AsyncBytesSource:
     def __init__(self, uri: str, opts: Dict[str, Any]):
         self._uri = uri
@@ -27,6 +29,7 @@ class _AsyncBytesSource:
         cap = max(32, 2 * opts.get("prefetch", 8) * max(1, opts.get("batch_size", 1)))
         self._q: "queue.Queue[Optional[bytes]]" = queue.Queue(cap)
         self._thread: Optional[threading.Thread] = None
+
     def start(self) -> "_AsyncBytesSource":
         def runner():
             async def run():
@@ -37,22 +40,29 @@ class _AsyncBytesSource:
                             self._q.put(b, block=True)
                 finally:
                     self._q.put(None)
+
             loop = asyncio.new_event_loop()
             try:
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(run())
             finally:
-                try: loop.close()
-                except Exception: pass
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
         t = threading.Thread(target=runner, daemon=True)
         t.start()
         self._thread = t
         return self
+
     def __iter__(self):
         while True:
             item = self._q.get()
-            if item is None: break
+            if item is None:
+                break
             yield item
+
     def join(self, timeout: Optional[float] = None):
         if self._thread is not None:
             self._thread.join(timeout=timeout)
@@ -107,9 +117,11 @@ def run_tf(prefix: str, args):
         total += int(batch.shape[0])
         total_bytes += int(tf.size(batch).numpy())
     dt = time.perf_counter() - t0
-    mb = total_bytes / (1024*1024)
-    print(f"[tf] items={total} bytes={total_bytes} ({mb:.2f} MiB) "
-          f"time={dt:.3f}s -> {total/dt:.1f} it/s, {mb/dt:.2f} MiB/s")
+    mb = total_bytes / (1024 * 1024)
+    print(
+        f"[tf] items={total} bytes={total_bytes} ({mb:.2f} MiB) "
+        f"time={dt:.3f}s -> {total / dt:.1f} it/s, {mb / dt:.2f} MiB/s"
+    )
 
 
 def run_jax(prefix: str, args):
@@ -137,9 +149,11 @@ def run_jax(prefix: str, args):
     finally:
         src.join(timeout=1.0)
     dt = time.perf_counter() - t0
-    mb = total_bytes / (1024*1024)
-    print(f"[jax] items={total} bytes={total_bytes} ({mb:.2f} MiB) "
-          f"time={dt:.3f}s -> {total/dt:.1f} it/s, {mb/dt:.2f} MiB/s")
+    mb = total_bytes / (1024 * 1024)
+    print(
+        f"[jax] items={total} bytes={total_bytes} ({mb:.2f} MiB) "
+        f"time={dt:.3f}s -> {total / dt:.1f} it/s, {mb / dt:.2f} MiB/s"
+    )
 
 
 def main():
@@ -147,8 +161,8 @@ def main():
     ap.add_argument("--prefix", required=True)
     ap.add_argument("--tf", action="store_true")
     ap.add_argument("--jax", action="store_true")
-    ap.add_argument("--reader", choices=["sequential","range"], default="sequential")
-    ap.add_argument("--part-size", dest="part_size", type=int, default=8<<20)
+    ap.add_argument("--reader", choices=["sequential", "range"], default="sequential")
+    ap.add_argument("--part-size", dest="part_size", type=int, default=8 << 20)
     ap.add_argument("--inflight", type=int, default=4)
     ap.add_argument("--prefetch", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=4)
@@ -166,4 +180,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

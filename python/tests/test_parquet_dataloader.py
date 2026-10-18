@@ -68,7 +68,9 @@ def make_parquet_bytes(num_rgs: int = 2, rows_per_rg: int = 3) -> bytes:
     table = pa.table(
         {
             "id": pa.array(list(range(total_rows)), type=pa.int64()),
-            "value": pa.array([float(i) * 1.1 for i in range(total_rows)], type=pa.float32()),
+            "value": pa.array(
+                [float(i) * 1.1 for i in range(total_rows)], type=pa.float32()
+            ),
         }
     )
     buf = io.BytesIO()
@@ -87,7 +89,9 @@ def configure_s3():
     if not MINIO_AVAILABLE:
         return
     ca_bundle = os.environ.get("AWS_CA_BUNDLE", "")
-    region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    region = os.environ.get(
+        "AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    )
     s3dlio.configure_s3(
         endpoint_url=MINIO_ENDPOINT,
         region=region,
@@ -320,10 +324,10 @@ class TestParquetArrowIpc:
 # Dimensions exercised by the generation tests.
 # Each tuple is (num_cols, rows_per_rg, num_row_groups).
 GEN_DIMS = [
-    (1, 1, 1),        # minimal: single column, single row, single RG
-    (4, 16, 2),       # small multi-col, multi-RG
-    (10, 64, 4),      # moderate
-    (200, 8192, 3),   # DLRM-like schema, 3 RGs
+    (1, 1, 1),  # minimal: single column, single row, single RG
+    (4, 16, 2),  # small multi-col, multi-RG
+    (10, 64, 4),  # moderate
+    (200, 8192, 3),  # DLRM-like schema, 3 RGs
 ]
 
 
@@ -424,13 +428,17 @@ class TestLocalGenerateAndWriteParquet:
         paths = []
         for num_cols, rows_per_rg, num_rgs in specs:
             p = tmp_path / f"{num_cols}_{rows_per_rg}_{num_rgs}.parquet"
-            s3dlio.generate_and_write_parquet(f"file://{p}", num_cols, rows_per_rg, num_rgs)
+            s3dlio.generate_and_write_parquet(
+                f"file://{p}", num_cols, rows_per_rg, num_rgs
+            )
             paths.append((p, num_cols, rows_per_rg, num_rgs))
 
         for path, num_cols, rows_per_rg, num_rgs in paths:
             table = pq.read_table(str(path))
             assert table.num_columns == num_cols, f"{path.name}: wrong num_cols"
-            assert table.num_rows == rows_per_rg * num_rgs, f"{path.name}: wrong num_rows"
+            assert table.num_rows == rows_per_rg * num_rgs, (
+                f"{path.name}: wrong num_rows"
+            )
 
 
 class TestLocalParquetGetRg:
