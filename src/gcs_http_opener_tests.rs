@@ -758,21 +758,38 @@ fn the_rapid_route_receives_the_literal_name_unchanged() {
 /// The Rapid opener has no local server (see the header), so this reads the source: its `open`
 /// disables the SDK's bidi reconnection (`NeverResume`, whose absence would leave the default
 /// unlimited `Recommended` policy in charge, plan C-F3), as the HTTP opener's `open` does.
+///
+/// This is a SOURCE check, not a behavioural proof: there is no local bidi server to observe
+/// the policy at work.  It strips `//` comment lines from the `open` slice, then requires the
+/// policy call in the same builder expression as the opening call (before the next `;` or
+/// `.send()`).
 #[test]
 fn both_openers_disable_the_sdk_resume_layer_on_the_receive_path() {
     let src = include_str!("google_gcs_client.rs");
     for (opener, call) in [
-        ("impl ReadOpener for HttpOpener", "read_object("),
-        ("impl ReadOpener for RapidOpener", "open_object("),
+        ("impl ReadOpener for HttpOpener", ".read_object("),
+        ("impl ReadOpener for RapidOpener", ".open_object("),
     ] {
         let at = src.find(opener).expect("opener impl");
         let open = &src[at..];
         let open = &open[open.find("async fn open(").expect("open")..];
         let open = &open[..open.find("async fn describe(").expect("end of open")];
-        assert!(open.contains(call), "{opener}");
+        let code: String = open
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let from_call = &code[code
+            .find(call)
+            .unwrap_or_else(|| panic!("{opener}: no {call}"))..];
+        let expression_end = [from_call.find(';'), from_call.find(".send()")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(from_call.len());
         assert!(
-            open.contains(".with_read_resume_policy(NeverResume)"),
-            "{opener} must set an explicit resume policy"
+            from_call[..expression_end].contains(".with_read_resume_policy(NeverResume)"),
+            "{opener} must set an explicit resume policy in the same builder expression as {call}"
         );
     }
 }

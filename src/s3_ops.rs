@@ -295,6 +295,8 @@ impl S3Ops {
     /// A HEAD 404 has no body, so a missing bucket (`NoSuchBucket`) cannot be told from a
     /// missing key: both are `Ok(None)`.  The service's own answer is not visible here.
     ///
+    /// A 403 and every other failure are errors, never `Ok(None)`.
+    ///
     /// With a logger the call writes exactly ONE `HEAD` row: `bytes` is the size on success
     /// and 0 for absence, an error and a cancelled call, and the first-byte column is empty on
     /// every outcome.

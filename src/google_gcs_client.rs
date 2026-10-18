@@ -1817,8 +1817,12 @@ mod caller_buffer {
         /// never refills it, and the backoff delay is taken from it, so it never restarts either.
         /// Together with the no-progress bound above it makes the repair work finite for any
         /// object size.  The real HTTP and Rapid openers disable the SDK's own read-resume layer
-        /// (`NeverResume`), so every reconnection is a repair counted here: one read sends at
-        /// most `max_open_attempts + max_total_repairs` data requests.
+        /// (`NeverResume`), so every reconnection is a repair counted here, except server redirects
+        /// on the Rapid route: one read sends at most `max_open_attempts + max_total_repairs`
+        /// data requests plus those redirects.  The pinned fork's `ResumeRedirect`
+        /// (`bidi/resume_redirect.rs`) and `RetryRedirect` (`retry_redirect.rs`) continue server
+        /// redirects regardless of `NeverResume`, so redirect re-connects are bounded only by the
+        /// server, the per-attempt timeout and, in the stream phase, `chunk_timeout`.
         pub max_total_repairs: usize,
     }
 
@@ -2003,7 +2007,9 @@ mod caller_buffer {
     /// * Repair work is finite whatever the object size: at most `cfg.max_total_repairs` repairs in
     ///   all (progress never refills them), and at most `cfg.max_repairs` in a row without the
     ///   cursor advancing.  The openers disable the SDK's own read-resume layer, so these bounds
-    ///   are the only reconnections.  On exhaustion the typed failure is returned and `progress`
+    ///   are the only reconnections, except server redirects on the Rapid route (the
+    ///   fork's `ResumeRedirect` and `RetryRedirect` continue them regardless of `NeverResume`;
+    ///   see `ReceiveConfig::max_total_repairs`).  On exhaustion the typed failure is returned and `progress`
     ///   keeps what was received.
     pub(super) async fn receive_into<O: ReadOpener + ?Sized>(
         opener: &O,
@@ -2279,7 +2285,8 @@ mod caller_buffer {
             // once per byte of a slowly advancing body, outside every bound of the receive loop.
             // With `NeverResume` a broken body surfaces here as its typed error and the bounded
             // repair loop in `receive_into` owns every reconnection, each pinned to the
-            // generation.  The initial request keeps the client's own retry policy.
+            // generation (server redirects on the Rapid route are the documented exception).  The
+            // initial request keeps the client's own retry policy.
             let mut builder = self
                 .storage
                 .read_object(self.bucket_name, object.as_ref())

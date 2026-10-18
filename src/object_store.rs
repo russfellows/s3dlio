@@ -1718,7 +1718,8 @@ impl ObjectStore for S3ObjectStore {
     }
 
     /// Typed HEAD: `Ok(None)` only for typed absence. S3's bodyless HEAD 404 cannot tell an
-    /// absent bucket from an absent key, so both are `Ok(None)`. Client choice and row ownership
+    /// absent bucket from an absent key, so both are `Ok(None)`. A 403 and every other
+    /// failure are errors, never `Ok(None)`. Client choice and row ownership
     /// are those of [`S3ObjectStore::get_into`].
     async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
         if !uri.starts_with("s3://") {
@@ -3808,7 +3809,8 @@ impl ObjectStore for GcsObjectStore {
     }
 
     /// Typed HEAD, official GCS client only. GCS cannot tell an absent bucket from an absent
-    /// object, so both are `Ok(None)`.
+    /// object, so both are `Ok(None)`. A 403 and other failures are
+    /// errors, never `Ok(None)`.
     #[cfg(not(feature = "gcs-community"))]
     async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
         let (bucket, object) = parse_gcs_uri(uri)?;

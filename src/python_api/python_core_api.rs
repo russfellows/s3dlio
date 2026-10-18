@@ -8242,21 +8242,22 @@ def run(start):
         });
     }
 
-    /// The Python side of the C-F2 regression: start `mkdir_async`, then WITHOUT awaiting (so the
-    /// event-loop thread keeps the GIL) ask Rust whether the future body has finished.
+    /// The Python side of the C-F2 regression: one native call starts `mkdir_async` and polls the
+    /// body WHILE HOLDING the GIL, and returns `(finished, future)`; Python only awaits the
+    /// future.  No Python bytecode runs between the start and the poll, so CPython's switch
+    /// interval cannot hand the GIL to the worker in between.
     const GIL_HELD_PY: &std::ffi::CStr = c_str!(
         "
 import asyncio
 
-async def _main(start, body_finished):
-    fut = start()
-    finished = body_finished()
+async def _main(start):
+    finished, fut = start()
     return (finished, await fut)
 
-def run(start, body_finished):
+def run(start):
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(_main(start, body_finished))
+        return loop.run_until_complete(_main(start))
     finally:
         loop.close()
 "
@@ -8288,7 +8289,10 @@ def run(start, body_finished):
             let uri = format!("file://{}/", target.display());
             let finished = Arc::new(AtomicBool::new(false));
 
-            let armed = Arc::clone(&finished);
+            // Arm, start and poll inside ONE native call that keeps the GIL throughout: no Python
+            // bytecode runs between `mkdir_async` and the poll, so CPython's switch interval
+            // cannot give the worker the GIL in between (which would let the old body finish).
+            let watched = Arc::clone(&finished);
             let start = PyCFunction::new_closure(
                 py,
                 None,
@@ -8296,34 +8300,26 @@ def run(start, body_finished):
                 move |args: &Bound<'_, PyTuple>,
                       _: Option<&Bound<'_, PyDict>>|
                       -> PyResult<Py<PyAny>> {
+                    let py = args.py();
                     // The hook is per thread: it is armed on the thread that calls mkdir_async.
-                    crate::python_api::async_bridge::body_finished_hook::arm(Arc::clone(&armed));
-                    mkdir_async(args.py(), &uri).map(Bound::unbind)
-                },
-            )
-            .expect("start closure");
-
-            // Runs with the GIL held: it never detaches, which is the point.
-            let watched = Arc::clone(&finished);
-            let body_finished = PyCFunction::new_closure(
-                py,
-                None,
-                None,
-                move |_: &Bound<'_, PyTuple>, _: Option<&Bound<'_, PyDict>>| -> PyResult<bool> {
+                    crate::python_api::async_bridge::body_finished_hook::arm(Arc::clone(&watched));
+                    let future = mkdir_async(py, &uri)?;
+                    // Polled with the GIL held: it never detaches, which is the point.
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                     while !watched.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
-                    Ok(watched.load(Ordering::SeqCst))
+                    let done = watched.load(Ordering::SeqCst);
+                    Ok(
+                        PyTuple::new(py, [done.into_pyobject(py)?.to_owned().into_any(), future])?
+                            .into_any()
+                            .unbind(),
+                    )
                 },
             )
-            .expect("body_finished closure");
+            .expect("start closure");
 
-            let outcome = module
-                .getattr("run")
-                .unwrap()
-                .call1((start, body_finished))
-                .unwrap();
+            let outcome = module.getattr("run").unwrap().call1((start,)).unwrap();
             let (body_done_without_gil, value): (bool, Bound<'_, PyAny>) =
                 outcome.extract().expect("(bool, value)");
             assert!(
