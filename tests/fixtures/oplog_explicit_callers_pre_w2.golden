@@ -1,6 +1,6 @@
 # outcomes
 s3 save ok=true
-s3 load_latest ok=false
+s3 load_latest ok=true
 s3 read_all_shards_concurrent ok=true n=1
 s3 dataset get ok=true
 s3 dataset get ok=true

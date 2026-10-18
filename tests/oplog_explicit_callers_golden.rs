@@ -99,8 +99,10 @@ fn explicit_callers_write_their_pre_w2_rows() {
     let ckpt = CheckpointStore::open(&s3_ckpt).unwrap();
     let saved = rt.block_on(ckpt.save(1, 0, "test", b"checkpoint-bytes", None));
     outcomes.push(format!("s3 save ok={}", saved.is_ok()));
-    // The mock serves a fixed 4-byte body for every GET, so the manifest read
-    // fails to parse; the GET rows are written regardless.
+    // The mock serves a fixed 4-byte body for every GET, so `latest.json` does not
+    // parse. Since #290 a corrupt pointer counts as absent: the reader scans
+    // `manifests/` (a LIST, which writes no row), finds no valid manifest and
+    // returns `Ok(None)`. The GET row of `latest.json` is written regardless.
     let loaded = rt.block_on(ckpt.load_latest());
     outcomes.push(format!("s3 load_latest ok={}", loaded.is_ok()));
     // The concurrent shard reader, with a hand-made manifest.
