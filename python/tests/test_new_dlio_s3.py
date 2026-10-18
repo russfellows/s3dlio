@@ -1,11 +1,18 @@
-# Python test script to show python binding capabilities
-import time
+# Manual script (NOT a pytest test) showing python binding capabilities against a live
+# S3 bucket. Set S3DLIO_TEST_BUCKET to a bucket you own; there is no default, and the
+# script exits before any network call when it is unset.
+#   READ_PREFIX  : S3DLIO_TEST_READ_PREFIX (optional key prefix to LIST, default "")
 import asyncio
+import os
+import sys
+import time
+import uuid
+
 import s3dlio as s3
 
-# Adjust these to your S3 URIs:
-READ_PREFIX = "s3://my-bucket2/my-data2/"
-TEST_PREFIX = "s3://my-bucket2/test_rust_api/"
+BUCKET = os.environ.get("S3DLIO_TEST_BUCKET", "").strip()
+READ_PREFIX = f"s3://{BUCKET}/{os.environ.get('S3DLIO_TEST_READ_PREFIX', '')}"
+TEST_PREFIX = f"s3://{BUCKET}/test_rust_api_{uuid.uuid4().hex[:12]}/"
 NUM_OBJECTS = 500
 TEMPLATE = "object_{}_of_{}.dat"
 NUM_JOBS = 32
@@ -102,6 +109,10 @@ async def async_tests():
 
 
 def main():
+    if not BUCKET:
+        sys.exit(
+            "S3DLIO_TEST_BUCKET is not set; set it to a bucket you own to run this script."
+        )
 
     # turn on info‑level logs (shows the AWS S3 info messages, including AWS_CA_BUNDLE loading)
     #s3.init_logging("info")

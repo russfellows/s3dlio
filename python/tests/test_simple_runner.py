@@ -4,15 +4,11 @@ Simple test runner to verify s3dlio functionality works.
 This bypasses linter issues and focuses on actual functionality.
 """
 
-import os
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
-
-# Add the project root to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def test_basic_functionality():

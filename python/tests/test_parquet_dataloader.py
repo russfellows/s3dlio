@@ -27,6 +27,8 @@ import io
 import os
 import struct
 import tempfile
+import uuid
+
 import pytest
 
 # ── Dependency guards ─────────────────────────────────────────────────────────
@@ -38,10 +40,14 @@ pq = pytest.importorskip("pyarrow.parquet", reason="pyarrow.parquet not installe
 # ── Fixtures / helpers ────────────────────────────────────────────────────────
 
 MINIO_ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "")
-MINIO_AVAILABLE = bool(MINIO_ENDPOINT and os.environ.get("AWS_ACCESS_KEY_ID"))
+# Explicit opt-in: the live tests run only when the developer names a writable bucket in
+# S3DLIO_TEST_BUCKET (no default bucket) and configures the endpoint and credentials.
+TEST_BUCKET = os.environ.get("S3DLIO_TEST_BUCKET", "").strip()
+MINIO_AVAILABLE = bool(
+    TEST_BUCKET and MINIO_ENDPOINT and os.environ.get("AWS_ACCESS_KEY_ID")
+)
 
-TEST_BUCKET = "mlp-flux"
-TEST_PREFIX = "s3dlio/__parquet_tests__"
+TEST_PREFIX = f"s3dlio/__parquet_tests__/{uuid.uuid4().hex[:12]}"
 TEST_URI_PREFIX = f"s3://{TEST_BUCKET}/{TEST_PREFIX}/"
 
 
@@ -49,7 +55,10 @@ def skip_without_minio(func):
     """Decorator: skip the test if MinIO is not reachable."""
     return pytest.mark.skipif(
         not MINIO_AVAILABLE,
-        reason="AWS_ENDPOINT_URL / AWS_ACCESS_KEY_ID not set — MinIO unavailable",
+        reason=(
+            "live S3 test: set S3DLIO_TEST_BUCKET, AWS_ENDPOINT_URL and "
+            "AWS_ACCESS_KEY_ID to run"
+        ),
     )(func)
 
 
@@ -90,7 +99,9 @@ def configure_s3():
 def uploaded_parquet_uris():
     """Upload two test Parquet files; yield their URIs; delete on teardown."""
     if not MINIO_AVAILABLE:
-        pytest.skip("MinIO not available")
+        pytest.skip(
+            "live S3 test: set S3DLIO_TEST_BUCKET, AWS_ENDPOINT_URL and AWS_ACCESS_KEY_ID"
+        )
 
     data = make_parquet_bytes(num_rgs=2, rows_per_rg=3)
     keys = [

@@ -4,16 +4,12 @@ Working comprehensive test suite for s3dlio enhanced API.
 Tests all functionality that we know is available.
 """
 
-import os
 import sys
 import tempfile
 import asyncio
 from pathlib import Path
 
 import pytest
-
-# Add the project root to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def test_basic_functionality():
@@ -194,11 +190,28 @@ async def test_async_functionality():
             print(f"⚠ Async iteration processed {count} items (expected ≥ 3)")
 
 
-def test_backend_support():
+def test_backend_support(monkeypatch):
     """Test multi-backend URI support."""
     print("\n=== Backend Support Tests ===")
 
     import s3dlio
+
+    # The s3:// and az:// legs only need the scheme to be recognised. Point them at a dead
+    # local endpoint with dummy credentials so that a machine with ambient cloud credentials
+    # can never reach a live service (nothing listens on 127.0.0.1:9).
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AZURE_STORAGE_ENDPOINT", "http://127.0.0.1:9")
+    for var in (
+        "AWS_PROFILE",
+        "S3DLIO_AZURE_CREDENTIAL",
+        "S3DLIO_AZURE_SAS_TOKEN",
+        "AZURE_BLOB_ENDPOINT_URL",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
     # Test that different URI schemes are recognized
     # (they may fail due to configuration, but should be recognized)
@@ -240,7 +253,7 @@ async def main():
         ("Options Processing", test_options_functionality),
         ("PyTorch Integration", test_torch_integration),
         ("Async Support", test_async_functionality),
-        ("Backend Support", test_backend_support),
+        ("Backend Support", lambda: test_backend_support(pytest.MonkeyPatch())),
     ]
 
     passed = 0

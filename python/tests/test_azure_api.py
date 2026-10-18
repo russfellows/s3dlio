@@ -10,29 +10,41 @@ Tests:
 - Error handling
 
 Prerequisites:
-- AZURE_BLOB_ACCOUNT and AZURE_BLOB_CONTAINER environment variables
+- AZURE_BLOB_ACCOUNT and S3DLIO_TEST_AZURE_CONTAINER environment variables (both
+  required; the test is SKIPPED when either is unset, so a plain `pytest` run
+  never touches a live Azure endpoint, even with ambient `az login` credentials)
 - az login completed
 - s3dlio installed in current Python environment
 """
 
+import contextlib
 import os
 import time
+import uuid
 
 import pytest
 
+# Explicit opt-in: no default account or container.
+ACCOUNT = os.environ.get("AZURE_BLOB_ACCOUNT", "").strip()
+CONTAINER = os.environ.get("S3DLIO_TEST_AZURE_CONTAINER", "").strip()
 
-def test_azure_python_api():
+pytestmark = pytest.mark.skipif(
+    not (ACCOUNT and CONTAINER),
+    reason="live Azure test: set AZURE_BLOB_ACCOUNT and S3DLIO_TEST_AZURE_CONTAINER to run",
+)
+
+
+def test_azure_python_api(request):
     """Test Azure backend via Python API"""
+    _run_azure_python_api(request.addfinalizer)
 
-    # Check environment
-    account = os.getenv("AZURE_BLOB_ACCOUNT")
-    container = os.getenv("AZURE_BLOB_CONTAINER")
 
-    if not account or not container:
-        pytest.skip(
-            reason="requires live Azure credentials "
-            "(AZURE_BLOB_ACCOUNT/AZURE_BLOB_CONTAINER not set)"
-        )
+def _run_azure_python_api(register_cleanup):
+    """Body of the test; `register_cleanup(fn)` schedules fn after the run."""
+
+    account = ACCOUNT
+    container = CONTAINER
+    run_id = uuid.uuid4().hex[:12]
 
     print("=" * 60)
     print("Azure Python API Validation Test")
@@ -47,12 +59,29 @@ def test_azure_python_api():
 
     # Test 1: Bulk put with random data generation
     print("\n=== TEST 1: Bulk put() with random data ===")
-    prefix = f"az://{account}/{container}/test-python"
+    prefix = f"az://{account}/{container}/test-python-{run_id}"
     num_objects = 3
     object_size = 2 * 1024 * 1024  # 2MB each
 
     # Variables used by multiple tests
     test_uri = f"{prefix}/object-0"
+    large_prefix = f"az://{account}/{container}/test-python-large-{run_id}"
+    actual_large_uri = f"{large_prefix}/object-0.bin"
+
+    def _cleanup():
+        # Best-effort removal of everything this run created, pass or fail.
+        for uri in (
+            test_uri,
+            f"{prefix}/object-1",
+            f"{prefix}/object-2",
+            actual_large_uri,
+        ):
+            try:
+                s3dlio.delete(uri)
+            except Exception as exc:
+                print(f"cleanup warning for {uri}: {exc}")
+
+    register_cleanup(_cleanup)
 
     print(
         f"📤 Generating and uploading {num_objects} objects of {object_size // (1024 * 1024)}MB each..."
@@ -125,9 +154,6 @@ def test_azure_python_api():
     # Test 3: Large file (trigger RangeEngine)
     print("\n=== TEST 3: Large file (RangeEngine) ===")
     large_size = 8 * 1024 * 1024  # 8MB (> 4MB threshold for RangeEngine)
-    large_prefix = f"az://{account}/{container}/test-python-large"
-    actual_large_uri = f"{large_prefix}/object-0.bin"
-
     print("📤 Generating and uploading 8MB file...")
     start = time.time()
     # Use put() with bulk generation API - generate 1 object of 8MB
@@ -182,16 +208,6 @@ def test_azure_python_api():
         s3dlio.get(nonexistent_uri)
     print("   ✅ Correctly raised error on non-existent file")
 
-    # Cleanup
-    print("\n=== Cleanup ===")
-    try:
-        print("🗑️  Deleting test files...")
-        s3dlio.delete(test_uri)
-        s3dlio.delete(actual_large_uri)
-        print("   ✅ Cleanup complete")
-    except Exception as e:
-        print(f"   ⚠️  Cleanup warning: {e}")
-
     print("\n" + "=" * 60)
     print("✅ All Azure Python API tests PASSED!")
     print("=" * 60)
@@ -200,5 +216,11 @@ def test_azure_python_api():
 if __name__ == "__main__":
     import sys
 
-    test_azure_python_api()
+    if not (ACCOUNT and CONTAINER):
+        print(
+            "AZURE_BLOB_ACCOUNT and S3DLIO_TEST_AZURE_CONTAINER must be set; refusing to contact a live Azure endpoint."
+        )
+        sys.exit(2)
+    with contextlib.ExitStack() as stack:
+        _run_azure_python_api(stack.callback)
     sys.exit(0)

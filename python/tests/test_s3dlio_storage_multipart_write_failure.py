@@ -28,8 +28,6 @@ from unittest import mock
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 
 def _install_fake_dlio_benchmark():
     if "dlio_benchmark" in sys.modules:

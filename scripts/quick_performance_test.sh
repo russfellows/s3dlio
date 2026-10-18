@@ -25,7 +25,7 @@ if [[ -z "$AWS_ACCESS_KEY_ID" ]]; then
 fi
 
 # Quick test parameters
-S3_BUCKET="${S3_BUCKET:-my-bucket2}" 
+S3_BUCKET="${S3DLIO_TEST_BUCKET:?set S3DLIO_TEST_BUCKET to an S3 bucket you own (no default; refusing to touch a live bucket)}"
 TEST_PREFIX="quick-perf-$(date +%H%M%S)"
 OBJECT_SIZE_10MB=$((10 * 1024 * 1024))
 NUM_OBJECTS=20  # Smaller test for quick feedback

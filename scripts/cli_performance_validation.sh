@@ -7,8 +7,8 @@
 set -e
 
 # Configuration
-S3_BUCKET="${S3_BUCKET:-my-bucket2}"
-ENDPOINT_URL="${AWS_ENDPOINT_URL:-http://10.9.0.21}"
+S3_BUCKET="${S3DLIO_TEST_BUCKET:?set S3DLIO_TEST_BUCKET to an S3 bucket you own (no default; refusing to touch a live bucket)}"
+ENDPOINT_URL="${AWS_ENDPOINT_URL:-(AWS default)}"
 TEST_PREFIX="perf-validation-$(date +%Y%m%d_%H%M%S)"
 
 # Test parameters that match historical testing

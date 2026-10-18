@@ -8,10 +8,7 @@ import os
 import sys
 import time
 import threading
-from pathlib import Path
 
-# Add the Python module to path
-sys.path.insert(0, str(Path(__file__).parent / "python"))
 
 try:
     import s3dlio

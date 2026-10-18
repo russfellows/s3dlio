@@ -1,10 +1,34 @@
 #!/usr/bin/env python3
 """Test range request functionality (CLI and Python API)"""
 
-import s3dlio
-import tempfile
 import os
 import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+import s3dlio
+
+# python/tests/test_range_requests.py -> repo root is two levels above python/
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def find_s3_cli():
+    """Locate a built s3-cli binary, or None.
+
+    Search order: $S3DLIO_CLI (explicit path), then <target>/release and <target>/debug for
+    $CARGO_TARGET_DIR (when set) or else the repo's ./target.  PATH is deliberately NOT
+    searched: an installed s3-cli is not necessarily built from this tree.
+    """
+    explicit = os.environ.get("S3DLIO_CLI")
+    if explicit:
+        return explicit if os.access(explicit, os.X_OK) else None
+    target = os.environ.get("CARGO_TARGET_DIR") or str(REPO_ROOT / "target")
+    for profile in ("release", "debug"):
+        candidate = Path(target) / profile / "s3-cli"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
 
 
 def test_python_get_range():
@@ -100,6 +124,14 @@ def test_cli_range_flags():
     print("Test: CLI range flags")
     print("=" * 60)
 
+    cli = find_s3_cli()
+    if cli is None:
+        pytest.skip(
+            "s3-cli binary not found: build it with `cargo build --release --bin s3-cli` "
+            "in the repo root (it is then found under ./target/release), or set "
+            "S3DLIO_CLI=<path> / CARGO_TARGET_DIR=<dir containing release/ or debug/>"
+        )
+
     # Create test file
     test_data = b"ABCDEFGHIJ" * 200  # 2000 bytes
 
@@ -113,11 +145,13 @@ def test_cli_range_flags():
 
         print("\n1. Checking CLI help for range flags...")
         result = subprocess.run(
-            ["cargo", "run", "--release", "--bin", "s3-cli", "--", "get", "--help"],
+            [cli, "get", "--help"],
             capture_output=True,
             text=True,
-            cwd="/home/eval/Documents/Code/s3dlio",
+            cwd=REPO_ROOT,
+            timeout=60,
         )
+        assert result.returncode == 0, f"s3-cli get --help failed:\n{result.stderr}"
 
         assert "--offset" in result.stdout and "--length" in result.stdout, (
             f"CLI missing range flags:\n{result.stdout}"
@@ -144,6 +178,9 @@ def main():
     for name, test_func in tests:
         try:
             test_func()
+            results.append((name, True))
+        except pytest.skip.Exception as e:
+            print(f"\n- Test '{name}' skipped: {e}")
             results.append((name, True))
         except AssertionError as e:
             print(f"\n✗ Test '{name}' failed: {e}")

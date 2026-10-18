@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+# No default bucket: name one you own and may write to, or this script refuses to run.
+: "${S3DLIO_TEST_GCS_BUCKET:?set S3DLIO_TEST_GCS_BUCKET to a GCS bucket you own (refusing to touch a live bucket by default)}"
+BUCKET="$S3DLIO_TEST_GCS_BUCKET"
+
 echo "=== Comprehensive GCS Backend Test ==="
 echo ""
 
@@ -8,7 +12,6 @@ echo ""
 source gcs-native-env
 
 # Test parameters
-BUCKET="signal65-russ-b1"
 TEST_PREFIX="gcs-comprehensive-test"
 
 echo "1. Creating test files..."

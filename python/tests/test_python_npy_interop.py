@@ -8,11 +8,42 @@ This test verifies that:
 3. Round-trip conversion preserves data accuracy
 """
 
-import numpy as np
-import subprocess
-import tempfile
+import io
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+# python/tests/test_python_npy_interop.py -> repo root is two levels above python/
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Where `cargo` puts build output (the same rule cargo itself uses).
+TARGET_DIR = Path(os.environ.get("CARGO_TARGET_DIR") or REPO_ROOT / "target")
+
+
+def require_cargo():
+    """Skip unless the Rust-side half of an interop test was asked for and can run.
+
+    The Rust halves compile (and run) the s3dlio crate with `cargo`, which takes minutes
+    on a fresh checkout, so they are opt-in: set S3DLIO_TEST_CARGO=1 (cargo must be on
+    PATH; set CARGO_TARGET_DIR to reuse an existing build directory).
+    """
+    if os.environ.get("S3DLIO_TEST_CARGO") != "1":
+        pytest.skip(
+            "Rust-side interop check compiles the crate with cargo: set S3DLIO_TEST_CARGO=1 "
+            "to run it (optionally CARGO_TARGET_DIR=<existing target dir>)"
+        )
+    if shutil.which("cargo") is None:
+        pytest.skip("S3DLIO_TEST_CARGO=1 but `cargo` is not on PATH")
+    if not (REPO_ROOT / "Cargo.toml").is_file():
+        pytest.skip(
+            f"no Cargo.toml at the repo root derived from this file: {REPO_ROOT}"
+        )
 
 
 def test_rust_to_python_npy():
@@ -20,6 +51,8 @@ def test_rust_to_python_npy():
     print("=" * 70)
     print("TEST 1: Rust → Python NPY")
     print("=" * 70)
+
+    require_cargo()
 
     # Create a temporary file
     with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
@@ -57,6 +90,8 @@ fn main() -> anyhow::Result<()> {{
             rust_test_file = f.name
             f.write(rust_code)
 
+        rust_bin = rust_test_file + ".bin"
+
         # Compile and run Rust test
         result = subprocess.run(
             [
@@ -65,45 +100,31 @@ fn main() -> anyhow::Result<()> {{
                 "2021",
                 rust_test_file,
                 "-o",
-                "/tmp/test_npy_write",
+                rust_bin,
                 "-L",
-                "dependency=target/debug/deps",
+                f"dependency={TARGET_DIR}/debug/deps",
                 "--extern",
-                "s3dlio=target/debug/libs3dlio.rlib",
+                f"s3dlio={TARGET_DIR}/debug/libs3dlio.rlib",
                 "--extern",
-                "ndarray=target/debug/deps/libndarray.rlib",
+                f"ndarray={TARGET_DIR}/debug/deps/libndarray.rlib",
                 "--extern",
-                "anyhow=target/debug/deps/libanyhow.rlib",
+                f"anyhow={TARGET_DIR}/debug/deps/libanyhow.rlib",
             ],
-            cwd="/home/eval/Documents/Code/s3dlio",
+            cwd=REPO_ROOT,
             capture_output=True,
             text=True,
         )
 
-        if result.returncode != 0:
-            print("⚠️  Could not compile standalone Rust test, using cargo test instead")
-            # Fall back to using existing Rust test
-            subprocess.run(
-                [
-                    "cargo",
-                    "test",
-                    "--test",
-                    "test_npy_serialization",
-                    "test_custom_npy_implementation",
-                    "--",
-                    "--nocapture",
-                ],
-                cwd="/home/eval/Documents/Code/s3dlio",
-                capture_output=True,
-            )
-
-            # Create NPY file manually using Rust library
-            print("Creating NPY file via Python call to demonstrate format...")
-            arr = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
-            np.save(npy_file, arr)
-            # We'll verify the format works both ways
-        else:
-            subprocess.run(["/tmp/test_npy_write"])
+        # No fallback: a NumPy-written file that NumPy then reads back proves nothing about
+        # the Rust writer.  If the Rust step cannot run, this test fails with the reason.
+        assert result.returncode == 0, (
+            "could not compile the standalone Rust program that writes the NPY file "
+            "(it needs the debug build artifacts under "
+            f"{TARGET_DIR}/debug: run `cargo build` first, or set CARGO_TARGET_DIR):\n"
+            + result.stderr
+        )
+        subprocess.run([rust_bin], check=True, timeout=120)
+        assert os.path.getsize(npy_file) > 0, "the Rust program wrote no NPY data"
 
         # Read the NPY file with Python NumPy
         loaded_array = np.load(npy_file)
@@ -120,8 +141,9 @@ fn main() -> anyhow::Result<()> {{
     finally:
         if os.path.exists(npy_file):
             os.unlink(npy_file)
-        if "rust_test_file" in locals() and os.path.exists(rust_test_file):
-            os.unlink(rust_test_file)
+        for leftover in (locals().get("rust_test_file"), locals().get("rust_bin")):
+            if leftover and os.path.exists(leftover):
+                os.unlink(leftover)
 
 
 def test_python_to_rust_npy():
@@ -129,6 +151,8 @@ def test_python_to_rust_npy():
     print("\n" + "=" * 70)
     print("TEST 2: Python → Rust NPY")
     print("=" * 70)
+
+    require_cargo()
 
     with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
         npy_file = f.name
@@ -155,16 +179,18 @@ def test_python_to_rust_npy():
                 "--",
                 "--nocapture",
             ],
-            cwd="/home/eval/Documents/Code/s3dlio",
+            cwd=REPO_ROOT,
             capture_output=True,
             text=True,
+            timeout=1500,
         )
 
-        if result.returncode == 0:
-            print("✅ SUCCESS: Rust code successfully read Python-generated NPY file")
-        else:
-            print("⚠️  Rust test status:", result.returncode)
-            print("Note: Round-trip test passed, format is compatible")
+        assert result.returncode == 0, (
+            f"Rust test_npy_round_trip failed ({result.returncode}):\n"
+            + result.stdout
+            + result.stderr
+        )
+        print("✅ SUCCESS: Rust code successfully read Python-generated NPY file")
 
     finally:
         if os.path.exists(npy_file):
@@ -176,6 +202,8 @@ def test_python_to_rust_npz():
     print("\n" + "=" * 70)
     print("TEST 3: Python → Rust NPZ (ZIP archive)")
     print("=" * 70)
+
+    require_cargo()
 
     with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as f:
         npz_file = f.name
@@ -205,15 +233,18 @@ def test_python_to_rust_npz():
                 "--",
                 "--nocapture",
             ],
-            cwd="/home/eval/Documents/Code/s3dlio",
+            cwd=REPO_ROOT,
             capture_output=True,
             text=True,
+            timeout=1500,
         )
 
-        if result.returncode == 0:
-            print("✅ SUCCESS: Rust code successfully handles NPZ format")
-        else:
-            print("⚠️  Rust test status:", result.returncode)
+        assert result.returncode == 0, (
+            f"Rust test_npz_round_trip failed ({result.returncode}):\n"
+            + result.stdout
+            + result.stderr
+        )
+        print("✅ SUCCESS: Rust code successfully handles NPZ format")
 
     finally:
         if os.path.exists(npz_file):
@@ -254,54 +285,45 @@ def test_format_compatibility():
             os.unlink(npy_file)
 
 
-def main():
+def test_wheel_generated_npz_readable_by_numpy():
+    """NPZ/NPY bytes generated by the Rust core (through the s3dlio wheel) load in NumPy.
+
+    Needs no toolchain: it exercises the installed extension module directly.
+    """
+    import s3dlio
+
     print("\n" + "=" * 70)
-    print("NPY/NPZ Interoperability Test Suite")
-    print("Testing compatibility between s3dlio (Rust) and NumPy (Python)")
-    print("=" * 70 + "\n")
-
-    results = []
-
-    # Run all tests
-    tests = [
-        ("Format Header", test_format_compatibility),
-        ("Python → Rust NPY", test_python_to_rust_npy),
-        ("Python → Rust NPZ", test_python_to_rust_npz),
-        ("Rust → Python NPY", test_rust_to_python_npy),
-    ]
-    for name, test_func in tests:
-        try:
-            test_func()
-            results.append((name, True))
-        except AssertionError as e:
-            print(f"✗ {name} failed: {e}")
-            results.append((name, False))
-
-    # Summary
-    print("\n" + "=" * 70)
-    print("TEST SUMMARY")
+    print("TEST: s3dlio.generate_npz_bytes() -> NumPy")
     print("=" * 70)
 
-    for test_name, passed in results:
-        status = "✅ PASS" if passed else "❌ FAIL"
-        print(f"{status}: {test_name}")
+    raw = bytes(s3dlio.generate_npz_bytes(shape=[2, 3], dtype="<f4", num_samples=1))
 
-    total = len(results)
-    passed = sum(1 for _, p in results if p)
-    print(f"\nTotal: {passed}/{total} tests passed")
+    # The archive is a ZIP of .npy members; each member starts with the NPY magic and a 1.0 or 2.0 version.
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        assert zf.testzip() is None
+        names = zf.namelist()
+        assert names, "archive has no members"
+        for name in names:
+            head = zf.read(name)[:8]
+            assert head[:6] == b"\x93NUMPY", f"{name}: bad NPY magic {head!r}"
+            assert (head[6], head[7]) in {(1, 0), (2, 0)}, (
+                f"{name}: unsupported NPY format version {head[6]}.{head[7]}"
+            )
 
-    return 0 if passed == total else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    loaded = np.load(io.BytesIO(raw))
+    assert len(loaded.files) == len(names)
+    first = loaded[loaded.files[0]]
+    assert first.shape == (2, 3), first.shape
+    assert first.dtype == np.dtype("<f4"), first.dtype
+    print("✅ SUCCESS: NumPy loaded the Rust-generated NPZ")
 
 
 def test_multi_array_npz_python_interop():
     """Test that Python NumPy can read multi-array NPZ files created by Rust"""
     import shutil
-    import tempfile
     import subprocess
+    import tempfile
+
     import numpy as np
     import pytest
 
@@ -356,7 +378,7 @@ fn main() -> anyhow::Result<()> {
         result = subprocess.run(
             ["cargo", "script", rust_file],
             capture_output=True,
-            cwd="/home/eval/Documents/Code/s3dlio",
+            cwd=REPO_ROOT,
         )
 
         if result.returncode != 0:
@@ -389,3 +411,50 @@ fn main() -> anyhow::Result<()> {
         assert np.all(data["images"] <= 1.0)
 
         print("✅ Python can successfully read multi-array NPZ from Rust!")
+
+
+def main():
+    print("\n" + "=" * 70)
+    print("NPY/NPZ Interoperability Test Suite")
+    print("Testing compatibility between s3dlio (Rust) and NumPy (Python)")
+    print("=" * 70 + "\n")
+
+    results = []
+
+    # Run all tests
+    tests = [
+        ("Format Header", test_format_compatibility),
+        ("Python → Rust NPY", test_python_to_rust_npy),
+        ("Python → Rust NPZ", test_python_to_rust_npz),
+        ("Rust → Python NPY", test_rust_to_python_npy),
+        ("Rust (wheel) → NumPy NPZ", test_wheel_generated_npz_readable_by_numpy),
+    ]
+    for name, test_func in tests:
+        try:
+            test_func()
+            results.append((name, True))
+        except pytest.skip.Exception as e:
+            print(f"- {name} skipped: {e}")
+            results.append((name, True))
+        except AssertionError as e:
+            print(f"✗ {name} failed: {e}")
+            results.append((name, False))
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("TEST SUMMARY")
+    print("=" * 70)
+
+    for test_name, passed in results:
+        status = "✅ PASS" if passed else "❌ FAIL"
+        print(f"{status}: {test_name}")
+
+    total = len(results)
+    passed = sum(1 for _, p in results if p)
+    print(f"\nTotal: {passed}/{total} tests passed")
+
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
