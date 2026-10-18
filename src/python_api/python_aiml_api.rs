@@ -60,6 +60,7 @@ pub struct PyS3Dataset {
 impl PyS3Dataset {
     /// NEW: optional opts (reader mode)
     #[new]
+    #[pyo3(signature = (uri, opts=None))]
     fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         let o = opts_from_dict(opts);
         let ds = S3BytesDataset::from_prefix_with_opts(uri, &o)
@@ -82,6 +83,7 @@ pub struct PyDataset {
 #[pymethods]
 impl PyDataset {
     #[new]
+    #[pyo3(signature = (uri, opts=None))]
     fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         let o = opts_from_dict(opts);
         let dataset = dataset_for_uri_with_options(uri, &o).map_err(py_err)?;
@@ -146,6 +148,9 @@ impl PyDataset {
     /// ----------
     /// uris : list[str]
     ///     Full URIs of every object in the dataset.  Must be non-empty.
+    /// opts : dict or None
+    ///     Accepted for signature compatibility and ignored; dataset options are
+    ///     set on the loader.  (Before 0.10.0 this keyword was named ``_opts``.)
     ///
     /// Returns
     /// -------
@@ -161,8 +166,10 @@ impl PyDataset {
     /// >>> for item in loader:          # GIL released while waiting
     /// ...     process(len(item))       # bytes per object
     #[staticmethod]
-    #[pyo3(signature = (uris, _opts=None))]
-    fn from_uris(uris: Vec<String>, _opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+    #[pyo3(signature = (uris, opts=None))]
+    // Accepted and ignored: `api::dataset_from_uris` takes no options; the name is the documented Python keyword.
+    #[allow(unused_variables)]
+    fn from_uris(uris: Vec<String>, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         let ds = crate::api::dataset_from_uris(uris).map_err(py_err)?;
         Ok(Self {
             inner: Arc::from(ds),
@@ -820,6 +827,7 @@ pub struct PyS3AsyncDataLoader {
 #[pymethods]
 impl PyS3AsyncDataLoader {
     #[new]
+    #[pyo3(signature = (uri, opts=None))]
     fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         // Parse options once, and apply safe defaults for range mode tuning.
         let o = opts_from_dict(opts)
@@ -1459,7 +1467,10 @@ impl PyCheckpointStore {
     }
 
     /// Save a single-rank checkpoint
-    #[pyo3(text_signature = "(self, step, epoch, framework, data, user_meta=None)")]
+    #[pyo3(
+        signature = (step, epoch, framework, data, user_meta=None),
+        text_signature = "(self, step, epoch, framework, data, user_meta=None)"
+    )]
     fn save(
         &self,
         py: Python<'_>,
@@ -1890,7 +1901,10 @@ impl PyCheckpointWriter {
     }
 
     /// Finalize distributed checkpoint (rank 0 only)
-    #[pyo3(text_signature = "(self, step, epoch, framework, shard_metas, user_meta=None)")]
+    #[pyo3(
+        signature = (step, epoch, framework, shard_metas, user_meta=None),
+        text_signature = "(self, step, epoch, framework, shard_metas, user_meta=None)"
+    )]
     fn finalize_distributed_checkpoint(
         &self,
         py: Python<'_>,
@@ -2088,7 +2102,10 @@ impl PyCheckpointInfo {
 // Convenience functions
 #[cfg(feature = "extension-module")]
 #[pyfunction]
-#[pyo3(text_signature = "(uri, step, epoch, framework, data, user_meta=None)")]
+#[pyo3(
+    signature = (uri, step, epoch, framework, data, user_meta=None),
+    text_signature = "(uri, step, epoch, framework, data, user_meta=None)"
+)]
 fn save_checkpoint(
     py: Python<'_>,
     uri: String,
@@ -2132,6 +2149,7 @@ fn save_distributed_shard(
 #[cfg(feature = "extension-module")]
 #[pyfunction]
 #[pyo3(
+    signature = (uri, step, epoch, framework, shard_metas, world_size, rank, user_meta=None),
     text_signature = "(uri, step, epoch, framework, shard_metas, world_size, rank, user_meta=None)"
 )]
 #[allow(clippy::too_many_arguments)]
@@ -2155,7 +2173,13 @@ fn finalize_distributed_checkpoint(
 // Phase 3 Priority 4: Rich Python-Rust Data Exchange Enhancements
 // ---------------------------------------------------------------------------
 
-/// Enhanced checkpoint loading with integrity validation
+/// Read one checkpoint shard by URI.
+///
+/// With `validate_integrity=True` (default) the bytes are verified against the checksum
+/// the checkpoint's manifest recorded when the shard was written: a mismatch, a shard no
+/// manifest lists, or a manifest that recorded no checksum for it raises an error (the
+/// check is never skipped silently). A `.zst` shard is decoded first and the decoded bytes
+/// are returned. With `validate_integrity=False` the object is read as stored, unverified.
 #[pyfunction]
 #[pyo3(signature = (uri, validate_integrity=true))]
 pub fn load_checkpoint_with_validation(
@@ -2170,10 +2194,12 @@ pub fn load_checkpoint_with_validation(
         // Submit to global runtime (io_uring pattern — never calls block_on)
         run_on_global_rt(async move {
             if validate_integrity {
-                // load_checkpoint_with_validation returns Vec<u8> for backward compatibility
-                store
-                    .load_checkpoint_with_validation(&uri_owned, None)
+                // Verify against the checksum the checkpoint manifest recorded (issue #287).
+                let (base, shard_rel_key) = crate::checkpoint::reader::split_shard_uri(&uri_owned)?;
+                crate::checkpoint::Reader::new(&*store, base.to_string())
+                    .read_shard_against_manifest(shard_rel_key)
                     .await
+                    .map(|b| b.to_vec())
             } else {
                 // get returns Bytes, convert to Vec<u8>
                 store.get(&uri_owned).await.map(|b| b.to_vec())
@@ -2946,6 +2972,7 @@ pub struct PyS3DatasetCompat {
 #[pymethods]
 impl PyS3DatasetCompat {
     #[new]
+    #[pyo3(signature = (uri, opts=None))]
     fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         use crate::object_store::infer_scheme;
 
@@ -2983,6 +3010,7 @@ pub struct PyS3AsyncDataLoaderCompat {
 #[pymethods]
 impl PyS3AsyncDataLoaderCompat {
     #[new]
+    #[pyo3(signature = (uri, opts=None))]
     fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         use crate::object_store::infer_scheme;
 
@@ -3704,6 +3732,218 @@ mod shard_meta_conversion_tests {
             assert!(shard_checksum_from_dict(without.cast::<PyDict>().unwrap())
                 .unwrap()
                 .is_none());
+        });
+    }
+}
+
+/// #285: every constructor documented as taking an optional `opts` must be
+/// callable with only a URI (pyo3 0.27 makes a bare `Option<T>` parameter
+/// required unless a `#[pyo3(signature = ...)]` gives it a default).
+#[cfg(all(test, feature = "extension-module"))]
+mod optional_opts_constructor_tests {
+    use super::*;
+    use pyo3::types::PyTuple;
+
+    /// A URI that never touches the network. The S3-only constructors reject
+    /// it with their documented RuntimeError; the generic ones may succeed or
+    /// fail on the missing directory. None may fail on a missing argument.
+    const URI: &str = "file:///nonexistent-s3dlio-285-dir/";
+
+    fn assert_opts_optional(py: Python<'_>, name: &str, cls: Bound<'_, pyo3::types::PyType>) {
+        let args = PyTuple::new(py, [URI]).unwrap();
+        if let Err(e) = cls.call1(args) {
+            let msg = e.to_string();
+            assert!(
+                !(e.is_instance_of::<PyTypeError>(py) && msg.contains("opts")),
+                "{name}(uri) must not require 'opts', got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn constructors_accept_a_uri_alone() {
+        Python::initialize();
+        Python::attach(|py| {
+            assert_opts_optional(py, "PyS3Dataset", py.get_type::<PyS3Dataset>());
+            assert_opts_optional(py, "PyDataset", py.get_type::<PyDataset>());
+            assert_opts_optional(
+                py,
+                "PyS3AsyncDataLoader",
+                py.get_type::<PyS3AsyncDataLoader>(),
+            );
+            assert_opts_optional(py, "PyS3DatasetCompat", py.get_type::<PyS3DatasetCompat>());
+            assert_opts_optional(
+                py,
+                "PyS3AsyncDataLoaderCompat",
+                py.get_type::<PyS3AsyncDataLoaderCompat>(),
+            );
+        });
+    }
+}
+
+/// #286: every checkpoint entry point whose published signature advertises
+/// `user_meta=None` must be callable without it, and #287: the integrity
+/// check of `load_checkpoint_with_validation` must compare against the
+/// checksum the checkpoint recorded when it was written.
+#[cfg(all(test, feature = "extension-module"))]
+mod checkpoint_286_287_tests {
+    use super::*;
+    use pyo3::types::PyTuple;
+
+    fn shard_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        let mut all = Vec::new();
+        walk(&root.join("shards"), &mut all);
+        all
+    }
+
+    fn module<'py>(py: Python<'py>) -> Bound<'py, PyModule> {
+        let m = PyModule::new(py, "ckpt_286").unwrap();
+        m.add_function(wrap_pyfunction!(save_checkpoint, &m).unwrap())
+            .unwrap();
+        m.add_function(wrap_pyfunction!(save_distributed_shard, &m).unwrap())
+            .unwrap();
+        m.add_function(wrap_pyfunction!(finalize_distributed_checkpoint, &m).unwrap())
+            .unwrap();
+        m.add_function(wrap_pyfunction!(load_checkpoint_with_validation, &m).unwrap())
+            .unwrap();
+        m
+    }
+
+    #[test]
+    fn user_meta_is_optional_everywhere_it_is_advertised() {
+        Python::initialize();
+        Python::attach(|py| {
+            let m = module(py);
+
+            // Module function save_checkpoint(uri, step, epoch, framework, data)
+            let dir = tempfile::tempdir().unwrap();
+            let uri = format!("file://{}", dir.path().display());
+            let args = (uri.clone(), 1u64, 1u64, "test", PyBytes::new(py, b"abc"));
+            m.getattr("save_checkpoint")
+                .unwrap()
+                .call1(args)
+                .expect("save_checkpoint must accept a call without user_meta");
+
+            // PyCheckpointStore.save(step, epoch, framework, data)
+            let dir2 = tempfile::tempdir().unwrap();
+            let uri2 = format!("file://{}", dir2.path().display());
+            let store = Py::new(
+                py,
+                PyCheckpointStore::new(uri2.clone(), None, None, None).unwrap(),
+            )
+            .unwrap();
+            store
+                .bind(py)
+                .call_method1("save", (2u64, 1u64, "test", PyBytes::new(py, b"abc")))
+                .expect("PyCheckpointStore.save must accept a call without user_meta");
+
+            // PyCheckpointWriter.finalize_distributed_checkpoint(step, epoch, framework, metas)
+            let dir3 = tempfile::tempdir().unwrap();
+            let uri3 = format!("file://{}", dir3.path().display());
+            let store3 = PyCheckpointStore::new(uri3.clone(), None, None, None).unwrap();
+            let writer = Py::new(py, store3.writer(1, 0).unwrap()).unwrap();
+            let meta = writer
+                .bind(py)
+                .call_method1(
+                    "save_distributed_shard",
+                    (3u64, 1u64, "test", PyBytes::new(py, b"abc")),
+                )
+                .unwrap();
+            let metas = vec![meta];
+            writer
+                .bind(py)
+                .call_method1(
+                    "finalize_distributed_checkpoint",
+                    (3u64, 1u64, "test", metas.clone()),
+                )
+                .expect("PyCheckpointWriter.finalize_distributed_checkpoint must accept a call without user_meta");
+
+            // Module function finalize_distributed_checkpoint(uri, step, epoch, framework,
+            // shard_metas, world_size, rank)
+            let dir4 = tempfile::tempdir().unwrap();
+            let uri4 = format!("file://{}", dir4.path().display());
+            let shard_args = PyTuple::new(
+                py,
+                [
+                    uri4.clone().into_pyobject(py).unwrap().into_any(),
+                    4u64.into_pyobject(py).unwrap().into_any(),
+                    1u64.into_pyobject(py).unwrap().into_any(),
+                    "test".into_pyobject(py).unwrap().into_any(),
+                    PyBytes::new(py, b"abc").into_any(),
+                    1u32.into_pyobject(py).unwrap().into_any(),
+                    0u32.into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap();
+            let shard_meta = m
+                .getattr("save_distributed_shard")
+                .unwrap()
+                .call1(shard_args)
+                .unwrap();
+            m.getattr("finalize_distributed_checkpoint")
+                .unwrap()
+                .call1((uri4, 4u64, 1u64, "test", vec![shard_meta], 1u32, 0u32))
+                .expect("finalize_distributed_checkpoint must accept a call without user_meta");
+        });
+    }
+
+    #[test]
+    fn validated_load_round_trips_and_detects_corruption() {
+        Python::initialize();
+        Python::attach(|py| {
+            let m = module(py);
+            let dir = tempfile::tempdir().unwrap();
+            let uri = format!("file://{}", dir.path().display());
+            let payload = b"checkpoint payload for 287 round trip".to_vec();
+            m.getattr("save_checkpoint")
+                .unwrap()
+                .call1((
+                    uri.clone(),
+                    7u64,
+                    1u64,
+                    "test",
+                    PyBytes::new(py, &payload),
+                    py.None(),
+                ))
+                .unwrap();
+
+            let files = shard_files(dir.path());
+            assert_eq!(files.len(), 1, "one shard expected, got {files:?}");
+            let rel = files[0].strip_prefix(dir.path()).unwrap();
+            let shard_uri = format!("{}/{}", uri, rel.display());
+
+            // Clean round trip passes and returns the stored bytes.
+            let got = load_checkpoint_with_validation(py, &shard_uri, true).unwrap();
+            let got: Vec<u8> = got.extract(py).unwrap();
+            assert_eq!(got, payload);
+
+            // Corrupt the stored bytes (same length): validate_integrity=True must raise.
+            let mut bad = payload.clone();
+            bad[0] ^= 0xff;
+            std::fs::write(&files[0], &bad).unwrap();
+            let err = load_checkpoint_with_validation(py, &shard_uri, true)
+                .expect_err("corrupted shard must fail integrity validation");
+            assert!(
+                err.to_string().contains("Integrity validation failed"),
+                "unexpected error: {err}"
+            );
+
+            // validate_integrity=False keeps returning the stored bytes.
+            let raw = load_checkpoint_with_validation(py, &shard_uri, false).unwrap();
+            let raw: Vec<u8> = raw.extract(py).unwrap();
+            assert_eq!(raw, bad);
         });
     }
 }

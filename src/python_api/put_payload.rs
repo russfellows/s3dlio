@@ -479,10 +479,13 @@ pub(crate) fn retained_for_test() -> usize {
         .len()
 }
 
-/// Drop every retained clone, in order. Never touches Python (an `ExportOwner` drop only queues),
-/// so it is safe to call with the GIL held - which also keeps every drainer out until all of
-/// them are queued. Returns how many were dropped.
+/// Drop every retained clone, in order, and disarm a pending [`arm_retain_for_test`] (so a test
+/// that armed the hook and failed before any put consumed it cannot make the NEXT test's put
+/// retain a clone forever). Never touches Python (an `ExportOwner` drop only queues), so it is
+/// safe to call with the GIL held - which also keeps every drainer out until all of them are
+/// queued. Returns how many were dropped.
 pub(crate) fn release_retained_for_test() -> usize {
+    TEST_RETAIN_NEXT.store(false, Ordering::SeqCst);
     let retained =
         std::mem::take(&mut *TEST_RETAINED.lock().unwrap_or_else(PoisonError::into_inner));
     let n = retained.len();
@@ -525,24 +528,51 @@ struct RawExport {
 unsafe impl Send for RawExport {}
 unsafe impl Sync for RawExport {}
 
-/// Whether a `struct`-module format string describes Python objects or pointers (`O`, `P`),
-/// which must never be uploaded as bytes. `:name:` field names are skipped.
+/// Whether a PEP 3118 / `struct`-module format string describes Python objects or pointers, which
+/// must never be uploaded as bytes (the bytes are memory addresses). The pointer-bearing codes are
+/// `O` (object), `P` (`void *`), `&` (pointer to the following type: `ctypes.POINTER(T)` is
+/// `&<T>`), `z` (`char *`), `Z` (`wchar_t *`) and `X` (function pointer, `X{}`), wherever they
+/// appear: after byte-order prefixes and counts, and inside `T{...}`. `:name:` field names are
+/// skipped. `Zf` / `Zd` / `Zg` are complex numbers (NumPy), not pointers. A lowercase `p` is a
+/// Pascal string (a length byte plus characters), not a pointer, and is accepted.
+///
+/// Known limits (the format string alone cannot tell, so these buffers are NOT refused):
+/// * A `:` inside a ctypes structure FIELD NAME hides what follows it. The PEP 3118 name syntax
+///   (`:name:`) has no escape for a colon, so the scan cannot tell where such a name ends and a
+///   pointer field after it can be missed.
+/// * A ctypes `Union` reports the format `B` (plain bytes) whatever it contains, so a pointer
+///   inside a union cannot be detected from the format.
 fn format_has_pointers(fmt: &str) -> bool {
     let mut in_name = false;
-    for c in fmt.chars() {
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             ':' => in_name = !in_name,
-            'O' | 'P' if !in_name => return true,
+            _ if in_name => {}
+            'Z' if matches!(chars.peek(), Some('f' | 'd' | 'g')) => {
+                chars.next(); // the complex-number code, not a wide-string pointer
+            }
+            'O' | 'P' | '&' | 'z' | 'Z' | 'X' => return true,
             _ => {}
         }
     }
     false
 }
 
+/// The PUT refusal of a buffer of Python objects or pointers.
 fn pointer_format_error(fmt: &str) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
         "cannot upload a buffer of Python objects or pointers (buffer format {fmt:?}): \
          its bytes are memory addresses, not data"
+    ))
+}
+
+/// The same refusal for a READ destination (`get_into_async`): nothing is uploaded there, so the
+/// wording is about the destination (issue #277).
+fn pointer_destination_error(fmt: &str) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+        "a buffer of Python objects or pointers (buffer format {fmt:?}) cannot be used as a \
+         read destination: object data would overwrite its memory addresses"
     ))
 }
 
@@ -1066,6 +1096,16 @@ fn check_writable_view(view: &ffi::Py_buffer, expected_len: usize) -> PyResult<(
             "the destination buffer is read-only; get_into needs a writable buffer",
         ));
     }
+    // The pointer-bearing formats are named before the item size is checked: an array of
+    // pointers (`ctypes.c_void_p * n`) has 8-byte items, and "pointers" is the useful reason.
+    if !view.format.is_null() {
+        // SAFETY: a non-null `format` is a NUL-terminated string owned by the exporter, valid
+        // while the export is held (the caller holds it).
+        let fmt = unsafe { std::ffi::CStr::from_ptr(view.format) }.to_string_lossy();
+        if format_has_pointers(&fmt) {
+            return Err(pointer_destination_error(&fmt));
+        }
+    }
     if view.itemsize != 1 {
         return Err(PyTypeError::new_err(format!(
             "the destination buffer must have 1-byte items, got itemsize {}",
@@ -1073,12 +1113,8 @@ fn check_writable_view(view: &ffi::Py_buffer, expected_len: usize) -> PyResult<(
         )));
     }
     if !view.format.is_null() {
-        // SAFETY: a non-null `format` is a NUL-terminated string owned by the exporter, valid
-        // while the export is held (the caller holds it).
+        // SAFETY: as above.
         let fmt = unsafe { std::ffi::CStr::from_ptr(view.format) }.to_string_lossy();
-        if format_has_pointers(&fmt) {
-            return Err(pointer_format_error(&fmt));
-        }
         // At most ONE leading byte-order/alignment character (`@ = < > !`), then exactly one byte
         // code: what a ctypes byte array reports (`<B`), and what the borrowed PUT path accepts.
         let code = fmt
@@ -1206,12 +1242,16 @@ fn snapshot_copy(py: Python<'_>, src: &[u8], may_detach: bool) -> PyResult<Bytes
     } else {
         py.detach(|| try_snapshot(src, src.len()))
     };
-    result.map_err(|_| {
-        PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
-            "cannot allocate {} bytes for the put_bytes_async snapshot",
-            src.len()
-        ))
-    })
+    result.map_err(|_| snapshot_allocation_error(src.len()))
+}
+
+/// The `MemoryError` of a failed snapshot allocation. Every caller that snapshots a payload
+/// (`put_bytes_async`, `put_many`, `MultiEndpointStore`, the streaming writers) shares it, so the
+/// wording names no single API.
+fn snapshot_allocation_error(len: usize) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
+        "cannot allocate {len} bytes for the payload snapshot"
+    ))
 }
 
 /// Copy `src` into a fresh buffer reserved fallibly (`reserve` is `src.len()`; a parameter so
@@ -1925,11 +1965,249 @@ mod tests {
             .is_ok()
     }
 
+    /// #282: EVERY pointer-bearing format code is refused, not only `O` and `P`. The formats are
+    /// the ones CPython reports for real ctypes arrays: `POINTER(T)` is `&<T>`, `c_char_p` is
+    /// `z`, `c_wchar_p` is `Z`, a function pointer is `X{}`; a structure with a pointer field is
+    /// `T{...}`. Every put conversion refuses them in every mode, and nothing stays exported;
+    /// a read destination refuses them with the destination wording.
+    #[test]
+    fn every_pointer_bearing_ctypes_buffer_is_refused() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!(
+                    "import ctypes\n\
+                     S = lambda base, name, *fields: type(name, (base,), {'_fields_': list(fields)})\n\
+                     WithPointer = S(ctypes.Structure, 'WithPointer', ('n', ctypes.c_int), ('p', ctypes.POINTER(ctypes.c_int)))\n\
+                     WithText = S(ctypes.Structure, 'WithText', ('n', ctypes.c_int), ('s', ctypes.c_char_p))\n\
+                     Plain = S(ctypes.Structure, 'Plain', ('n', ctypes.c_int), ('x', ctypes.c_double))\n\
+                     bad = {\n\
+                       'POINTER': (ctypes.POINTER(ctypes.c_int) * 4)(),\n\
+                       'c_char_p': (ctypes.c_char_p * 4)(),\n\
+                       'c_wchar_p': (ctypes.c_wchar_p * 4)(),\n\
+                       'py_object': (ctypes.py_object * 2)(),\n\
+                       'c_void_p': (ctypes.c_void_p * 4)(),\n\
+                       'function_pointer': (ctypes.CFUNCTYPE(None) * 2)(),\n\
+                       'struct_with_pointer': (WithPointer * 2)(),\n\
+                       'struct_with_char_p': (WithText * 2)(),\n\
+                     }\n\
+                     good = {\n\
+                       'c_ubyte': (ctypes.c_ubyte * 8)(),\n\
+                       'c_byte': (ctypes.c_byte * 8)(),\n\
+                       'c_char': (ctypes.c_char * 8)(),\n\
+                       'c_short': (ctypes.c_short * 8)(),\n\
+                       'c_uint': (ctypes.c_uint * 8)(),\n\
+                       'c_float': (ctypes.c_float * 8)(),\n\
+                       'c_double': (ctypes.c_double * 8)(),\n\
+                       'c_bool': (ctypes.c_bool * 8)(),\n\
+                       'c_wchar': (ctypes.c_wchar * 8)(),\n\
+                       'plain_struct': (Plain * 2)(),\n\
+                     }"
+                ),
+            );
+            let bad = l.get_item("bad").unwrap().unwrap();
+            let bad = bad.cast::<PyDict>().unwrap();
+            for (name, obj) in bad.iter() {
+                let name: String = name.extract().unwrap();
+                for mode in BOTH {
+                    let err = put_payload_from_py(py, &obj, mode)
+                        .err()
+                        .unwrap_or_else(|| panic!("{name} ({mode:?}) was accepted for upload"));
+                    assert!(
+                        err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                        "{name} ({mode:?}): {err}"
+                    );
+                    assert!(
+                        err.to_string().contains("cannot upload a buffer"),
+                        "{name} ({mode:?}): {err}"
+                    );
+                }
+                assert!(
+                    snapshot_for_call(py, &obj).is_err(),
+                    "{name}: snapshot_for_call accepted it"
+                );
+                assert!(
+                    hold_for_call(py, &obj).is_err(),
+                    "{name}: hold_for_call accepted it"
+                );
+                assert!(resizable_len_check(&obj), "{name}: export leaked");
+
+                let latch = Latch::new();
+                let err = acquire_writable(py, &obj, 4, &latch)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name}: accepted as a read destination"));
+                assert!(
+                    err.to_string().contains("read destination"),
+                    "{name}: {err}"
+                );
+            }
+            let good = l.get_item("good").unwrap().unwrap();
+            let good = good.cast::<PyDict>().unwrap();
+            for (name, obj) in good.iter() {
+                for mode in BOTH {
+                    put_payload_from_py(py, &obj, mode)
+                        .unwrap_or_else(|e| panic!("{name} ({mode:?}) was refused: {e}"));
+                }
+                drain_pending_exports(py);
+            }
+        });
+    }
+
+    /// #282: the format scan, on format strings: pointer codes anywhere (also after byte-order
+    /// prefixes and inside `T{...}`), field names skipped, complex `Zf`/`Zd`/`Zg` and plain
+    /// codes untouched.
+    #[test]
+    fn format_scan_names_every_pointer_code_and_nothing_else() {
+        for fmt in [
+            "O",
+            "<O",
+            "P",
+            "<P",
+            "&<i",
+            "&i",
+            "<z",
+            "z",
+            "<Z",
+            "Z",
+            "X{}",
+            "T{<i:a:4x<P:p:}",
+            "T{<i:a:4x&<i:p:}",
+            "T{<i:a:<z:s:}",
+            "T{<i:a:<Z:s:}",
+            "T{<i:a:X{}:f:}",
+            "3<P",
+            "T{<Zd:c:<P:p:}",
+            "4P",
+            "3<P",
+            "(2,3)P",
+            "T{T{<i:a:<P:p:}:b:}",
+        ] {
+            assert!(format_has_pointers(fmt), "{fmt:?} must be refused");
+        }
+        for fmt in [
+            "B",
+            "b",
+            "c",
+            "<B",
+            "<H",
+            "<I",
+            "<q",
+            "<f",
+            "<d",
+            "<?",
+            "<u",
+            "<e",
+            "<Zf",
+            "Zd",
+            "<Zg",
+            "10s",
+            "T{<i:a:4x<d:x:}",
+            "T{<i:Pos:<B:Obj:}",
+            "T{<i:zed:<Zd:Zeta:}",
+            "2x",
+            "T{<i:X:}",
+            // lowercase `p` is a Pascal string (length byte + characters), not a pointer
+            "p",
+            "<p",
+            "10p",
+            "T{<i:a:8p:s:}",
+        ] {
+            assert!(!format_has_pointers(fmt), "{fmt:?} must stay valid");
+        }
+    }
+
+    /// #277: a pointer-format buffer is refused as a READ destination with wording about a
+    /// destination, not an upload; the PUT wording is unchanged. Both are `TypeError`s and nothing
+    /// stays exported.
+    #[test]
+    fn pointer_format_refusal_wording_depends_on_the_direction() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!("import ctypes\nptrs = (ctypes.c_void_p * 4)()\nobjs = (ctypes.py_object * 2)()"),
+            );
+            for name in ["ptrs", "objs"] {
+                let obj = l.get_item(name).unwrap().unwrap();
+
+                let latch = Latch::new();
+                let err = acquire_writable(py, &obj, 4, &latch)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name}: a pointer destination must be refused"));
+                assert!(
+                    err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                    "{name}: {err}"
+                );
+                let text = err.to_string();
+                assert!(
+                    !text.contains("upload"),
+                    "{name}: a read destination refusal talks about uploading: {text}"
+                );
+                assert!(
+                    text.contains("read destination"),
+                    "{name}: the refusal does not say it is a read destination: {text}"
+                );
+                assert!(resizable_len_check(&obj), "{name}: export leaked");
+
+                let err = put_payload_from_py(py, &obj, PayloadUse::Blocking)
+                    .expect_err("a pointer buffer must not be uploaded");
+                assert!(
+                    err.to_string().contains("cannot upload a buffer"),
+                    "{name}: the PUT wording changed: {err}"
+                );
+            }
+        });
+    }
+
+    /// #278: `release_retained_for_test` also disarms a pending `arm_retain_for_test`, so a test
+    /// that armed the hook and failed before any put consumed it cannot make the NEXT test's put
+    /// retain a clone forever.
+    #[test]
+    fn release_retained_disarms_a_pending_arming() {
+        init();
+        Python::attach(|py| {
+            let l = ns(py, c_str!("buf = bytearray(b'abcdefgh')"));
+            let buf = l.get_item("buf").unwrap().unwrap();
+
+            arm_retain_for_test();
+            release_retained_for_test();
+            let payload = put_payload(py, &buf, PayloadUse::Blocking).expect("payload");
+            let retained = retained_for_test();
+
+            // Leave nothing behind whatever the outcome: drop any clone, then the payload.
+            release_retained_for_test();
+            drop(payload);
+            drain_pending_exports(py);
+
+            assert_eq!(
+                retained, 0,
+                "a pending arming survived release_retained_for_test: the next put retained a clone"
+            );
+            assert!(resizable(&buf), "export leaked");
+        });
+    }
+
     /// Item 7: a failed snapshot allocation is a MemoryError, not an abort.
     #[test]
     fn snapshot_allocation_failure_is_a_memory_error() {
         assert!(try_snapshot(&[1, 2, 3], usize::MAX).is_err());
         assert_eq!(try_snapshot(&[1, 2, 3], 3).unwrap().as_ref(), &[1, 2, 3]);
+    }
+
+    /// The snapshot `MemoryError` is shared by `put_many` / `MultiEndpointStore` / the writers, so
+    /// its wording must not name `put_bytes_async`.
+    #[test]
+    fn snapshot_memory_error_wording_is_generic() {
+        init();
+        Python::attach(|py| {
+            let e = snapshot_allocation_error(12345);
+            assert!(e.is_instance_of::<pyo3::exceptions::PyMemoryError>(py));
+            let text = e.value(py).str().unwrap().to_string();
+            assert!(text.contains("12345 bytes"), "{text}");
+            assert!(text.contains("payload snapshot"), "{text}");
+            assert!(!text.contains("put_bytes_async"), "{text}");
+        });
     }
 
     /// Item 5: a small snapshot is copied with the GIL held (no detach); big ones detach.

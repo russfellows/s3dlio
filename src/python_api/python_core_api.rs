@@ -35,6 +35,7 @@ use crate::object_error::{object_error, ObjectErrorKind};
 use crate::object_store::{
     get_many_with_stores, store_for_uri_with_logger, store_routing_endpoint_for_uri,
 };
+use crate::redact::redact_uri;
 use crate::s3_client::run_on_global_rt;
 use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger, op_log_stats};
 use crate::s3_utils::{
@@ -1689,7 +1690,10 @@ fn put_bytes_async<'py>(
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
         put_verified_with_retry(store.as_ref(), &uri, data_owned)
             .await
-            .map_err(py_err)
+            .map_err(py_err)?;
+        // Python `None` (the Rust unit would reach Python as `()`; issue #271). `Option<()>`
+        // converts to `None` INSIDE the exit-safe delivery (#192): this body never attaches.
+        Ok(None::<()>)
     });
     // On EVERY error path from here the barrier is kept: the blocking wait + drain below.
     let fail = |py: Python<'py>, latch: &Option<std::sync::Arc<Latch>>, e: PyErr| -> PyErr {
@@ -2031,7 +2035,7 @@ fn _put_test_retained() -> usize {
     super::put_payload::retained_for_test()
 }
 
-/// TEST-ONLY hidden hook (not part of the API; never call it in production): drop every retained clone (in order, with the GIL held); returns how many.
+/// TEST-ONLY hidden hook (not part of the API; never call it in production): drops every retained clone (in order, with the GIL held) and disarms a pending arming; returns how many were dropped.
 #[pyfunction]
 fn _put_test_release_retained() -> usize {
     super::put_payload::release_retained_for_test()
@@ -3066,6 +3070,122 @@ pub fn upload(
 // put_many() - Batch put for maximum throughput (Python API)
 // ---------------------------------------------------------------------------
 
+/// The payloads of a `put_many` / `put_many_async` batch as owned `Bytes`, converted exactly like
+/// `put_bytes` payloads (issue #272): `bytes`, any buffer-protocol object and any object with
+/// `__bytes__()` are accepted; an int, a bool or an arbitrary iterable (a list of ints) is a
+/// `TypeError`. Every item is converted before the caller sends anything, so one bad item means no
+/// request at all. A mutable buffer is copied once with the GIL held (no export is kept past this
+/// call, so no completion barrier is needed); exact `bytes` and `BytesView` are not copied.
+fn batch_payloads(
+    py: Python<'_>,
+    items: Vec<(String, Bound<'_, PyAny>)>,
+) -> PyResult<Vec<(String, Bytes)>> {
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, (uri, data))| match snapshot_for_call(py, &data) {
+            Ok(bytes) => Ok((uri, bytes)),
+            Err(e) => Err(error_with_context(
+                py,
+                e,
+                &format!("item {index} ({})", redact_uri(&uri)),
+            )),
+        })
+        .collect()
+}
+
+/// `e` with `context` in front of its message, for a failure in one item of a batch.
+///
+/// Only an exact builtin class that a single string rebuilds faithfully (`TypeError`,
+/// `ValueError`, `MemoryError`, `BufferError`, `OverflowError`, ... see [`REBUILDABLE`]), with
+/// exactly one `str` argument and no extra state, is rebuilt as the same class with the message
+/// `"{context}: {original}"`, and `e` is kept as its `__cause__`. Everything else is returned
+/// UNCHANGED, the same object, with no constructor of its class ever called: a subclass (its
+/// `__str__` and `__init__` are its own), an exception with fields (`ImportError(name=...)`,
+/// `AttributeError(name=..., obj=...)`, `StopIteration`), `KeyError` (whose `str` is a `repr`),
+/// `OSError(errno, msg)`, `UnicodeDecodeError`, `KeyboardInterrupt`, `SystemExit`. The context
+/// then goes onto the original as a note (`add_note`, Python 3.11+; skipped on older versions).
+fn error_with_context(py: Python<'_>, e: PyErr, context: &str) -> PyErr {
+    match rebuilt_with_context(py, &e, context) {
+        Some(wrapped) => {
+            wrapped.set_cause(py, Some(e));
+            wrapped
+        }
+        None => {
+            let value = e.value(py);
+            if value.hasattr("add_note").unwrap_or(false) {
+                // A note is a convenience: if it cannot be added the error still stands.
+                let _ = value.call_method1("add_note", (context,));
+            }
+            e
+        }
+    }
+}
+
+/// Builtin exception classes whose whole state is one message.
+const REBUILDABLE: &[&str] = &[
+    "Exception",
+    "TypeError",
+    "ValueError",
+    "MemoryError",
+    "BufferError",
+    "OverflowError",
+    "ArithmeticError",
+    "ZeroDivisionError",
+    "FloatingPointError",
+    "RuntimeError",
+    "NotImplementedError",
+    "RecursionError",
+    "LookupError",
+    "IndexError",
+    "EOFError",
+    "AssertionError",
+    "ReferenceError",
+    "SystemError",
+];
+
+/// The same-class error with `context` in front, or `None` when `e` is not a plain
+/// single-message builtin exception (see [`error_with_context`]).
+fn rebuilt_with_context(py: Python<'_>, e: &PyErr, context: &str) -> Option<PyErr> {
+    use pyo3::exceptions::PyBaseException;
+    use pyo3::types::{PyString, PyTuple};
+    let value = e.value(py);
+    let class = e.get_type(py);
+    // An exact builtin class: `type(e).__module__ == "builtins"` and `type(e)` is the very
+    // object `builtins.<name>` (a look-alike class that only claims the module is not).
+    let name = class.name().ok()?.to_string();
+    let builtin = py.import("builtins").ok()?.getattr(name.as_str()).ok()?;
+    if !REBUILDABLE.contains(&name.as_str())
+        || !builtin.is(&class)
+        || class.getattr("__module__").ok()?.extract::<String>().ok()? != "builtins"
+    {
+        return None;
+    }
+    let args = value.getattr("args").ok()?.cast_into::<PyTuple>().ok()?;
+    if args.len() != 1 || !args.get_item(0).ok()?.is_instance_of::<PyString>() {
+        return None;
+    }
+    // Extra state (a custom attribute, an earlier note) would be lost by a rebuild.
+    let has_state = value
+        .getattr("__dict__")
+        .ok()
+        .and_then(|d| d.len().ok())
+        .is_none_or(|n| n != 0);
+    if has_state {
+        return None;
+    }
+    let message = value.str().ok()?.to_string();
+    let rebuilt = class.call1((format!("{context}: {message}"),)).ok()?;
+    if !rebuilt.get_type().is(&class) || !rebuilt.is_instance_of::<PyBaseException>() {
+        return None;
+    }
+    // The rebuilt error must really carry the context.
+    if !rebuilt.str().ok()?.to_string().contains(context) {
+        return None;
+    }
+    Some(PyErr::from_value(rebuilt))
+}
+
 /// One `put_many` item with its store already resolved (or the resolution
 /// error, surfaced from that item's task): (uri, data, store).
 type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
@@ -3078,14 +3198,18 @@ type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
 /// how get_objects_parallel works for reads.
 ///
 /// # Arguments
-/// * `items` - List of (uri, data) tuples: uri is a string, data is bytes
+/// * `items` - List of (uri, data) tuples: uri is a string, data is `bytes`, any buffer-protocol
+///   object (bytearray, memoryview, numpy array, ...) or an object with `__bytes__()` - the same
+///   payloads `put_bytes` accepts. An int, a bool or an arbitrary iterable is refused with a
+///   `TypeError` before any request is sent (issue #272)
 /// * `max_in_flight` - Maximum concurrent put operations (default: 64); must be
 ///   an integer >= 1, otherwise `ValueError` is raised at once (issue #211)
 ///
 /// # Zero-copy path
-/// Each Python bytes is copied once into Bytes (unavoidable — Python GIL →
-/// Rust ownership boundary). After that, the Bytes (Arc-based) flows through
-/// the async pipeline with zero additional copies.
+/// Exact `bytes` and `BytesView` payloads are not copied; any other buffer is copied once
+/// into an owned `Bytes` with the GIL held (so the caller may reuse it as soon as the call
+/// returns). After that, the Bytes (Arc-based) flows through the async pipeline with zero
+/// additional copies.
 ///
 /// # Examples
 /// ```python
@@ -3102,19 +3226,16 @@ type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
 #[pyo3(signature = (items, max_in_flight = 64))]
 pub fn put_many(
     py: Python<'_>,
-    items: Vec<(String, Vec<u8>)>,
+    items: Vec<(String, Bound<'_, PyAny>)>,
     max_in_flight: usize,
 ) -> PyResult<()> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::Semaphore;
 
-    // Convert Vec<u8> → Bytes on the Python thread (one copy per item,
-    // after this everything is zero-copy via Arc)
-    let owned_items: Vec<(String, Bytes)> = items
-        .into_iter()
-        .map(|(uri, data)| (uri, Bytes::from(data)))
-        .collect();
+    // Every payload is converted (strictly, like `put_bytes`) on the Python thread BEFORE any
+    // request is sent: one owned `Bytes` per item, after which everything is zero-copy via Arc.
+    let owned_items = batch_payloads(py, items)?;
 
     py.detach(move || {
         // Build every store on the caller thread BEFORE submit_io (issue
@@ -3163,18 +3284,16 @@ pub fn put_many(
 #[pyo3(signature = (items, max_in_flight = 64))]
 pub fn put_many_async<'py>(
     py: Python<'py>,
-    items: Vec<(String, Vec<u8>)>,
+    items: Vec<(String, Bound<'py, PyAny>)>,
     max_in_flight: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::Semaphore;
 
-    // Convert Vec<u8> → Bytes
-    let owned_items: Vec<(String, Bytes)> = items
-        .into_iter()
-        .map(|(uri, data)| (uri, Bytes::from(data)))
-        .collect();
+    // Strict conversion and one owned snapshot per item, taken NOW with the GIL held: the
+    // awaitable never reads the caller's buffers after this function returns.
+    let owned_items = batch_payloads(py, items)?;
 
     future_into_py(py, async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));
@@ -3193,7 +3312,8 @@ pub fn put_many_async<'py>(
         while let Some(res) = futs.next().await {
             res.map_err(py_err)??;
         }
-        Ok(())
+        // Python `None`, converted inside the exit-safe delivery (issue #271; see `mkdir_async`).
+        Ok(None::<()>)
     })
 }
 // ---------------------------------------------------------------------------
@@ -3216,6 +3336,7 @@ impl PyWriterOptions {
     }
 
     /// Set compression for the writer
+    #[pyo3(signature = (compression_type, level = None))]
     fn with_compression(&mut self, compression_type: &str, level: Option<i32>) -> PyResult<()> {
         let compression = match compression_type.to_lowercase().as_str() {
             "zstd" => {
@@ -3432,6 +3553,7 @@ impl PyObjectWriter {
 
 /// Create a streaming writer for S3
 #[pyfunction]
+#[pyo3(signature = (uri, options = None))]
 pub fn create_s3_writer(
     py: Python<'_>,
     uri: String,
@@ -3455,6 +3577,7 @@ pub fn create_s3_writer(
 /// Create a streaming writer for Azure Blob Storage
 #[pyfunction]
 #[cfg(feature = "backend-azure")]
+#[pyo3(signature = (uri, options = None))]
 pub fn create_azure_writer(
     py: Python<'_>,
     uri: String,
@@ -3478,10 +3601,12 @@ pub fn create_azure_writer(
 /// Create a streaming writer for Azure Blob Storage
 #[pyfunction]
 #[cfg(not(feature = "backend-azure"))]
+#[pyo3(signature = (uri, options = None))]
+// Accepted and ignored: this build has no Azure backend; the names must match the real build's Python keywords.
+#[allow(unused_variables)]
 pub fn create_azure_writer(
-    _py: Python<'_>,
-    _uri: String,
-    _options: Option<&PyWriterOptions>,
+    uri: String,
+    options: Option<&PyWriterOptions>,
 ) -> PyResult<PyObjectWriter> {
     Err(PyRuntimeError::new_err(
         "Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'."
@@ -3490,6 +3615,7 @@ pub fn create_azure_writer(
 
 /// Create a streaming writer for filesystem
 #[pyfunction]
+#[pyo3(signature = (uri, options = None))]
 pub fn create_filesystem_writer(
     py: Python<'_>,
     uri: String,
@@ -3512,6 +3638,7 @@ pub fn create_filesystem_writer(
 
 /// Create a streaming writer for direct I/O filesystem
 #[pyfunction]
+#[pyo3(signature = (uri, options = None))]
 pub fn create_direct_filesystem_writer(
     py: Python<'_>,
     uri: String,
@@ -3563,6 +3690,7 @@ impl PyMultiEndpointStore {
     }
 
     /// Get a byte range from an object (zero-copy via BytesView)
+    #[pyo3(signature = (uri, offset, length = None))]
     fn get_range<'py>(
         &self,
         py: Python<'py>,
@@ -3583,10 +3711,20 @@ impl PyMultiEndpointStore {
         })
     }
 
-    /// Put an object to the multi-endpoint store
-    fn put<'py>(&self, py: Python<'py>, uri: &str, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    /// Put an object to the multi-endpoint store.
+    ///
+    /// `data` is converted like `put_bytes` payloads (issue #281): `bytes`, any buffer-protocol
+    /// object or an object with `__bytes__()`; an int, a bool or an arbitrary iterable is a
+    /// `TypeError` before any request. A mutable buffer is copied once, now, with the GIL held.
+    fn put<'py>(
+        &self,
+        py: Python<'py>,
+        uri: &str,
+        data: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let data = Bytes::copy_from_slice(data);
+        let data = snapshot_for_call(py, data)
+            .map_err(|e| error_with_context(py, e, &format!("payload for {}", redact_uri(&uri))))?;
         let store = self.store.clone();
 
         future_into_py(py, async move {
@@ -3594,7 +3732,8 @@ impl PyMultiEndpointStore {
                 .put(&uri, data)
                 .await
                 .map_err(|e| py_err(e.context("Put failed")))?;
-            Ok(())
+            // Python `None`, converted inside the exit-safe delivery (issue #271).
+            Ok(None::<()>)
         })
     }
 
@@ -3630,7 +3769,8 @@ impl PyMultiEndpointStore {
                 .delete(&uri)
                 .await
                 .map_err(|e| py_err(e.context("Delete failed")))?;
-            Ok(())
+            // Python `None`, converted inside the exit-safe delivery (issue #271).
+            Ok(None::<()>)
         })
     }
 
@@ -3691,10 +3831,11 @@ impl PyMultiEndpointStore {
         py: Python<'py>,
         index: usize,
         uri: &str,
-        data: &[u8],
+        data: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let data = Bytes::copy_from_slice(data);
+        let data = snapshot_for_call(py, data)
+            .map_err(|e| error_with_context(py, e, &format!("payload for {}", redact_uri(&uri))))?;
         let store = self.store.clone();
 
         future_into_py(py, async move {
@@ -3702,7 +3843,8 @@ impl PyMultiEndpointStore {
                 .put_to_endpoint(index, &uri, data)
                 .await
                 .map_err(|e| py_err(e.context("Put to endpoint failed")))?;
-            Ok(())
+            // Python `None`, converted inside the exit-safe delivery (issue #271).
+            Ok(None::<()>)
         })
     }
 
@@ -3724,7 +3866,8 @@ impl PyMultiEndpointStore {
                 .delete_from_endpoint(index, &uri)
                 .await
                 .map_err(|e| py_err(e.context("Delete from endpoint failed")))?;
-            Ok(())
+            // Python `None`, converted inside the exit-safe delivery (issue #271).
+            Ok(None::<()>)
         })
     }
 
@@ -3738,10 +3881,11 @@ impl PyMultiEndpointStore {
         &self,
         py: Python<'py>,
         uri: &str,
-        data: &[u8],
+        data: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let data = Bytes::copy_from_slice(data);
+        let data = snapshot_for_call(py, data)
+            .map_err(|e| error_with_context(py, e, &format!("payload for {}", redact_uri(&uri))))?;
         let store = self.store.clone();
 
         future_into_py(py, async move {
@@ -3749,7 +3893,8 @@ impl PyMultiEndpointStore {
                 .put_all_endpoints(&uri, data)
                 .await
                 .map_err(|e| py_err(e.context("Put-all-endpoints failed")))?;
-            Ok(())
+            // Python `None`, converted inside the exit-safe delivery (issue #271).
+            Ok(None::<()>)
         })
     }
 
@@ -3818,6 +3963,7 @@ impl PyMultiEndpointStore {
 ///     >>> # All methods are async and require await
 ///     >>> data = asyncio.run(store.get("s3://host1:9000/bucket/object.dat"))
 #[pyfunction]
+#[pyo3(signature = (uris, strategy = None))]
 fn create_multi_endpoint_store(
     uris: Vec<String>,
     strategy: Option<&str>,
@@ -3860,6 +4006,7 @@ fn create_multi_endpoint_store(
 ///     >>> # All methods are async and require await
 ///     >>> data = asyncio.run(store.get("s3://10.0.0.1:9000/bucket/object.dat"))
 #[pyfunction]
+#[pyo3(signature = (uri_template, strategy = None))]
 fn create_multi_endpoint_store_from_template(
     uri_template: &str,
     strategy: Option<&str>,
@@ -3892,6 +4039,7 @@ fn create_multi_endpoint_store_from_template(
 ///     >>> # All methods are async and require await
 ///     >>> data = asyncio.run(store.get("s3://host1:9000/bucket/object.dat"))
 #[pyfunction]
+#[pyo3(signature = (file_path, strategy = None))]
 fn create_multi_endpoint_store_from_file(
     file_path: &str,
     strategy: Option<&str>,
@@ -3924,6 +4072,7 @@ fn create_multi_endpoint_store_from_file(
 ///     >>> os.environ['S3_ENDPOINT_URIS'] = 's3://host1:9000/bucket/,s3://host2:9000/bucket/'
 ///     >>> store = s3dlio.create_multi_endpoint_store_from_env(strategy="round_robin")
 #[pyfunction]
+#[pyo3(signature = (strategy = None))]
 fn create_multi_endpoint_store_from_env(strategy: Option<&str>) -> PyResult<PyMultiEndpointStore> {
     let lb_strategy = match strategy.unwrap_or("round_robin") {
         "round_robin" => LoadBalanceStrategy::RoundRobin,
@@ -3964,7 +4113,9 @@ fn gcs_set_channel_count(n: usize) {
 
 #[pyfunction]
 #[cfg(not(feature = "backend-gcs"))]
-fn gcs_set_channel_count(_n: usize) {}
+// Accepted and ignored: this build has no GCS backend; the name must match the real build's Python keyword.
+#[allow(unused_variables)]
+fn gcs_set_channel_count(n: usize) {}
 
 /// Configure GCS RAPID (Hyperdisk ML / zonal) mode before the first ``gs://``
 /// operation.
@@ -3979,13 +4130,17 @@ fn gcs_set_channel_count(_n: usize) {}
 /// The ``S3DLIO_GCS_RAPID`` environment variable still takes precedence if set.
 #[pyfunction]
 #[cfg(feature = "backend-gcs")]
+#[pyo3(signature = (force = None))]
 fn gcs_set_rapid_mode(force: Option<bool>) {
     crate::google_gcs_client::set_gcs_rapid_mode(force);
 }
 
 #[pyfunction]
 #[cfg(not(feature = "backend-gcs"))]
-fn gcs_set_rapid_mode(_force: Option<bool>) {}
+#[pyo3(signature = (force = None))]
+// Accepted and ignored: this build has no GCS backend; the name must match the real build's Python keyword.
+#[allow(unused_variables)]
+fn gcs_set_rapid_mode(force: Option<bool>) {}
 
 /// Return the programmatically-configured GCS subchannel count.
 ///
@@ -4052,7 +4207,9 @@ fn gcs_query_rapid_bucket(py: Python<'_>, bucket_or_uri: &str) -> PyResult<bool>
 
 #[pyfunction]
 #[cfg(not(feature = "backend-gcs"))]
-fn gcs_query_rapid_bucket(_bucket_or_uri: &str) -> PyResult<bool> {
+// Accepted and ignored: this build has no GCS backend; the name must match the real build's Python keyword.
+#[allow(unused_variables)]
+fn gcs_query_rapid_bucket(bucket_or_uri: &str) -> PyResult<bool> {
     Ok(false)
 }
 
@@ -8037,12 +8194,13 @@ def unsupported_is_raised_synchronously(core):
 mod put_strict_payload_and_mkdir_tests {
     use super::*;
     use pyo3::ffi::c_str;
-    use pyo3::types::{PyCFunction, PyDict, PyModule, PyTuple};
+    use pyo3::types::{PyBytes, PyCFunction, PyDict, PyList, PyModule, PyTuple};
 
     const SCENARIO_PY: &std::ffi::CStr = c_str!(
         "
 import array
 import asyncio
+import inspect
 
 class B:
     def __bytes__(self):
@@ -8079,6 +8237,16 @@ def run(start):
         return loop.run_until_complete(_main(start))
     finally:
         loop.close()
+
+def start_of(fn, args):
+    # A start callable for `run`: calls fn(*args) and awaits the result if it is awaitable (the
+    # sync batch API returns its result directly).
+    async def go():
+        result = fn(*args)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+    return go
 "
     );
 
@@ -8242,6 +8410,366 @@ def run(start):
         });
     }
 
+    /// #271: `put_bytes_async` resolves to Python `None` (it used to resolve to `()`), also with
+    /// `borrow=True` (the `GuardedFuture` passes the result through), and the bytes are written.
+    #[test]
+    fn put_bytes_async_returns_python_none() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let dir = tempfile::tempdir().expect("tempdir");
+            for borrow in [false, true] {
+                let (uri, path) = uri_in(dir.path(), &format!("none-{borrow}"));
+                let data = pyo3::types::PyByteArray::new(py, b"payload").into_any();
+                let start = put_async_start(py, uri, data.unbind(), borrow);
+                let outcome = module.getattr("run").unwrap().call1((start,)).unwrap();
+                assert!(
+                    outcome.is_none(),
+                    "put_bytes_async (borrow={borrow}) resolved to {outcome:?}"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+            }
+        });
+    }
+
+    /// The module-level `#[pyfunction]` `name` as a Python callable (its real argument extraction).
+    fn batch_function<'py>(py: Python<'py>, name: &str) -> Bound<'py, PyAny> {
+        let function = match name {
+            "put_many" => wrap_pyfunction!(put_many, py),
+            "put_many_async" => wrap_pyfunction!(put_many_async, py),
+            other => panic!("no such function in this test: {other}"),
+        };
+        function.expect("wrap pyfunction").into_any()
+    }
+
+    /// Run `callable(*args)` (a Python call, awaited if it returns an awaitable) on a fresh event
+    /// loop; returns its result, or the exception it raised.
+    fn run_call<'py, A: IntoPyObject<'py>>(
+        module: &Bound<'py, PyModule>,
+        callable: &Bound<'py, PyAny>,
+        args: A,
+    ) -> Bound<'py, PyAny> {
+        let start = module
+            .getattr("start_of")
+            .unwrap()
+            .call1((callable, args))
+            .unwrap();
+        module.getattr("run").unwrap().call1((start,)).unwrap()
+    }
+
+    /// A Python list of `(uri, payload)` tuples.
+    fn items_list<'py>(
+        py: Python<'py>,
+        pairs: Vec<(String, Bound<'py, PyAny>)>,
+    ) -> Bound<'py, PyAny> {
+        PyList::new(py, pairs).expect("items list").into_any()
+    }
+
+    /// #271: `put_many_async` resolves to Python `None`, and `put_many` returns `None`.
+    #[test]
+    fn put_many_and_put_many_async_return_python_none() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let dir = tempfile::tempdir().expect("tempdir");
+            for name in ["put_many", "put_many_async"] {
+                let (uri_a, path_a) = uri_in(dir.path(), &format!("{name}-a"));
+                let (uri_b, path_b) = uri_in(dir.path(), &format!("{name}-b"));
+                let items = items_list(
+                    py,
+                    vec![
+                        (uri_a, PyBytes::new(py, b"aa").into_any()),
+                        (uri_b, PyBytes::new(py, b"bb").into_any()),
+                    ],
+                );
+                let outcome = run_call(&module, &batch_function(py, name), (items,));
+                assert!(outcome.is_none(), "{name} resolved to {outcome:?}");
+                assert_eq!(std::fs::read(path_a).unwrap(), b"aa");
+                assert_eq!(std::fs::read(path_b).unwrap(), b"bb");
+            }
+        });
+    }
+
+    /// #272: the batch PUT APIs refuse an int, a bool and arbitrary iterables as a payload with a
+    /// `TypeError`, BEFORE any request is sent: an earlier, valid item of the same batch is not
+    /// written either.
+    #[test]
+    fn put_many_refuses_ints_bools_and_iterables_before_submission() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let bad = module.getattr("bad").unwrap();
+            let bad = bad.cast::<PyDict>().unwrap();
+            for name in ["put_many", "put_many_async"] {
+                for (kind, obj) in bad.iter() {
+                    let (good_uri, good_path) = uri_in(dir.path(), &format!("{name}-{kind}-good"));
+                    let (bad_uri, bad_path) = uri_in(dir.path(), &format!("{name}-{kind}-bad"));
+                    let items = items_list(
+                        py,
+                        vec![
+                            (good_uri, PyBytes::new(py, b"ok").into_any()),
+                            (bad_uri, obj),
+                        ],
+                    );
+                    let outcome = run_call(&module, &batch_function(py, name), (items,));
+                    let is_type_error = outcome
+                        .is_instance(&py.get_type::<pyo3::exceptions::PyTypeError>())
+                        .unwrap();
+                    assert!(
+                        is_type_error,
+                        "{name} {kind}: expected a TypeError, got {outcome:?}"
+                    );
+                    assert!(
+                        !bad_path.exists(),
+                        "{name} {kind}: the bad item was written"
+                    );
+                    assert!(
+                        !good_path.exists(),
+                        "{name} {kind}: the valid item was written: a request was sent"
+                    );
+                }
+            }
+        });
+    }
+
+    /// #272: bytes, buffer-protocol objects and `__bytes__` objects are still accepted by the batch
+    /// PUT APIs and the right bytes are written (a strided view is gathered in logical order).
+    #[test]
+    fn put_many_accepts_bytes_buffers_and_dunder_bytes() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let good = module.getattr("good").unwrap();
+            let good = good.cast::<PyDict>().unwrap();
+            for name in ["put_many", "put_many_async"] {
+                for (kind, pair) in good.iter() {
+                    let (obj, expected): (Bound<'_, PyAny>, Vec<u8>) = pair.extract().unwrap();
+                    let (uri, path) = uri_in(dir.path(), &format!("{name}-{kind}"));
+                    let items = items_list(py, vec![(uri, obj)]);
+                    let outcome = run_call(&module, &batch_function(py, name), (items,));
+                    assert!(outcome.is_none(), "{name} {kind}: {outcome:?}");
+                    assert_eq!(std::fs::read(&path).unwrap(), expected, "{name} {kind}");
+                }
+            }
+        });
+    }
+
+    /// The message text of the exception object `outcome`.
+    fn error_text(outcome: &Bound<'_, PyAny>) -> String {
+        outcome.str().map(|s| s.to_string()).unwrap_or_default()
+    }
+
+    /// #282 follow-up: a batch conversion error names the failing item (index and URI), keeps its
+    /// exception class and the original message after the prefix; a `MultiEndpointStore` write
+    /// names the URI.
+    #[test]
+    fn payload_errors_name_the_failing_item() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let type_error = py.get_type::<pyo3::exceptions::PyTypeError>();
+            for name in ["put_many", "put_many_async"] {
+                let (ok_uri, _) = uri_in(dir.path(), "named-ok");
+                let (bad_uri, _) = uri_in(dir.path(), "named-bad");
+                let int_payload = 42i32.into_pyobject(py).unwrap().into_any();
+                let items = items_list(
+                    py,
+                    vec![
+                        (ok_uri, PyBytes::new(py, b"ok").into_any()),
+                        (bad_uri.clone(), int_payload),
+                    ],
+                );
+                let outcome = run_call(&module, &batch_function(py, name), (items,));
+                assert!(
+                    outcome.is_instance(&type_error).unwrap(),
+                    "{name}: {outcome:?}"
+                );
+                let text = error_text(&outcome);
+                assert!(text.contains("item 1"), "{name}: no item index: {text}");
+                assert!(text.contains(&bad_uri), "{name}: no URI: {text}");
+                assert!(
+                    text.contains("Cannot convert data to bytes"),
+                    "{name}: the original message is gone: {text}"
+                );
+            }
+
+            let ep0 = tempfile::tempdir().expect("tempdir");
+            let store = create_multi_endpoint_store(
+                vec![format!("file://{}/", ep0.path().display())],
+                None,
+            )
+            .expect("store");
+            let store = Bound::new(py, store).expect("store object").into_any();
+            let uri = format!("file://{}/named", ep0.path().display());
+            let outcome = run_call(
+                &module,
+                &store.getattr("put").unwrap(),
+                (uri.clone(), 42i32.into_pyobject(py).unwrap()),
+            );
+            assert!(outcome.is_instance(&type_error).unwrap(), "{outcome:?}");
+            let text = error_text(&outcome);
+            assert!(text.contains(&uri), "no URI: {text}");
+            assert!(text.contains("Cannot convert data to bytes"), "{text}");
+        });
+    }
+
+    /// #271: the `MultiEndpointStore` mutators resolve to Python `None` (they used to resolve to
+    /// `()`), on two `file://` endpoints; each one really did its work.
+    #[test]
+    fn multi_endpoint_store_mutators_return_python_none() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let ep0 = tempfile::tempdir().expect("tempdir");
+            let ep1 = tempfile::tempdir().expect("tempdir");
+            let store = create_multi_endpoint_store(
+                vec![
+                    format!("file://{}/", ep0.path().display()),
+                    format!("file://{}/", ep1.path().display()),
+                ],
+                None,
+            )
+            .expect("store");
+            let store = Bound::new(py, store).expect("store object").into_any();
+            let uri_on = |ep: &tempfile::TempDir, name: &str| {
+                format!("file://{}/{name}", ep.path().display())
+            };
+            let method = |name: &str| store.getattr(name).expect("method");
+            let payload = |bytes: &[u8]| PyBytes::new(py, bytes);
+
+            let outcome = run_call(
+                &module,
+                &method("put"),
+                (uri_on(&ep0, "balanced"), payload(b"x")),
+            );
+            assert!(outcome.is_none(), "put resolved to {outcome:?}");
+
+            let outcome = run_call(
+                &module,
+                &method("put_to_endpoint"),
+                (1usize, uri_on(&ep1, "direct"), payload(b"direct")),
+            );
+            assert!(outcome.is_none(), "put_to_endpoint resolved to {outcome:?}");
+            assert_eq!(std::fs::read(ep1.path().join("direct")).unwrap(), b"direct");
+
+            let outcome = run_call(
+                &module,
+                &method("put_all_endpoints"),
+                (uri_on(&ep0, "everywhere"), payload(b"all")),
+            );
+            assert!(
+                outcome.is_none(),
+                "put_all_endpoints resolved to {outcome:?}"
+            );
+            for ep in [&ep0, &ep1] {
+                assert_eq!(std::fs::read(ep.path().join("everywhere")).unwrap(), b"all");
+            }
+
+            let outcome = run_call(
+                &module,
+                &method("delete_from_endpoint"),
+                (1usize, uri_on(&ep1, "direct")),
+            );
+            assert!(
+                outcome.is_none(),
+                "delete_from_endpoint resolved to {outcome:?}"
+            );
+            assert!(!ep1.path().join("direct").exists(), "not deleted");
+
+            let outcome = run_call(&module, &method("delete"), (uri_on(&ep0, "everywhere"),));
+            assert!(outcome.is_none(), "delete resolved to {outcome:?}");
+        });
+    }
+
+    /// #281: `MultiEndpointStore.put`, `put_to_endpoint` and `put_all_endpoints` convert their
+    /// payload like `put_bytes`: bytes, buffers and `__bytes__` objects are written; an int, a
+    /// bool and arbitrary iterables are a `TypeError` and nothing is written on any endpoint.
+    #[test]
+    fn multi_endpoint_store_writes_use_the_strict_payload_conversion() {
+        init();
+        Python::attach(|py| {
+            let module = scenario(py);
+            let ep0 = tempfile::tempdir().expect("tempdir");
+            let ep1 = tempfile::tempdir().expect("tempdir");
+            let store = create_multi_endpoint_store(
+                vec![
+                    format!("file://{}/", ep0.path().display()),
+                    format!("file://{}/", ep1.path().display()),
+                ],
+                None,
+            )
+            .expect("store");
+            let store = Bound::new(py, store).expect("store object").into_any();
+            let uri_on = |ep: &tempfile::TempDir, name: &str| {
+                format!("file://{}/{name}", ep.path().display())
+            };
+            // Every write method as (name, args builder over (object name, payload)).
+            let call = |method: &str, name: &str, payload: Py<PyAny>| {
+                let function = store.getattr(method).expect("method");
+                match method {
+                    "put" => run_call(&module, &function, (uri_on(&ep0, name), payload)),
+                    "put_to_endpoint" => {
+                        run_call(&module, &function, (1usize, uri_on(&ep1, name), payload))
+                    }
+                    _ => run_call(&module, &function, (uri_on(&ep0, name), payload)),
+                }
+            };
+
+            let bad = module.getattr("bad").unwrap();
+            let bad = bad.cast::<PyDict>().unwrap();
+            for method in ["put", "put_to_endpoint", "put_all_endpoints"] {
+                for (kind, obj) in bad.iter() {
+                    let name = format!("{method}-{kind}");
+                    let outcome = call(method, &name, obj.unbind());
+                    let is_type_error = outcome
+                        .is_instance(&py.get_type::<pyo3::exceptions::PyTypeError>())
+                        .unwrap();
+                    assert!(
+                        is_type_error,
+                        "{method} {kind}: expected a TypeError, got {outcome:?}"
+                    );
+                    for ep in [&ep0, &ep1] {
+                        assert!(
+                            !ep.path().join(&name).exists(),
+                            "{method} {kind}: an object was written"
+                        );
+                    }
+                }
+            }
+
+            let good = module.getattr("good").unwrap();
+            let good = good.cast::<PyDict>().unwrap();
+            for method in ["put", "put_to_endpoint", "put_all_endpoints"] {
+                for (kind, pair) in good.iter() {
+                    let (obj, expected): (Bound<'_, PyAny>, Vec<u8>) = pair.extract().unwrap();
+                    let name = format!("{method}-{kind}");
+                    let outcome = call(method, &name, obj.unbind());
+                    assert!(outcome.is_none(), "{method} {kind}: {outcome:?}");
+                    // `put` is load balanced: it lands on exactly one of the endpoints.
+                    let written = [&ep0, &ep1]
+                        .into_iter()
+                        .filter_map(|ep| std::fs::read(ep.path().join(&name)).ok())
+                        .collect::<Vec<_>>();
+                    assert!(!written.is_empty(), "{method} {kind}: nothing was written");
+                    assert!(
+                        written.iter().all(|bytes| *bytes == expected),
+                        "{method} {kind}: wrong bytes {written:?}"
+                    );
+                    if method == "put_all_endpoints" {
+                        assert_eq!(
+                            std::fs::read(ep1.path().join(&name)).unwrap(),
+                            expected,
+                            "{method} {kind} (second endpoint)"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// The Python side of the C-F2 regression: one native call starts `mkdir_async` and polls the
     /// body WHILE HOLDING the GIL, and returns `(finished, future)`; Python only awaits the
     /// future.  No Python bytecode runs between the start and the poll, so CPython's switch
@@ -8330,5 +8858,763 @@ def run(start):
             assert!(value.is_none(), "mkdir_async resolved to {value:?}");
             assert!(target.is_dir(), "the directory was not made");
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- `error_with_context` (batch / multi-endpoint payload errors).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod error_context_tests {
+    use super::*;
+    use pyo3::exceptions::{PyMemoryError, PyTypeError};
+
+    const CLASSES_PY: &std::ffi::CStr = c_str!(
+        "
+class TwoArg(Exception):
+    def __init__(self, a, b):
+        super().__init__(a, b)
+
+class KwOnly(Exception):
+    def __init__(self, *, code):
+        super().__init__('kw')
+        self.code = code
+
+class WithAttr(Exception):
+    pass
+
+def with_attr():
+    e = WithAttr('plain message')
+    e.code = 7
+    return e
+
+def make(cls, *args):
+    return cls(*args)
+
+def make_kw():
+    return KwOnly(code=3)
+
+class CustomStr(ValueError):
+    def __str__(self):
+        return 'custom text'
+
+class IgnoresArgs(Exception):
+    def __init__(self, *a):
+        super().__init__('fixed text')
+
+class Counting(Exception):
+    created = 0
+    def __init__(self, *a):
+        type(self).created += 1
+        super().__init__(*a)
+
+class NoteFails(ValueError):
+    def add_note(self, note):
+        raise RuntimeError('no notes here')
+
+class TypeError(Exception):
+    pass
+
+def import_error():
+    return ImportError('cannot import x', name='pkg.x', path='/p/x.py')
+
+def attribute_error():
+    class Owner:
+        pass
+    owner = Owner()
+    return AttributeError('no attribute q', name='q', obj=owner), owner
+"
+    );
+
+    fn init() {
+        Python::initialize();
+    }
+
+    fn classes(py: Python<'_>) -> Bound<'_, pyo3::types::PyModule> {
+        pyo3::types::PyModule::from_code(
+            py,
+            CLASSES_PY,
+            c_str!("s3dlio_error_context_classes.py"),
+            c_str!("_s3dlio_error_context_classes"),
+        )
+        .expect("classes module")
+    }
+
+    fn text(py: Python<'_>, e: &PyErr) -> String {
+        e.value(py).str().expect("str(e)").to_string()
+    }
+
+    fn same_object(py: Python<'_>, a: &PyErr, b: &PyErr) -> bool {
+        a.value(py).is(b.value(py))
+    }
+
+    /// A plain single-message exception is rebuilt as the SAME class with the context in front,
+    /// and the original object is the `__cause__`.
+    #[test]
+    fn single_message_classes_are_preserved_with_the_original_as_cause() {
+        init();
+        Python::attach(|py| {
+            for original in [
+                PyErr::new::<PyTypeError, _>("Cannot convert data to bytes"),
+                PyErr::new::<PyMemoryError, _>("cannot allocate 5 bytes"),
+            ] {
+                let class_name = original.get_type(py).name().unwrap().to_string();
+                let message = text(py, &original);
+                let keep = original.clone_ref(py);
+                let wrapped = error_with_context(py, original, "item 1 (file:///x)");
+                assert_eq!(
+                    wrapped.get_type(py).name().unwrap().to_string(),
+                    class_name,
+                    "the class changed"
+                );
+                assert_eq!(text(py, &wrapped), format!("item 1 (file:///x): {message}"));
+                let cause = wrapped.cause(py).expect("the original is the __cause__");
+                assert!(
+                    same_object(py, &cause, &keep),
+                    "__cause__ is not the original"
+                );
+                assert!(!same_object(py, &wrapped, &keep));
+            }
+        });
+    }
+
+    /// Exceptions that a one-string constructor cannot rebuild come back UNCHANGED (the same
+    /// object, same class, same arguments), never as a different class.
+    #[test]
+    fn exceptions_that_cannot_be_rebuilt_come_back_unchanged() {
+        init();
+        Python::attach(|py| {
+            let module = classes(py);
+            let make = module.getattr("make").unwrap();
+            let builtins = py.import("builtins").unwrap();
+            let cases: Vec<(&str, Bound<'_, PyAny>)> = vec![
+                (
+                    "TwoArg",
+                    make.call1((module.getattr("TwoArg").unwrap(), 1, 2))
+                        .unwrap(),
+                ),
+                (
+                    "KwOnly",
+                    module.getattr("make_kw").unwrap().call0().unwrap(),
+                ),
+                (
+                    "UnicodeDecodeError",
+                    make.call1((
+                        builtins.getattr("UnicodeDecodeError").unwrap(),
+                        "utf-8",
+                        PyBytes::new(py, b"\xff"),
+                        0,
+                        1,
+                        "invalid start byte",
+                    ))
+                    .unwrap(),
+                ),
+                (
+                    "OSError",
+                    make.call1((builtins.getattr("OSError").unwrap(), 2, "No such file"))
+                        .unwrap(),
+                ),
+                (
+                    "WithAttr",
+                    module.getattr("with_attr").unwrap().call0().unwrap(),
+                ),
+                (
+                    "KeyboardInterrupt",
+                    make.call1((builtins.getattr("KeyboardInterrupt").unwrap(),))
+                        .unwrap(),
+                ),
+            ];
+            for (name, instance) in cases {
+                // `OSError(2, ...)` is built as its errno subclass, so compare with the instance.
+                let class_name = instance.get_type().name().unwrap().to_string();
+                let original = PyErr::from_value(instance.clone());
+                let wrapped = error_with_context(py, original, "item 1 (file:///x)");
+                assert!(
+                    wrapped.value(py).is(&instance),
+                    "{name}: a different exception object was returned"
+                );
+                assert_eq!(
+                    wrapped.get_type(py).name().unwrap().to_string(),
+                    class_name,
+                    "{name}: the class changed"
+                );
+                assert!(
+                    !wrapped.is_instance_of::<PyTypeError>(py),
+                    "{name}: turned into a TypeError"
+                );
+                assert!(
+                    wrapped.cause(py).is_none(),
+                    "{name}: an unchanged error must not get a __cause__"
+                );
+            }
+        });
+    }
+
+    /// The unchanged original still tells which item failed: a note (Python >= 3.11) with the
+    /// context, and no class name twice.
+    #[test]
+    fn an_unchanged_original_carries_the_context_as_a_note() {
+        init();
+        Python::attach(|py| {
+            let module = classes(py);
+            let instance = module
+                .getattr("make")
+                .unwrap()
+                .call1((module.getattr("TwoArg").unwrap(), 1, 2))
+                .unwrap();
+            let before = instance.str().unwrap().to_string();
+            let wrapped = error_with_context(
+                py,
+                PyErr::from_value(instance.clone()),
+                "item 4 (file:///x)",
+            );
+            assert_eq!(text(py, &wrapped), before, "the message must not change");
+            if instance.hasattr("add_note").unwrap() {
+                let notes: Vec<String> = instance.getattr("__notes__").unwrap().extract().unwrap();
+                assert_eq!(notes, vec!["item 4 (file:///x)".to_string()]);
+                assert!(
+                    !notes[0].contains("TwoArg"),
+                    "class name repeated in the note"
+                );
+            }
+        });
+    }
+
+    /// `e` came back unchanged: the same object, no `__cause__`, and (when Python has
+    /// `add_note`) the context as its last note.
+    fn assert_unchanged_with_note(py: Python<'_>, name: &str, instance: &Bound<'_, PyAny>) {
+        let before = instance.str().unwrap().to_string();
+        let args_before = instance.getattr("args").unwrap().to_string();
+        let wrapped = error_with_context(
+            py,
+            PyErr::from_value(instance.clone()),
+            "item 2 (file:///y)",
+        );
+        assert!(
+            wrapped.value(py).is(instance),
+            "{name}: a different exception object was returned"
+        );
+        assert!(wrapped.cause(py).is_none(), "{name}: got a __cause__");
+        assert_eq!(text(py, &wrapped), before, "{name}: the message changed");
+        assert_eq!(
+            instance.getattr("args").unwrap().to_string(),
+            args_before,
+            "{name}: args changed"
+        );
+        if instance.hasattr("add_note").unwrap() {
+            let notes: Vec<String> = instance.getattr("__notes__").unwrap().extract().unwrap();
+            assert_eq!(notes.last().map(String::as_str), Some("item 2 (file:///y)"));
+        }
+    }
+
+    /// A subclass, even of a builtin, is never rebuilt: its `__str__` and `__init__` are its own.
+    #[test]
+    fn subclasses_with_their_own_str_or_init_are_returned_unchanged() {
+        init();
+        Python::attach(|py| {
+            let module = classes(py);
+            let make = module.getattr("make").unwrap();
+            let class = |name: &str| module.getattr(name).unwrap();
+            for name in ["CustomStr", "IgnoresArgs", "TypeError"] {
+                let instance = make.call1((class(name), "original")).unwrap();
+                assert_unchanged_with_note(py, name, &instance);
+            }
+            // The `__str__` of a subclass is still its own after the call.
+            let custom = make.call1((class("CustomStr"), "original")).unwrap();
+            assert_unchanged_with_note(py, "CustomStr", &custom);
+            assert_eq!(custom.str().unwrap().to_string(), "custom text");
+            let ignores = make.call1((class("IgnoresArgs"), "original")).unwrap();
+            assert_unchanged_with_note(py, "IgnoresArgs", &ignores);
+            assert_eq!(ignores.str().unwrap().to_string(), "fixed text");
+        });
+    }
+
+    /// The constructor of a class that is not rebuilt must not run a second time.
+    #[test]
+    fn a_side_effect_in_init_does_not_run_a_second_time() {
+        init();
+        Python::attach(|py| {
+            let module = classes(py);
+            let class = module.getattr("Counting").unwrap();
+            let instance = module
+                .getattr("make")
+                .unwrap()
+                .call1((class.clone(), "boom"))
+                .unwrap();
+            assert_eq!(
+                class.getattr("created").unwrap().extract::<u32>().unwrap(),
+                1
+            );
+            assert_unchanged_with_note(py, "Counting", &instance);
+            assert_eq!(
+                class.getattr("created").unwrap().extract::<u32>().unwrap(),
+                1,
+                "__init__ ran again"
+            );
+        });
+    }
+
+    /// Exceptions with fields keep them: the same object comes back, with a note.
+    #[test]
+    fn exceptions_with_fields_keep_their_fields() {
+        init();
+        Python::attach(|py| {
+            let module = classes(py);
+            let import_error = module.getattr("import_error").unwrap().call0().unwrap();
+            assert_unchanged_with_note(py, "ImportError", &import_error);
+            assert_eq!(import_error.getattr("name").unwrap().to_string(), "pkg.x");
+            assert_eq!(import_error.getattr("path").unwrap().to_string(), "/p/x.py");
+
+            let pair = module.getattr("attribute_error").unwrap().call0().unwrap();
+            let attribute_error = pair.get_item(0).unwrap();
+            let owner = pair.get_item(1).unwrap();
+            assert_unchanged_with_note(py, "AttributeError", &attribute_error);
+            assert_eq!(attribute_error.getattr("name").unwrap().to_string(), "q");
+            assert!(attribute_error.getattr("obj").unwrap().is(&owner));
+
+            let builtins = py.import("builtins").unwrap();
+            let make = module.getattr("make").unwrap();
+            let key_error = make
+                .call1((builtins.getattr("KeyError").unwrap(), "k"))
+                .unwrap();
+            assert_unchanged_with_note(py, "KeyError", &key_error);
+            let stop = make
+                .call1((builtins.getattr("StopIteration").unwrap(), 3))
+                .unwrap();
+            assert_unchanged_with_note(py, "StopIteration", &stop);
+            assert_eq!(stop.getattr("value").unwrap().to_string(), "3");
+        });
+    }
+
+    /// Every plain builtin class on the rebuild list comes back as the same class, with the
+    /// context in front and the original as `__cause__`.
+    #[test]
+    fn plain_builtins_are_rebuilt_with_the_prefix_and_a_cause() {
+        init();
+        Python::attach(|py| {
+            let builtins = py.import("builtins").unwrap();
+            for name in [
+                "TypeError",
+                "ValueError",
+                "BufferError",
+                "OverflowError",
+                "MemoryError",
+            ] {
+                let class = builtins.getattr(name).unwrap();
+                let instance = class.call1(("original text",)).unwrap();
+                let wrapped = error_with_context(
+                    py,
+                    PyErr::from_value(instance.clone()),
+                    "item 7 (s3://b/k)",
+                );
+                assert!(wrapped.get_type(py).is(&class), "{name}: class changed");
+                assert_eq!(text(py, &wrapped), "item 7 (s3://b/k): original text");
+                assert!(
+                    wrapped.cause(py).unwrap().value(py).is(&instance),
+                    "{name}: __cause__ is not the original"
+                );
+            }
+        });
+    }
+
+    /// A failing `add_note` is ignored: the original still comes back.
+    #[test]
+    fn a_failing_add_note_is_ignored() {
+        init();
+        Python::attach(|py| {
+            let module = classes(py);
+            let instance = module
+                .getattr("make")
+                .unwrap()
+                .call1((module.getattr("NoteFails").unwrap(), "original"))
+                .unwrap();
+            let wrapped = error_with_context(
+                py,
+                PyErr::from_value(instance.clone()),
+                "item 1 (file:///x)",
+            );
+            assert!(wrapped.value(py).is(&instance));
+            assert!(
+                PyErr::take(py).is_none(),
+                "the failed add_note left an exception set"
+            );
+        });
+    }
+
+    /// End to end: a `?` in an `s3://` key stays in the message; an https SAS query does not.
+    #[test]
+    fn batch_error_keeps_a_question_mark_key_and_drops_a_sas_query() {
+        init();
+        Python::attach(|py| {
+            for (uri, shown, hidden) in [
+                ("s3://b/what?.csv", "s3://b/what?.csv", ""),
+                (
+                    "https://acct.blob.core.windows.net/c/k?sv=1&sig=TOPSECRET",
+                    "https://acct.blob.core.windows.net/c/k",
+                    "TOPSECRET",
+                ),
+            ] {
+                let bad = 42i32.into_pyobject(py).unwrap().into_any();
+                let err = batch_payloads(py, vec![(uri.to_string(), bad)])
+                    .expect_err("an int payload must be refused");
+                let message = text(py, &err);
+                assert!(message.contains(shown), "{message}");
+                assert!(hidden.is_empty() || !message.contains(hidden), "{message}");
+            }
+        });
+    }
+
+    /// End to end: a bad item in a batch names the item and its (redacted) URI, keeps the class
+    /// and the `__cause__`, and the secret never appears.
+    #[test]
+    fn batch_error_redacts_the_uri_and_keeps_the_cause() {
+        init();
+        Python::attach(|py| {
+            let secret_uri = "https://acct.blob.core.windows.net/c/o?sv=1&sig=TOPSECRET";
+            let good = PyBytes::new(py, b"ok").into_any();
+            let bad = 42i32.into_pyobject(py).unwrap().into_any();
+            let err = batch_payloads(
+                py,
+                vec![
+                    ("file:///ok".to_string(), good),
+                    (secret_uri.to_string(), bad),
+                ],
+            )
+            .expect_err("an int payload must be refused");
+            let message = text(py, &err);
+            assert!(err.is_instance_of::<PyTypeError>(py), "{message}");
+            assert!(
+                !message.contains("TOPSECRET") && !message.contains("sig="),
+                "{message}"
+            );
+            assert!(message.contains("item 1"), "{message}");
+            assert!(
+                message.contains("https://acct.blob.core.windows.net/c/o"),
+                "{message}"
+            );
+            assert!(
+                message.contains("Cannot convert data to bytes"),
+                "{message}"
+            );
+            assert!(
+                err.cause(py).is_some(),
+                "the original TypeError is the __cause__"
+            );
+        });
+    }
+}
+
+/// Issue #285: every `Option<...>` parameter the docstrings call optional must be callable
+/// when omitted. Each function / method is checked on its own, once without the parameter and
+/// once with it passed by keyword; all failures are collected and reported together.
+#[cfg(test)]
+mod omitted_optional_parameter_tests {
+    use super::*;
+    use pyo3::types::PyModule;
+
+    fn init() {
+        Python::initialize();
+    }
+
+    /// `None` when the call got past argument parsing (any result, any other error), else why not.
+    fn argument_problem(result: PyResult<Bound<'_, PyAny>>, py: Python<'_>) -> Option<String> {
+        let err = result.err()?;
+        if !err.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
+            return None;
+        }
+        let message = err.value(py).str().ok()?.to_string();
+        let bad = message.contains("required positional argument")
+            || message.contains("unexpected keyword argument");
+        bad.then_some(message)
+    }
+
+    fn call<'py>(
+        target: &Bound<'py, PyAny>,
+        args: Vec<Bound<'py, PyAny>>,
+        kwargs: Vec<(&str, Bound<'py, PyAny>)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = target.py();
+        let args = pyo3::types::PyTuple::new(py, args)?;
+        let dict = pyo3::types::PyDict::new(py);
+        for (name, value) in kwargs {
+            dict.set_item(name, value)?;
+        }
+        target.call(args, Some(&dict))
+    }
+
+    #[test]
+    fn omitted_optional_parameters_are_defaults() {
+        init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_str().expect("utf-8 temp path").to_string();
+        Python::attach(|py| {
+            let m = PyModule::new(py, "s3dlio_285_probe").expect("module");
+            register_core_functions(&m).expect("register");
+            let get = |name: &str| m.getattr(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let s = |text: &str| text.into_pyobject(py).expect("str").into_any();
+            let options = Bound::new(py, PyWriterOptions::new())
+                .expect("options")
+                .into_any();
+            let uris_file = format!("{base}/endpoints.txt");
+            std::fs::write(&uris_file, format!("file://{base}/a/\nfile://{base}/b/\n"))
+                .expect("write endpoints file");
+            let two = || {
+                pyo3::types::PyList::new(
+                    py,
+                    [format!("file://{base}/a/"), format!("file://{base}/b/")],
+                )
+                .expect("list")
+                .into_any()
+            };
+
+            let failures: std::cell::RefCell<Vec<String>> = std::cell::RefCell::default();
+            let check = |label: &str, result: PyResult<Bound<'_, PyAny>>| {
+                if let Some(why) = argument_problem(result, py) {
+                    failures.borrow_mut().push(format!("{label}: {why}"));
+                }
+            };
+
+            // Writer factories: `options` omitted, then by keyword. The S3 and Azure ones get a
+            // URI of the wrong scheme so that nothing leaves the process.
+            for (name, uri) in [
+                ("create_s3_writer", "file:///not-an-s3-uri".to_string()),
+                (
+                    "create_azure_writer",
+                    "file:///not-an-azure-uri".to_string(),
+                ),
+                ("create_filesystem_writer", format!("file://{base}/w1.bin")),
+                (
+                    "create_direct_filesystem_writer",
+                    format!("file://{base}/w2.bin"),
+                ),
+            ] {
+                let f = get(name);
+                check(&format!("{name}(uri)"), call(&f, vec![s(&uri)], vec![]));
+                check(
+                    &format!("{name}(uri, options=...)"),
+                    call(&f, vec![s(&uri)], vec![("options", options.clone())]),
+                );
+                check(
+                    &format!("{name}(uri, options=None)"),
+                    call(
+                        &f,
+                        vec![s(&uri)],
+                        vec![("options", py.None().into_bound(py))],
+                    ),
+                );
+            }
+
+            // Multi-endpoint factories: `strategy` omitted, then by keyword.
+            let f = get("create_multi_endpoint_store");
+            check(
+                "create_multi_endpoint_store(uris)",
+                call(&f, vec![two()], vec![]),
+            );
+            check(
+                "create_multi_endpoint_store(uris, strategy=...)",
+                call(&f, vec![two()], vec![("strategy", s("least_connections"))]),
+            );
+            let f = get("create_multi_endpoint_store_from_template");
+            let template = format!("file://{base}/t{{1...2}}/");
+            check(
+                "create_multi_endpoint_store_from_template(template)",
+                call(&f, vec![s(&template)], vec![]),
+            );
+            check(
+                "create_multi_endpoint_store_from_template(template, strategy=...)",
+                call(&f, vec![s(&template)], vec![("strategy", s("round_robin"))]),
+            );
+            let f = get("create_multi_endpoint_store_from_file");
+            check(
+                "create_multi_endpoint_store_from_file(path)",
+                call(&f, vec![s(&uris_file)], vec![]),
+            );
+            check(
+                "create_multi_endpoint_store_from_file(path, strategy=...)",
+                call(
+                    &f,
+                    vec![s(&uris_file)],
+                    vec![("strategy", s("round_robin"))],
+                ),
+            );
+            // S3_ENDPOINT_URIS is not touched here (other tests run in this process): unset or
+            // set, the call must get past argument parsing.
+            let f = get("create_multi_endpoint_store_from_env");
+            check(
+                "create_multi_endpoint_store_from_env()",
+                call(&f, vec![], vec![]),
+            );
+            check(
+                "create_multi_endpoint_store_from_env(strategy=...)",
+                call(&f, vec![], vec![("strategy", s("round_robin"))]),
+            );
+
+            // `PyWriterOptions.with_compression(level)`.
+            let w = options
+                .getattr("with_compression")
+                .expect("with_compression");
+            check(
+                "with_compression('none')",
+                call(&w, vec![s("none")], vec![]),
+            );
+            check(
+                "with_compression('zstd')",
+                call(&w, vec![s("zstd")], vec![]),
+            );
+            check(
+                "with_compression('zstd', level=5)",
+                call(
+                    &w,
+                    vec![s("zstd")],
+                    vec![("level", 5i32.into_pyobject(py).unwrap().into_any())],
+                ),
+            );
+
+            // `MultiEndpointStore.get_range(length)`.
+            match call(
+                &get("create_multi_endpoint_store"),
+                vec![two()],
+                vec![("strategy", s("round_robin"))],
+            ) {
+                Ok(store) => {
+                    let g = store.getattr("get_range").expect("get_range");
+                    let uri = s(&format!("file://{base}/a/missing.bin"));
+                    let zero = 0u64.into_pyobject(py).unwrap().into_any();
+                    check(
+                        "get_range(uri, offset)",
+                        call(&g, vec![uri.clone(), zero.clone()], vec![]),
+                    );
+                    check(
+                        "get_range(uri, offset, length=4)",
+                        call(
+                            &g,
+                            vec![uri, zero],
+                            vec![("length", 4u64.into_pyobject(py).unwrap().into_any())],
+                        ),
+                    );
+                }
+                Err(e) => failures
+                    .borrow_mut()
+                    .push(format!("no store for get_range: {e}")),
+            }
+
+            // `gcs_set_rapid_mode(force)`; None means auto-detect, i.e. no change.
+            let f = get("gcs_set_rapid_mode");
+            check("gcs_set_rapid_mode()", call(&f, vec![], vec![]));
+            check(
+                "gcs_set_rapid_mode(force=None)",
+                call(&f, vec![], vec![("force", py.None().into_bound(py))]),
+            );
+
+            let failures = failures.into_inner();
+            assert!(
+                failures.is_empty(),
+                "{} call(s) failed argument parsing:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        });
+    }
+}
+
+/// Python sees the parameter NAMES of a `#[pyfunction]`, so the no-backend stubs must expose the
+/// same names as the real functions of a build with the backend (a keyword call such as
+/// `gcs_set_channel_count(n=4)` must not depend on how the wheel was built). The expected text
+/// signatures below are the contract of every build.
+#[cfg(test)]
+mod stub_signature_tests {
+    use super::*;
+    use pyo3::types::PyModule;
+
+    fn init() {
+        Python::initialize();
+    }
+
+    fn text_signature(function: &Bound<'_, PyAny>) -> String {
+        function
+            .getattr("__text_signature__")
+            .and_then(|s| s.extract::<String>())
+            .unwrap_or_else(|e| panic!("no __text_signature__: {e}"))
+    }
+
+    #[test]
+    fn stubs_and_real_functions_expose_the_same_parameter_names() {
+        init();
+        Python::attach(|py| {
+            let m = PyModule::new(py, "s3dlio_stub_signature_probe").expect("module");
+            register_core_functions(&m).expect("register");
+            let mut wrong = Vec::new();
+            for (name, want) in [
+                ("gcs_set_channel_count", "(n)"),
+                ("gcs_set_rapid_mode", "(force=None)"),
+                ("gcs_query_rapid_bucket", "(bucket_or_uri)"),
+                ("create_azure_writer", "(uri, options=None)"),
+            ] {
+                let got =
+                    text_signature(&m.getattr(name).unwrap_or_else(|e| panic!("{name}: {e}")));
+                if got != want {
+                    wrong.push(format!("{name}: {got} (want {want})"));
+                }
+            }
+            let dataset = py
+                .get_type::<crate::python_api::python_aiml_api::PyDataset>()
+                .getattr("from_uris")
+                .expect("PyDataset.from_uris");
+            let got = text_signature(&dataset);
+            if got != "(uris, opts=None)" {
+                wrong.push(format!(
+                    "PyDataset.from_uris: {got} (want (uris, opts=None))"
+                ));
+            }
+            assert!(
+                wrong.is_empty(),
+                "signature mismatch:\n{}",
+                wrong.join("\n")
+            );
+        });
+    }
+
+    /// In a build without the GCS / Azure backend the stubs take the real keywords too.
+    #[cfg(not(any(feature = "backend-gcs", feature = "backend-azure")))]
+    #[test]
+    fn stubs_accept_the_real_keywords() {
+        init();
+        Python::attach(|py| {
+            let m = PyModule::new(py, "s3dlio_stub_keyword_probe").expect("module");
+            register_core_functions(&m).expect("register");
+            let kw = |name: &str, value: Bound<'_, PyAny>| {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item(name, value).expect("kwarg");
+                d
+            };
+            let n = 4usize.into_pyobject(py).expect("int").into_any();
+            m.getattr("gcs_set_channel_count")
+                .and_then(|f| f.call((), Some(&kw("n", n))))
+                .expect("gcs_set_channel_count(n=4)");
+            let b = "my-bucket".into_pyobject(py).expect("str").into_any();
+            let got = m
+                .getattr("gcs_query_rapid_bucket")
+                .and_then(|f| f.call((), Some(&kw("bucket_or_uri", b))))
+                .expect("gcs_query_rapid_bucket(bucket_or_uri=...)");
+            assert!(!got.is_truthy().expect("bool"));
+        });
+    }
+
+    /// `with_compression("zstd")` without a level uses zstd level 3, an explicit level is kept.
+    #[test]
+    fn with_compression_default_zstd_level_is_three() {
+        let mut options = PyWriterOptions::new();
+        options.with_compression("zstd", None).expect("zstd");
+        assert_eq!(
+            options.inner.compression,
+            Some(CompressionConfig::Zstd { level: 3 })
+        );
+        options.with_compression("zstd", Some(7)).expect("zstd 7");
+        assert_eq!(
+            options.inner.compression,
+            Some(CompressionConfig::Zstd { level: 7 })
+        );
+        options.with_compression("none", None).expect("none");
+        assert_eq!(options.inner.compression, Some(CompressionConfig::None));
     }
 }

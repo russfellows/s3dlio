@@ -97,7 +97,9 @@ impl<'a> Writer<'a> {
                 key,
                 size: meta.size,
                 etag: meta.e_tag,
-                checksum: None, // TODO: Add checksum support if needed
+                checksum: Some(crate::checksum::crc32c_label(crate::checksum::crc32c_of(
+                    data,
+                ))),
             })
         }
     }
@@ -144,7 +146,9 @@ impl<'a> Writer<'a> {
                 key: key.to_string(),
                 size: meta.size,
                 etag: meta.e_tag,
-                checksum: None,
+                checksum: Some(crate::checksum::crc32c_label(crate::checksum::crc32c_of(
+                    data,
+                ))),
             })
         }
     }

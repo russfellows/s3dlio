@@ -65,7 +65,7 @@ class _AsyncBytesSource:
                 # Use generic create_async_loader - works with any URI scheme
                 loader = _core.create_async_loader(self._uri, self._opts)
                 try:
-                    async for batch in loader:  # batch: List[bytes]
+                    async for batch in loader:  # batch: list of BytesView
                         for b in batch:
                             self._q.put(b, block=True)
                 finally:

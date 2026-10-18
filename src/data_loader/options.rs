@@ -602,3 +602,202 @@ impl LoaderOptions {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Assert every field a preset is NOT supposed to touch still has its default value.
+    /// `touched` fields are checked by the individual tests.
+    fn assert_untouched_defaults(o: &LoaderOptions) {
+        let d = LoaderOptions::default();
+        assert_eq!(o.batch_size, d.batch_size);
+        assert_eq!(o.drop_last, d.drop_last);
+        assert_eq!(o.shuffle, d.shuffle);
+        assert_eq!(o.seed, d.seed);
+        assert_eq!(o.prefetch, d.prefetch);
+        assert_eq!(o.loading_mode, d.loading_mode);
+        assert_eq!(o.reader_mode, d.reader_mode);
+        assert_eq!(o.part_size, d.part_size);
+        assert_eq!(o.max_inflight_parts, d.max_inflight_parts);
+        assert_eq!(o.worker_id, d.worker_id);
+        assert_eq!(o.num_workers_pytorch, d.num_workers_pytorch);
+        assert_eq!(o.generator_seed, d.generator_seed);
+        assert_eq!(o.enable_transforms, d.enable_transforms);
+        assert_eq!(o.collate_buffer_size, d.collate_buffer_size);
+        assert_eq!(o.page_cache_mode, d.page_cache_mode);
+        assert!(o.adaptive.is_none());
+        assert!(o.cancellation_token.is_none());
+        assert_eq!(o.skip_head, d.skip_head);
+    }
+
+    #[test]
+    fn default_has_expected_ai_ml_knobs() {
+        let o = LoaderOptions::default();
+        assert!(!o.pin_memory);
+        assert!(!o.persistent_workers);
+        assert!(!o.non_blocking);
+        assert_eq!(o.num_workers, 0);
+        assert!(!o.auto_tune);
+        assert_eq!(o.timeout_seconds, None);
+        assert_eq!(o.multiprocessing_context, MultiprocessingContext::default());
+        assert_eq!(o.memory_format, MemoryFormat::default());
+        assert_eq!(o.sampler_type, SamplerType::Sequential);
+        assert_eq!((o.shard_rank, o.shard_world_size), (0, 1));
+    }
+
+    #[test]
+    fn gpu_optimized_sets_exactly_the_gpu_knobs() {
+        let o = LoaderOptions::default().gpu_optimized();
+        assert!(o.pin_memory);
+        assert!(o.persistent_workers);
+        assert!(o.non_blocking);
+        assert_eq!(o.memory_format, MemoryFormat::ChannelsFirst);
+        assert_eq!(o.multiprocessing_context, MultiprocessingContext::Spawn);
+
+        // Knobs the preset does not own stay at their defaults.
+        assert_eq!(o.num_workers, 0);
+        assert!(!o.auto_tune);
+        assert_eq!(o.timeout_seconds, None);
+        assert_eq!(o.sampler_type, SamplerType::Sequential);
+        assert_eq!((o.shard_rank, o.shard_world_size), (0, 1));
+        assert_untouched_defaults(&o);
+    }
+
+    #[test]
+    fn gpu_optimized_preserves_caller_settings() {
+        let o = LoaderOptions::default()
+            .num_workers(6)
+            .with_batch_size(64)
+            .with_timeout(3.0)
+            .gpu_optimized();
+        assert_eq!(o.num_workers, 6);
+        assert_eq!(o.batch_size, 64);
+        assert_eq!(o.timeout_seconds, Some(3.0));
+        assert!(o.pin_memory && o.persistent_workers && o.non_blocking);
+    }
+
+    #[test]
+    fn distributed_optimized_is_gpu_preset_plus_rank_sharding() {
+        let o = LoaderOptions::default().distributed_optimized(2, 8);
+        // GPU preset part.
+        assert!(o.pin_memory);
+        assert!(o.persistent_workers);
+        assert!(o.non_blocking);
+        assert_eq!(o.memory_format, MemoryFormat::ChannelsFirst);
+        assert_eq!(o.multiprocessing_context, MultiprocessingContext::Spawn);
+        // Distributed part: sampler and shard both carry (rank, world_size).
+        assert_eq!(
+            o.sampler_type,
+            SamplerType::DistributedRandom {
+                rank: 2,
+                world_size: 8
+            }
+        );
+        assert_eq!(o.shard_rank, 2);
+        assert_eq!(o.shard_world_size, 8);
+        assert_eq!(o.num_workers, 0);
+        assert_untouched_defaults(&o);
+    }
+
+    #[test]
+    fn distributed_optimized_clamps_zero_world_size_for_shard() {
+        let o = LoaderOptions::default().distributed_optimized(0, 0);
+        // `shard` clamps world size to >= 1; the sampler records what it was given.
+        assert_eq!(o.shard_world_size, 1);
+        assert_eq!(
+            o.sampler_type,
+            SamplerType::DistributedRandom {
+                rank: 0,
+                world_size: 0
+            }
+        );
+    }
+
+    #[test]
+    fn debug_mode_sets_safe_single_threaded_settings() {
+        let o = LoaderOptions::default().debug_mode();
+        assert_eq!(o.num_workers, 0);
+        assert!(!o.persistent_workers);
+        assert_eq!(o.timeout_seconds, Some(10.0));
+        assert!(!o.auto_tune);
+
+        // It does not turn on the GPU knobs.
+        assert!(!o.pin_memory);
+        assert!(!o.non_blocking);
+        assert_untouched_defaults(&o);
+    }
+
+    #[test]
+    fn debug_mode_overrides_prior_aggressive_settings() {
+        let o = LoaderOptions::default()
+            .num_workers(16)
+            .auto_tune(true)
+            .persistent_workers(true)
+            .timeout_seconds(None)
+            .debug_mode();
+        assert_eq!(o.num_workers, 0);
+        assert!(!o.persistent_workers);
+        assert_eq!(o.timeout_seconds, Some(10.0));
+        assert!(!o.auto_tune);
+    }
+
+    #[test]
+    fn gpu_optimized_then_debug_mode_disables_persistent_workers_only() {
+        let o = LoaderOptions::default().gpu_optimized().debug_mode();
+        assert!(!o.persistent_workers);
+        // debug_mode does not undo the other GPU knobs.
+        assert!(o.pin_memory);
+        assert!(o.non_blocking);
+        assert_eq!(o.memory_format, MemoryFormat::ChannelsFirst);
+    }
+
+    #[test]
+    fn simple_setters_set_their_fields() {
+        let o = LoaderOptions::default()
+            .pin_memory(true)
+            .persistent_workers(true)
+            .non_blocking(true)
+            .channels_last()
+            .use_fork();
+        assert!(o.pin_memory && o.persistent_workers && o.non_blocking);
+        assert_eq!(o.memory_format, MemoryFormat::ChannelsLast);
+        assert_eq!(o.multiprocessing_context, MultiprocessingContext::Fork);
+
+        let o = o.channels_first().use_forkserver().non_blocking(false);
+        assert_eq!(o.memory_format, MemoryFormat::ChannelsFirst);
+        assert_eq!(
+            o.multiprocessing_context,
+            MultiprocessingContext::ForkServer
+        );
+        assert!(!o.non_blocking);
+
+        let o = o.use_spawn().with_timeout(2.5).with_generator_seed(7);
+        assert_eq!(o.multiprocessing_context, MultiprocessingContext::Spawn);
+        assert_eq!(o.timeout_seconds, Some(2.5));
+        assert_eq!(o.generator_seed, Some(7));
+    }
+
+    #[test]
+    fn shard_and_worker_clamp_world_to_at_least_one() {
+        let o = LoaderOptions::default().shard(3, 0).worker(1, 0);
+        assert_eq!((o.shard_rank, o.shard_world_size), (3, 1));
+        assert_eq!((o.worker_id, o.num_workers_pytorch), (1, 1));
+    }
+
+    #[test]
+    fn collate_buffer_size_has_a_64_byte_floor() {
+        assert_eq!(
+            LoaderOptions::default()
+                .collate_buffer_size(1)
+                .collate_buffer_size,
+            64
+        );
+        assert_eq!(
+            LoaderOptions::default()
+                .collate_buffer_size(4096)
+                .collate_buffer_size,
+            4096
+        );
+    }
+}

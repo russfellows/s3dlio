@@ -6,8 +6,9 @@ use super::manifest::Manifest;
 use super::paths::KeyLayout;
 use crate::data_loader::parallel_fetch::DropCancel;
 use crate::object_store::{store_for_uri_with_helper_rows, ObjectStore};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -15,6 +16,57 @@ use tokio_util::sync::CancellationToken;
 pub struct Reader<'a> {
     pub store: &'a dyn ObjectStore,
     pub base_uri: String,
+}
+
+/// How many manifests a search reads at once.
+const MANIFEST_SCAN_CONCURRENCY: usize = 16;
+
+/// The step and manifest key a shard's directory implies: `<..>/ckpt-<step>-<ts>/<file>` is
+/// listed by `manifests/ckpt-<step>-<ts>.json` (see [`KeyLayout`]). `None` when the shard is
+/// not in a `ckpt-<step>-<ts>` directory (a caller-chosen key).
+fn manifest_hint(shard_rel_key: &str) -> Option<(u64, String)> {
+    let mut segments = shard_rel_key.rsplit('/');
+    segments.next()?; // the shard file name
+    let dir = segments.next()?;
+    let id = dir.strip_prefix("ckpt-")?;
+    let (step, ts) = id.split_once('-')?;
+    if ts.is_empty() {
+        return None;
+    }
+    Some((step.parse().ok()?, format!("manifests/ckpt-{id}.json")))
+}
+
+/// A complete manifest that lists a shard, reduced to what the choice between several needs.
+struct ManifestMatch {
+    /// `wall_time` as an instant; `None` when it is not valid RFC 3339.
+    instant: Option<chrono::DateTime<chrono::FixedOffset>>,
+    manifest_key: String,
+    checksum: Option<String>,
+}
+
+impl ManifestMatch {
+    /// Newer instant wins; an unparseable `wall_time` is older than any parseable one; a tie
+    /// goes to the lexically larger manifest key.
+    fn is_newer_than(&self, other: &Self) -> bool {
+        (self.instant, &self.manifest_key) > (other.instant, &other.manifest_key)
+    }
+}
+
+/// `Some` when `manifest` is complete and lists `shard_rel_key`.
+fn manifest_match(
+    manifest: &Manifest,
+    manifest_key: &str,
+    shard_rel_key: &str,
+) -> Option<ManifestMatch> {
+    if manifest.status != "complete" {
+        return None;
+    }
+    let shard = manifest.shards.iter().find(|s| s.key == shard_rel_key)?;
+    Some(ManifestMatch {
+        instant: chrono::DateTime::parse_from_rfc3339(&manifest.wall_time).ok(),
+        manifest_key: manifest_key.to_string(),
+        checksum: shard.checksum.clone(),
+    })
 }
 
 /// Fetch a shard and decode it, validating `expected_checksum` when there is one.
@@ -46,6 +98,37 @@ async fn fetch_shard_validated(
     } else {
         // Return Bytes directly - zero copy!
         store.get_with_validation(uri, expected_checksum).await
+    }
+}
+
+/// Split a shard URI into the checkpoint base URI and the shard key relative to it.
+///
+/// Shards always live under the base's `shards/` directory whatever the key-layout
+/// strategy (`shards/ckpt-..`, `shards/rr/..`, `shards/bin/..`), so the last `/shards/`
+/// separates the two (issue #287). Only the path is searched: a bucket or container that is
+/// itself named `shards` (`s3://shards/rank-0.bin`) is the authority, not a shard directory.
+pub fn split_shard_uri(uri: &str) -> Result<(&str, &str)> {
+    // The path starts at the first '/' after `scheme://authority`; without a scheme the whole
+    // string is the path.
+    let path_start = match uri.find("://") {
+        Some(scheme_end) => {
+            let authority_start = scheme_end + "://".len();
+            uri[authority_start..]
+                .find('/')
+                .map_or(uri.len(), |i| authority_start + i)
+        }
+        None => 0,
+    };
+    match uri[path_start..].rfind("/shards/") {
+        Some(rel) if path_start + rel > 0 && uri.len() > path_start + rel + "/shards/".len() => {
+            let pos = path_start + rel;
+            Ok((&uri[..pos], &uri[pos + 1..]))
+        }
+        _ => anyhow::bail!(
+            "cannot validate integrity of '{uri}': not a checkpoint shard URI \
+             (expected '<checkpoint base>/shards/<shard key>'); pass validate_integrity=False \
+             to read it without verification"
+        ),
     }
 }
 
@@ -197,6 +280,172 @@ impl<'a> Reader<'a> {
         let uri = format!("{}/{}", self.base_uri, shard_rel_key);
         // A `.zst` shard is decompressed first: the checksum covers the uncompressed bytes.
         fetch_shard_validated(self.store, &uri, shard_rel_key, expected_checksum).await
+    }
+
+    /// Read the shard at `shard_rel_key` and verify it against the checksum its checkpoint
+    /// manifest recorded when the shard was written (issue #287).
+    ///
+    /// Only manifests whose `status` is `complete` count (as in
+    /// [`Reader::scan_latest_complete`]). Precedence, exactly:
+    /// 1. the manifest named after the shard directory (`shards/ckpt-<step>-<ts>/..` is listed
+    ///    by `manifests/ckpt-<step>-<ts>.json`, which `save_checkpoint` and
+    ///    `save_distributed_shard` produce) is used when it is complete and lists the shard --
+    ///    one GET in the common case, and no other manifest is compared with it, even a
+    ///    newer one;
+    /// 2. only otherwise, the newest complete manifest of the same step
+    ///    (`manifests/ckpt-<step>-*.json`, where a writer that stamps the manifest later than
+    ///    the shard puts it) that lists the shard is used, "newest" being the parsed
+    ///    `wall_time` compared as an RFC 3339 instant;
+    /// 3. only when none of those lists it, the newest such manifest among all the others
+    ///    (a shard stored under a caller-chosen key), by the same rule.
+    ///
+    /// A manifest whose `wall_time` does not parse ranks older than every parseable one, and
+    /// ties go to the lexically larger manifest key.
+    ///
+    /// The check is never skipped silently: when no complete manifest lists the shard, or the
+    /// manifest recorded no checksum for it, this returns an error that says so, and a
+    /// mismatch is an "Integrity validation failed" error. A `.zst` shard is decoded first,
+    /// exactly as in [`Reader::read_shard_with_validation`].
+    ///
+    /// A manifest that cannot be read is never taken for "does not list this shard": in
+    /// steps 2 and 3 a listed manifest that is gone (typed not-found) is skipped, but any other
+    /// failure to read, parse or validate a manifest is returned as the error. (Step 1 is a
+    /// guess at a name; if it fails for any reason the listing steps decide.)
+    pub async fn read_shard_against_manifest(&self, shard_rel_key: &str) -> Result<Bytes> {
+        let hint = manifest_hint(shard_rel_key);
+        let mut tried: HashSet<String> = HashSet::new();
+
+        // Step 1: the manifest the shard directory names.
+        if let Some((_, manifest_key)) = &hint {
+            if let Ok(outcome) = self.fetch_complete_manifest(manifest_key).await {
+                tried.insert(manifest_key.clone());
+                if let Some(found) =
+                    outcome.and_then(|m| manifest_match(&m, manifest_key, shard_rel_key))
+                {
+                    return self.read_with_recorded(shard_rel_key, found.checksum).await;
+                }
+            }
+        }
+
+        // Steps 2 and 3 share one LIST of the manifests.
+        let prefix = format!("{}/manifests/", self.base_uri);
+        let mut keys: Vec<String> = Vec::new();
+        for uri in self.store.list(&prefix, false).await? {
+            if !uri.ends_with(".json") {
+                continue;
+            }
+            if let Ok(rel_key) = self.extract_relative_key(&uri) {
+                if !tried.contains(&rel_key) {
+                    keys.push(rel_key);
+                }
+            }
+        }
+
+        let mut found = None;
+        if let Some((step, _)) = &hint {
+            let same_step: Vec<String> = keys
+                .iter()
+                .filter(|k| matches!(KeyLayout::parse_manifest_key(k), Ok((s, _)) if s == *step))
+                .cloned()
+                .collect();
+            found = self.newest_listing(&same_step, shard_rel_key).await?;
+            tried.extend(same_step);
+        }
+        if found.is_none() {
+            keys.retain(|k| !tried.contains(k));
+            found = self.newest_listing(&keys, shard_rel_key).await?;
+        }
+
+        match found {
+            None => anyhow::bail!(
+                "cannot validate integrity of '{}/{}': no complete checkpoint manifest under \
+                 '{}' lists this shard (pass validate_integrity=False to read it without \
+                 verification)",
+                self.base_uri,
+                shard_rel_key,
+                self.base_uri
+            ),
+            Some(found) => self.read_with_recorded(shard_rel_key, found.checksum).await,
+        }
+    }
+
+    /// Validate-read `shard_rel_key` against the checksum a manifest recorded for it.
+    async fn read_with_recorded(
+        &self,
+        shard_rel_key: &str,
+        checksum: Option<String>,
+    ) -> Result<Bytes> {
+        match checksum {
+            None => anyhow::bail!(
+                "cannot validate integrity of '{}/{}': the checkpoint manifest recorded no \
+                 checksum for this shard (pass validate_integrity=False to read it without \
+                 verification)",
+                self.base_uri,
+                shard_rel_key
+            ),
+            Some(checksum) => {
+                self.read_shard_with_validation(shard_rel_key, Some(&checksum))
+                    .await
+            }
+        }
+    }
+
+    /// Read the manifest at `manifest_rel_key`. `Ok(None)` when it is absent (typed
+    /// not-found) or not `complete`; any other failure is an error.
+    async fn fetch_complete_manifest(&self, manifest_rel_key: &str) -> Result<Option<Manifest>> {
+        let uri = format!("{}/{}", self.base_uri, manifest_rel_key);
+        let bytes = match self.store.get(&uri).await {
+            Ok(bytes) => bytes,
+            Err(e) if crate::delete_contract::is_not_found(&e) => return Ok(None),
+            Err(e) => return Err(e.context(format!("failed to read checkpoint manifest '{uri}'"))),
+        };
+        let manifest: Manifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse checkpoint manifest '{uri}'"))?;
+        if manifest.status != "complete" {
+            return Ok(None);
+        }
+        manifest
+            .validate()
+            .with_context(|| format!("invalid checkpoint manifest '{uri}'"))?;
+        Ok(Some(manifest))
+    }
+
+    /// `Some` when the manifest at `manifest_key` is complete and lists `shard_rel_key`.
+    async fn listing_of(
+        &self,
+        manifest_key: &str,
+        shard_rel_key: &str,
+    ) -> Result<Option<ManifestMatch>> {
+        let manifest = self.fetch_complete_manifest(manifest_key).await?;
+        Ok(manifest.and_then(|m| manifest_match(&m, manifest_key, shard_rel_key)))
+    }
+
+    /// Read the named manifests (a bounded number at a time) and return the newest complete
+    /// one that lists `shard_rel_key`. The first read failure aborts the search.
+    async fn newest_listing(
+        &self,
+        manifest_keys: &[String],
+        shard_rel_key: &str,
+    ) -> Result<Option<ManifestMatch>> {
+        let mut best: Option<ManifestMatch> = None;
+        for chunk in manifest_keys.chunks(MANIFEST_SCAN_CONCURRENCY) {
+            // The futures are built up front (not through a stream adaptor holding a closure),
+            // which keeps this future provably `Send` for callers that spawn it.
+            let reads: Vec<_> = chunk
+                .iter()
+                .map(|key| self.listing_of(key, shard_rel_key))
+                .collect();
+            for candidate in futures::future::try_join_all(reads)
+                .await?
+                .into_iter()
+                .flatten()
+            {
+                if best.as_ref().is_none_or(|b| candidate.is_newer_than(b)) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        Ok(best)
     }
 
     /// Read a shard by rank from a manifest
@@ -684,5 +933,575 @@ mod tests {
         assert!(errors.is_empty(), "Validation should pass: {:?}", errors);
 
         Ok(())
+    }
+
+    #[test]
+    fn split_shard_uri_finds_base_and_key_for_every_layout() {
+        assert_eq!(
+            split_shard_uri("file:///d/run/shards/ckpt-1-ts/rank-0.bin").unwrap(),
+            ("file:///d/run", "shards/ckpt-1-ts/rank-0.bin")
+        );
+        assert_eq!(
+            split_shard_uri("s3://b/p/shards/rr/03/ckpt-1-ts/rank-3.bin.zst").unwrap(),
+            ("s3://b/p", "shards/rr/03/ckpt-1-ts/rank-3.bin.zst")
+        );
+        // A base that itself contains "shards" splits at the LAST separator.
+        assert_eq!(
+            split_shard_uri("file:///a/shards/run/shards/ckpt-1-ts/rank-0.bin").unwrap(),
+            ("file:///a/shards/run", "shards/ckpt-1-ts/rank-0.bin")
+        );
+        for bad in [
+            "file:///d/run",
+            "file:///d/run/shards/",
+            "/shards/x",
+            "shards/x",
+        ] {
+            assert!(split_shard_uri(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_shard_against_manifest_round_trip_and_corruption() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base_uri = format!("file://{}", temp_dir.path().display());
+        let store = store_for_uri(&base_uri)?;
+
+        let writer = Writer::new(&*store, base_uri.clone(), 1, 0);
+        let data = b"payload recorded with a checksum";
+        writer.save_checkpoint(5, 1, "torch", data, None).await?;
+
+        let reader = Reader::new(&*store, base_uri.clone());
+        let manifest = reader.load_latest_manifest().await?.unwrap();
+        let shard = &manifest.shards[0];
+        assert!(
+            shard.checksum.is_some(),
+            "an uncompressed shard must record its checksum"
+        );
+
+        let got = reader.read_shard_against_manifest(&shard.key).await?;
+        assert_eq!(&got[..], data);
+
+        // Corrupt the stored shard in place: the recorded checksum must reject it.
+        let path = temp_dir.path().join(&shard.key);
+        let mut bad = data.to_vec();
+        bad[0] ^= 0xff;
+        std::fs::write(&path, &bad)?;
+        let err = reader
+            .read_shard_against_manifest(&shard.key)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Integrity validation failed"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_shard_against_manifest_reports_missing_checksum_and_unlisted_shard() -> Result<()>
+    {
+        let temp_dir = TempDir::new()?;
+        let base_uri = format!("file://{}", temp_dir.path().display());
+        let store = store_for_uri(&base_uri)?;
+
+        // A checkpoint whose manifest recorded no checksum (streamed shard without one).
+        let writer = Writer::new(&*store, base_uri.clone(), 1, 0);
+        let layout = KeyLayout::new(base_uri.clone(), 9);
+        let key = layout.shard_key(0, writer.strategy);
+        store
+            .put(
+                &layout.to_uri(&base_uri, &key),
+                Bytes::from_static(b"no sum"),
+            )
+            .await?;
+        let meta = writer.finalize_shard_meta(&layout, key.clone()).await?;
+        assert!(meta.checksum.is_none());
+        writer
+            .finalize_distributed_checkpoint(&layout, "torch", 1, vec![meta], None)
+            .await?;
+
+        let reader = Reader::new(&*store, base_uri);
+        let err = reader.read_shard_against_manifest(&key).await.unwrap_err();
+        assert!(
+            err.to_string().contains("recorded no checksum"),
+            "unexpected error: {err}"
+        );
+
+        let err = reader
+            .read_shard_against_manifest("shards/ckpt-0-none/rank-0.bin")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("lists this shard"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    // ---- #287 follow-up: manifest lookup scaling, selection and error handling ----
+
+    use crate::object_store::{ObjectMetadata, ObjectWriter};
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// How a manifest GET fails in [`ProbeStore`].
+    enum Injected {
+        /// A typed "object not found" (a listed key that vanished).
+        NotFound,
+        /// An untyped failure such as a dropped connection or throttling.
+        Transient,
+    }
+
+    /// A store that delegates to `inner`, counts GETs of manifest objects, and can make
+    /// the GET of one manifest fail.
+    struct ProbeStore {
+        inner: Box<dyn ObjectStore>,
+        manifest_gets: AtomicUsize,
+        fail_suffix: Option<(String, Injected)>,
+    }
+
+    impl ProbeStore {
+        fn new(inner: Box<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                manifest_gets: AtomicUsize::new(0),
+                fail_suffix: None,
+            }
+        }
+
+        fn failing(inner: Box<dyn ObjectStore>, suffix: &str, how: Injected) -> Self {
+            Self {
+                fail_suffix: Some((suffix.to_string(), how)),
+                ..Self::new(inner)
+            }
+        }
+
+        fn manifest_gets(&self) -> usize {
+            self.manifest_gets.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ProbeStore {
+        async fn get(&self, uri: &str) -> Result<Bytes> {
+            if uri.contains("/manifests/") {
+                self.manifest_gets.fetch_add(1, Ordering::SeqCst);
+                if let Some((suffix, how)) = &self.fail_suffix {
+                    if uri.ends_with(suffix.as_str()) {
+                        return Err(match how {
+                            Injected::NotFound => crate::object_error::attach_object_error(
+                                anyhow::anyhow!("injected 404"),
+                                crate::object_error::ObjectErrorKind::NotFound,
+                                "test",
+                                "not found",
+                            ),
+                            Injected::Transient => anyhow::anyhow!("injected transient failure"),
+                        });
+                    }
+                }
+            }
+            self.inner.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
+            self.inner.get_range(uri, offset, length).await
+        }
+        async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
+            self.inner.put(uri, data).await
+        }
+        async fn put_multipart(
+            &self,
+            uri: &str,
+            data: Bytes,
+            part_size: Option<usize>,
+        ) -> Result<()> {
+            self.inner.put_multipart(uri, data, part_size).await
+        }
+        async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
+            self.inner.list(uri_prefix, recursive).await
+        }
+        fn list_stream<'a>(
+            &'a self,
+            uri_prefix: &'a str,
+            recursive: bool,
+        ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+            self.inner.list_stream(uri_prefix, recursive)
+        }
+        async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
+            self.inner.stat(uri).await
+        }
+        fn list_objects_with_prefix<'a>(
+            &'a self,
+            uri_prefix: &'a str,
+        ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+            self.inner.list_objects_with_prefix(uri_prefix)
+        }
+        async fn delete(&self, uri: &str) -> Result<()> {
+            self.inner.delete(uri).await
+        }
+        async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+            self.inner.delete_batch(uris).await
+        }
+        async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+            self.inner.delete_prefix(uri_prefix).await
+        }
+        async fn create_container(&self, name: &str) -> Result<()> {
+            self.inner.create_container(name).await
+        }
+        async fn delete_container(&self, name: &str) -> Result<()> {
+            self.inner.delete_container(name).await
+        }
+        async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
+            self.inner.get_writer(uri).await
+        }
+    }
+
+    const SHARD_DATA: &[u8] = b"the real shard bytes";
+
+    fn good_checksum() -> String {
+        crate::checksum::crc32c_label(crate::checksum::crc32c_of(SHARD_DATA))
+    }
+
+    fn bogus_checksum() -> String {
+        crate::checksum::crc32c_label(crate::checksum::crc32c_of(b"not the shard"))
+    }
+
+    /// Put a one-rank manifest named `manifests/<name>.json` that lists `shard_key`.
+    async fn put_manifest(
+        store: &dyn ObjectStore,
+        base_uri: &str,
+        name: &str,
+        wall_time: &str,
+        status: &str,
+        shard_key: &str,
+        checksum: Option<String>,
+    ) -> Result<()> {
+        let (step, _) = KeyLayout::parse_manifest_key(&format!("{name}.json"))?;
+        let mut manifest = Manifest::new("torch".to_string(), step, 1, 1);
+        manifest.wall_time = wall_time.to_string();
+        manifest.status = status.to_string();
+        manifest.add_shard(crate::checkpoint::manifest::ShardMeta {
+            rank: 0,
+            key: shard_key.to_string(),
+            size: SHARD_DATA.len() as u64,
+            etag: None,
+            checksum,
+        });
+        store
+            .put(
+                &format!("{base_uri}/manifests/{name}.json"),
+                Bytes::from(serde_json::to_vec(&manifest)?),
+            )
+            .await
+    }
+
+    async fn put_shard(store: &dyn ObjectStore, base_uri: &str, shard_key: &str) -> Result<()> {
+        store
+            .put(
+                &format!("{base_uri}/{shard_key}"),
+                Bytes::from_static(SHARD_DATA),
+            )
+            .await
+    }
+
+    /// `n` unrelated complete checkpoints (steps 1000..) so a scan has something to read.
+    async fn put_fillers(store: &dyn ObjectStore, base_uri: &str, n: u64) -> Result<()> {
+        for i in 0..n {
+            let step = 1000 + i;
+            put_manifest(
+                store,
+                base_uri,
+                &format!("ckpt-{step}-fill"),
+                "2026-01-01T00:00:00Z",
+                "complete",
+                &format!("shards/ckpt-{step}-fill/rank-0.bin"),
+                Some(bogus_checksum()),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_shard_against_manifest_reads_one_manifest_when_names_match() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base_uri = format!("file://{}", temp_dir.path().display());
+        let plain = store_for_uri(&base_uri)?;
+        put_fillers(&*plain, &base_uri, 60).await?;
+        let key = "shards/ckpt-5-A/rank-0.bin";
+        put_shard(&*plain, &base_uri, key).await?;
+        put_manifest(
+            &*plain,
+            &base_uri,
+            "ckpt-5-A",
+            "2026-10-18T10:00:00Z",
+            "complete",
+            key,
+            Some(good_checksum()),
+        )
+        .await?;
+
+        let probe = ProbeStore::new(store_for_uri(&base_uri)?);
+        let got = Reader::new(&probe, base_uri)
+            .read_shard_against_manifest(key)
+            .await?;
+        assert_eq!(&got[..], SHARD_DATA);
+        assert_eq!(
+            probe.manifest_gets(),
+            1,
+            "61 manifests exist; one is needed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_shard_against_manifest_narrows_to_the_shards_step() -> Result<()> {
+        // The Python writer stamps the shard directory and the manifest at different
+        // instants, so the manifest name does not match the shard directory.
+        let temp_dir = TempDir::new()?;
+        let base_uri = format!("file://{}", temp_dir.path().display());
+        let plain = store_for_uri(&base_uri)?;
+        put_fillers(&*plain, &base_uri, 60).await?;
+        let key = "shards/ckpt-7-shardtime/rank-0.bin";
+        put_shard(&*plain, &base_uri, key).await?;
+        put_manifest(
+            &*plain,
+            &base_uri,
+            "ckpt-7-manifesttime",
+            "2026-10-18T10:00:00Z",
+            "complete",
+            key,
+            Some(good_checksum()),
+        )
+        .await?;
+
+        let probe = ProbeStore::new(store_for_uri(&base_uri)?);
+        let got = Reader::new(&probe, base_uri)
+            .read_shard_against_manifest(key)
+            .await?;
+        assert_eq!(&got[..], SHARD_DATA);
+        // The one failed direct probe (no such manifest) plus the one step-7 manifest.
+        assert!(
+            probe.manifest_gets() <= 2,
+            "read {} manifests",
+            probe.manifest_gets()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_shard_against_manifest_falls_back_to_a_full_scan_for_a_custom_key() -> Result<()>
+    {
+        // put_shard_with_key can store a shard anywhere; the manifest then names that key.
+        let temp_dir = TempDir::new()?;
+        let base_uri = format!("file://{}", temp_dir.path().display());
+        let plain = store_for_uri(&base_uri)?;
+        put_fillers(&*plain, &base_uri, 5).await?;
+        let key = "shards/custom/weights.bin";
+        put_shard(&*plain, &base_uri, key).await?;
+        put_manifest(
+            &*plain,
+            &base_uri,
+            "ckpt-2-x",
+            "2026-10-18T10:00:00Z",
+            "complete",
+            key,
+            Some(good_checksum()),
+        )
+        .await?;
+
+        let got = Reader::new(&*plain, base_uri)
+            .read_shard_against_manifest(key)
+            .await?;
+        assert_eq!(&got[..], SHARD_DATA);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_shard_against_manifest_ignores_an_incomplete_newer_manifest() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base_uri = format!("file://{}", temp_dir.path().display());
+        let store = store_for_uri(&base_uri)?;
+        let key = "shards/ckpt-3-S/rank-0.bin";
+        put_shard(&*store, &base_uri, key).await?;
+        put_manifest(
+            &*store,
+            &base_uri,
+            "ckpt-3-A",
+            "2026-10-18T10:00:00Z",
+            "complete",
+            key,
+            Some(good_checksum()),
+        )
+        .await?;
+        // Newer, but still incomplete and carrying a bogus checksum.
+        put_manifest(
+            &*store,
+            &base_uri,
+            "ckpt-3-B",
+            "2026-10-18T11:00:00Z",
+            "incomplete",
+            key,
+            Some(bogus_checksum()),
+        )
+        .await?;
+
+        let got = Reader::new(&*store, base_uri)
+            .read_shard_against_manifest(key)
+            .await?;
+        assert_eq!(&got[..], SHARD_DATA);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_shard_against_manifest_skips_an_incomplete_manifest_named_after_the_shard(
+    ) -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base_uri = format!("file://{}", temp_dir.path().display());
+        let store = store_for_uri(&base_uri)?;
+        let key = "shards/ckpt-3-S/rank-0.bin";
+        put_shard(&*store, &base_uri, key).await?;
+        // The manifest the shard directory names is incomplete; the complete one is elsewhere.
+        put_manifest(
+            &*store,
+            &base_uri,
+            "ckpt-3-S",
+            "2026-10-18T11:00:00Z",
+            "incomplete",
+            key,
+            Some(bogus_checksum()),
+        )
+        .await?;
+        put_manifest(
+            &*store,
+            &base_uri,
+            "ckpt-3-A",
+            "2026-10-18T10:00:00Z",
+            "complete",
+            key,
+            Some(good_checksum()),
+        )
+        .await?;
+
+        let got = Reader::new(&*store, base_uri)
+            .read_shard_against_manifest(key)
+            .await?;
+        assert_eq!(&got[..], SHARD_DATA);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_shard_against_manifest_orders_by_instant_not_by_string() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base_uri = format!("file://{}", temp_dir.path().display());
+        let store = store_for_uri(&base_uri)?;
+        let key = "shards/ckpt-3-S/rank-0.bin";
+        put_shard(&*store, &base_uri, key).await?;
+        // 09:00-06:00 is 15:00Z, the NEWER instant, but its text sorts before "10:00:00Z".
+        put_manifest(
+            &*store,
+            &base_uri,
+            "ckpt-3-A",
+            "2026-10-18T09:00:00-06:00",
+            "complete",
+            key,
+            Some(good_checksum()),
+        )
+        .await?;
+        put_manifest(
+            &*store,
+            &base_uri,
+            "ckpt-3-B",
+            "2026-10-18T10:00:00Z",
+            "complete",
+            key,
+            Some(bogus_checksum()),
+        )
+        .await?;
+
+        let got = Reader::new(&*store, base_uri)
+            .read_shard_against_manifest(key)
+            .await?;
+        assert_eq!(&got[..], SHARD_DATA);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_shard_against_manifest_surfaces_a_manifest_load_error() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base_uri = format!("file://{}", temp_dir.path().display());
+        let plain = store_for_uri(&base_uri)?;
+        let key = "shards/ckpt-3-S/rank-0.bin";
+        put_shard(&*plain, &base_uri, key).await?;
+        for name in ["ckpt-3-A", "ckpt-3-B"] {
+            put_manifest(
+                &*plain,
+                &base_uri,
+                name,
+                "2026-10-18T10:00:00Z",
+                "complete",
+                key,
+                Some(good_checksum()),
+            )
+            .await?;
+        }
+
+        // A transient failure must not be reported as a missing or corrupt shard.
+        let probe = ProbeStore::failing(
+            store_for_uri(&base_uri)?,
+            "ckpt-3-B.json",
+            Injected::Transient,
+        );
+        let err = Reader::new(&probe, base_uri.clone())
+            .read_shard_against_manifest(key)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("injected transient failure"),
+            "unexpected error: {err:#}"
+        );
+
+        // A listed manifest that is gone (typed not-found) may be skipped.
+        let probe = ProbeStore::failing(
+            store_for_uri(&base_uri)?,
+            "ckpt-3-B.json",
+            Injected::NotFound,
+        );
+        let got = Reader::new(&probe, base_uri.clone())
+            .read_shard_against_manifest(key)
+            .await?;
+        assert_eq!(&got[..], SHARD_DATA);
+
+        // An unparseable manifest surfaces too.
+        plain
+            .put(
+                &format!("{base_uri}/manifests/ckpt-3-B.json"),
+                Bytes::from_static(b"{ not json"),
+            )
+            .await?;
+        let err = Reader::new(&*plain, base_uri)
+            .read_shard_against_manifest(key)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("lists this shard"),
+            "a corrupt manifest was reported as an unlisted shard: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn split_shard_uri_ignores_a_bucket_named_shards() {
+        assert!(split_shard_uri("s3://shards/rank-0.bin").is_err());
+        assert!(split_shard_uri("az://shards/rank-0.bin").is_err());
+        assert_eq!(
+            split_shard_uri("s3://shards/run/shards/ckpt-1-ts/rank-0.bin").unwrap(),
+            ("s3://shards/run", "shards/ckpt-1-ts/rank-0.bin")
+        );
+        assert_eq!(
+            split_shard_uri("s3://shards/shards/ckpt-1-ts/rank-0.bin").unwrap(),
+            ("s3://shards", "shards/ckpt-1-ts/rank-0.bin")
+        );
     }
 }

@@ -163,7 +163,7 @@ class _AsyncBytesSource:
                 # Use the new generic create_async_loader function
                 loader = _core.create_async_loader(self._uri, self._opts)
                 try:
-                    async for batch in loader:  # batch: List[bytes]
+                    async for batch in loader:  # batch: list of BytesView
                         for b in batch:
                             self._q.put(b, block=True)
                 finally:
