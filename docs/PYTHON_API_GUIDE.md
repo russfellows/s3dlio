@@ -361,6 +361,80 @@ chunk = s3dlio.get_range("s3://bucket/key", offset=1024, length=4096)
 tail = s3dlio.get_range("s3://bucket/key", offset=1024)
 ```
 
+### get_into_async() / head_async() — Read Into Your Own Buffer ✨ New in v0.10.0
+
+`get_into_async` reads a whole object into memory you own (a `bytearray`, a NumPy `uint8`
+array, an `mmap`, a ctypes byte array, a writable `memoryview`, ...). Data is written into the
+destination as it arrives: there is no whole-object staging buffer and no copy afterwards.
+`head_async` returns the object's size and version identity without reading it.
+`object_capabilities` says, from the URI and the build alone, whether both are available.
+
+```python
+import asyncio
+import numpy as np
+import s3dlio
+
+async def load(uri):
+    meta = await s3dlio.head_async(uri)        # ObjectMetadata or None (absent)
+    if meta is None:
+        raise FileNotFoundError(uri)
+    dst = np.empty(meta.size, dtype=np.uint8)  # any writable, C-contiguous byte buffer
+    n = await s3dlio.get_into_async(uri, dst, expected_len=meta.size)
+    assert n == meta.size
+    return dst
+
+s3dlio.object_capabilities("az://account/container/key")
+# {'provider': 'az', 'get_into': True, 'head': True}
+```
+
+| Call | Result |
+|---|---|
+| `object_capabilities(uri)` | `{"provider": "s3"\|"az"\|"gs"\|"file"\|"direct"\|"unknown", "get_into": bool, "head": bool}`. No store, credentials or network. `ValueError` for a malformed URI. |
+| `get_into_async(uri, dst, *, expected_len)` | Awaitable resolving to `expected_len` once `dst[:expected_len]` holds the whole object. |
+| `head_async(uri)` | Awaitable resolving to `ObjectMetadata(size, etag, version_id)`, or `None` when the object does not exist. |
+
+**Errors.**
+- `ObjectNotFoundError` (a `FileNotFoundError`): `get_into_async` on a missing object.
+- `LengthMismatchError` (a `ValueError`, with `.expected` and `.actual`, `None` if unknown):
+  the object's size is not `expected_len`. Nothing is written past `expected_len`.
+- `UnsupportedOperationError` (a `NotImplementedError`): raised at once when the build or
+  provider lacks the operation. No fallback download is attempted.
+- `ValueError`: a URI that is malformed for its scheme (checked before anything else).
+- A refused buffer raises `BufferError` (read-only or not C-contiguous) or `TypeError` (item size or
+  format); an `expected_len` that is not an integer (or is a `bool`) raises `TypeError`, and one
+  that is negative or larger than the buffer raises `ValueError`. All of these are raised before
+  any request is sent.
+- Every other failure (403, throttling, transport, server errors, and an object that changed
+  version during the read) raises `RuntimeError` with the full cause chain in its message.
+
+**Buffer rules (important).**
+- Until the awaitable finishes, s3dlio has exclusive use of `dst[:expected_len]`: do not read,
+  modify, resize or reuse it. After a failure its contents are unspecified.
+- The awaitable never finishes before every native writer has stopped and the buffer is
+  released, even on an error, `cancel()`, `Task.cancel()`, `asyncio.timeout()` or `wait_for()`.
+  The buffer is safe to reuse right after the `await`.
+- Await the returned object directly; do not wrap it in `asyncio.shield`, and do not call
+  `set_result`/`set_exception` on it.
+- Concurrent calls need their own destinations, or non-overlapping slices of one buffer.
+- Accepted: writable, C-contiguous buffers with item size 1 (formats `B`, `b`, `c`, or none).
+  Read-only, strided, pointer and object formats are refused before any request is sent.
+
+**Semantics.**
+- A read never mixes data from two object versions. The S3 range fan-out sends `If-Match` with
+  the HEAD's ETag on every range; otherwise the first response's ETag (S3, Azure) or generation
+  (GCS) pins every retry and repair. A concurrent overwrite therefore fails the read. If the first
+  response has no usable ETag, a read that fails part-way fails instead of retrying.
+- `etag` is opaque (not an MD5). `version_id` is the S3 or Azure version ID (when versioning is
+  on) or the GCS generation.
+- On `s3://` and `gs://`, `head_async` also returns `None` for a missing bucket: the provider
+  cannot tell it from a missing object. A missing Azure container raises.
+- Supported: S3 and S3-compatible endpoints, Azure Blob, and native GCS in builds with the GCS
+  backend (the PyPI wheels have S3 and Azure). Not supported: `file://`, `direct://`.
+- Once native work has started, the op-log writes one GET row per `get_into_async` and one HEAD
+  row per `head_async`, with the real outcome (also after an error or cancellation). A call
+  refused up front writes no row.
+- A call still running when the interpreter exits is not waited for.
+
 ### list() — List Objects
 
 ```python

@@ -109,7 +109,7 @@ def test_compression():
                 options = s3dlio.PyWriterOptions()
                 options.with_compression('zstd', test['level'])
                 
-                writer = s3dlio.create_filesystem_writer(f'file://{tmpdir}/compressed_{test['level']}.txt', options)
+                writer = s3dlio.create_filesystem_writer(f'file://{tmpdir}/compressed_{test["level"]}.txt', options)
                 writer.write_chunk(test_data)
                 stats = writer.finalize()
                 

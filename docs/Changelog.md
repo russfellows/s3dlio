@@ -1,5 +1,186 @@
 # s3dlio Changelog
 
+## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; stricter PUT payloads and URI validation
+
+This release adds a new public API surface (#264) and fixes seven issues (#224, #230, #233, #235,
+#261, #263 and #269); #250's test import is fixed and its event-loop report did not reproduce (see
+Fixed). The new Python calls read an object straight into memory the caller owns (a `bytearray`, a
+NumPy array, an `mmap`, a ctypes array, ...), look up an object's size and version identity without
+reading it, and say, from the URI alone, whether this build supports them. They work on S3 and
+S3-compatible services (including GCS through its S3 endpoint), Azure Blob and native GCS (`gs://`,
+in builds with the GCS backend, which the PyPI wheels do not include). The existing APIs are
+unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
+
+**Read the behaviour changes before upgrading.** Each one is described in full below:
+
+- **`put_bytes` and `put_bytes_async` payloads are strict (#261).** They raise `TypeError` for an
+  `int`, a `bool` or an arbitrary iterable instead of writing a payload made from it
+  (`put_bytes(uri, 42)` used to write 42 zero bytes), as the streaming writers already did. Buffers
+  and `__bytes__` objects still work.
+- **`az://account//key` and some `https://` Azure URIs are refused (#224, #269).** An empty
+  container, and an https authority that is not a plain blob host, are malformed-URI errors before
+  any client is built.
+- **`S3DLIO_CHUNK_SIZE=0` and `S3DLIO_RANGE_CONCURRENCY=0` are errors on the S3 range-read paths
+  (#235)**, naming the variable, instead of a hang or memory exhaustion.
+- **`mkdir_async` resolves to `None` (#233)** instead of an empty tuple.
+- **Times are RFC 3339 (#263).** GCS bucket creation dates, GCS object times and `file://`/`direct://`
+  modification times read like `2025-05-16T09:46:12Z`, not as a debug dump of the internal type.
+
+### Added
+
+- **`s3dlio.get_into_async(uri, dst, *, expected_len)`** (#264). Reads the whole object at `uri` into
+  `dst[:expected_len]` and resolves to `expected_len`. `dst` is any writable, C-contiguous byte
+  buffer (item size 1, byte formats such as `B`, `b` and `c`; read-only, strided, pointer and object
+  buffers are refused before any request). There is no whole-object staging buffer and no copy after
+  the download: data is written into the caller's memory as it arrives.
+  - **Exact length.** `expected_len` is the object's size. Any other size raises
+    `LengthMismatchError` (`.expected`, and `.actual`, which is `None` when the size is unknown), and
+    nothing is written past `expected_len`.
+  - **One version.** A read never combines data from two object versions. The S3 range fan-out sends
+    `If-Match` with the HEAD's ETag on every range and retry; otherwise the first response's ETag
+    (S3, Azure) or generation (GCS) pins every retry and repair. When the first response carries no
+    usable ETag, nothing can be pinned: a read that fails part-way then fails instead of retrying. A
+    version change during the read fails it (as a `RuntimeError`).
+  - **Ownership.** Until the awaitable finishes, native code has exclusive use of
+    `dst[:expected_len]`: do not read, modify, resize or reuse it. The awaitable does not finish,
+    even on an error, a `cancel()`, a `Task.cancel()`, `asyncio.timeout()` or `wait_for()`, until
+    every native writer has stopped and the buffer export is released, so the buffer is safe to
+    reuse right after the `await`. Its contents after a failure are unspecified. Do not wrap the
+    awaitable in `asyncio.shield`, and give concurrent calls non-overlapping destinations. A call
+    still running when the interpreter exits is not waited for.
+- **`s3dlio.head_async(uri)`** (#264). Resolves to an `ObjectMetadata` or to `None` when the object
+  does not exist. A 403 and every other failure raise. On `s3://` and `gs://` an absent bucket also
+  resolves to `None`, because the provider's response cannot tell it from an absent object; a
+  missing Azure container raises. The awaitable follows the same completion rule as
+  `get_into_async`.
+- **`s3dlio.ObjectMetadata`**: a frozen value with `size`, `etag` and `version_id` (the S3 or Azure
+  version ID when versioning is on, the GCS generation). ETags are opaque strings, not MD5 digests.
+- **`s3dlio.object_capabilities(uri)`** returns `{"provider", "get_into", "head"}` from the URI and
+  the build alone: no store, credentials, client or network. The default (PyPI) wheel reports `s3`
+  and `az` as supported; builds with the GCS backend add `gs`; `file://`, `direct://`, the Arrow
+  backend and the legacy community GCS client report unsupported. A malformed URI is a `ValueError`.
+- **Three exceptions:** `ObjectNotFoundError` (a `FileNotFoundError`), `LengthMismatchError` (a
+  `ValueError`) and `UnsupportedOperationError` (a `NotImplementedError`, raised at once for an
+  unsupported build or provider; no fallback download is ever attempted). A malformed URI raises
+  `ValueError`, a refused buffer `BufferError` or `TypeError`, and a bad `expected_len`
+  `TypeError` or `ValueError`, all before any request.
+- **Op-log.** Once a call's native work has started, each `get_into_async` call writes one GET row
+  and each `head_async` call one HEAD row, with the real outcome, including after a failure or
+  cancellation; a call refused before that (bad URI, buffer or length, unsupported) writes none.
+  Internal ranges, retries and size probes are not extra rows. The GET byte count is the number of
+  distinct destination positions filled, so a retried range is not counted twice; it does not mean
+  the data is valid. A HEAD row's byte count is the object size. The TSV schema is unchanged.
+- **Rust:** two provided methods on `ObjectStore`, `get_into(uri, &mut [u8], &ReceiveProgress)` and
+  `head(uri) -> Option<HeadMetadata>`. Both default to "unsupported", so existing implementations
+  compile unchanged; the S3, Azure and GCS stores and the logged wrapper implement them. New public
+  types: `object_store::HeadMetadata`, and in the new modules `capabilities`
+  (`object_capabilities`, `Capabilities`), `object_error` (`ObjectError`, `ObjectErrorKind`) and
+  `receive_progress` (`ReceiveProgress`, `SpanMark`). Like the crate's other implementation modules,
+  these may still change before 1.0.
+- **Provider details.**
+  - **S3:** all three receive routes (single GET, concurrent ranges, per-endpoint clients) write into
+    the destination. The range fan-out makes a fresh HEAD for the size and ETag, ignoring the size
+    cache, and checks every response's range bounds and total; when that HEAD fails or gives no
+    usable size or ETag, the read falls back to one GET. A pinned response without an ETag fails,
+    because it cannot confirm the version.
+  - **Azure:** one bounded request per attempt for `expected_len + 1` bytes (`0..1` for an empty
+    destination), so an oversized blob is detected from the response even if a proxy strips
+    `Content-Range`. The extra byte is never written. The SDK's own request retries apply within
+    each attempt.
+  - **Native GCS:** HTTP and Rapid routes, with the generation pinned on every repair. Repairs have
+    a total budget per read that progress does not refill, and the SDK's own read resumption is
+    turned off on this path, so the bounded repair loop is the only one. On the HTTP route, object
+    names containing `%` or `\` are sent escaped, so the request names the exact object.
+
+### Changed (BEHAVIOUR CHANGE)
+
+- **Strict `put_bytes` / `put_bytes_async` payloads (#261).** Both now use the strict conversion the
+  streaming writers (`write_chunk`, `write_owned_bytes`, `MultipartUploadWriter.write`) already
+  used: only buffer-protocol objects and objects with `__bytes__()` are accepted. An `int` or `bool`
+  (which `bytes(5)` turns into five zero bytes) and an arbitrary iterable now raise `TypeError`
+  before any request is sent. Code that passed a list of byte values must wrap it in `bytes(...)`
+  first. `put_many`/`put_many_async` are not changed in this release (#272).
+- **Azure URIs (#224, #269).** `az://account//key` (an empty container) is rejected, as the https
+  form already was. An `https://` Azure URI whose authority is not a plain `host[:port]` (user
+  information, a backslash, `?`, `#`, `%` or whitespace), and so could name a different account
+  than its host, is rejected as malformed. Valid roots and keys containing `%` parse as before.
+- **Zero range settings (#235).** On the S3 concurrent-range read paths (the allocating range GET,
+  the known-size range read and the `get_into_async` fan-out), a zero effective `S3DLIO_CHUNK_SIZE`
+  or `S3DLIO_RANGE_CONCURRENCY` (or the matching explicit argument) is an error that names the
+  variable or parameter. It is raised before any range is allocated or semaphore awaited; on the two
+  allocating range paths that includes an empty object and offsets at or past its end, and on
+  `get_into_async` it applies whenever the fan-out is chosen.
+  It used to hang or exhaust memory. A concurrency above the semaphore limit is also an error
+  instead of a panic. Explicit arguments still take precedence over the environment. A read that
+  never takes a range path (range optimisation off, HEAD skipped, an object below the threshold)
+  does not read the settings and is unaffected. Range offset and length arithmetic, and a huge
+  `S3DLIO_RANGE_THRESHOLD_MB`, now saturate instead of overflowing.
+- **`mkdir_async` resolves to `None` (#233).** The conversion happens inside the exit-safe delivery
+  of the async bridge, so a call finishing during interpreter shutdown cannot touch the interpreter.
+  Other async APIs that still resolve to `()` are tracked in #271.
+- **RFC 3339 times (#263).** GCS bucket listing (`creation_date`), GCS object metadata (control
+  plane and Rapid) and the `file://` and `direct://` stores' modification times are RFC 3339 UTC.
+  For files, sub-second precision is kept and a pre-epoch or unrepresentable time is left absent.
+  GCS times use the Google client's own RFC 3339 conversion. The legacy community GCS client is
+  unchanged.
+
+### Fixed
+
+- **#250.** `python/tests/test_buffer_protocol_support.py` imported the source tree instead of the
+  installed wheel; the `sys.path` insertion is removed. The reported "no running event loop" error
+  does not reproduce with pytest-asyncio against the installed wheel (the async tests were already
+  coroutines), so no product change was made for it; the new wheel suite runs those tests
+  explicitly.
+- **#230.** `docs/CLI_GUIDE.md` listed a nonexistent `s3-cli get --output` option. The `get` entry
+  now lists exactly the options of `s3-cli get --help`, is titled "High-Performance Read" and says
+  that `get` does not save objects (use `download`).
+- Test scripts and three legacy Python tests read the Azure account from `AZURE_BLOB_ACCOUNT`
+  instead of naming one. Test-only; no library change.
+
+### Changed (dependencies)
+
+- `aws-sdk-s3` 1.137.0 → 1.152.0, `aws-config` 1.8.18 → 1.12.0, `aws-runtime` 1.7.5 → 1.10.0, with
+  the matching `aws-smithy-*`, SigV4, SSO and STS crates. The error-code tables s3dlio copies from
+  `aws-runtime` are unchanged in 1.10.0. New in `aws-runtime` 1.10: the SDK's own retry delay
+  honours an `x-amz-retry-after` response header, so SDK retry timing changes against servers that
+  send it (s3dlio's retry loop and request counts are unaffected).
+- `azure_storage_blob` 1.0.0 → 1.1.0 (adds `azure_storage_common`); the download behaviour the new
+  Azure receive depends on is unchanged.
+- `reqwest` 0.13.4 → 0.13.5. The pinned GCS fork, `azure_core` and `azure_identity` are unchanged.
+
+### Validation
+
+- Rust: `cargo fmt`, clippy with `-D warnings` in seven feature configurations, and the unit and
+  integration suites, including fault-injection tests for the S3, Azure and GCS receive paths
+  (exact request counts, version pinning, wrong lengths, mid-stream failures, cancellation, no
+  whole-object allocation).
+- Installed wheels: a 64-test Python suite (`python/tests/test_caller_buffer_get_into.py`) against
+  a local fake server covers accepted and refused buffers, the cancellation and timeout matrix,
+  bytes arriving in caller memory before completion, and interpreter exit with calls in flight.
+  It passed on the 0.10.0 wheels for CPython 3.11 (default build) and 3.12 and 3.13 (default and
+  full builds), on x86_64. The release workflow also builds aarch64 wheels, which were not run here.
+- Live: GCS (through its S3 endpoint and natively) and Azure Blob, from Rust and from Python through
+  the installed wheel, with isolated test prefixes.
+- **Not measured:** throughput, memory use and GIL behaviour against the existing allocating GET.
+  This release makes no performance claim for the new calls.
+
+### Known limitations
+
+- **Unsupported stores.** `file://`, `direct://`, the Arrow backend and the legacy community GCS
+  client do not offer `get_into_async`/`head_async` and report so through `object_capabilities`.
+  The Rust `MultiEndpointStore` keeps the trait's "unsupported" default for `get_into`/`head`.
+- **HEAD absence is ambiguous on S3 and GCS** (see Added).
+- **Azure trailing dot.** On the tested Azure path, a blob named `name.` and one named `name` are the
+  same blob. The layer responsible was not identified.
+- **GCS Rapid (zonal buckets)** is covered by local tests of the new receive and HEAD routes, but was
+  not run against a live zonal bucket. On the Rapid route the pinned GCS client still follows server
+  redirects, outside the repair budget.
+- **GCS retries.** The repair budget bounds s3dlio's outer opener calls and repairs, not every wire
+  request: the GCS client keeps its own request retries (time-limited, not count-limited).
+- Open and not changed here: the existing GCS GET of an object whose name contains `%` (#270), async
+  APIs that resolve to `()` (#271), list payloads to `put_many` (#272), and older async APIs that
+  attach to the interpreter inside the native future (#276).
+
 ## Version 0.9.128 — Zero-copy Python writes, opt-in `.env` loading for library users, Azure credential modes, real CRC-32C, shared `direct://` bounce pool, Arrow-backend and `get_many` fixes
 
 This release fixes twenty issues and part of a twenty-first: #222, #223, #232, #238, #239, #240,

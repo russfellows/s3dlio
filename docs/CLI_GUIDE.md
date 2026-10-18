@@ -15,7 +15,7 @@
    - [upload - Upload Files](#upload---upload-files)
    - [download - Download Objects](#download---download-objects)
    - [delete - Delete Objects](#delete---delete-objects)
-   - [get - High-Performance Download](#get---high-performance-download)
+   - [get - High-Performance Read](#get---high-performance-read)
    - [put - High-Performance Upload](#put---high-performance-upload)
 6. [Regex Pattern Filtering](#regex-pattern-filtering)
 7. [Operation Logging](#operation-logging)
@@ -375,15 +375,15 @@ mean "everything under".
 
 ---
 
-### get - High-Performance Download
+### get - High-Performance Read
 
 Read objects with concurrency for maximum throughput. `get` fetches the object bytes and reports the
 byte count and throughput; it does **not** write them to a file and has no `--output` option. To save
 objects to a local path use [download](#download---download-objects).
 
 On `s3://` the URI selects as described under [ls](#ls---list-objects): `s3-cli get s3://b/file.txt`
-downloads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` downloads everything under `dl/`
-(never `dl2/`); `get 's3://b/file.txt*'` downloads `file.txt`, `file.txt.bak` and `file.txt2`. To filter
+reads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` reads everything under `dl/`
+(never `dl2/`); `get 's3://b/file.txt*'` reads `file.txt`, `file.txt.bak` and `file.txt2`. To filter
 with a regex use `-p/--pattern`, applied after the selection and matched against the name relative to
 the listing base (for `s3://b/dl/` and the key `dl/sub/c.npz` the pattern sees `sub/c.npz`). An invalid
 pattern fails before any request is sent. `--pattern` cannot be combined with `--keylist` or

@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![CI](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-1478-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.128-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-1654-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.10.0-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94.1%2B-orange)](https://www.rust-lang.org)
@@ -10,10 +10,11 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-Full-backend builds support the stable Azure Blob Storage Rust SDK 1.0 API.
+Full-backend builds support the stable Azure Blob Storage Rust SDK 1.x API (1.1).
 
 ## Recent Releases
 
+- **v0.10.0** — Caller-buffer GET, typed HEAD, capabilities; stricter payloads — [#264](https://github.com/russfellows/s3dlio/issues/264)
 - **v0.9.128** — Zero-copy writes, opt-in `.env`, Azure credentials — [PR #262](https://github.com/russfellows/s3dlio/pull/262)
 - **v0.9.126** — Exact URI selection; routing, upload fixes — [PR #237](https://github.com/russfellows/s3dlio/pull/237)
 - **v0.9.124** (not on PyPI) — Exact delete contract, op-log safety — [PR #217](https://github.com/russfellows/s3dlio/pull/217)
@@ -439,6 +440,24 @@ from torch.utils.data import DataLoader
 dataset = S3IterableDataset("gs://bucket/data/", loader_opts={})
 dataloader = DataLoader(dataset, batch_size=16)
 ```
+
+**Read into your own buffer (v0.10.0):**
+```python
+import asyncio, s3dlio
+
+async def read(uri):
+    meta = await s3dlio.head_async(uri)          # ObjectMetadata(size, etag, version_id) or None
+    if meta is None:
+        raise FileNotFoundError(uri)
+    buf = bytearray(meta.size)                   # any writable byte buffer: numpy, mmap, ctypes, ...
+    await s3dlio.get_into_async(uri, buf, expected_len=meta.size)  # written into buf as it arrives
+    return buf
+
+data = asyncio.run(read("s3://bucket/key"))
+s3dlio.object_capabilities("s3://bucket/key")  # {"provider": "s3", "get_into": True, "head": True}
+```
+Do not touch `buf` until the `await` returns; a size other than `expected_len` raises
+`LengthMismatchError`. See the [Changelog](docs/Changelog.md) for the full contract.
 
 **Streaming & Compression:**
 ```python
