@@ -1,7 +1,8 @@
 # s3dlio Python API Guide
 
-**Version:** 0.9.100  
-**Last Updated:** May 12, 2026
+**Version:** 0.10.0
+
+**Last Updated:** October 18, 2026
 
 ## Table of Contents
 
@@ -50,8 +51,8 @@ pip install s3dlio
 
 ### Requirements
 
-- Python 3.12+
-- Rust 1.90+ (for building from source)
+- Python 3.11+ (release validation targets CPython 3.11–3.13)
+- Rust 1.94.1+ (for building from source)
 - Optional: PyTorch, JAX, or TensorFlow for ML integration
 
 ---
@@ -389,7 +390,7 @@ s3dlio.object_capabilities("az://account/container/key")
 
 | Call | Result |
 |---|---|
-| `object_capabilities(uri)` | `{"provider": "s3"\|"az"\|"gs"\|"file"\|"direct"\|"unknown", "get_into": bool, "head": bool}`. No store, credentials or network. `ValueError` for a malformed URI. |
+| `object_capabilities(uri)` | `{"provider": "s3"\|"az"\|"gs"\|"file"\|"direct"\|"unknown", "get_into": bool, "head": bool}`. No store, credentials or network. `ValueError` for a malformed URI in a known object scheme; unknown schemes return `"unknown"` and both operations false. |
 | `get_into_async(uri, dst, *, expected_len)` | Awaitable resolving to `expected_len` once `dst[:expected_len]` holds the whole object. |
 | `head_async(uri)` | Awaitable resolving to `ObjectMetadata(size, etag, version_id)`, or `None` when the object does not exist. |
 
@@ -422,8 +423,11 @@ s3dlio.object_capabilities("az://account/container/key")
 **Semantics.**
 - A read never mixes data from two object versions. The S3 range fan-out sends `If-Match` with
   the HEAD's ETag on every range; otherwise the first response's ETag (S3, Azure) or generation
-  (GCS) pins every retry and repair. A concurrent overwrite therefore fails the read. If the first
-  response has no usable ETag, a read that fails part-way fails instead of retrying.
+  (GCS) pins every retry and repair. A response that violates the pinned identity fails the read;
+  a concurrent overwrite can still permit a consistent read of the original version when that
+  version remains available. If the first response has no usable ETag, a read that fails part-way
+  fails instead of retrying. A separate `head_async` call does not condition the following GET:
+  a same-size replacement between those calls can be the version the GET reads.
 - `etag` is opaque (not an MD5). `version_id` is the S3 or Azure version ID (when versioning is
   on) or the GCS generation.
 - On `s3://` and `gs://`, `head_async` also returns `None` for a missing bucket: the provider

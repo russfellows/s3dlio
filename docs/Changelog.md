@@ -40,7 +40,8 @@ unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
     `If-Match` with the HEAD's ETag on every range and retry; otherwise the first response's ETag
     (S3, Azure) or generation (GCS) pins every retry and repair. When the first response carries no
     usable ETag, nothing can be pinned: a read that fails part-way then fails instead of retrying. A
-    version change during the read fails it (as a `RuntimeError`).
+    response that violates the pinned identity fails the read (as a `RuntimeError`). A concurrent
+    overwrite need not fail a read that can still fetch the original pinned version consistently.
   - **Ownership.** Until the awaitable finishes, native code has exclusive use of
     `dst[:expected_len]`: do not read, modify, resize or reuse it. The awaitable does not finish,
     even on an error, a `cancel()`, a `Task.cancel()`, `asyncio.timeout()` or `wait_for()`, until
@@ -58,7 +59,8 @@ unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
 - **`s3dlio.object_capabilities(uri)`** returns `{"provider", "get_into", "head"}` from the URI and
   the build alone: no store, credentials, client or network. The default (PyPI) wheel reports `s3`
   and `az` as supported; builds with the GCS backend add `gs`; `file://`, `direct://`, the Arrow
-  backend and the legacy community GCS client report unsupported. A malformed URI is a `ValueError`.
+  backend and the legacy community GCS client report unsupported. A malformed URI in a known
+  object scheme is a `ValueError`; unknown schemes return provider `"unknown"` and both operations false.
 - **Three exceptions:** `ObjectNotFoundError` (a `FileNotFoundError`), `LengthMismatchError` (a
   `ValueError`) and `UnsupportedOperationError` (a `NotImplementedError`, raised at once for an
   unsupported build or provider; no fallback download is ever attempted). A malformed URI raises
@@ -89,8 +91,9 @@ unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
     each attempt.
   - **Native GCS:** HTTP and Rapid routes, with the generation pinned on every repair. Repairs have
     a total budget per read that progress does not refill, and the SDK's own read resumption is
-    turned off on this path, so the bounded repair loop is the only one. On the HTTP route, object
-    names containing `%` or `\` are sent escaped, so the request names the exact object.
+    turned off on this path. Ordinary SDK request retries and Rapid server redirects remain
+    separate layers, as described under Known limitations. On the HTTP route, object names
+    containing `%` or `\` are sent escaped, so the request names the exact object.
 
 ### Changed (BEHAVIOUR CHANGE)
 
