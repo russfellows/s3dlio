@@ -264,7 +264,9 @@ def test_validated_load_works_when_the_checkpoint_directory_is_named_shards():
         root = os.path.join(tmp, "shards")
         s3dlio.save_checkpoint(_uri(root), 13, 1, "test", PAYLOAD)
         shard_uri, _, _ = _latest_shard(root)
-        assert shard_uri.count("/shards/") == 2
+        # The checkpoint root is itself named `shards`, so the shard URI holds `/shards/shards/`
+        # (str.count would see one non-overlapping match there).
+        assert "/shards/shards/" in shard_uri
         assert (
             s3dlio.load_checkpoint_with_validation(shard_uri, validate_integrity=True)
             == PAYLOAD
