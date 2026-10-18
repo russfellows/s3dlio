@@ -233,6 +233,48 @@ sees `sub/c.npz`. The pattern is compiled before anything is listed: an invalid 
 sent and no directory created. `--pattern` works on every backend (`file://` and `direct://` included);
 the selection rule is implemented for `s3://` only.
 
+**Local layout (issue #284).** A download keeps each object's key path relative to the listing base:
+`download -r s3://b/dl/ ./out/` writes `dl/a/x.bin` to `./out/a/x.bin` and `dl/b/x.bin` to `./out/b/x.bin`,
+creating directories as needed. The listing base is the directory the URI selects (`dl/` for `dl/` and `dl`,
+the directory before the first `*` for a glob, and the parent directory for a single exact object, so
+`download s3://b/dir/file.txt ./out/` writes `./out/file.txt`). Zero-length "folder" objects (keys ending in
+`/`) are skipped: no directory is created for them and they are not counted. `s3-cli cp -r <URI> <dir>` uses the
+same layout.
+
+An object is **refused** (counted as `failed` in the `DOWNLOAD summary` line, the command exits non-zero, and
+nothing is written for it) when its relative key is empty or absolute, has an empty (`a//b`), `.` or `..`
+component, contains a NUL byte or a component that is exactly a drive designator (`C:`; `a:b`, `x:y` and `v:1/x`
+are ordinary names), or lies outside the listing base; a backslash counts as a separator on every platform, so
+`..\evil` is refused too. The reason for each is logged as a WARN line
+(the Python `download()` and the Rust `generic_download_objects` also repeat the first three in their error). Two objects that map to the
+same local path are never merged: the first in listing order
+is written and each later one fails with a collision error (an object and a directory of one name: below). A symlink that already exists below the
+destination directory is not followed; the object fails instead, and on Unix the file itself is opened with
+`O_NOFOLLOW`, so a symlink planted there between the check and the write is refused too. (An intermediate
+directory swapped for a symlink by another local process in that instant is not detected. Names that differ
+only in case can still merge on a case-insensitive file system, a file left by an earlier run is overwritten,
+and a write that fails after its directories were created leaves those directories behind, empty.)
+
+The base is one for the whole listing. `download -r s3://b/dl ./out/` where `dl` is both an object (typically a
+zero-byte folder marker) and a directory (`dl/a`, `dl/b/c`) places everything relative to the parent: `dl/a`
+goes to `./out/dl/a` and `dl/b/c` to `./out/dl/b/c`, never to `./out/a`. A file system cannot hold the
+object `dl` and the directory `dl/`, so **the directory wins**: only the single object `dl` is refused (one
+failed object, with the reason "object 'dl' and directory 'dl/' cannot both exist locally; ... fetch the
+object alone (non-recursively), or use 's3://b/dl/' to download only the directory"). The same holds for a glob that
+selects both. To get only the directory, add the trailing slash (`s3://b/dl/` writes `./out/a` and
+`./out/b/c`); to get only the object, download it without `-r`. Only a directory with at least one downloadable object counts: if EVERY child under `dl/` is refused (unsafe key, collision), the object `dl` is downloaded as an ordinary file; in a chain (`p`, `p/q`, `p/q/r`) every object that has a valid child (`p` and `p/q`) is refused and only `p/q/r` is downloaded. `--pattern` is applied BEFORE this decision:
+the layout base and the exact-object check see only the objects the pattern kept, so a pattern that filters
+out `dl` itself makes the directory the base (`dl/a` goes to `./out/a`). `gs://`, `gcs://`, `az://` and the
+Azure `https://<account>.blob.core.windows.net/<container>/...` spellings of a source all give the same
+layout. For `gs://` and `az://` the listing is by RAW KEY PREFIX (the `s3://` selection rule is not implemented
+there, tracked in #220), so `download -r gs://b/dl` can also list a sibling such as `dl.bak`; it is written
+to `./out/dl.bak`, beside the directory's own files. Use `gs://b/dl/` to select the directory only. A file
+that was only partly written (disk full, interrupted write) is NOT removed: the object fails, the command
+exits non-zero, and the partial file stays in the destination for you to delete or overwrite. The CLI refuses per object (the rest is downloaded, the exit status is non-zero); the Rust library helpers
+`s3dlio::s3_copy::download_objects*` are fail-fast: one bad key (or an object and directory of one name)
+refuses the whole call before anything is created or fetched. Control characters in a remote key (newline,
+ESC, bidi and other invisible format characters) are shown escaped (`\n`, `\u{1b}`, `\u{202e}`) in the error text, the failure reasons and the log lines of a download, including the cause text of a failed fetch, and credentials in the URI are redacted.
+
 ```bash
 s3-cli download [OPTIONS] <SOURCE_URI> <LOCAL_PATH>
 ```

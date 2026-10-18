@@ -177,11 +177,11 @@ with s3dlio.open_stream("s3://bucket/data.bin") as stream:
 ### Phase 1 Testing:
 ```bash
 # Large object GET performance
-time ./target/release/s3-cli get s3://bucket/large-file.bin /tmp/test.bin
+time ./target/release/s3-cli get s3://bucket/large-file.bin
 
 # Compare single vs concurrent  
-S3DLIO_GET_INFLIGHT=1 time ./target/release/s3-cli get s3://bucket/large-file.bin /tmp/single.bin
-S3DLIO_GET_INFLIGHT=128 time ./target/release/s3-cli get s3://bucket/large-file.bin /tmp/concurrent.bin
+S3DLIO_GET_INFLIGHT=1 time ./target/release/s3-cli get s3://bucket/large-file.bin
+S3DLIO_GET_INFLIGHT=128 time ./target/release/s3-cli get s3://bucket/large-file.bin
 ```
 
 ### Phase 2 Testing:

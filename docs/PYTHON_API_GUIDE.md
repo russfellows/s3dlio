@@ -299,7 +299,8 @@ awaitable completes):
   (`PyBuffer_Release` has run, so a resize no longer raises `BufferError`). A native reader is any clone of the
   payload, wherever it lives: a store task, an SDK/HTTP task, a detached file write. The supported consumer
   operations cannot change that: `await`, `fut.cancel()`, `Task.cancel()` (once or repeatedly), `asyncio.timeout()`
-  and `asyncio.wait_for()` all leave the awaiting task pending until the future ends. The guarantee covers
+  and `asyncio.wait_for()` all leave the awaiting task pending until the future ends - with one Python 3.11
+  exception for `wait_for`, described below (#288). The guarantee covers
   those consumer operations only: the future belongs to s3dlio, so calling its producer methods
   (`set_result`, `set_exception`, or the base-class `asyncio.Future.set_result` / `cancel`) is unsupported and ends
   it at once, whether or not a native reader remains. `cancel()` cancels the put, but a running native write cannot
@@ -327,8 +328,40 @@ awaitable completes):
   at once while the put still reads the buffer, and nothing waits for the barrier. Do not shield a borrowed put
   (if you must, await `fut` again after the cancellation before touching the buffer). `asyncio.wait_for(fut, t)` and
   `asyncio.timeout(t)` can take up to `t` plus however long a running native write needs;
-* buffers whose item format is `O` (Python objects) or `P` (pointers) are refused with a `TypeError`: their bytes are
-  addresses, not data. A structured numpy dtype with padding is uploaded as its raw memory, padding bytes
+* **`asyncio.wait_for` after the put itself finished (Python-version difference).** If the deadline expires after
+  the put has finished but before its export is released, the cancellation is refused (the outcome is already
+  fixed) and the future completes with the put's own result once the export is released. What `wait_for` then
+  reports is asyncio's behaviour: on Python 3.12 and later it raises `TimeoutError`; on Python 3.11 it returns the
+  result. In both cases the future itself completes only after the release. The same applies to `get_into_async`
+  and `head_async`, which use the same guard;
+* **Python 3.11 only: do not cancel a task that is inside `asyncio.wait_for` (#288).** In 3.11, once `wait_for`'s
+  deadline has fired (or it has been cancelled once), it cancels the s3dlio future and waits for it in a way that a
+  further `Task.cancel()` interrupts. The awaiting task then ends while the future is still pending and s3dlio may
+  still read (or, for `get_into_async`, write) the buffer, so the buffer is **not** safe to reuse at that point
+  (for `head_async`, the request may still be running). Python 3.12 and 3.13 (tested) are not affected. On 3.11,
+  use `asyncio.timeout()` instead of `wait_for` (it has no such gap, however many times the task is cancelled), or,
+  if a `wait_for`-wrapped task can be cancelled, keep a reference to the s3dlio future and wait for it in a loop
+  that a further cancellation cannot cut short before touching the buffer:
+
+  ```python
+  async def wait_for_guard(fut):
+      """Wait until the s3dlio future has ended, then re-raise any cancellation received meanwhile."""
+      cancelled = False
+      while not fut.done():
+          try:
+              await asyncio.wait({fut})
+          except asyncio.CancelledError:
+              cancelled = True
+      if cancelled:
+          raise asyncio.CancelledError
+  ```
+
+  Plain `await`, `asyncio.timeout()`, and a `wait_for` that is cancelled at most once and before its deadline
+  fires are safe on every supported version;
+* buffers that hold Python objects or pointers are refused with a `TypeError`: their bytes are addresses, not
+  data. Since v0.10.0 (#282) this covers every pointer-bearing format code anywhere in the buffer format: `O`, `P`,
+  `&` (ctypes `POINTER(T)`), `z` / `Z` (`c_char_p` / `c_wchar_p`) and `X` (function pointers), on every write
+  path. NumPy complex formats (`Zf`, `Zd`, `Zg`) are accepted. A structured numpy dtype with padding is uploaded as its raw memory, padding bytes
   included (they are whatever was in memory).
 
 The default `put_bytes_async` takes a snapshot instead, so the buffer can be reused or resized as soon as the call
@@ -413,7 +446,17 @@ s3dlio.object_capabilities("az://account/container/key")
   modify, resize or reuse it. After a failure its contents are unspecified.
 - The awaitable never finishes before every native writer has stopped and the buffer is
   released, even on an error, `cancel()`, `Task.cancel()`, `asyncio.timeout()` or `wait_for()`.
-  The buffer is safe to reuse right after the `await`.
+  The buffer is safe to reuse right after the `await` (Python 3.11 has one `wait_for` exception,
+  below).
+- `asyncio.wait_for` (Python-version difference): if its deadline expires after the read or HEAD
+  has itself finished but before the buffer is released, the cancellation is refused and the call
+  completes with its own result once released. Python 3.12+ `wait_for` then raises
+  `TimeoutError`; Python 3.11 `wait_for` returns the result.
+- **Python 3.11 only (#288):** a task inside `asyncio.wait_for` that is cancelled after the
+  deadline fired, or cancelled twice, can end while the read still writes into `dst`. Use
+  `asyncio.timeout()` on 3.11, or keep the future and wait for it with the cancellation-proof
+  `wait_for_guard` loop shown in the `put_bytes_async` section before touching `dst`. Python 3.12
+  and 3.13 are not affected.
 - Await the returned object directly; do not wrap it in `asyncio.shield`, and do not call
   `set_result`/`set_exception` on it.
 - Concurrent calls need their own destinations, or non-overlapping slices of one buffer.
@@ -627,7 +670,12 @@ raw = bytes(data)
 
 ### put_many() — Batch Upload (v0.9.50+)
 
-Upload multiple objects in a single call with parallel execution:
+Upload multiple objects in a single call with parallel execution. Each `data` may be `bytes`, any buffer-protocol
+object (`bytearray`, `memoryview`, a NumPy array, ...) or an object with `__bytes__()`; since v0.10.0 (#272) an
+`int`, a `bool`, a list of ints or any other iterable raises `TypeError` (wrap byte values in `bytes(...)`).
+Every item is converted before the first request, so one bad item writes nothing, and the error names the item
+(index and URI). Each payload is copied once when the call is made (exact `bytes` are not copied), so you may
+reuse the buffers as soon as `put_many` returns or `put_many_async` is called. Both resolve to `None`.
 
 ```python
 # List of (uri, data) tuples
@@ -679,6 +727,43 @@ s3dlio.download(
 # On s3:// the source URI selects like list(): "s3://bucket/a.txt" is only a.txt (never
 # a.txt.bak); "s3://bucket/a.txt*" is the explicit glob that also takes a.txt.bak
 ```
+
+`download()` keeps each object's key path relative to the listing base (issue #284): downloading
+`s3://bucket/downloads/` writes the key `downloads/a/x.bin` to `<dest_dir>/a/x.bin` and `downloads/b/x.bin` to
+`<dest_dir>/b/x.bin`, creating directories as needed. A single exact object is written to
+`<dest_dir>/<object name>`. The base is one for the whole listing: `s3://bucket/dl` selects the object `dl` (for
+example a zero-byte folder marker) and the directory `dl/`, so both are placed relative to the parent
+(`dl/a` goes to `<dest_dir>/dl/a`, never to `<dest_dir>/a`). A file system cannot hold the object `dl` and the
+directory `dl/`, so **the directory wins**: only the single object `dl` is refused, as one failed object, with
+"object 'dl' and directory 'dl/' cannot both exist locally; ... fetch the object alone (non-recursively), or use
+'s3://bucket/dl/' to download only the directory". The same holds for a glob that selects both. Use the
+trailing slash (`s3://bucket/dl/`) for the directory only, or `recursive=False` for the object only.
+Only a directory with at least one downloadable object counts: if EVERY child under `dl/` is refused (unsafe key,
+collision), the object `dl` is downloaded as an ordinary file; in a chain (`p`, `p/q`, `p/q/r`) every object that
+has a valid child (`p` and `p/q`) is refused and only `p/q/r` is downloaded.
+`s3-cli download --pattern` (`download()` has no pattern argument) is applied BEFORE this decision: the layout base and the exact-object check see only the objects the
+pattern kept, so a pattern that filters out `dl` itself makes the directory the base. `gs://`, `gcs://`,
+`az://` and `https://<account>.blob.core.windows.net/...` sources all map correctly; for `gs://` and `az://`
+the listing is by RAW KEY PREFIX (the `s3://` selection rule is not implemented there, tracked in #220), so a
+sibling such as `dl.bak` can appear in a `gs://bucket/dl` listing and is written to `<dest_dir>/dl.bak`; use
+the trailing slash to select the directory only. An object whose
+relative key is empty, absolute, contains a `.` / `..` / empty (`a//b`) component, a NUL byte, a backslash-based
+traversal or a component that is exactly a drive designator (`C:`) is refused (`a:b`, `x:y` and `v:1/x` are
+ordinary names), as is one that would write through a symlink below `dest_dir`; two objects that map to the
+same local path are never merged. `download()` refuses PER OBJECT: the other
+objects are still written, and then it raises an error that lists the counts and the first three failures (the
+object URI and the reason), `... failed=2: s3://b/dl/../x: ... refused; ... (and N more; see the log)`. Control
+characters in a remote key (newline, ESC, bidi and other invisible format characters) appear escaped (`\n`,
+`\u{1b}`, `\u{202e}`) in these messages, including the cause text of a failed fetch, and
+credentials in the URI are redacted.
+(The Rust library helpers `s3dlio::s3_copy::download_objects*` are fail-fast instead: one bad key, or an object
+and directory of one name, refuses the whole call
+before anything is created or fetched.) A symlink below `dest_dir` is checked before the write and, for the
+file itself on Unix, refused at open time (`O_NOFOLLOW`); an intermediate directory swapped for a symlink by
+another local process in the instant between check and write is not detected. A write that fails after its
+directories were created leaves those directories, empty, behind, and a file that was only partly written is
+NOT removed (delete or overwrite it). Zero-length "folder" keys (ending in `/`) are
+skipped.
 
 ### mp_get() — Multi-Process GET
 
@@ -1115,45 +1200,139 @@ For complete migration instructions, see [S3TORCHCONNECTOR_MIGRATION.md](S3TORCH
 
 ## Checkpoint System
 
+A checkpoint lives under a base URI (`s3://`, `gs://`, `az://`, `file://`, ...). Data is
+always `bytes` (serialize your state first, e.g. `torch.save` into a `BytesIO`), and every
+checkpoint is identified by `step`, `epoch` and a `framework` tag.
+
+> **`user_meta` is optional** (default `None`) in `save_checkpoint`, `PyCheckpointStore.save`
+> and `finalize_distributed_checkpoint` (module function and writer method). User metadata is
+> accepted but not yet persisted.
+
 ### Save / Load
 
 ```python
-# Save checkpoint to any backend
-s3dlio.save_checkpoint(
-    uri="s3://bucket/checkpoints/epoch_10.bin",
-    data={"epoch": 10, "model": model.state_dict()},
-    compress=True
-)
+import s3dlio
 
-# Load checkpoint
-ckpt = s3dlio.load_checkpoint("s3://bucket/checkpoints/epoch_10.bin")
+# Single-rank checkpoint: save_checkpoint(uri, step, epoch, framework, data, user_meta=None)
+key = s3dlio.save_checkpoint(
+    "s3://bucket/checkpoints/run1", 10, 10, "pytorch", state_bytes
+)  # returns the manifest key
 
-# Load with validation
-ckpt = s3dlio.load_checkpoint_with_validation(
-    uri="s3://bucket/checkpoints/epoch_10.bin",
-    expected_keys=["epoch", "model"]
+# Load the latest checkpoint under that base URI -> BytesView (or None if there is none)
+view = s3dlio.load_checkpoint("s3://bucket/checkpoints/run1")
+state_bytes = bytes(view)   # or memoryview(view) for zero-copy access
+
+# Read one checkpoint shard by URI -> bytes. There is no `expected_keys` argument.
+# With validate_integrity=True (the default) the bytes are checked against the checksum the
+# checkpoint's manifest recorded when the shard was written: a mismatch raises
+# ("Integrity validation failed ..."), and so does a shard that no manifest under the
+# checkpoint base lists, a manifest that recorded no checksum for it, or a URI that is not a
+# shard URI (`<checkpoint base>/shards/<key>`) -- the check is never skipped silently.
+# A `.zst` shard is decoded first. validate_integrity=False reads the object as stored,
+# unverified.
+# Only manifests whose status is "complete" count. Precedence: the manifest named after the
+# shard directory (`manifests/ckpt-<step>-<ts>.json`) is used when it is complete and lists
+# the shard (no other manifest is compared with it); only otherwise is the newest complete
+# manifest of the same step that lists the shard used (newest by parsed wall_time, compared
+# as an instant), and only after that a scan of all the other manifests. A manifest that
+# cannot be read or parsed raises that error rather than being reported as an unlisted shard.
+data = s3dlio.load_checkpoint_with_validation(
+    "s3://bucket/checkpoints/run1/shards/<ckpt-id>/rank-0.bin", validate_integrity=True
 )
-model.load_state_dict(ckpt["model"])
+```
+
+For more control use `PyCheckpointStore`:
+
+```python
+store = s3dlio.PyCheckpointStore(
+    "s3://bucket/checkpoints/run1",
+    strategy=None, multipart_threshold=None, compression_level=None,
+)
+store.save(step, epoch, framework, data, user_meta=None)   # -> manifest key
+store.load_latest()                                   # -> BytesView | None
+store.list_checkpoints()                              # -> [PyCheckpointInfo]
+store.delete_checkpoint(step)                         # -> bool
 ```
 
 ### Distributed Checkpointing
 
-```python
-# Each rank saves its shard
-s3dlio.save_distributed_shard(
-    uri=f"s3://bucket/ckpt/shard_{rank}.bin",
-    shard_data=local_state,
-    rank=rank,
-    world_size=world_size
-)
+Each rank writes its own shard and returns a shard-metadata dict (`rank`, `key`, `size`,
+and `etag` / `checksum` when available). Rank 0 gathers the dicts (for example with
+`torch.distributed.gather_object`) and publishes the manifest.
 
-# Rank 0 finalizes
+```python
+store = s3dlio.PyCheckpointStore("s3://bucket/ckpt")
+writer = store.writer(world_size, rank)                  # writer(world_size, rank)
+
+# Every rank: save_distributed_shard(step, epoch, framework, data) -> shard-meta dict
+meta = writer.save_distributed_shard(step, epoch, "pytorch", local_state_bytes)
+
+# Rank 0 only: finalize_distributed_checkpoint(step, epoch, framework, shard_metas, user_meta=None)
 if rank == 0:
-    s3dlio.finalize_distributed_checkpoint(
-        base_uri="s3://bucket/ckpt/",
-        world_size=world_size
+    manifest_key = writer.finalize_distributed_checkpoint(
+        step, epoch, "pytorch", all_shard_metas
     )
 ```
+
+Streaming variant for large shards: `writer.get_distributed_shard_stream(step, epoch,
+framework)` returns a `PyCheckpointStream` with `write_chunk(data)`, `bytes_written()`,
+`finalize()` (returns the shard-meta dict) and `cancel()`.
+
+The module-level one-shot functions open a store at `uri` on every call and are
+equivalent to the writer methods:
+
+```python
+meta = s3dlio.save_distributed_shard(uri, step, epoch, framework, data, world_size, rank)
+key = s3dlio.finalize_distributed_checkpoint(
+    uri, step, epoch, framework, shard_metas, world_size, rank, None
+)
+```
+
+### Reading a Distributed Checkpoint
+
+`reader.load_latest_manifest()` returns the newest manifest as a dict (or `None`);
+`reader.read_shard_by_rank(manifest, rank)` returns that rank's shard as a `BytesView`. When
+the shard entry of the manifest dict you pass carries a `crc32c:` checksum the read is validated
+against it and a mismatch raises; an entry without a checksum is read unvalidated (it is not
+refused, and no stored manifest is consulted). Use `load_checkpoint_with_validation` to refuse a
+shard that has no recorded checksum.
+
+Runnable end-to-end example (all four "ranks" in one process, `file://` URI):
+
+```python
+import tempfile
+import s3dlio
+
+with tempfile.TemporaryDirectory() as tmp:
+    base = f"file://{tmp}/ckpt"
+    world_size, step, epoch = 4, 100, 3
+
+    # Write: every rank saves a distinct shard
+    shard_metas = []
+    for rank in range(world_size):
+        writer = s3dlio.PyCheckpointStore(base).writer(world_size, rank)
+        shard_metas.append(
+            writer.save_distributed_shard(step, epoch, "pytorch", bytes([rank]) * 1024)
+        )
+
+    # Rank 0 publishes the manifest
+    store = s3dlio.PyCheckpointStore(base)
+    store.writer(world_size, 0).finalize_distributed_checkpoint(
+        step, epoch, "pytorch", shard_metas, None
+    )
+
+    # Read: latest manifest, then each rank's shard
+    reader = store.reader()
+    manifest = reader.load_latest_manifest()
+    assert manifest["framework"] == "pytorch"
+    assert (manifest["global_step"], manifest["epoch"], manifest["world_size"]) == (100, 3, 4)
+    for rank in range(world_size):
+        shard = reader.read_shard_by_rank(manifest, rank)   # BytesView
+        assert bytes(shard) == bytes([rank]) * 1024
+```
+
+The manifest dict has the keys `format_version`, `framework`, `global_step`, `epoch`,
+`wall_time`, `world_size`, `status` and `shards` (a list of shard-meta dicts).
 
 ---
 
@@ -1456,7 +1635,9 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `create_multi_endpoint_store_from_template(template, strategy)` | Create from template |
 | `create_multi_endpoint_store_from_file(path, strategy)` | Create from file |
 
-**MultiEndpointStore Methods** (all async):
+**MultiEndpointStore Methods** (all async). Since v0.10.0 the write methods (`put`, `put_to_endpoint`,
+`put_all_endpoints`) accept the same payloads as `put_bytes` (#281), copied once when the call is made, and every
+method returning `Coroutine[None]` resolves to `None`, not `()` (#271):
 
 | Method | Returns |
 |--------|---------|
@@ -1506,11 +1687,14 @@ Streaming API section (`copy=True` for a snapshot).
 
 | Function | Description |
 |----------|-------------|
-| `save_checkpoint(uri, data, compress)` | Save checkpoint |
-| `load_checkpoint(uri)` | Load checkpoint |
-| `load_checkpoint_with_validation(uri, expected_keys)` | Load with validation |
-| `save_distributed_shard(uri, data, rank, world_size)` | Save distributed shard |
-| `finalize_distributed_checkpoint(base_uri, world_size)` | Finalize distributed checkpoint |
+| `save_checkpoint(uri, step, epoch, framework, data, user_meta=None)` | Save single-rank checkpoint; returns manifest key |
+| `load_checkpoint(uri)` | Load latest checkpoint; returns `BytesView` or `None` |
+| `load_checkpoint_with_validation(uri, validate_integrity=True)` | Read one checkpoint shard by URI; returns `bytes`. `validate_integrity=True` verifies the returned bytes against the checksum the manifest recorded at write time and raises on a mismatch, an unlisted shard, a missing recorded checksum, or a non-shard URI; `False` reads unverified |
+| `save_distributed_shard(uri, step, epoch, framework, data, world_size, rank)` | Save this rank's shard; returns shard-meta dict |
+| `finalize_distributed_checkpoint(uri, step, epoch, framework, shard_metas, world_size, rank, user_meta=None)` | Rank 0 publishes the manifest; returns manifest key |
+| `PyCheckpointStore(uri, strategy=None, multipart_threshold=None, compression_level=None)` | Store: `save`, `load_latest`, `list_checkpoints`, `delete_checkpoint`, `writer(world_size, rank)`, `reader()` |
+| `PyCheckpointWriter` (`store.writer(world_size, rank)`) | `save_distributed_shard(step, epoch, framework, data)`, `get_distributed_shard_stream(step, epoch, framework)`, `finalize_distributed_checkpoint(step, epoch, framework, shard_metas, user_meta=None)` |
+| `PyCheckpointReader` (`store.reader()`) | `load_latest_manifest()` -> dict or `None`; `read_shard_by_rank(manifest, rank)` -> `BytesView` (checks the shard against the `checksum` in the manifest dict you pass it; reads unvalidated when that entry has none, and does not consult the stored manifests) |
 
 ### Logging
 

@@ -1,15 +1,18 @@
 # s3dlio Changelog
 
-## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; stricter PUT payloads and URI validation
+## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 
-This release adds a new public API surface (#264) and fixes seven issues (#224, #230, #233, #235,
-#261, #263 and #269); #250's test import is fixed and its event-loop report did not reproduce (see
-Fixed). The new Python calls read an object straight into memory the caller owns (a `bytearray`, a
-NumPy array, an `mmap`, a ctypes array, ...), look up an object's size and version identity without
-reading it, and say, from the URI alone, whether this build supports them. They work on S3 and
-S3-compatible services (including GCS through its S3 endpoint), Azure Blob and native GCS (`gs://`,
-in builds with the GCS backend, which the PyPI wheels do not include). The existing APIs are
-unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
+This release adds a new public API surface (#264) and fixes twenty issues (#224, #230, #233,
+#235, #261, #263, #269, #270, #271, #272, #277, #278, #279, #280, #281, #282, #284, #285, #286 and
+#287);
+#250's test import is fixed and its event-loop report did not reproduce (see Fixed), and a Python
+3.11 standard-library limitation is documented (#288). The new Python calls read an
+object straight into memory the caller owns (a `bytearray`, a NumPy array, an `mmap`, a ctypes
+array, ...), look up an object's size and version identity without reading it, and say, from the URI
+alone, whether this build supports them. They work on S3 and S3-compatible services (including
+GCS through its S3 endpoint), Azure Blob and native GCS (`gs://`, in builds with the GCS backend,
+which the PyPI wheels do not include). The existing APIs are unchanged except for the fixes listed
+under "Changed (BEHAVIOUR CHANGE)".
 
 **Read the behaviour changes before upgrading.** Each one is described in full below:
 
@@ -22,7 +25,28 @@ unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
   any client is built.
 - **`S3DLIO_CHUNK_SIZE=0` and `S3DLIO_RANGE_CONCURRENCY=0` are errors on the S3 range-read paths
   (#235)**, naming the variable, instead of a hang or memory exhaustion.
-- **`mkdir_async` resolves to `None` (#233)** instead of an empty tuple.
+- **`put_many`, `put_many_async` and the `MultiEndpointStore` writes use the same strict payloads
+  (#272, #281).** They accept any buffer (`bytearray`, `memoryview`, NumPy, ...) and `__bytes__`
+  objects, and raise `TypeError` for an `int`, a `bool`, a list of ints or another iterable.
+- **Pointer buffers are refused on every write path (#282).** ctypes arrays of pointers
+  (`POINTER(T)`, `c_char_p`, `c_wchar_p`, `c_void_p`, function pointers) and object arrays raise
+  `TypeError` instead of uploading memory addresses.
+- **`mkdir_async`, `put_bytes_async`, `put_many_async` and the `MultiEndpointStore` `put`,
+  `delete`, `put_to_endpoint`, `delete_from_endpoint` and `put_all_endpoints` resolve to `None`
+  (#233, #271)** instead of an empty tuple.
+- **Optional arguments are optional (#285, #286).** Constructors and functions whose documented
+  signature shows a default (`opts`, `options`, `strategy`, `level`, `length`, `force`,
+  `user_meta`) can now be called without it; they used to raise `TypeError` for a missing argument.
+- **Checkpoint integrity (#287).** `load_checkpoint_with_validation(uri, validate_integrity=True)`
+  now checks the shard against the checksum recorded at write time and raises on a mismatch or when
+  none was recorded (it used to check nothing). Uncompressed one-shot shards now record a CRC-32C
+  when written, so new checkpoints have something to validate.
+- **Recursive `download` keeps the key layout (#284).** Each object is written to
+  `<dest>/<key path relative to the listing base>` instead of `<dest>/<last key segment>`, so nested
+  keys no longer collide; keys that would escape the destination are refused. This also applies to
+  `s3-cli cp -r` and the Python `download`.
+- **Python 3.11 and `asyncio.wait_for` (#288).** On 3.11, do not cancel a task that is inside
+  `wait_for` around a borrowed-buffer call; use `asyncio.timeout()` (see Known limitations).
 - **Times are RFC 3339 (#263).** GCS bucket creation dates, GCS object times and `file://`/`direct://`
   modification times read like `2025-05-16T09:46:12Z`, not as a debug dump of the internal type.
 
@@ -102,7 +126,7 @@ unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
   used: only buffer-protocol objects and objects with `__bytes__()` are accepted. An `int` or `bool`
   (which `bytes(5)` turns into five zero bytes) and an arbitrary iterable now raise `TypeError`
   before any request is sent. Code that passed a list of byte values must wrap it in `bytes(...)`
-  first. `put_many`/`put_many_async` are not changed in this release (#272).
+  first.
 - **Azure URIs (#224, #269).** `az://account//key` (an empty container) is rejected, as the https
   form already was. An `https://` Azure URI whose authority is not a plain `host[:port]` (user
   information, a backslash, `?`, `#`, `%` or whitespace), and so could name a different account
@@ -118,9 +142,25 @@ unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
   never takes a range path (range optimisation off, HEAD skipped, an object below the threshold)
   does not read the settings and is unaffected. Range offset and length arithmetic, and a huge
   `S3DLIO_RANGE_THRESHOLD_MB`, now saturate instead of overflowing.
-- **`mkdir_async` resolves to `None` (#233).** The conversion happens inside the exit-safe delivery
-  of the async bridge, so a call finishing during interpreter shutdown cannot touch the interpreter.
-  Other async APIs that still resolve to `()` are tracked in #271.
+- **Strict batch and multi-endpoint payloads (#272, #281).** `put_many`, `put_many_async` and the
+  `MultiEndpointStore` writes (`put`, `put_to_endpoint`, `put_all_endpoints`) use the same strict
+  conversion as `put_bytes`. They used to accept a list of ints (`put_many`) or only exact `bytes`
+  (`MultiEndpointStore`); now every buffer-protocol object and `__bytes__` object is accepted, and an
+  `int`, a `bool` or an arbitrary iterable raises `TypeError`. Every item is converted before the
+  first request, so one bad item writes nothing, and the error names the failing item and its URI
+  (the exception type and original message are kept). Each payload is copied once with the GIL held
+  (exact `bytes` and `BytesView` are not copied), so the call never reads the caller's buffer after
+  it returns.
+- **Pointer buffers refused (#282).** The check that refuses buffers of memory addresses recognised
+  only the `O` and `P` format codes. It now also refuses `&` (`POINTER(T)`), `z` / `Z`
+  (`c_char_p` / `c_wchar_p`) and `X` (function pointers), anywhere in the format, including inside
+  structures, on every write path and for `get_into_async` destinations. NumPy complex formats
+  (`Zf`, `Zd`, `Zg`) are still accepted.
+- **`None` instead of `()` (#233, #271).** `mkdir_async`, `put_bytes_async` (both `borrow`
+  values), `put_many_async` and the `MultiEndpointStore` `put`, `delete`, `put_to_endpoint`,
+  `delete_from_endpoint` and `put_all_endpoints` resolve to `None`. The conversion happens inside
+  the exit-safe delivery of the async bridge, so a call finishing during interpreter shutdown cannot
+  touch the interpreter.
 - **RFC 3339 times (#263).** GCS bucket listing (`creation_date`), GCS object metadata (control
   plane and Rapid) and the `file://` and `direct://` stores' modification times are RFC 3339 UTC.
   For files, sub-second precision is kept and a pre-epoch or unrepresentable time is left absent.
@@ -137,6 +177,74 @@ unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
 - **#230.** `docs/CLI_GUIDE.md` listed a nonexistent `s3-cli get --output` option. The `get` entry
   now lists exactly the options of `s3-cli get --help`, is titled "High-Performance Read" and says
   that `get` does not save objects (use `download`).
+- **#270.** The existing native GCS GET (`get`, `get_range` and everything built on them) fetched a
+  different object when the name contained `%` or `\`: the pinned Google client leaves both
+  unescaped in the request URL, so `a%2Fb` was requested as `a/b`. The HTTP read route now sends
+  them escaped, as the new caller-buffer route does. gRPC and Rapid routes carry the name in a
+  protobuf field and are unchanged. (Object names `.` and `..`, which GCS forbids, cannot be
+  addressed over HTTP.)
+- **#285, #286.** About twenty Python entry points documented an argument as optional but required
+  it: the `PyS3Dataset`, `PyDataset` and `PyS3AsyncDataLoader` constructors and their
+  compatibility classes (`opts`), the `create_*_writer` factories (`options`), the
+  `create_multi_endpoint_store*` functions (`strategy`), `PyWriterOptions.with_compression`
+  (`level`), `MultiEndpointStore.get_range` (`length`), `gcs_set_rapid_mode` (`force`), and the
+  checkpoint `save` / `finalize_distributed_checkpoint` functions and methods (`user_meta`, which
+  is accepted but not stored). Each now has its documented default. Build stubs now expose the same
+  keyword names as the real functions (`gcs_set_channel_count(n)`,
+  `gcs_query_rapid_bucket(bucket_or_uri)`).
+  `PyDataset.from_uris(uris, opts=None)`: the ignored keyword was named `_opts` before 0.10.0, so a
+  caller passing `_opts=` must drop it or rename it to `opts=`.
+- **#287.** `load_checkpoint_with_validation(..., validate_integrity=True)` passed no expected
+  checksum, so it validated nothing and returned corrupted data. It now validates against the
+  manifest's recorded checksum (the same path as `read_shard_by_rank`) and raises a clear error on a
+  mismatch, when the manifest recorded no checksum, or for a URI that is not a checkpoint shard;
+  `validate_integrity=False` reads without validation, as before. The writer now records a CRC-32C
+  for uncompressed one-shot shards (it recorded none). Checkpoints written by earlier releases still
+  load normally through `load_checkpoint` and `load_latest`, which validate only when a checksum is
+  recorded.
+- **#284.** A recursive download (`s3-cli download -r`, `s3-cli cp -r`, Python `download`, and the
+  Rust `s3_copy` helpers) wrote every object to `<dest>/<last key segment>`, so nested keys were
+  flattened and objects with the same final name silently overwrote each other. Each object is now
+  written to `<dest>/<key path relative to the listing base>`, creating parent directories. A single
+  exact object still lands at `<dest>/<name>`. Keys that would escape the destination (absolute, `..`
+  or `.` components, empty components, NUL, an exact drive designator such as `C:`, backslash
+  traversal) and collisions
+  (the same path twice, or a file where a directory is needed) are refused before anything is
+  fetched: per object in the CLI and Python paths, for the whole call in the Rust `s3_copy` helpers.
+  A pre-existing symlink inside the destination is refused, not followed, and on Unix the final file
+  is opened with `O_NOFOLLOW`. Limits: a symlink planted in an intermediate directory by another
+  process between the check and the write is not detected; names differing only in case can merge
+  on a case-insensitive filesystem; a failed write can leave a partial file and empty directories;
+  `gs://` and `az://` list by raw key prefix (#220), so a sibling such as `dl.bak` is included in a
+  `gs://b/dl` download.
+  When an exact object and the directory of the same name are both selected (`s3://b/dl` with the
+  folder marker `dl` and `dl/a`), the directory's contents win: `dl/a` goes to `<dest>/dl/a` and
+  only the object `dl` is refused, with a message that names the trailing-slash alternative. URIs
+  in these messages are redacted by the same function the Python errors use, and control
+  characters in a remote key are escaped.
+- **#277.** A `get_into_async` destination refused for holding pointers said it "cannot upload";
+  it now says it cannot be used as a read destination.
+- **#278.** On CPython 3.11 four borrowed-PUT barrier tests failed and one hung (also with 0.9.128).
+  Cause: two tests use a Python-level buffer exporter (`__buffer__`, Python 3.12+); on 3.11 they
+  failed after arming a test-only "retain the next clone" hook, which made the next test's put keep
+  its buffer, and the guard then correctly never completed. The tests are now scoped to 3.12+ with
+  an equivalent 3.11 schedule, every test disarms the hook, the hook's release also disarms it, and
+  the helper that hung is bounded. The hang was not a product defect: on 3.11, 3.12 and 3.13 the
+  s3dlio future completes once native work has stopped and the buffer is released, never before.
+  Review of the 3.11 behaviour found one standard-library limitation of `asyncio.wait_for` on 3.11
+  (#288, see Known limitations), now documented and pinned by version-specific tests.
+- **#279, #280 and other test hygiene.** The dotenv tests no longer depend on the caller's
+  environment. No test or script contacts a live cloud endpoint unless the developer names the
+  bucket or container in `S3DLIO_TEST_BUCKET`, `S3DLIO_TEST_GCS_BUCKET` or
+  `AZURE_BLOB_ACCOUNT` plus `S3DLIO_TEST_AZURE_CONTAINER` (some legacy tests used to reach
+  hard-coded buckets whenever ambient credentials existed), and hard-coded bucket names are gone.
+  `python/tests` collects and runs under pytest without collection errors:
+  script-style files became real pytest tests, tests that need a live endpoint skip with a reason
+  when it is not configured, hard-coded machine paths were removed, test files import the installed
+  wheel instead of the source tree, and stale uses of retired APIs (`list_keys_from_s3`,
+  `list_uris`) were updated.
+- **CLI.** `s3-cli get --help` and its progress output say it reads objects (it never saved them;
+  use `download`), and documentation examples that passed `get` an output path now use `download`.
 - Test scripts and three legacy Python tests read the Azure account from `AZURE_BLOB_ACCOUNT`
   instead of naming one. Test-only; no library change.
 
@@ -153,17 +261,21 @@ unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
 
 ### Validation
 
-- Rust: `cargo fmt`, clippy with `-D warnings` in seven feature configurations, and the unit and
-  integration suites, including fault-injection tests for the S3, Azure and GCS receive paths
-  (exact request counts, version pinning, wrong lengths, mid-stream failures, cancellation, no
-  whole-object allocation).
-- Installed wheels: a 64-test Python suite (`python/tests/test_caller_buffer_get_into.py`) against
-  a local fake server covers accepted and refused buffers, the cancellation and timeout matrix,
-  bytes arriving in caller memory before completion, and interpreter exit with calls in flight.
-  It passed on the 0.10.0 wheels for CPython 3.11 (default build) and 3.12 and 3.13 (default and
-  full builds), on x86_64. The release workflow also builds aarch64 wheels, which were not run here.
-- Live: GCS (through its S3 endpoint and natively) and Azure Blob, from Rust and from Python through
-  the installed wheel, with isolated test prefixes.
+- Rust: `cargo fmt`, clippy with `-D warnings` in seven feature configurations, and the full
+  default-feature test run (1728 passed, 0 failed), the full-backend library tests (1076 passed)
+  and the Python-extension unit tests (1008 passed), including fault-injection tests for the S3,
+  Azure and GCS receive paths (exact request counts, version pinning, wrong lengths, mid-stream
+  failures, cancellation, no whole-object allocation), the download-layout safety tests and the
+  checkpoint validation tests.
+- Installed wheels (x86_64; CPython 3.11 default build, 3.12 and 3.13 default and full builds): the
+  caller-buffer suite, the borrowed-PUT barrier suite and the new stage tests (295 tests) pass on
+  every wheel, including the Python 3.11 cancellation cases; the curated regression set passes on
+  3.11, 3.12 and 3.13; the whole `python/tests` directory runs with no failures and no collection
+  errors on 3.11 and 3.13 with all cloud credentials removed (tests that need a live endpoint skip
+  with a reason). The release workflow also builds aarch64 wheels, which were not run here.
+- Live: GCS (through its S3 endpoint and natively, including `%` and `\` keys) and Azure Blob, from
+  Rust and from Python through the installed wheels, with isolated prefixes and nothing left behind.
+  The GCS Rapid (zonal bucket) route was not run live (see Known limitations).
 - **Not measured:** throughput, memory use and GIL behaviour against the existing allocating GET.
   This release makes no performance claim for the new calls.
 
@@ -180,9 +292,31 @@ unchanged except for the fixes listed under "Changed (BEHAVIOUR CHANGE)".
   redirects, outside the repair budget.
 - **GCS retries.** The repair budget bounds s3dlio's outer opener calls and repairs, not every wire
   request: the GCS client keeps its own request retries (time-limited, not count-limited).
-- Open and not changed here: the existing GCS GET of an object whose name contains `%` (#270), async
-  APIs that resolve to `()` (#271), list payloads to `put_many` (#272), and older async APIs that
-  attach to the interpreter inside the native future (#276).
+- **`asyncio.wait_for` after the operation finished.** If a `wait_for` deadline expires after a
+  borrowed `put_bytes_async`, a `get_into_async` or a `head_async` has itself finished but before
+  its buffer export is released, the cancellation is refused (the outcome is fixed) and the call
+  completes once the export is released. Python 3.12+ `wait_for` then raises `TimeoutError`; Python
+  3.11 `wait_for` returns the call's result. Either way the s3dlio future completes only after the
+  release.
+- **Python 3.11: cancelling a task inside `asyncio.wait_for` (#288).** On 3.11, a task awaiting
+  `asyncio.wait_for(...)` around a borrowed `put_bytes_async`, a `get_into_async` or a `head_async`
+  can end while s3dlio still uses the buffer (or, for `head_async`, while its request still runs),
+  if the task is cancelled after `wait_for`'s deadline fired or is cancelled twice: 3.11's
+  `wait_for` deliberately stops waiting for the inner future in that case. s3dlio cannot prevent
+  it. Use `asyncio.timeout()` on 3.11, or keep the s3dlio future and wait for it in a loop that
+  ignores further cancellations (the Python API guide shows one) before touching the buffer. Python
+  3.12 and 3.13 (tested) are not affected; plain `await`, `asyncio.timeout()`, and a `wait_for`
+  cancelled at most once and before its deadline are safe on every supported version.
+- **Pointer detection is format-based (#282).** A ctypes `Union` containing a pointer reports a
+  plain byte format, and a `:` inside a ctypes structure field name can hide a following pointer
+  code, so neither can be detected from the buffer format.
+- **`PyLoaderOptions` values (#283).** Seven option values (`pin_memory`, `num_workers`, `shuffle`,
+  `drop_last`, `prefetch`, `persistent_workers`, `non_blocking`) cannot be read back as properties:
+  the builder methods of the same names shadow them. Setting them through the builder works.
+- **Older async APIs touch the interpreter inside the native future (#276).** `stat_async`,
+  `stat_many_async`, `get_async`, `get_range_async`, `upload_async`, the `MultiEndpointStore` `get`
+  and `get_range`, and the other sites listed in #276 can attach to the interpreter after the work
+  finishes, outside the exit-safe delivery. The new calls and those fixed in this release do not.
 
 ## Version 0.9.128 — Zero-copy Python writes, opt-in `.env` loading for library users, Azure credential modes, real CRC-32C, shared `direct://` bounce pool, Arrow-backend and `get_many` fixes
 

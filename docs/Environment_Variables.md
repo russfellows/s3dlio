@@ -131,7 +131,9 @@ AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli stat s3://bucket/key
 S3DLIO_H2C=1  AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli put s3://bucket/prefix -n 100
 
 # Opt in to HTTP/2 on https:// only (restores pre-v0.9.108 default)
-S3DLIO_HTTPS_H2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli get s3://bucket/dataset/ -o /data/
+S3DLIO_HTTPS_H2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli download -r s3://bucket/dataset/ /data/
+# Note: a recursive download keeps each object's key path relative to the listing base
+# (a/x.bin and b/x.bin land in <dest>/a/ and <dest>/b/); unsafe keys are refused (#284).
 
 # Master switch — HTTP/2 on both schemes with one variable
 S3DLIO_ENABLE_HTTP2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli put s3://bucket/prefix -n 100
@@ -180,13 +182,13 @@ For all other workloads, leave adaptive ON (the default).
 
 ```bash
 # Default: adaptive BDP estimator (recommended for most workloads)
-S3DLIO_H2C=1 s3-cli get s3://bucket/large-dataset/ -o /data/
+S3DLIO_H2C=1 s3-cli download -r s3://bucket/large-dataset/ /data/
 
 # Static windows — useful for reproducible benchmarks
 S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
   S3DLIO_H2_STREAM_WINDOW_MB=16 \
   S3DLIO_H2_CONN_WINDOW_MB=64 \
-  s3-cli get s3://bucket/large-dataset/ -o /data/
+  s3-cli download -r s3://bucket/large-dataset/ /data/
 
 # High-throughput static config (many large objects, low-latency network)
 S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
