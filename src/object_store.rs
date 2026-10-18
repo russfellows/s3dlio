@@ -5236,23 +5236,41 @@ pub async fn generic_download_objects(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
-    let summary = generic_download_objects_with_summary(
+    let (summary, reasons) = download_with_reasons(
         src_uri,
         dest_dir,
         max_in_flight,
         recursive,
+        None,
         progress_callback,
     )
     .await?;
     if summary.failed > 0 {
-        bail!(
-            "Download completed with failures: attempted={}, succeeded={}, failed={}",
-            summary.attempted,
-            summary.succeeded,
-            summary.failed
-        );
+        bail!("{}", download_failure_message(&summary, &reasons));
     }
     Ok(())
+}
+
+/// How many failure reasons (object URI and cause) the error of [`generic_download_objects`]
+/// repeats; the log has all of them.
+const REPORTED_DOWNLOAD_FAILURES: usize = 3;
+
+/// The error text of a download that ended with failures: the counts, then the first
+/// [`REPORTED_DOWNLOAD_FAILURES`] reasons, then how many more there were.
+fn download_failure_message(summary: &TransferSummary, reasons: &[String]) -> String {
+    let mut msg = format!(
+        "Download completed with failures: attempted={}, succeeded={}, failed={}",
+        summary.attempted, summary.succeeded, summary.failed
+    );
+    if !reasons.is_empty() {
+        msg.push_str(": ");
+        msg.push_str(&reasons.join("; "));
+    }
+    let more = summary.failed.saturating_sub(reasons.len() as u64);
+    if more > 0 {
+        msg.push_str(&format!(" (and {more} more; see the log)"));
+    }
+    msg
 }
 
 /// Generic download function with detailed transfer summary.
@@ -5262,6 +5280,11 @@ pub async fn generic_download_objects(
 /// `name.bak`, a trailing `/` a directory, `*` / `**` an explicit glob.
 /// Use [`generic_download_objects_matching_with_summary`] to narrow the selection with an
 /// explicit regex.
+///
+/// Issue #284: each object is written to `<dest_dir>/<key relative to the listing base>`
+/// (parent directories are created), never only to its last key segment. An object whose
+/// relative key is unsafe, collides with another, or would be written through a symlink is
+/// counted in `failed` and not written; see [`crate::download_layout`] for the rules.
 pub async fn generic_download_objects_with_summary(
     src_uri: &str,
     dest_dir: &Path,
@@ -5297,6 +5320,28 @@ pub async fn generic_download_objects_matching_with_summary(
     pattern: Option<&crate::list_pattern::ListPattern>,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<TransferSummary> {
+    let (summary, _reasons) = download_with_reasons(
+        src_uri,
+        dest_dir,
+        max_in_flight,
+        recursive,
+        pattern,
+        progress_callback,
+    )
+    .await?;
+    Ok(summary)
+}
+
+/// The download implementation: the summary, and the first [`REPORTED_DOWNLOAD_FAILURES`]
+/// failure reasons (redacted object URI and cause) for callers that return an error.
+async fn download_with_reasons(
+    src_uri: &str,
+    dest_dir: &Path,
+    max_in_flight: usize,
+    recursive: bool,
+    pattern: Option<&crate::list_pattern::ListPattern>,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<(TransferSummary, Vec<String>)> {
     // Issue #211: a limit of 0 builds a semaphore with no permits and hangs.  This is the
     // implementation every backend-aware download funnels through (and a public entry of
     // its own), so the guard lives here: before the store is chosen, anything is listed or
@@ -5328,7 +5373,7 @@ pub async fn generic_download_objects_matching_with_summary(
     info!(
         "Starting download of {} object(s) from {} to {:?} (jobs={})",
         keys.len(),
-        src_uri,
+        crate::redact::redact_and_escape(src_uri),
         dest_dir,
         effective_jobs
     );
@@ -5336,50 +5381,58 @@ pub async fn generic_download_objects_matching_with_summary(
     let sem = Arc::new(Semaphore::new(effective_jobs));
     let mut futs = FuturesUnordered::new();
 
-    for uri in keys.clone() {
+    // Issue #284: every object keeps its key path relative to the listing base; the local
+    // path of each is decided (and collisions settled) before anything is fetched.
+    let mut summary = TransferSummary::default();
+    let mut reasons: Vec<String> = Vec::new();
+    for planned in crate::download_layout::plan_downloads(src_uri, &keys) {
+        summary.attempted += 1;
+        let uri = planned.entry;
+        let comps = match planned.target {
+            Ok(comps) => comps,
+            Err(e) => {
+                summary.failed += 1;
+                // The cause chain may quote the raw remote key: escape the final text.
+                let reason = crate::redact::escape_control(&format!("{e:#}"));
+                warn!("Download refused: {}", reason);
+                if reasons.len() < REPORTED_DOWNLOAD_FAILURES {
+                    reasons.push(reason);
+                }
+                continue;
+            }
+        };
         let sem = sem.clone();
         let store = Arc::clone(&store);
         let progress = progress_callback.clone();
         let out_dir = dest_dir.to_path_buf();
+        let shown = crate::redact::redact_and_escape(&uri);
 
         futs.push(tokio::spawn(async move {
-            debug!("starting download of {} → {:?}", uri, out_dir);
-            let _permit = sem.acquire_owned().await.unwrap();
+            debug!("starting download of {} → {:?}", shown, out_dir);
+            let fetched_and_written = async {
+                let _permit = sem.acquire_owned().await?;
 
-            // Skip "directories" (URIs that end with slash)
-            if uri.ends_with('/') {
-                return Ok::<(), anyhow::Error>(());
+                // Download the object
+                let bytes = store.get(&uri).await?;
+                let byte_count = bytes.len() as u64;
+
+                // Write to disk below the destination, never outside it
+                let out_path =
+                    crate::download_layout::write_object(&out_dir, &comps, bytes).await?;
+
+                debug!("finished download of {} → {:?}", shown, out_path);
+
+                // Update progress if callback provided
+                if let Some(ref progress) = progress {
+                    progress.object_completed(byte_count);
+                }
+                Ok::<(), anyhow::Error>(())
             }
-
-            // Download the object
-            let bytes = store.get(&uri).await?;
-            let byte_count = bytes.len() as u64;
-
-            // Extract filename from URI
-            let fname = uri
-                .split('/')
-                .next_back()
-                .ok_or_else(|| anyhow!("Cannot extract filename from URI: {}", uri))?;
-            let out_path = out_dir.join(fname);
-
-            // Write to disk
-            tokio::fs::write(&out_path, bytes).await?;
-
-            debug!("finished download of {} → {:?}", uri, out_path);
-
-            // Update progress if callback provided
-            if let Some(ref progress) = progress {
-                progress.object_completed(byte_count);
-            }
-
-            Ok::<(), anyhow::Error>(())
+            .await;
+            // The failure carries the object it belongs to (the redacted URI).
+            fetched_and_written.map_err(|e| e.context(crate::redact::redact_and_escape(&uri)))
         }));
     }
-
-    let mut summary = TransferSummary {
-        attempted: keys.iter().filter(|k| !k.ends_with('/')).count() as u64,
-        ..Default::default()
-    };
 
     // Wait for all downloads to complete
     while let Some(join_res) = futs.next().await {
@@ -5389,11 +5442,19 @@ pub async fn generic_download_objects_matching_with_summary(
             }
             Ok(Err(e)) => {
                 summary.failed += 1;
-                warn!("Download task failed: {}", e);
+                // The store's own error quotes the raw remote key: escape the final text.
+                let reason = crate::redact::escape_control(&format!("{e:#}"));
+                warn!("Download task failed: {}", reason);
+                if reasons.len() < REPORTED_DOWNLOAD_FAILURES {
+                    reasons.push(reason);
+                }
             }
             Err(e) => {
                 summary.failed += 1;
                 warn!("Download task join failed: {}", e);
+                if reasons.len() < REPORTED_DOWNLOAD_FAILURES {
+                    reasons.push(format!("download task failed: {e}"));
+                }
             }
         }
     }
@@ -5408,7 +5469,7 @@ pub async fn generic_download_objects_matching_with_summary(
             .bytes_transferred
             .load(std::sync::atomic::Ordering::Relaxed);
     }
-    Ok(summary)
+    Ok((summary, reasons))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

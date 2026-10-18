@@ -122,7 +122,7 @@ fn list_requests(
     bucket: &str,
 ) -> Vec<common::mock_s3_server::RecordedRequest> {
     state
-        .requests_containing(bucket)
+        .requests_for_bucket(bucket)
         .into_iter()
         .filter(|r| r.method == "GET" && r.query.contains("list-type=2"))
         .collect()
@@ -393,7 +393,7 @@ async fn request_counts_per_operation() {
     }
     assert!(
         !state
-            .requests_containing(&b)
+            .requests_for_bucket(&b)
             .iter()
             .any(|r| r.method == "HEAD"),
         "no HEAD is ever sent"
@@ -469,14 +469,24 @@ where
         .block_on(f)
 }
 
+/// Every file below `dir`, as `/`-joined paths relative to `dir` (a download keeps the key
+/// path relative to the listing base, #284), sorted.
 fn downloaded_names(dir: &std::path::Path) -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.filter_map(|e| e.ok()) {
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                walk(&entry.path(), &format!("{name}/"), out);
+            } else {
+                out.push(name);
+            }
+        }
+    }
+    let mut v = Vec::new();
+    walk(dir, "", &mut v);
     v.sort();
     v
 }
@@ -512,7 +522,7 @@ fn download_of_file_txt_takes_only_file_txt() {
     }
     // the only object GETs are for file.txt itself
     let gets: std::collections::BTreeSet<String> = state
-        .requests_containing(&b)
+        .requests_for_bucket(&b)
         .into_iter()
         .filter(|r| r.method == "GET" && !r.query.contains("list-type"))
         .map(|r| r.path)
@@ -527,9 +537,33 @@ fn download_of_file_txt_takes_only_file_txt() {
 #[test]
 fn download_of_run_dot_1_takes_the_object_and_its_directory() {
     let (_p, _s, b) = seeded();
-    assert_eq!(
-        download(&format!("s3://{b}/run.1"), None, true),
-        keys_of(&["child", "run.1"])
+    // Recursive: the selection is the object `run.1` and its directory `run.1/`. Key paths are
+    // kept relative to one base (#284), and a local file system cannot hold both the file
+    // `run.1` and the directory `run.1/`. The directory's contents win and the single object is
+    // refused; the fail-fast library helper refuses the whole call before writing anything.
+    let out = tempfile::tempdir().expect("tempdir");
+    let res = on_fresh_runtime(s3dlio::s3_copy::download_objects_matching(
+        &format!("s3://{b}/run.1"),
+        None,
+        out.path(),
+        4,
+        true,
+        None,
+    ));
+    let err = res.expect_err("a file/directory collision must refuse the download");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("cannot both exist locally"),
+        "unexpected error: {msg}"
+    );
+    assert!(msg.contains("run.1"), "the message must name run.1: {msg}");
+    assert!(
+        msg.contains(&format!("'s3://{b}/run.1/'")),
+        "the message must name the trailing-slash alternative: {msg}"
+    );
+    assert!(
+        downloaded_names(out.path()).is_empty(),
+        "nothing may be written when the layout is refused"
     );
     // non-recursive: the object (the `run.1/` entry is a directory and is skipped)
     assert_eq!(
@@ -551,7 +585,7 @@ fn download_of_a_wildcard_takes_the_glob_matches() {
     );
     assert_eq!(
         download(&format!("s3://{b}/data/**.npz"), None, true),
-        keys_of(&["top.npz", "z.npz"])
+        keys_of(&["sub/deep/z.npz", "top.npz"])
     );
 }
 
@@ -560,7 +594,7 @@ fn download_of_a_directory_name_does_not_cross_into_dl2() {
     let (_p, _s, b) = seeded();
     assert_eq!(
         download(&format!("s3://{b}/dl"), None, true),
-        keys_of(&["a.npz", "b.txt", "c.npz"])
+        keys_of(&["a.npz", "b.txt", "sub/c.npz"])
     );
 }
 
@@ -576,11 +610,11 @@ fn an_explicit_pattern_applies_after_the_selection() {
     assert!(download(&format!("s3://{b}/file.txt"), Some(r"\.bak$"), true).is_empty());
     assert_eq!(
         download(&format!("s3://{b}/dl/"), Some(r"\.npz$"), true),
-        keys_of(&["a.npz", "c.npz"])
+        keys_of(&["a.npz", "sub/c.npz"])
     );
     assert_eq!(
         download(&format!("s3://{b}/dl"), Some(r"^sub/"), true),
-        keys_of(&["c.npz"])
+        keys_of(&["sub/c.npz"])
     );
 }
 

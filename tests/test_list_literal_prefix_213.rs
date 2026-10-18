@@ -180,7 +180,7 @@ async fn an_exact_key_is_two_probes_that_cannot_return_siblings() {
         .expect("list");
 
     let lists: Vec<_> = state
-        .requests_containing(&b)
+        .requests_for_bucket(&b)
         .into_iter()
         .filter(|r| r.method == "GET" && r.query.contains("list-type=2"))
         .collect();
@@ -318,14 +318,24 @@ where
         .block_on(f)
 }
 
+/// Every file below `dir`, as `/`-joined paths relative to `dir` (a download keeps the key
+/// path relative to the listing base, #284), sorted.
 fn downloaded_names(dir: &std::path::Path) -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.filter_map(|e| e.ok()) {
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                walk(&entry.path(), &format!("{name}/"), out);
+            } else {
+                out.push(name);
+            }
+        }
+    }
+    let mut v = Vec::new();
+    walk(dir, "", &mut v);
     v.sort();
     v
 }
@@ -362,10 +372,10 @@ fn download_a_prefix_directory_downloads_every_object_under_it() {
         None,
     ))
     .expect("download");
-    // every object under dl/ (recursive), by basename
+    // every object under dl/ (recursive), by path relative to dl/
     assert_eq!(
         downloaded_names(out.path()),
-        vec!["a.npz", "b.npz", "c.txt", "d.npz"]
+        vec!["a.npz", "b.npz", "c.txt", "sub/d.npz"]
     );
 }
 
@@ -401,17 +411,24 @@ fn download_one_key_downloads_that_object_and_its_directory_and_no_sibling() {
     .expect("download");
     assert_eq!(downloaded_names(out.path()), vec!["c.txt"]);
 
-    // `data/run.1` is the object and its directory: run.1 and run.1/child, not run.1.old / run_1 / prerun.1
+    // `data/run.1` selects the object and its directory (run.1 and run.1/child, not run.1.old /
+    // run_1 / prerun.1). One base for the listing (#284): the directory `run.1/` and the file
+    // `run.1` cannot both exist locally, so the fail-fast s3_copy helper
+    // refuses the whole download instead of moving `child` next to `run.1`.
     let out = tempfile::tempdir().expect("tempdir");
-    on_fresh_runtime(s3dlio::s3_copy::download_objects(
+    let err = on_fresh_runtime(s3dlio::s3_copy::download_objects(
         &format!("s3://{b}/data/run.1"),
         out.path(),
         4,
         true,
         None,
     ))
-    .expect("download");
-    assert_eq!(downloaded_names(out.path()), vec!["child", "run.1"]);
+    .expect_err("object and directory of one name cannot both be written");
+    assert!(
+        format!("{err:#}").contains("cannot both exist locally"),
+        "{err:#}"
+    );
+    assert!(downloaded_names(out.path()).is_empty());
 }
 
 #[test]
@@ -431,7 +448,7 @@ fn download_with_an_explicit_pattern_keeps_the_glob_regex_selection() {
     .expect("download");
     assert_eq!(
         downloaded_names(out.path()),
-        vec!["a.npz", "b.npz", "d.npz"]
+        vec!["a.npz", "b.npz", "sub/d.npz"]
     );
 
     // the pattern sees the key relative to the listing base (`sub/d.npz`)
@@ -445,7 +462,7 @@ fn download_with_an_explicit_pattern_keeps_the_glob_regex_selection() {
         None,
     ))
     .expect("download");
-    assert_eq!(downloaded_names(out.path()), vec!["d.npz"]);
+    assert_eq!(downloaded_names(out.path()), vec!["sub/d.npz"]);
 
     // a pattern nothing matches is the same "no objects" error as an empty prefix
     let out = tempfile::tempdir().expect("tempdir");
@@ -539,7 +556,7 @@ fn host_form_uri_download_matching_agrees_with_list_on_the_pattern() {
         None,
     ))
     .expect("download");
-    assert_eq!(downloaded_names(out.path()), vec!["d.npz"]);
+    assert_eq!(downloaded_names(out.path()), vec!["sub/d.npz"]);
 }
 
 // ----------------------------------------------------------------------------
@@ -642,4 +659,63 @@ fn download_matching_with_a_non_slash_prefix_and_a_pattern() {
         }
         assert_eq!(downloaded_names(out.path()), *want, "pattern {pattern}");
     }
+}
+
+#[test]
+fn download_refuses_an_unsafe_key_before_creating_or_fetching_anything() {
+    // Issue #284: a key is data from the server; `../evil` must not leave the destination.
+    let (_port, state) = ensure_mock_s3_server();
+    static HOSTILE: AtomicU64 = AtomicU64::new(0);
+    let b = format!("hostile284-{}", HOSTILE.fetch_add(1, Ordering::SeqCst));
+    state.seed_bucket(&b, &["dl/ok.bin", "dl/../evil"]);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest = tmp.path().join("dest");
+    let err = on_fresh_runtime(s3dlio::s3_copy::download_objects(
+        &format!("s3://{b}/dl/"),
+        &dest,
+        4,
+        true,
+        None,
+    ))
+    .expect_err("an unsafe key refuses the download");
+    assert!(format!("{err:#}").contains("Download refused"), "{err:#}");
+    assert!(!dest.exists(), "nothing may be created");
+    assert!(!tmp.path().join("evil").exists());
+    let gets: Vec<_> = state
+        .requests_for_bucket(&b)
+        .into_iter()
+        .filter(|r| r.method == "GET" && !r.query.contains("list-type"))
+        .collect();
+    assert!(gets.is_empty(), "nothing may be fetched: {gets:?}");
+}
+
+#[tokio::test]
+async fn the_bucket_request_filter_does_not_match_longer_bucket_names() {
+    // The flaky `an_exact_key_is_two_probes_that_cannot_return_siblings` filtered the
+    // shared mock's log with a substring match: `lit213-1` also matched `lit213-10`.
+    let (port, state) = ensure_mock_s3_server();
+    state.seed_bucket("ovl213-1", &["k/a"]);
+    state.seed_bucket("ovl213-10", &["k/a"]);
+    let store = S3ObjectStore::for_endpoint(&format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("for_endpoint");
+    for b in ["ovl213-1", "ovl213-10"] {
+        store
+            .list(&format!("s3://{b}/k/a"), false)
+            .await
+            .expect("list");
+    }
+
+    let substring = state.requests_containing("ovl213-1").len();
+    let exact = state.requests_for_bucket("ovl213-1");
+    assert!(
+        substring > exact.len(),
+        "the substring match overlaps ({substring} requests vs {} for the exact bucket)",
+        exact.len()
+    );
+    assert!(!exact.is_empty());
+    assert!(
+        exact.iter().all(|r| !r.path.contains("ovl213-10")),
+        "{exact:?}"
+    );
 }

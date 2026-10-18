@@ -279,6 +279,17 @@ impl MockS3State {
             .collect()
     }
 
+    /// Every request received so far for EXACTLY the path-style bucket `bucket` (the first
+    /// path segment), in arrival order. Use this, not [`Self::requests_containing`], to
+    /// filter by bucket: `requests_containing("b-1")` is a substring match and also returns
+    /// the traffic of `b-10` .. `b-19` created by tests running concurrently on the same mock.
+    pub fn requests_for_bucket(&self, bucket: &str) -> Vec<RecordedRequest> {
+        self.requests_containing(bucket)
+            .into_iter()
+            .filter(|r| r.path.trim_start_matches('/').split('/').next() == Some(bucket))
+            .collect()
+    }
+
     /// Poll `counts_for(key_path)` until `predicate` returns true or
     /// `timeout` elapses. Returns the last observed snapshot either way
     /// — callers assert on the returned value so a timeout still

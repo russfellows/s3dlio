@@ -79,12 +79,23 @@ fn text(out: &Output) -> String {
     )
 }
 
-/// Names of the files directly inside `dir` (download writes a flat directory).
+/// Every file below `dir`, as `/`-joined paths relative to `dir`: a download keeps each
+/// object's key path relative to the listing base (#284).
 fn files_in(dir: &Path) -> BTreeSet<String> {
-    std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"))
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect()
+    fn walk(dir: &Path, prefix: &str, out: &mut BTreeSet<String>) {
+        for e in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}")) {
+            let e = e.unwrap();
+            let name = format!("{prefix}{}", e.file_name().to_string_lossy());
+            if e.file_type().unwrap().is_dir() {
+                walk(&e.path(), &format!("{name}/"), out);
+            } else {
+                out.insert(name);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(dir, "", &mut out);
+    out
 }
 
 fn set(names: &[&str]) -> BTreeSet<String> {
@@ -95,7 +106,7 @@ fn set(names: &[&str]) -> BTreeSet<String> {
 fn object_gets(state: &MockS3State, bucket: &str) -> BTreeSet<String> {
     let prefix = format!("/{bucket}/");
     state
-        .requests_containing(bucket)
+        .requests_for_bucket(bucket)
         .into_iter()
         .filter(|r| r.method == "GET" && !r.query.contains("list-type"))
         .filter_map(|r| r.path.strip_prefix(&prefix).map(str::to_string))
@@ -123,7 +134,12 @@ fn download_pattern_selects_only_matching_objects() {
     );
     assert!(out.status.success(), "{}", text(&out));
     // dl/b.txt is a decoy under the prefix; dl2/ is outside the `dl/` directory.
-    assert_eq!(files_in(&dest), set(&["a.npz", "c.npz"]), "{}", text(&out));
+    assert_eq!(
+        files_in(&dest),
+        set(&["a.npz", "sub/c.npz"]),
+        "{}",
+        text(&out)
+    );
     assert_eq!(std::fs::read(dest.join("a.npz")).unwrap(), b"mock");
     let _ = std::fs::remove_dir_all(&dest);
 }
@@ -145,7 +161,7 @@ fn download_pattern_is_matched_relative_to_the_listing_base() {
         ],
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(files_in(&dest), set(&["c.npz"]), "{}", text(&out));
+    assert_eq!(files_in(&dest), set(&["sub/c.npz"]), "{}", text(&out));
     let _ = std::fs::remove_dir_all(&dest);
 }
 
@@ -166,7 +182,12 @@ fn download_pattern_composes_with_a_key_without_slash() {
         ],
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(files_in(&dest), set(&["a.npz", "c.npz"]), "{}", text(&out));
+    assert_eq!(
+        files_in(&dest),
+        set(&["a.npz", "sub/c.npz"]),
+        "{}",
+        text(&out)
+    );
     let _ = std::fs::remove_dir_all(&dest);
 }
 
@@ -192,9 +213,9 @@ fn download_invalid_pattern_sends_nothing_and_creates_nothing() {
         text(&out)
     );
     assert!(
-        state.requests_containing(&b).is_empty(),
+        state.requests_for_bucket(&b).is_empty(),
         "an invalid --pattern must send no request: {:?}",
-        state.requests_containing(&b)
+        state.requests_for_bucket(&b)
     );
     assert!(!dest.exists(), "no output directory may be created");
 }
@@ -288,7 +309,12 @@ fn download_wildcard_is_an_explicit_glob() {
         ],
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(files_in(&two), set(&["a.npz", "c.npz"]), "{}", text(&out));
+    assert_eq!(
+        files_in(&two),
+        set(&["a.npz", "sub/c.npz"]),
+        "{}",
+        text(&out)
+    );
     let _ = std::fs::remove_dir_all(&two);
 }
 
@@ -308,7 +334,7 @@ fn download_without_pattern_a_directory_name_does_not_cross_into_dl2() {
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(
         files_in(&with_slash),
-        set(&["a.npz", "b.txt", "c.npz"]),
+        set(&["a.npz", "b.txt", "sub/c.npz"]),
         "{}",
         text(&out)
     );
@@ -327,7 +353,7 @@ fn download_without_pattern_a_directory_name_does_not_cross_into_dl2() {
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(
         files_in(&bare),
-        set(&["a.npz", "b.txt", "c.npz"]),
+        set(&["a.npz", "b.txt", "sub/c.npz"]),
         "s3://b/dl selects dl/... and never dl2/...: {}",
         text(&out)
     );
@@ -378,9 +404,9 @@ fn get_invalid_pattern_sends_nothing() {
         text(&out)
     );
     assert!(
-        state.requests_containing(&b).is_empty(),
+        state.requests_for_bucket(&b).is_empty(),
         "an invalid --pattern must send no request: {:?}",
-        state.requests_containing(&b)
+        state.requests_for_bucket(&b)
     );
 }
 
@@ -406,7 +432,7 @@ fn get_pattern_with_a_keylist_is_refused_before_any_request() {
         "{}",
         text(&out)
     );
-    assert!(state.requests_containing(&b).is_empty());
+    assert!(state.requests_for_bucket(&b).is_empty());
 }
 
 #[test]
@@ -463,8 +489,13 @@ fn download_pattern_works_on_the_file_backend() {
         .output()
         .expect("run s3-cli");
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(files_in(&dest), set(&["a.npz", "c.npz"]), "{}", text(&out));
-    assert_eq!(std::fs::read(dest.join("c.npz")).unwrap(), b"sub/c.npz");
+    assert_eq!(
+        files_in(&dest),
+        set(&["a.npz", "sub/c.npz"]),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(std::fs::read(dest.join("sub/c.npz")).unwrap(), b"sub/c.npz");
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dest);
 

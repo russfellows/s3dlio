@@ -38,10 +38,12 @@ pub mod progress;
 // NOTE: sharded_client.rs and range_engine.rs (the S3-specific variant) were
 // removed in v0.9.90.  They were never-completed stubs with no callers.  The
 // production range engine is range_engine_generic.rs — see that file for context.
+pub mod download_layout; // (#284): where a downloaded object is written
 pub mod list_pattern; // (#213): the explicit client-side regex filter for listings
 pub mod mp;
 pub mod multi_endpoint;
 pub mod range_engine_generic; // Universal stream-based range engine (v0.9.2+)
+pub(crate) mod redact; // credential redaction of URIs shown in messages (one implementation)
 pub mod s3_selection; // (#213): which objects an s3:// URI selects
 pub mod uri_utils; // v0.9.14: Multi-endpoint URI expansion utilities // v0.9.14: Multi-endpoint load balancing with thread/process control
 
