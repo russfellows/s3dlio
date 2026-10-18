@@ -696,9 +696,9 @@ fn case_literal_keys(scope: &Scope) -> CaseFuture<'_> {
             );
             dst.assert_untouched(neighbour);
         }
-        // Azure strips a trailing '.' from a blob name in the URL, so "name." and "name" are the
-        // same blob (Azure naming rules); recorded as a provider limitation.  "name" is NOT
-        // registered as a written key: deleting "name." removes the aliased blob.
+        // On the tested s3dlio/Azure SDK/service path, "name." and "name" alias the same blob.
+        // This test does not isolate whether the SDK, URL handling or service causes the alias.
+        // "name" is NOT registered as a written key: deleting "name." removes the aliased blob.
         let alias_len = 32 + "name.".len();
         let alias_data = content(&scope.uri("name."), alias_len);
         let written = scope
