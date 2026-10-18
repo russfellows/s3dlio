@@ -181,10 +181,11 @@ def test_put_head_get_into_round_trip_with_identity(run, size):
         assert got == size
         assert bytes(buf[:size]) == data, "bytes differ from what was written"
         assert buf[size:].count(CANARY) == CANARY_LEN, "a write past expected_len"
-        assert resizable(buf), "the export outlived the await"
+        # Identity first: the resize probe below may realloc and move the bytearray.
         after = (ctypes.c_char * len(buf)).from_buffer(buf)
         assert ctypes.addressof(after) == address, "the buffer moved: not filled in place"
         del after
+        assert resizable(buf), "the export outlived the await"
 
         # A ctypes destination: the bytes land at the allocation's own address.
         arr = (ctypes.c_ubyte * size)()
