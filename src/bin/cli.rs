@@ -754,7 +754,21 @@ fn parse_human_size(input: &str) -> std::result::Result<usize, String> {
 /// worker threads) is built, so the runtime and everything after it see the file's
 /// values and the environment is set while the process has only its main thread
 /// (issue #243). The runtime is built right after.
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    // Every command's error ends up here, so the one place that prints it also redacts it:
+    // credentials in any `scheme://` URI of the cause chain (userinfo, signed queries) are
+    // removed and control / bidi characters are escaped. Same `Error: ...` form as the
+    // default `main` result printer, and the exit code stays non-zero.
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {:?}", s3dlio::sanitized_error(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     // s3-cli loads a `.env` file by default (variables already set are never overridden).
     // `S3DLIO_LOAD_DOTENV=0` turns that off, `=<path>` loads that file instead (issue #243).
     // No log subscriber exists yet, so a problem with the named file is printed here.
@@ -978,7 +992,11 @@ async fn async_main() -> Result<()> {
                     if dest.starts_with("s3://") {
                         if let Ok((bucket, _)) = parse_s3_uri(&dest) {
                             if let Err(e) = store.create_container(&bucket).await {
-                                warn!("Failed to create bucket {}: {}", bucket, e);
+                                warn!(
+                                    "Failed to create bucket {}: {}",
+                                    bucket,
+                                    s3dlio::sanitized_error(&e)
+                                );
                             }
                         }
                     } else if dest.starts_with("az://") || dest.starts_with("azure://") {
@@ -990,7 +1008,11 @@ async fn async_main() -> Result<()> {
                             .collect();
                         if let Some(container) = parts.first() {
                             if let Err(e) = store.create_container(container).await {
-                                warn!("Failed to create container {}: {}", container, e);
+                                warn!(
+                                    "Failed to create container {}: {}",
+                                    container,
+                                    s3dlio::sanitized_error(&e)
+                                );
                             }
                         }
                     } else if dest.starts_with("gs://") || dest.starts_with("gcs://") {
@@ -1002,7 +1024,11 @@ async fn async_main() -> Result<()> {
                             .collect();
                         if let Some(bucket) = parts.first() {
                             if let Err(e) = store.create_container(bucket).await {
-                                warn!("Failed to create GCS bucket {}: {}", bucket, e);
+                                warn!(
+                                    "Failed to create GCS bucket {}: {}",
+                                    bucket,
+                                    s3dlio::sanitized_error(&e)
+                                );
                             }
                         }
                     }
@@ -1056,8 +1082,15 @@ async fn async_main() -> Result<()> {
             }
             // Use generic object store to list objects (works with all backends)
             let logger = global_logger();
-            let store = store_for_uri_with_logger(&src, logger)?;
-            let mut keys = store.list(&src, recursive).await?;
+            // The store and listing errors may quote a provider message with signed URLs or
+            // `user:password@`, and `main` prints the whole cause chain: they are sanitised
+            // here (credentials redacted from every URI, control and bidi characters escaped).
+            let store =
+                store_for_uri_with_logger(&src, logger).map_err(|e| s3dlio::sanitized_error(&e))?;
+            let mut keys = store
+                .list(&src, recursive)
+                .await
+                .map_err(|e| s3dlio::sanitized_error(&e))?;
             if let Some(filter) = &filter {
                 filter.retain(&src, &mut keys);
             }
@@ -1132,7 +1165,11 @@ async fn async_main() -> Result<()> {
                             if dest.starts_with("s3://") {
                                 if let Ok((bucket, _)) = parse_s3_uri(&dest) {
                                     if let Err(e) = store.create_container(&bucket).await {
-                                        warn!("Failed to create bucket {}: {}", bucket, e);
+                                        warn!(
+                                            "Failed to create bucket {}: {}",
+                                            bucket,
+                                            s3dlio::sanitized_error(&e)
+                                        );
                                     }
                                 }
                             } else if dest.starts_with("az://") || dest.starts_with("azure://") {
@@ -1143,7 +1180,11 @@ async fn async_main() -> Result<()> {
                                     .collect();
                                 if let Some(container) = parts.first() {
                                     if let Err(e) = store.create_container(container).await {
-                                        warn!("Failed to create container {}: {}", container, e);
+                                        warn!(
+                                            "Failed to create container {}: {}",
+                                            container,
+                                            s3dlio::sanitized_error(&e)
+                                        );
                                     }
                                 }
                             } else if dest.starts_with("gs://") || dest.starts_with("gcs://") {
@@ -1154,7 +1195,11 @@ async fn async_main() -> Result<()> {
                                     .collect();
                                 if let Some(bucket) = parts.first() {
                                     if let Err(e) = store.create_container(bucket).await {
-                                        warn!("Failed to create GCS bucket {}: {}", bucket, e);
+                                        warn!(
+                                            "Failed to create GCS bucket {}: {}",
+                                            bucket,
+                                            s3dlio::sanitized_error(&e)
+                                        );
                                     }
                                 }
                             }
@@ -1241,7 +1286,11 @@ async fn async_main() -> Result<()> {
                     let target = s3dlio::s3_utils::s3_bucket_target(&uri_prefix)?;
                     if let Err(e) = s3dlio::s3_utils::create_bucket_for_uri_async(&uri_prefix).await
                     {
-                        eprintln!("Warning: failed to create bucket {}: {}", target.bucket, e);
+                        eprintln!(
+                            "Warning: failed to create bucket {}: {}",
+                            target.bucket,
+                            s3dlio::sanitized_error(&e)
+                        );
                     }
                 }
             }
@@ -1607,7 +1656,7 @@ async fn get_cmd(
                 }
                 Ok(Err(e)) => {
                     failure_count += 1;
-                    warn!("GET failed: {}", e);
+                    warn!("GET failed: {}", s3dlio::sanitized_error(&e));
                 }
                 Err(e) => {
                     failure_count += 1;
@@ -1904,7 +1953,7 @@ async fn get_cmd(
             Ok(Ok(_)) => {} // atomics already updated inside the task
             Ok(Err(e)) => {
                 failure_count += 1;
-                warn!("GET failed: {}", e);
+                warn!("GET failed: {}", s3dlio::sanitized_error(&e));
             }
             Err(e) => {
                 failure_count += 1;
@@ -2286,7 +2335,7 @@ async fn put_many_cmd(
             }
             Ok(Err(e)) => {
                 failure_count += 1;
-                warn!("PUT failed: {}", e);
+                warn!("PUT failed: {}", s3dlio::sanitized_error(&e));
             }
             Err(e) => {
                 failure_count += 1;

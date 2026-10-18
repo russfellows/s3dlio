@@ -114,33 +114,59 @@ pub async fn upload_files<P: AsRef<Path>>(
             // Get file size for progress tracking
             let file_size = fs::metadata(&path)?.len();
 
+            // The object as the messages name it, control characters of the file name escaped.
+            let shown = crate::redact::escape_control(&format!("s3://{bucket}/{key}"));
+
             futs.push(tokio::spawn(async move {
-                debug!("starting upload of {:?} → s3://{}/{}", path, bucket, key);
-                let _permit = sem.acquire_owned().await.unwrap();
-                let body = ByteStream::from_path(&path).await?;
-                let bytes = body.collect().await?.into_bytes();
-                match (&endpoint_store, &endpoint) {
-                    (Some(store), Some(authority)) => {
-                        let uri = format!("s3://{authority}/{bucket}/{key}");
-                        store.put(&uri, bytes).await?;
+                debug!("starting upload of {:?} → {}", path, shown);
+                let uploaded = async {
+                    let _permit = sem.acquire_owned().await?;
+                    let body = ByteStream::from_path(&path).await?;
+                    let bytes = body.collect().await?.into_bytes();
+                    match (&endpoint_store, &endpoint) {
+                        (Some(store), Some(authority)) => {
+                            let uri = format!("s3://{authority}/{bucket}/{key}");
+                            store.put(&uri, bytes).await?;
+                        }
+                        _ => put_object_async(&bucket, &key, bytes).await?,
                     }
-                    _ => put_object_async(&bucket, &key, bytes).await?,
-                }
-                debug!("finished upload of {:?} → s3://{}/{}", path, bucket, key);
+                    debug!("finished upload of {:?} → {}", path, shown);
 
-                // Update progress if callback provided
-                if let Some(ref progress) = progress {
-                    progress.object_completed(file_size);
-                }
+                    // Update progress if callback provided
+                    if let Some(ref progress) = progress {
+                        progress.object_completed(file_size);
+                    }
 
-                Ok::<(), anyhow::Error>(())
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                // The failure names the object it belongs to. The store's own error may carry a
+                // provider message with signed URLs or userinfo, so every URI in the final text of
+                // the whole chain is redacted and the text escaped (a returned error is shown by
+                // callers and logged as it stands).
+                uploaded.map_err(|e| {
+                    anyhow::anyhow!(crate::redact::redact_and_escape_text(&format!(
+                        "{shown}: {e:#}"
+                    )))
+                })
             }));
         }
 
+        // Fail fast on the first failure, but let it reach the log below (a `?` here would
+        // return from the function and skip it).
+        let mut outcome: Result<()> = Ok(());
         while let Some(join_res) = futs.next().await {
-            join_res??;
+            let failure = match join_res {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => e,
+                Err(e) => anyhow::anyhow!(crate::redact::redact_and_escape_text(&format!(
+                    "upload task failed: {e}"
+                ))),
+            };
+            outcome = Err(failure);
+            break;
         }
-        Ok(())
+        outcome
     };
 
     // INFO: result of bulk upload
@@ -219,10 +245,14 @@ pub async fn download_objects_matching(
     // implementation `download_objects` delegates to (and a public entry of its own), so the
     // guard lives here: before the URI is parsed, anything is listed or a directory is made.
     crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
-    let (bucket, key_prefix) = parse_s3_uri_for_global_client(src_uri)?;
+    let (bucket, key_prefix) =
+        parse_s3_uri_for_global_client(src_uri).map_err(|e| crate::redact::sanitized_error(&e))?;
 
-    // List the objects the URI selects, narrowed by the explicit pattern.
-    let keys = list_objects_with_pattern(&bucket, &key_prefix, pattern, recursive)?;
+    // List the objects the URI selects, narrowed by the explicit pattern. The listing error may
+    // carry a provider message with signed URLs or userinfo: it is sanitised (its typed
+    // classification, if any, is kept).
+    let keys = list_objects_with_pattern(&bucket, &key_prefix, pattern, recursive)
+        .map_err(|e| crate::redact::sanitized_error(&e))?;
 
     if keys.is_empty() {
         bail!("No objects matched for download");
@@ -239,7 +269,10 @@ pub async fn download_objects_matching(
     for plan in crate::download_layout::plan_downloads(src_uri, &uris) {
         let comps = match plan.target {
             Ok(comps) => comps,
-            Err(e) => bail!("Download refused: {:#}", e),
+            Err(e) => bail!(
+                "{}",
+                crate::redact::redact_and_escape_text(&format!("Download refused: {e:#}"))
+            ),
         };
         let key = plan
             .entry
@@ -297,18 +330,32 @@ pub async fn download_objects_matching(
                 }
                 .await;
                 // The failure names the object it belongs to. The store's own error quotes the
-                // raw key, so the final text of the whole chain is escaped (a returned error
-                // is shown by callers and logged as it stands).
+                // raw key and may carry a provider message with signed URLs or userinfo, so every
+                // URI in the final text of the whole chain is redacted and the text escaped (a
+                // returned error is shown by callers and logged as it stands).
                 fetched_and_written.map_err(|e| {
-                    anyhow::anyhow!(crate::redact::escape_control(&format!("{shown}: {e:#}")))
+                    anyhow::anyhow!(crate::redact::redact_and_escape_text(&format!(
+                        "{shown}: {e:#}"
+                    )))
                 })
             }));
         }
 
+        // Fail fast on the first failure, but let it reach the log below (a `?` here would
+        // return from the function and skip it).
+        let mut outcome: Result<()> = Ok(());
         while let Some(join_res) = futs.next().await {
-            join_res??;
+            let failure = match join_res {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => e,
+                Err(e) => anyhow::anyhow!(crate::redact::redact_and_escape_text(&format!(
+                    "download task failed: {e}"
+                ))),
+            };
+            outcome = Err(failure);
+            break;
         }
-        Ok(())
+        outcome
     };
 
     // INFO: result of bulk download

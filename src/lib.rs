@@ -44,6 +44,9 @@ pub mod mp;
 pub mod multi_endpoint;
 pub mod range_engine_generic; // Universal stream-based range engine (v0.9.2+)
 pub(crate) mod redact; // credential redaction of URIs shown in messages (one implementation)
+                       // The one entry the `s3-cli` binary needs: an error from a store call, made safe to print.
+#[doc(hidden)]
+pub use redact::sanitized_error;
 pub mod s3_selection; // (#213): which objects an s3:// URI selects
 pub mod uri_utils; // v0.9.14: Multi-endpoint URI expansion utilities // v0.9.14: Multi-endpoint load balancing with thread/process control
 

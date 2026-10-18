@@ -120,6 +120,27 @@ pub const GET_FORBIDDEN_MARKER: &str = "get-403";
 /// retried by the s3dlio retry loop).
 pub const GET_NOT_FOUND_MARKER: &str = "get-404";
 
+/// Key substring marker that makes the mock server answer GetObject with `403 AccessDenied`
+/// whose `<Message>` quotes [`LEAKY_ERROR_MESSAGE`]: two credential-bearing URLs (userinfo,
+/// signatures) and a bidi override, all synthetic. A provider's service error is
+/// shown by the SDK with that message intact, so a caller that renders the cause chain must
+/// sanitise every URI in it (issue #284 review F-F1).
+pub const GET_LEAKY_ERROR_MARKER: &str = "get-leaky";
+
+/// The `<Message>` text served for [`GET_LEAKY_ERROR_MARKER`] keys (XML-escaped on the wire).
+/// The synthetic secrets are `SECRETPW1`, `SIGONE1`, `SIGTWO2`, `CREDONE1`.
+pub const LEAKY_ERROR_MESSAGE: &str = "denied: see https://admin:SECRETPW1@creds.example.invalid/p?X-Amz-Credential=CREDONE1&X-Amz-Signature=SIGONE1 and also (s3://other-bucket/k?sig=SIGTWO2) \u{202e}end";
+
+/// Key substring marker that makes the mock server answer PutObject with `403 AccessDenied`
+/// whose `<Message>` quotes [`LEAKY_ERROR_MESSAGE`] (an upload whose failure quotes
+/// credential-bearing URLs).
+pub const PUT_LEAKY_ERROR_MARKER: &str = "put-leaky";
+
+/// Bucket-name marker: ListObjectsV2 on a bucket whose name contains this answers
+/// `403 AccessDenied` with the [`LEAKY_ERROR_MESSAGE`] text (issue #284 review F-F1: a LIST failure
+/// quoting credential-bearing URLs).
+pub const LIST_LEAKY_ERROR_MARKER: &str = "list-leaky";
+
 /// Key substring marker that makes the mock server answer GetObject with
 /// `503 SlowDown` every time (issue #240: a transient failure that must still
 /// be retried).
@@ -898,6 +919,15 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     if method == Method::GET && query.contains("list-type=2") {
         let prefix = query_param(&query, "prefix").unwrap_or_default();
         let bucket = path.trim_matches('/').split('/').next().unwrap_or("");
+        if bucket.contains(LIST_LEAKY_ERROR_MARKER) {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <Error><Code>AccessDenied</Code><Message>{}</Message>\
+                 <RequestId>mock-request-id</RequestId></Error>",
+                LEAKY_ERROR_MESSAGE.replace('&', "&amp;")
+            );
+            return xml_response(StatusCode::FORBIDDEN, &xml);
+        }
         if let Some(catalog) = state.catalog(bucket) {
             let xml = seeded_list_response(&catalog, bucket, &prefix, &query);
             return xml_response(StatusCode::OK, &xml);
@@ -967,6 +997,16 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         if path.contains(PUT_FORBIDDEN_MARKER) {
             state.record(&path, |c| c.put_calls += 1);
             return error_response(StatusCode::FORBIDDEN, "AccessDenied");
+        }
+        if path.contains(PUT_LEAKY_ERROR_MARKER) {
+            state.record(&path, |c| c.put_calls += 1);
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <Error><Code>AccessDenied</Code><Message>{}</Message>\
+                 <RequestId>mock-request-id</RequestId></Error>",
+                LEAKY_ERROR_MESSAGE.replace('&', "&amp;")
+            );
+            return xml_response(StatusCode::FORBIDDEN, &xml);
         }
         if path.contains(PUT_FAILS_MARKER) {
             state.record(&path, |c| c.put_calls += 1);
@@ -1038,6 +1078,15 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         let attempt = state.record_and_get(&path, |c| c.get_calls += 1);
         if path.contains(GET_FORBIDDEN_MARKER) {
             return error_response(StatusCode::FORBIDDEN, "AccessDenied");
+        }
+        if path.contains(GET_LEAKY_ERROR_MARKER) {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <Error><Code>AccessDenied</Code><Message>{}</Message>\
+                 <RequestId>mock-request-id</RequestId></Error>",
+                LEAKY_ERROR_MESSAGE.replace('&', "&amp;")
+            );
+            return xml_response(StatusCode::FORBIDDEN, &xml);
         }
         if path.contains(GET_NOT_FOUND_MARKER) {
             return error_response(StatusCode::NOT_FOUND, "NoSuchKey");

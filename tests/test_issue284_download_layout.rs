@@ -807,3 +807,305 @@ fn s3_copy_error_for_a_failing_get_of_a_hostile_key_is_escaped() {
     assert_no_raw_control(&msg);
     assert!(msg.contains("\\t") && msg.contains("\\u{85}"), "{msg}");
 }
+
+// ---------------------------------------------------------------------------
+// Review F-F1: credentials inside an underlying (provider) error message
+// ---------------------------------------------------------------------------
+
+/// Everything secret in `common::mock_s3_server::LEAKY_ERROR_MESSAGE`.
+const LEAKY_SECRETS: [&str; 5] = ["SECRETPW1", "admin:", "SIGONE1", "SIGTWO2", "CREDONE1"];
+
+/// A listed key (safe, but with a tab) whose GET answers `403` with a message quoting two
+/// credential-bearing URLs and a bidi override.
+const LEAKY_KEY: &str = "dl/get-leaky\tkey";
+
+fn assert_no_leaked_secret(what: &str, text: &str) {
+    for secret in LEAKY_SECRETS {
+        assert!(!text.contains(secret), "{what} leaked `{secret}`: {text:?}");
+    }
+}
+
+/// The message must still be useful: the host and the non-secret path survive, the escape of
+/// the bidi override is visible, and no raw control / bidi character remains.
+fn assert_leaky_text_is_sanitised_but_useful(what: &str, text: &str) {
+    assert_no_leaked_secret(what, text);
+    assert!(text.contains("get-leaky"), "{what} names the key: {text:?}");
+    assert!(
+        text.contains("creds.example.invalid"),
+        "{what} lost the host: {text:?}"
+    );
+    assert!(
+        text.contains("s3://other-bucket/k"),
+        "{what} lost the second URI: {text:?}"
+    );
+    assert_no_raw_control(text);
+    assert!(
+        text.contains("\\u{202e}") && text.contains("\\t"),
+        "{what} lost the escapes: {text:?}"
+    );
+}
+
+/// A `tracing` writer that keeps what the WARN / ERROR lines say.
+#[derive(Clone, Default)]
+struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("log buffer poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        let bytes = self.0.lock().map(|b| b.clone()).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Run `f` on a fresh runtime of the calling thread with the WARN-and-up output captured
+/// (the lines these functions log from their own task are emitted on this thread).
+fn capturing_warnings<F, T>(f: F) -> (T, String)
+where
+    F: std::future::Future<Output = T>,
+{
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, || on_fresh_runtime(f));
+    (out, log.text())
+}
+
+#[test]
+fn a_provider_error_with_credential_urls_is_sanitised_in_the_generic_download() {
+    let (_port, state) = ensure_mock_s3_server();
+    let bucket = format!("dl284-{}", N.fetch_add(1, Ordering::SeqCst));
+    state.seed_bucket(&bucket, &["dl/ok.bin", LEAKY_KEY]);
+    let d = dirs();
+
+    let src = format!("s3://{bucket}/dl/");
+    let (result, warned) =
+        capturing_warnings(generic_download_objects(&src, &d.dest, 4, true, None));
+    let err = result.expect_err("the leaky key fails");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("failed=1"), "{msg}");
+    assert!(
+        d.dest.join("ok.bin").exists(),
+        "the healthy object still downloaded"
+    );
+    assert_leaky_text_is_sanitised_but_useful("the returned error", &msg);
+    assert!(
+        warned.contains("get-leaky"),
+        "no WARN was captured: {warned:?}"
+    );
+    assert_no_leaked_secret("the WARN log", &warned);
+}
+
+#[test]
+fn a_provider_error_with_credential_urls_is_sanitised_in_s3_copy() {
+    let (_port, state) = ensure_mock_s3_server();
+    let bucket = format!("dl284-{}", N.fetch_add(1, Ordering::SeqCst));
+    state.seed_bucket(&bucket, &["dl/ok.bin", LEAKY_KEY]);
+    let d = dirs();
+
+    let src = format!("s3://{bucket}/dl/");
+    let (result, logged) = capturing_warnings(s3dlio::s3_copy::download_objects(
+        &src, &d.dest, 4, true, None,
+    ));
+    let err = result.expect_err("the leaky key fails");
+    let msg = format!("{err:#}");
+    assert_leaky_text_is_sanitised_but_useful("the returned error", &msg);
+    // The failure reaches the ERROR log, and that line is clean too.
+    assert!(
+        logged.contains("Download failed") && logged.contains("get-leaky"),
+        "no ERROR line was captured: {logged:?}"
+    );
+    assert_no_leaked_secret("the logged error", &logged);
+}
+
+/// A bucket whose LIST answers `403` with a message quoting credential-bearing URLs.
+fn list_leaky_bucket() -> String {
+    let (_port, _state) = ensure_mock_s3_server();
+    format!(
+        "dl284-{}-{}",
+        common::mock_s3_server::LIST_LEAKY_ERROR_MARKER,
+        N.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+#[test]
+fn a_failing_list_with_credential_urls_is_sanitised_in_the_generic_download() {
+    let bucket = list_leaky_bucket();
+    let d = dirs();
+    let (result, logged) = capturing_warnings(generic_download_objects(
+        &format!("s3://{bucket}/dl/"),
+        &d.dest,
+        4,
+        true,
+        None,
+    ));
+    let err = result.expect_err("the LIST fails");
+    let msg = format!("{err:#}");
+    assert_no_leaked_secret("the returned error", &msg);
+    assert!(msg.contains("creds.example.invalid"), "{msg}");
+    assert_no_raw_control(&msg);
+    assert!(msg.contains("\\u{202e}"), "{msg}");
+    assert_no_leaked_secret("the log", &logged);
+}
+
+#[test]
+fn a_failing_list_with_credential_urls_is_sanitised_in_s3_copy() {
+    let bucket = list_leaky_bucket();
+    let d = dirs();
+    let (result, logged) = capturing_warnings(s3dlio::s3_copy::download_objects(
+        &format!("s3://{bucket}/dl/"),
+        &d.dest,
+        4,
+        true,
+        None,
+    ));
+    let err = result.expect_err("the LIST fails");
+    let msg = format!("{err:#}");
+    assert_no_leaked_secret("the returned error", &msg);
+    assert!(msg.contains("creds.example.invalid"), "{msg}");
+    assert_no_raw_control(&msg);
+    assert!(msg.contains("\\u{202e}"), "{msg}");
+    assert_no_leaked_secret("the log", &logged);
+}
+
+/// Review B1: `s3-cli download` lists the source itself before the shared helper runs; a
+/// listing failure quoting credential-bearing URLs must reach stderr clean (the raw cause
+/// chain used to be printed by `main`).
+#[test]
+fn cli_download_with_a_failing_list_prints_no_credentials_or_raw_bidi() {
+    let bucket = list_leaky_bucket();
+    let d = dirs();
+    let (port, _state) = ensure_mock_s3_server();
+    for recursive in [false, true] {
+        let src = format!("s3://{bucket}/dl/");
+        let dest = d.dest.display().to_string();
+        let mut args = vec!["download"];
+        if recursive {
+            args.push("-r");
+        }
+        args.extend([src.as_str(), dest.as_str()]);
+        let out = s3_cli_on(port, &args);
+        assert!(
+            !out.status.success(),
+            "the LIST failure must fail the command"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        for (what, text) in [("stderr", &stderr), ("stdout", &stdout)] {
+            assert_no_leaked_secret(what, text);
+            assert!(
+                !text.contains('\u{202e}'),
+                "{what} holds a raw U+202E: {text:?}"
+            );
+        }
+        assert!(
+            stderr.contains("creds.example.invalid"),
+            "the message is still useful: {stderr:?}"
+        );
+        assert!(!d.dest.exists(), "nothing is created for a failed listing");
+    }
+}
+
+/// The same through `s3-cli cp <uri> <dir>` (it goes through the shared helper).
+#[test]
+fn cli_cp_download_with_a_failing_list_prints_no_credentials_or_raw_bidi() {
+    let bucket = list_leaky_bucket();
+    let d = dirs();
+    let (port, _state) = ensure_mock_s3_server();
+    let src = format!("s3://{bucket}/dl/");
+    let dest = d.dest.display().to_string();
+    let out = s3_cli_on(port, &["cp", "-r", src.as_str(), dest.as_str()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_no_leaked_secret("stderr", &stderr);
+    assert!(!stderr.contains('\u{202e}'), "raw U+202E: {stderr:?}");
+}
+
+/// An upload whose failure quotes credential-bearing URLs: the returned error and the ERROR
+/// log line are clean, and the failure reaches the log at all (the early `??` return used to
+/// skip it).
+#[test]
+fn s3_copy_upload_failure_is_sanitised_and_logged() {
+    let (_port, _state) = ensure_mock_s3_server();
+    let bucket = format!("up284-{}", N.fetch_add(1, Ordering::SeqCst));
+    let d = dirs();
+    let file = d.src.join(format!(
+        "{}.bin",
+        common::mock_s3_server::PUT_LEAKY_ERROR_MARKER
+    ));
+    write(&file, b"payload");
+
+    let (result, logged) = capturing_warnings(s3dlio::s3_copy::upload_files(
+        &format!("s3://{bucket}/up/"),
+        &[file],
+        2,
+        false,
+        None,
+    ));
+    let err = result.expect_err("the PUT fails");
+    let msg = format!("{err:#}");
+    assert_leaky_text_is_sanitised_but_useful_for_upload("the returned error", &msg);
+    assert!(
+        logged.contains("Upload failed"),
+        "no ERROR line was captured: {logged:?}"
+    );
+    assert_no_leaked_secret("the logged error", &logged);
+}
+
+fn assert_leaky_text_is_sanitised_but_useful_for_upload(what: &str, text: &str) {
+    assert_no_leaked_secret(what, text);
+    assert!(
+        text.contains("creds.example.invalid"),
+        "{what} lost the host: {text:?}"
+    );
+    assert!(
+        text.contains("put-leaky"),
+        "{what} does not name the file: {text:?}"
+    );
+    assert_no_raw_control(text);
+    assert!(
+        text.contains("\\u{202e}"),
+        "{what} lost the escape: {text:?}"
+    );
+}
+
+/// A per-object GET failure quoting credential-bearing URLs reaches the CLI's stderr clean.
+#[test]
+fn cli_download_with_a_failing_get_prints_no_credentials_or_raw_bidi() {
+    let (port, state) = ensure_mock_s3_server();
+    let bucket = format!("dl284-{}", N.fetch_add(1, Ordering::SeqCst));
+    state.seed_bucket(&bucket, &["dl/ok.bin", LEAKY_KEY]);
+    let d = dirs();
+    let src = format!("s3://{bucket}/dl/");
+    let dest = d.dest.display().to_string();
+    let out = s3_cli_on(port, &["download", "-r", src.as_str(), dest.as_str()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    for (what, text) in [("stderr", &stderr), ("stdout", &stdout)] {
+        assert_no_leaked_secret(what, text);
+        assert!(!text.contains('\u{202e}'), "{what}: raw U+202E in {text:?}");
+    }
+    assert!(d.dest.join("ok.bin").exists());
+}

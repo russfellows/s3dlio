@@ -5205,7 +5205,7 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
             }
             Ok(Err(e)) => {
                 summary.failed += 1;
-                warn!("Upload task failed: {}", e);
+                warn!("Upload task failed: {}", crate::sanitized_error(&e));
             }
             Err(e) => {
                 summary.failed += 1;
@@ -5351,11 +5351,17 @@ async fn download_with_reasons(
     // per-endpoint store, whose entries come back in bucket form; a store built from such an
     // entry would use the process-wide client (another server).  The per-endpoint store
     // accepts the bucket-form URIs of its own bucket and uses its own client for them.
-    let store: Arc<dyn ObjectStore> =
-        Arc::from(store_for_uri_with_logger(src_uri, global_logger())?);
+    let store: Arc<dyn ObjectStore> = Arc::from(
+        store_for_uri_with_logger(src_uri, global_logger())
+            .map_err(|e| crate::redact::sanitized_error(&e))?,
+    );
 
-    // List objects to download
-    let mut keys = store.list(src_uri, recursive).await?;
+    // List objects to download. The listing error may carry a provider message with signed
+    // URLs or userinfo: it is sanitised (its typed classification, if any, is kept).
+    let mut keys = store
+        .list(src_uri, recursive)
+        .await
+        .map_err(|e| crate::redact::sanitized_error(&e))?;
     if let Some(pattern) = pattern {
         pattern.retain(src_uri, &mut keys);
     }
@@ -5392,8 +5398,9 @@ async fn download_with_reasons(
             Ok(comps) => comps,
             Err(e) => {
                 summary.failed += 1;
-                // The cause chain may quote the raw remote key: escape the final text.
-                let reason = crate::redact::escape_control(&format!("{e:#}"));
+                // The cause chain may quote the raw remote key: redact every URI in it, escape the
+                // final text.
+                let reason = crate::redact::redact_and_escape_text(&format!("{e:#}"));
                 warn!("Download refused: {}", reason);
                 if reasons.len() < REPORTED_DOWNLOAD_FAILURES {
                     reasons.push(reason);
@@ -5442,8 +5449,10 @@ async fn download_with_reasons(
             }
             Ok(Err(e)) => {
                 summary.failed += 1;
-                // The store's own error quotes the raw remote key: escape the final text.
-                let reason = crate::redact::escape_control(&format!("{e:#}"));
+                // The store's own error quotes the raw remote key and may carry a provider
+                // message with signed URLs or userinfo: redact every URI in the final text,
+                // then escape it.
+                let reason = crate::redact::redact_and_escape_text(&format!("{e:#}"));
                 warn!("Download task failed: {}", reason);
                 if reasons.len() < REPORTED_DOWNLOAD_FAILURES {
                     reasons.push(reason);
@@ -5451,9 +5460,14 @@ async fn download_with_reasons(
             }
             Err(e) => {
                 summary.failed += 1;
-                warn!("Download task join failed: {}", e);
+                warn!(
+                    "Download task join failed: {}",
+                    crate::redact::redact_and_escape_text(&e.to_string())
+                );
                 if reasons.len() < REPORTED_DOWNLOAD_FAILURES {
-                    reasons.push(format!("download task failed: {e}"));
+                    reasons.push(crate::redact::redact_and_escape_text(&format!(
+                        "download task failed: {e}"
+                    )));
                 }
             }
         }
