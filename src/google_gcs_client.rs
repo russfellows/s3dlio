@@ -1792,10 +1792,10 @@ mod caller_buffer {
 
     /// Most repairs one caller-buffer read may use in TOTAL, whatever progress they make.  It is
     /// four times the no-progress limit (`GCS_FULL_READ_REPAIR_MAX_ATTEMPTS`), so a read that
-    /// keeps advancing may survive several interruptions, yet the work (reconnections, backoff,
-    /// the time the caller's allocation stays in use) is finite and independent of the object
-    /// size.  Without it, one byte followed by a failure could cost one reconnection per object
-    /// byte.  With the backoff capped at 2 s the worst case adds about 25 s of waiting.
+    /// keeps advancing may survive several interruptions, yet the number of outer repairs is
+    /// finite and independent of the object size. Without it, one byte followed by a failure
+    /// could cost one repair per object byte. With the backoff capped at 2 s the outer repairs
+    /// add about 25 s of backoff at most; SDK retries, redirects and I/O time are additional.
     const GCS_FULL_READ_TOTAL_REPAIR_MAX_ATTEMPTS: usize = 4 * GCS_FULL_READ_REPAIR_MAX_ATTEMPTS;
 
     /// Retry and repair limits, and the one behavioural switch (`rapid`).
@@ -1816,10 +1816,11 @@ mod caller_buffer {
         /// Repairs allowed in TOTAL for the whole logical read (pinned reads only).  Progress
         /// never refills it, and the backoff delay is taken from it, so it never restarts either.
         /// Together with the no-progress bound above it makes the repair work finite for any
-        /// object size.  The real HTTP and Rapid openers disable the SDK's own read-resume layer
-        /// (`NeverResume`), so every reconnection is a repair counted here, except server redirects
-        /// on the Rapid route: one read sends at most `max_open_attempts + max_total_repairs`
-        /// data requests plus those redirects.  The pinned fork's `ResumeRedirect`
+        /// object size. The real HTTP and Rapid openers disable ordinary SDK body resumption
+        /// (`NeverResume`). There are at most `max_open_attempts + max_total_repairs` outer
+        /// opener calls, not wire requests: each call retains the SDK's ordinary request retry
+        /// policy (the pinned default has a 300 s retry time limit, not an attempt-count cap).
+        /// The pinned fork's `ResumeRedirect`
         /// (`bidi/resume_redirect.rs`) and `RetryRedirect` (`retry_redirect.rs`) continue server
         /// redirects regardless of `NeverResume`, so redirect re-connects are bounded only by the
         /// server, the per-attempt timeout and, in the stream phase, `chunk_timeout`.
@@ -2006,11 +2007,10 @@ mod caller_buffer {
     /// * Retries use only [`gcs_typed_retry_verdict`].
     /// * Repair work is finite whatever the object size: at most `cfg.max_total_repairs` repairs in
     ///   all (progress never refills them), and at most `cfg.max_repairs` in a row without the
-    ///   cursor advancing.  The openers disable the SDK's own read-resume layer, so these bounds
-    ///   are the only reconnections, except server redirects on the Rapid route (the
-    ///   fork's `ResumeRedirect` and `RetryRedirect` continue them regardless of `NeverResume`;
-    ///   see `ReceiveConfig::max_total_repairs`).  On exhaustion the typed failure is returned and `progress`
-    ///   keeps what was received.
+    ///   cursor advancing. The openers disable ordinary SDK body resumption; ordinary SDK
+    ///   request retries and Rapid server redirects remain separate layers, so this is not a
+    ///   wire-request or elapsed-time bound (see `ReceiveConfig::max_total_repairs`). On
+    ///   exhaustion the typed failure is returned and `progress` keeps what was received.
     pub(super) async fn receive_into<O: ReadOpener + ?Sized>(
         opener: &O,
         what: &str,
@@ -2284,9 +2284,9 @@ mod caller_buffer {
             // (`read_resume_policy.rs:134-140` ignores the resume count), so it could reconnect
             // once per byte of a slowly advancing body, outside every bound of the receive loop.
             // With `NeverResume` a broken body surfaces here as its typed error and the bounded
-            // repair loop in `receive_into` owns every reconnection, each pinned to the
-            // generation (server redirects on the Rapid route are the documented exception).  The
-            // initial request keeps the client's own retry policy.
+            // repair loop in `receive_into` owns ordinary body repairs, each pinned to the
+            // generation. Every open still keeps the client's request retry policy; Rapid
+            // server redirects are a separate documented exception to the body-resume policy.
             let mut builder = self
                 .storage
                 .read_object(self.bucket_name, object.as_ref())
