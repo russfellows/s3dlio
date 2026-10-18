@@ -731,7 +731,9 @@ impl GcsClient {
         range: Option<ReadRange>,
         window: Option<(u64, Option<u64>)>,
     ) -> Result<Bytes> {
-        let mut builder = self.storage.read_object(bucket_name, object);
+        // The fork's URL encoder leaves a literal `%` alone (issue #270); see the helper.
+        let wire_name = http_media_object_name(object);
+        let mut builder = self.storage.read_object(bucket_name, wire_name.as_ref());
         if let Some(r) = range {
             builder = builder.set_read_range(r);
         }
@@ -1596,6 +1598,34 @@ pub(crate) fn gcs_typed_retry_verdict(err: &anyhow::Error) -> bool {
     )
 }
 
+/// The object name as the pinned fork's HTTP `read_object` must be given it, so that the
+/// URL names exactly the literal object.
+///
+/// `read_object` builds `/storage/v1/b/{bucket}/o/{enc(object)}?alt=media`, and its `enc`
+/// (`storage/client.rs`) encodes the characters GCS requires (`/`, `@`, `=`, space, ...) but
+/// deliberately PRESERVES `%` (its own test maps `preserve%percent%21` to itself).  A literal
+/// `%2F` in an object name would therefore reach GCS as an escape and be decoded to `/`, which
+/// names a different object.  Sending every literal `%` as `%25` makes the fork's encoder
+/// produce the right URL for any name.
+///
+/// The same mechanism covers `\`: `enc` leaves it alone, and the URL parser then reads it as a
+/// `/` in an http path (measured: `a\b` reached the server as `a/b`), so it is sent as `%5C`.
+/// The `%` replacement runs first, so the `%` of a `%5C` is never doubled.
+///
+/// Every HTTP read goes through this (issue #270): `get_object_via_http` (whole and ranged
+/// reads) and the caller-buffer `HttpOpener`.  The gRPC/Rapid routes carry the name in a
+/// protobuf field, not a URL, and must receive it unchanged.
+///
+/// The names `.` and `..` cannot be addressed over the HTTP path (URL parsing collapses dot
+/// segments); GCS forbids them as object names anyway, and this helper does not change that.
+fn http_media_object_name(object: &str) -> std::borrow::Cow<'_, str> {
+    if object.contains(['%', '\\']) {
+        std::borrow::Cow::Owned(object.replace('%', "%25").replace('\\', "%5C"))
+    } else {
+        std::borrow::Cow::Borrowed(object)
+    }
+}
+
 /// How many bytes an HTTP read will return, for sizing its destination buffer once (#252).
 ///
 /// `object_size` is the object's size from the response; `window` is the requested
@@ -2231,30 +2261,6 @@ mod caller_buffer {
         pub(super) storage: &'a Storage,
         pub(super) bucket_name: &'a str,
         pub(super) object: &'a str,
-    }
-
-    /// The object name as the pinned fork's HTTP `read_object` must be given it, so that the
-    /// URL names exactly the literal object.
-    ///
-    /// `read_object` builds `/storage/v1/b/{bucket}/o/{enc(object)}?alt=media`, and its `enc`
-    /// (`storage/client.rs`) encodes the characters GCS requires (`/`, `@`, `=`, space, ...) but
-    /// deliberately PRESERVES `%` (its own test maps `preserve%percent%21` to itself).  A literal
-    /// `%2F` in an object name would therefore reach GCS as an escape and be decoded to `/`, which
-    /// names a different object.  Sending every literal `%` as `%25` makes the fork's encoder
-    /// produce the right URL for any name.
-    ///
-    /// The same mechanism covers `\`: `enc` leaves it alone, and the URL parser then reads it as a
-    /// `/` in an http path (measured: `a\b` reached the server as `a/b`), so it is sent as `%5C`.
-    /// The `%` replacement runs first, so the `%` of a `%5C` is never doubled.
-    ///
-    /// Only the HTTP route needs this.  The Rapid route carries the name in a protobuf field, not
-    /// a URL, and must receive it unchanged.
-    fn http_media_object_name(object: &str) -> std::borrow::Cow<'_, str> {
-        if object.contains(['%', '\\']) {
-            std::borrow::Cow::Owned(object.replace('%', "%25").replace('\\', "%5C"))
-        } else {
-            std::borrow::Cow::Borrowed(object)
-        }
     }
 
     struct HttpStream(ReadObjectResponse);

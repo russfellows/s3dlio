@@ -708,6 +708,146 @@ async fn a_repair_open_of_a_percent_name_names_the_same_object() {
     assert_eq!(seen[0].query("generation").as_deref(), Some("77"));
 }
 
+// ---------------------------------------------------------------------------
+// Literal object names on the EXISTING read paths (issue #270)
+// ---------------------------------------------------------------------------
+
+/// The rows every read path must satisfy: (literal object name, the path segment after `/o/`
+/// that must reach the server).  An ordinary name stays as it was.
+const LITERAL_NAME_ROWS: [(&str, &str); 8] = [
+    ("dir/object", "dir%2Fobject"),
+    ("plain.bin", "plain.bin"),
+    ("a%2Fb", "a%252Fb"),
+    ("100%", "100%25"),
+    ("%", "%25"),
+    ("a\\b", "a%5Cb"),
+    ("a\\%b", "a%5C%25b"),
+    ("dir/a%2Fb c=d@e%", "dir%2Fa%252Fb%20c%3Dd%40e%25"),
+];
+
+/// A client on the standard (HTTP) route against the local `server`: Rapid is forced off, so no
+/// bucket-layout request precedes the read.
+async fn http_client(server: &Server) -> GcsClient {
+    let control = StorageControl::builder()
+        .with_endpoint(format!("http://{}", server.addr))
+        .with_credentials(Anonymous::new().build())
+        .build()
+        .await
+        .expect("control client");
+    GcsClient {
+        storage: Arc::new(server.client().await),
+        control: Arc::new(control),
+        rapid_mode: RapidMode::ForceOff,
+    }
+}
+
+/// The existing whole-object read (`get_object`, over `get_object_via_http`) names the exact
+/// literal object: a `%` in the name is sent as `%25`, a `\` as `%5C`, an ordinary name is
+/// unchanged, and the bytes come back.  Before the fix `a%2Fb` was requested as `a/b`.
+#[tokio::test]
+async fn get_object_names_the_literal_object_in_the_request_path() {
+    let data = object_bytes();
+    let mut wrong = Vec::new();
+    for (literal, segment) in LITERAL_NAME_ROWS {
+        let server = Server::start([Reply::whole(GEN, &data)]).await;
+        let client = http_client(&server).await;
+        let got = client
+            .get_object("bucket", literal)
+            .await
+            .map_err(|e| e.to_string())
+            .expect("read");
+        assert_eq!(got.as_ref(), data.as_slice(), "bytes for {literal:?}");
+        let seen = server.requests();
+        assert_eq!(seen.len(), 1, "one request for {literal:?}");
+        let want = format!("/storage/v1/b/bucket/o/{segment}");
+        if seen[0].path() != want {
+            wrong.push(format!(
+                "{literal:?}: sent {}, wanted {want}",
+                seen[0].path()
+            ));
+        }
+        assert_eq!(seen[0].query("alt").as_deref(), Some("media"));
+    }
+    assert!(wrong.is_empty(), "wrong paths:\n{}", wrong.join("\n"));
+}
+
+/// The existing ranged read (`get_object_range`) names the same literal object, and still sends
+/// the range.
+#[tokio::test]
+async fn get_object_range_names_the_literal_object_in_the_request_path() {
+    let data = object_bytes();
+    let mut wrong = Vec::new();
+    for (literal, segment) in LITERAL_NAME_ROWS {
+        let server = Server::start([Reply::ranged(GEN, 4, &data[4..10])]).await;
+        let client = http_client(&server).await;
+        let got = client
+            .get_object_range("bucket", literal, 4, Some(6))
+            .await
+            .map_err(|e| e.to_string())
+            .expect("range read");
+        assert_eq!(got.as_ref(), &data[4..10], "bytes for {literal:?}");
+        let seen = server.requests();
+        assert_eq!(seen.len(), 1, "one request for {literal:?}");
+        let want = format!("/storage/v1/b/bucket/o/{segment}");
+        if seen[0].path() != want {
+            wrong.push(format!(
+                "{literal:?}: sent {}, wanted {want}",
+                seen[0].path()
+            ));
+        }
+        assert_eq!(seen[0].header("range"), Some("bytes=4-9"));
+    }
+    assert!(wrong.is_empty(), "wrong paths:\n{}", wrong.join("\n"));
+}
+
+/// The HTTP escape is one helper shared by every HTTP read path, and only those: it is called by
+/// `get_object_via_http` and by `HttpOpener::open`, never by the gRPC read (`get_object_via_grpc`
+/// / `get_object_via_grpc_once`), whose name travels in a protobuf field and must stay literal.
+#[test]
+fn the_http_escape_is_shared_by_the_http_read_paths_only() {
+    let src = include_str!("google_gcs_client.rs");
+    let before_tests = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests")];
+    let code: String = before_tests
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        code.matches("fn http_media_object_name(").count(),
+        1,
+        "exactly one definition"
+    );
+
+    let in_fn = |signature: &str, next: &str| -> String {
+        let at = code
+            .find(signature)
+            .unwrap_or_else(|| panic!("no {signature}"));
+        let rest = &code[at..];
+        rest[..rest.find(next).unwrap_or_else(|| panic!("no {next}"))].to_string()
+    };
+    let http = in_fn(
+        "async fn get_object_via_http(",
+        "pub async fn get_object_range(",
+    );
+    assert!(
+        http.contains("http_media_object_name(object)"),
+        "get_object_via_http must escape the name: {http}"
+    );
+    let grpc = in_fn(
+        "async fn get_object_via_grpc(",
+        "async fn get_object_via_http(",
+    );
+    assert!(
+        !grpc.contains("http_media_object_name"),
+        "the gRPC read must not escape: {grpc}"
+    );
+    let calls = code.matches("http_media_object_name(").count();
+    assert_eq!(
+        calls, 3,
+        "one definition, get_object_via_http and HttpOpener::open"
+    );
+}
+
 /// The Rapid route puts the object name in a protobuf field, not in a URL, so it must receive the
 /// literal name unchanged: the escape belongs to `HttpOpener::open` alone.  No local server can
 /// drive the Rapid opener (see the header), so this reads the source: the escape helper is called
@@ -743,16 +883,22 @@ fn the_rapid_route_receives_the_literal_name_unchanged() {
         "{rapid_branch}"
     );
 
-    // The helper has exactly one caller outside its definition and tests: the HTTP opener.
-    let before_tests = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests")];
-    let calls: Vec<_> = before_tests
+    // Inside the caller-buffer module the helper has exactly one caller: the HTTP opener.  (Its
+    // other caller, `get_object_via_http`, is checked by
+    // `the_http_escape_is_shared_by_the_http_read_paths_only`.)
+    let module_at = src
+        .find("mod caller_buffer {")
+        .expect("caller_buffer module");
+    let module_end = src.find("#[cfg(test)]\nmod tests").expect("tests");
+    let calls: Vec<_> = src[module_at..module_end]
         .match_indices("http_media_object_name(")
         .collect();
-    assert_eq!(calls.len(), 2, "one definition and one call");
-    let http_at = before_tests
+    assert_eq!(calls.len(), 1, "one call inside the caller-buffer module");
+    let http_at = src[module_at..]
         .find("impl ReadOpener for HttpOpener")
-        .expect("HTTP opener impl");
-    assert!(calls[1].0 > http_at && calls[1].0 < rapid_at);
+        .expect("HTTP opener impl")
+        + module_at;
+    assert!(module_at + calls[0].0 > http_at && module_at + calls[0].0 < rapid_at);
 }
 
 /// The Rapid opener has no local server (see the header), so this reads the source: its `open`

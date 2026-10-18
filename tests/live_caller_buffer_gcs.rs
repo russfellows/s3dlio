@@ -635,7 +635,13 @@ fn case_missing(scope: &Scope) -> CaseFuture<'_> {
 /// Case 4: literal keys round-trip, and a near-neighbour key is absent.
 fn case_literal_keys(scope: &Scope) -> CaseFuture<'_> {
     Box::pin(async move {
-        let keys = ["a%2Fb", "100%", "x@y", "k=v", "p/q/r", "name."];
+        let mut keys = vec!["a%2Fb", "100%", "x@y", "k=v", "p/q/r", "name."];
+        // GCS allows a backslash in an object name (not among the documented restrictions).  An
+        // unescaped HTTP read would turn 'a\b' into 'a/b', the absent neighbour checked below.
+        // Only gs:// is asked for it: other stores treat a backslash differently.
+        if scope.is_gs() {
+            keys.push("a\\b");
+        }
         for key in keys {
             let len = 32 + key.len();
             let data = content(&scope.uri(key), len);
@@ -652,13 +658,9 @@ fn case_literal_keys(scope: &Scope) -> CaseFuture<'_> {
             assert_same(&format!("{key}: get_into vs source"), dst.bytes(), &data);
             dst.assert_canaries(key);
             assert_eq!(progress.filled(), len as u64, "{key}: progress.filled()");
-            // Known: the existing GCS get mis-encodes '%' (#270); get_into is checked against the source bytes.
-            if scope.is_gs() && key.contains('%') {
-                eprintln!("{key}: skipping the existing-get cross-check on gs (#270)");
-            } else {
-                let independent = scope.get(key).await?;
-                assert_same(&format!("{key}: get vs source"), &independent, &data);
-            }
+            // The existing get is cross-checked on every key, '%' keys on gs:// included (#270).
+            let independent = scope.get(key).await?;
+            assert_same(&format!("{key}: get vs source"), &independent, &data);
         }
         // A key is literal: the neighbour of a written key is a different, absent object.
         for neighbour in ["a/b", "100", "name"] {
