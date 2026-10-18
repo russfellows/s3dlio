@@ -29,7 +29,7 @@ use crate::api::dataset_for_uri_with_options;
 use crate::checkpoint::{CheckpointConfig, CheckpointInfo, CheckpointStore, Strategy};
 use crate::data_loader::{
     dataset::{blocking_recv_locked, require_known_length, Dataset, DatasetError},
-    options::{LoaderOptions, ReaderMode},
+    options::{LoaderOptions, MemoryFormat, MultiprocessingContext, ReaderMode, SamplerType},
     parallel_fetch::DropCancel,
     s3_bytes::S3BytesDataset,
     DataLoader,
@@ -1075,19 +1075,25 @@ impl PyLoaderOptions {
         }
     }
 
-    // Property accessors (renamed to avoid conflicts)
+    // Property accessors.
+    //
+    // Python cannot hold a method and a property with one name, and the builder
+    // methods (`pin_memory(True)`, `num_workers(8)`, ...) must keep working, so the
+    // seven values shadowed by a builder are exposed as `<name>_value` (#283).
+    // `batch_size`, `seed`, `timeout_seconds`, `shard_rank` and `shard_world_size`
+    // have no same-named builder and keep their plain property names.
     #[getter]
     fn get_batch_size(&self) -> usize {
         self.inner.batch_size
     }
 
     #[getter]
-    fn get_drop_last(&self) -> bool {
+    fn get_drop_last_value(&self) -> bool {
         self.inner.drop_last
     }
 
     #[getter]
-    fn get_shuffle(&self) -> bool {
+    fn get_shuffle_value(&self) -> bool {
         self.inner.shuffle
     }
 
@@ -1097,22 +1103,22 @@ impl PyLoaderOptions {
     }
 
     #[getter]
-    fn get_num_workers(&self) -> usize {
+    fn get_num_workers_value(&self) -> usize {
         self.inner.num_workers
     }
 
     #[getter]
-    fn get_prefetch(&self) -> usize {
+    fn get_prefetch_value(&self) -> usize {
         self.inner.prefetch
     }
 
     #[getter]
-    fn get_pin_memory(&self) -> bool {
+    fn get_pin_memory_value(&self) -> bool {
         self.inner.pin_memory
     }
 
     #[getter]
-    fn get_persistent_workers(&self) -> bool {
+    fn get_persistent_workers_value(&self) -> bool {
         self.inner.persistent_workers
     }
 
@@ -1122,7 +1128,7 @@ impl PyLoaderOptions {
     }
 
     #[getter]
-    fn get_non_blocking(&self) -> bool {
+    fn get_non_blocking_value(&self) -> bool {
         self.inner.non_blocking
     }
 
@@ -1134,6 +1140,75 @@ impl PyLoaderOptions {
     #[getter]
     fn get_shard_world_size(&self) -> usize {
         self.inner.shard_world_size
+    }
+
+    /// Return every option that `PyLoaderOptions` can set as a plain dict keyed by
+    /// option name (#283).
+    ///
+    /// Options that cannot be set from Python (for example `loading_mode`,
+    /// `reader_mode`, `part_size`, `max_inflight_parts`, `worker_id`) are not
+    /// included. Purely additive: the builder methods are unchanged. Enum-valued
+    /// options are reported by lower-case name. `sampler_type` is one of
+    /// `"sequential"`, `"random"`, `"weighted_random"`, `"distributed_random"`;
+    /// its parameters are reported losslessly in `sampler_replacement` (`bool`
+    /// for `"random"`, else `None`) and `sampler_rank` / `sampler_world_size`
+    /// (`int` for `"distributed_random"`, else `None`).
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let o = &self.inner;
+        let d = PyDict::new(py);
+        d.set_item("batch_size", o.batch_size)?;
+        d.set_item("drop_last", o.drop_last)?;
+        d.set_item("shuffle", o.shuffle)?;
+        d.set_item("seed", o.seed)?;
+        d.set_item("num_workers", o.num_workers)?;
+        d.set_item("prefetch", o.prefetch)?;
+        d.set_item("auto_tune", o.auto_tune)?;
+        d.set_item("pin_memory", o.pin_memory)?;
+        d.set_item("persistent_workers", o.persistent_workers)?;
+        d.set_item("timeout_seconds", o.timeout_seconds)?;
+        d.set_item("non_blocking", o.non_blocking)?;
+        d.set_item("shard_rank", o.shard_rank)?;
+        d.set_item("shard_world_size", o.shard_world_size)?;
+        d.set_item("generator_seed", o.generator_seed)?;
+        d.set_item("enable_transforms", o.enable_transforms)?;
+        d.set_item("collate_buffer_size", o.collate_buffer_size)?;
+        d.set_item(
+            "multiprocessing_context",
+            match o.multiprocessing_context {
+                MultiprocessingContext::Spawn => "spawn",
+                MultiprocessingContext::Fork => "fork",
+                MultiprocessingContext::ForkServer => "forkserver",
+            },
+        )?;
+        d.set_item(
+            "memory_format",
+            match o.memory_format {
+                MemoryFormat::ChannelsLast => "channels_last",
+                MemoryFormat::ChannelsFirst => "channels_first",
+                MemoryFormat::Auto => "auto",
+            },
+        )?;
+        d.set_item(
+            "sampler_type",
+            match o.sampler_type {
+                SamplerType::Sequential => "sequential",
+                SamplerType::Random { .. } => "random",
+                SamplerType::WeightedRandom { .. } => "weighted_random",
+                SamplerType::DistributedRandom { .. } => "distributed_random",
+            },
+        )?;
+        let replacement = match o.sampler_type {
+            SamplerType::Random { replacement } => Some(replacement),
+            _ => None,
+        };
+        let (rank, world_size) = match o.sampler_type {
+            SamplerType::DistributedRandom { rank, world_size } => (Some(rank), Some(world_size)),
+            _ => (None, None),
+        };
+        d.set_item("sampler_replacement", replacement)?;
+        d.set_item("sampler_rank", rank)?;
+        d.set_item("sampler_world_size", world_size)?;
+        Ok(d)
     }
 }
 
@@ -3944,6 +4019,208 @@ mod checkpoint_286_287_tests {
             let raw = load_checkpoint_with_validation(py, &shard_uri, false).unwrap();
             let raw: Vec<u8> = raw.extract(py).unwrap();
             assert_eq!(raw, bad);
+        });
+    }
+}
+
+#[cfg(test)]
+mod loader_options_tests {
+    use super::PyLoaderOptions;
+    use pyo3::types::{PyAnyMethods, PyDictMethods};
+
+    /// #283: the seven values shadowed by same-named builder methods are readable
+    /// through the `*_value` getters, and every builder still returns the options
+    /// object so calls chain.
+    #[test]
+    fn value_getters_return_values_set_by_builders() {
+        let opts = PyLoaderOptions::new()
+            .pin_memory(true)
+            .num_workers(8)
+            .shuffle(true, 42)
+            .drop_last(true)
+            .prefetch(4)
+            .persistent_workers(true)
+            .non_blocking(true);
+
+        assert!(opts.get_pin_memory_value());
+        assert_eq!(opts.get_num_workers_value(), 8);
+        assert!(opts.get_shuffle_value());
+        assert!(opts.get_drop_last_value());
+        assert_eq!(opts.get_prefetch_value(), 4);
+        assert!(opts.get_persistent_workers_value());
+        assert!(opts.get_non_blocking_value());
+        // The seed given to `shuffle` is still readable through its working getter.
+        assert_eq!(opts.get_seed(), 42);
+    }
+
+    /// Each `_value` getter tracks the builder in both directions (set then unset).
+    #[test]
+    fn value_getters_follow_builder_changes() {
+        let on = PyLoaderOptions::new()
+            .pin_memory(true)
+            .persistent_workers(true)
+            .non_blocking(true)
+            .drop_last(true)
+            .shuffle(true, 7);
+        let off = on
+            .clone()
+            .pin_memory(false)
+            .persistent_workers(false)
+            .non_blocking(false)
+            .drop_last(false)
+            .shuffle(false, 7)
+            .num_workers(0)
+            .prefetch(1);
+
+        assert!(on.get_pin_memory_value());
+        assert!(on.get_persistent_workers_value());
+        assert!(on.get_non_blocking_value());
+        assert!(on.get_drop_last_value());
+        assert!(on.get_shuffle_value());
+        assert!(!off.get_pin_memory_value());
+        assert!(!off.get_persistent_workers_value());
+        assert!(!off.get_non_blocking_value());
+        assert!(!off.get_drop_last_value());
+        assert!(!off.get_shuffle_value());
+        assert_eq!(off.get_num_workers_value(), 0);
+        assert_eq!(off.get_prefetch_value(), 1);
+    }
+
+    /// The presets (used by DLIO-style configs) set the shadowed values too.
+    #[test]
+    fn presets_are_visible_through_value_getters() {
+        let gpu = PyLoaderOptions::new().gpu_optimized();
+        assert!(gpu.get_pin_memory_value());
+        assert!(gpu.get_persistent_workers_value());
+        assert!(gpu.get_non_blocking_value());
+
+        let debug = PyLoaderOptions::new().debug_mode();
+        assert_eq!(debug.get_num_workers_value(), 0);
+        assert!(!debug.get_persistent_workers_value());
+
+        let dist = PyLoaderOptions::new().distributed_optimized(2, 8);
+        assert!(dist.get_pin_memory_value());
+        assert_eq!(dist.get_shard_rank(), 2);
+        assert_eq!(dist.get_shard_world_size(), 8);
+    }
+
+    /// `to_dict()` reports every option, matching the getters, after a builder chain.
+    #[test]
+    fn to_dict_matches_getters_after_builder_chain() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let opts = PyLoaderOptions::new()
+                .with_batch_size(64)
+                .num_workers(6)
+                .prefetch(3)
+                .shuffle(true, 99)
+                .drop_last(true)
+                .pin_memory(true)
+                .persistent_workers(true)
+                .non_blocking(true)
+                .with_timeout(12.5)
+                .distributed_optimized(3, 8)
+                .channels_last()
+                .use_forkserver();
+            let d = opts.to_dict(py).expect("to_dict");
+            fn get<'py, T: pyo3::conversion::FromPyObjectOwned<'py>>(
+                d: &pyo3::Bound<'py, pyo3::types::PyDict>,
+                k: &str,
+            ) -> T {
+                d.get_item(k)
+                    .expect("get_item")
+                    .unwrap_or_else(|| panic!("missing key {k}"))
+                    .extract::<T>()
+                    .unwrap_or_else(|_| panic!("extract {k}"))
+            }
+            assert_eq!(get::<usize>(&d, "batch_size"), opts.get_batch_size());
+            assert_eq!(get::<bool>(&d, "drop_last"), opts.get_drop_last_value());
+            assert_eq!(get::<bool>(&d, "shuffle"), opts.get_shuffle_value());
+            assert_eq!(get::<u64>(&d, "seed"), opts.get_seed());
+            assert_eq!(
+                get::<usize>(&d, "num_workers"),
+                opts.get_num_workers_value()
+            );
+            assert_eq!(get::<usize>(&d, "prefetch"), opts.get_prefetch_value());
+            assert_eq!(get::<bool>(&d, "pin_memory"), opts.get_pin_memory_value());
+            assert_eq!(
+                get::<bool>(&d, "persistent_workers"),
+                opts.get_persistent_workers_value()
+            );
+            assert_eq!(
+                get::<bool>(&d, "non_blocking"),
+                opts.get_non_blocking_value()
+            );
+            assert_eq!(
+                get::<Option<f64>>(&d, "timeout_seconds"),
+                opts.get_timeout_seconds()
+            );
+            assert_eq!(get::<usize>(&d, "shard_rank"), opts.get_shard_rank());
+            assert_eq!(
+                get::<usize>(&d, "shard_world_size"),
+                opts.get_shard_world_size()
+            );
+            assert_eq!(get::<usize>(&d, "shard_rank"), 3);
+            assert_eq!(get::<usize>(&d, "shard_world_size"), 8);
+            assert_eq!(get::<String>(&d, "memory_format"), "channels_last");
+            assert_eq!(get::<String>(&d, "multiprocessing_context"), "forkserver");
+            assert_eq!(get::<usize>(&d, "batch_size"), 64);
+            assert_eq!(get::<Option<f64>>(&d, "timeout_seconds"), Some(12.5));
+            assert!(get::<bool>(&d, "auto_tune") == opts.inner.auto_tune);
+        });
+    }
+
+    /// `to_dict()` exposes sampler parameters losslessly via the
+    /// `sampler_replacement`, `sampler_rank` and `sampler_world_size` keys.
+    #[test]
+    fn to_dict_reports_sampler_parameters() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            fn sampler(
+                opts: &PyLoaderOptions,
+                py: pyo3::Python<'_>,
+            ) -> (String, Option<bool>, Option<usize>, Option<usize>) {
+                let d = opts.to_dict(py).expect("to_dict");
+                fn item<'py, T: pyo3::conversion::FromPyObjectOwned<'py>>(
+                    d: &pyo3::Bound<'py, pyo3::types::PyDict>,
+                    k: &str,
+                ) -> T {
+                    d.get_item(k)
+                        .expect("get_item")
+                        .unwrap_or_else(|| panic!("missing key {k}"))
+                        .extract::<T>()
+                        .unwrap_or_else(|_| panic!("extract {k}"))
+                }
+                (
+                    item(&d, "sampler_type"),
+                    item(&d, "sampler_replacement"),
+                    item(&d, "sampler_rank"),
+                    item(&d, "sampler_world_size"),
+                )
+            }
+
+            let mut base = PyLoaderOptions::new();
+            assert_eq!(
+                sampler(&base, py),
+                ("sequential".to_string(), None, None, None)
+            );
+            assert_eq!(
+                sampler(&base.random_sampling(true), py),
+                ("random".to_string(), Some(true), None, None)
+            );
+            assert_eq!(
+                sampler(&base.random_sampling(false), py),
+                ("random".to_string(), Some(false), None, None)
+            );
+            assert_eq!(
+                sampler(&base.distributed_sampling(1, 4), py),
+                ("distributed_random".to_string(), None, Some(1), Some(4))
+            );
+            // Builders return a new object and leave the receiver unchanged.
+            assert_eq!(
+                sampler(&base, py),
+                ("sequential".to_string(), None, None, None)
+            );
         });
     }
 }
