@@ -910,7 +910,7 @@ class TestParent:
         reserve_doc = s3dlio.MultipartUploadWriter.reserve.__doc__ or ""
         assert "ReservedBuffer" in reserve_doc, reserve_doc
         assert "short commit" in reserve_doc.lower(), reserve_doc
-        assert "data-integrity" in reserve_doc, reserve_doc
+        assert "Do not write through a retained view after" in reserve_doc, reserve_doc
         commit_doc = s3dlio.MultipartUploadWriter.commit.__doc__ or ""
         assert "ValueError" in commit_doc and "pending" in commit_doc, commit_doc
 
