@@ -1351,6 +1351,14 @@ store.delete_checkpoint(step)                         # -> bool
 `store.delete_checkpoint(step)` returns `True` when a checkpoint of `step` was found and its
 manifest deleted, `False` when there is none.
 
+**Coordinate saves and deletes.** Before deleting, quiesce checkpoint saves, finalizations and
+other manifest/shard mutations under the same base, and prevent new ones until the delete
+returns. The caller must coordinate this across all participating processes; s3dlio does not
+provide a transaction or distributed lock. Shared-shard protection uses a listing snapshot:
+a checkpoint published after that snapshot, or still incomplete when inspected, can reference
+a shard that the delete then removes. Re-reading `latest.json` does not close this race.
+The shared-shard and manifest-preservation guarantees below assume this coordination.
+
 - **One checkpoint per call.** If two checkpoints share a step (saved twice at different
   times), a call deletes exactly one -- the first the store lists, whatever its status; the
   listing order is the store's and is not specified. Call again to delete the next; the result
