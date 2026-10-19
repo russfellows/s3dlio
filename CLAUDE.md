@@ -25,6 +25,12 @@ exceptions below.
   the user documentation AND in a comment at the copy site saying why it cannot be avoided.
 - **Every change to a data path proves it is zero-copy** with a test (pointer identity, a
   refcount/owner check, or a peak-memory bound), not with a claim.
+- **Why copies matter: performance.** Each copy of the payload costs roughly half the throughput
+  of the path it sits on; memory use is secondary. So the test of any copy is measured speed: a
+  single copy is acceptable when it makes the path measurably FASTER (for example coalescing many
+  tiny writes into one part buffer instead of tracking thousands of borrowed buffers). Such a copy
+  must be bounded, measured (benchmark numbers in the commit or plan), documented and commented
+  like the other exceptions.
 - If you think a copy is unavoidable, it is not your call: ask the maintainer first.
 
 The parent [/home/eval/Documents/Code/CLAUDE.md](../CLAUDE.md) Prime Directives
