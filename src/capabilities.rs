@@ -17,8 +17,8 @@
 //! (`parse_s3_uri_pure`, `parse_azure_uri_pure`, `parse_gs_uri_pure`), which read nothing but
 //! their argument. They are the single structural implementation, and every gated parser
 //! delegates to them: `s3_utils::parse_s3_uri_full` and `classify_s3_first_segment` (which add
-//! only the one-shot warning about a retired environment variable), both `parse_gcs_uri`
-//! functions (`google_gcs_client` and the community `gcs_client`), and `parse_azure_uri` in
+//! only the one-shot warning about a retired environment variable), `parse_gcs_uri`
+//! (`google_gcs_client`), and `parse_azure_uri` in
 //! `object_store` (which adds the endpoint-dependent account canonicalisation). The Azure
 //! account rules that every environment shares are used by `azure_client` as well. So the
 //! parsers cannot drift from what a store accepts. A malformed URI is an error; an unknown
@@ -76,10 +76,8 @@ const NATIVE_BACKENDS: bool = cfg!(all(
 /// True when native Azure is compiled in.
 const AZURE_COMPILED: bool = cfg!(feature = "backend-azure");
 
-/// True when native GCS on the official pinned SDK is compiled in. The legacy community
-/// implementation (`gcs-community`) does not acquire the new operations in this round.
-const GCS_OFFICIAL_COMPILED: bool =
-    cfg!(all(feature = "backend-gcs", not(feature = "gcs-community")));
+/// True when native GCS on the official pinned SDK is compiled in.
+const GCS_OFFICIAL_COMPILED: bool = cfg!(feature = "backend-gcs");
 
 /// Report what this build supports for `uri`, without credentials, a client or a runtime.
 ///
@@ -87,7 +85,7 @@ const GCS_OFFICIAL_COMPILED: bool =
 /// |---|---|
 /// | `s3://` | true (native-backend builds) |
 /// | `az://`, Azure blob host | true only when `backend-azure` is compiled |
-/// | `gs://`, `gcs://` | true only with `backend-gcs` on the official SDK (not `gcs-community`) |
+/// | `gs://`, `gcs://` | true only with `backend-gcs` (the official SDK) |
 /// | `file://`, `direct://` | false |
 /// | unknown scheme | provider `"unknown"`, false |
 /// | any `arrow-backend` build | false |
@@ -509,8 +507,8 @@ pub(crate) fn parse_azure_uri_pure(uri: &str) -> Result<(String, String, String)
 /// Split `gs://bucket/object` or `gcs://bucket/object` into `(bucket, object)`.
 ///
 /// A bucket-only URI (`gs://bucket/`) gives an empty object path. The object path is exactly as
-/// written. This is the environment-free form of both gated `parse_gcs_uri` functions
-/// (`google_gcs_client` and the community `gcs_client`).
+/// written. This is the environment-free form of the gated `parse_gcs_uri` in
+/// `google_gcs_client`.
 ///
 /// # Errors
 ///
@@ -544,7 +542,6 @@ mod tests {
     fn expect_gcs() -> bool {
         cfg!(all(
             feature = "backend-gcs",
-            not(feature = "gcs-community"),
             feature = "native-backends",
             not(feature = "arrow-backend")
         ))
@@ -986,7 +983,7 @@ mod tests {
     }
 
     /// The literal results of the `gs://` parser and of the gated `parse_gcs_uri` that
-    /// delegates to it (the official client, or the community one when that is compiled).
+    /// delegates to it (the official client).
     #[test]
     fn gs_uris_parse_to_these_literal_parts() {
         for (uri, want) in [
@@ -1013,16 +1010,10 @@ mod tests {
                 (Err(_), None) => {}
                 _ => panic!("{uri:?}: got {pure:?}, want {want:?}"),
             }
-            // The gated parsers return exactly what the pure one does, error text included.
-            #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+            // The gated parser returns exactly what the pure one does, error text included.
+            #[cfg(feature = "backend-gcs")]
             assert_eq!(
                 format!("{:?}", crate::google_gcs_client::parse_gcs_uri(uri)),
-                format!("{pure:?}"),
-                "{uri:?}"
-            );
-            #[cfg(feature = "gcs-community")]
-            assert_eq!(
-                format!("{:?}", crate::gcs_client::parse_gcs_uri(uri)),
                 format!("{pure:?}"),
                 "{uri:?}"
             );

@@ -70,7 +70,7 @@ use crate::data_loader::parallel_fetch::DropCancel;
 /// style range request, given a start `offset` and a nonzero byte `length`.
 ///
 /// audit #152 findings 2.5/2.6/2.7 (bug B4): the S3, Azure, and
-/// community-GCS `get_range()` implementations each computed this as a bare
+/// (since-removed community) GCS `get_range()` implementations each computed this as a bare
 /// `offset + length - 1`, which underflows — wrapping to a huge value in
 /// release builds, panicking in debug builds — whenever `length == 0`.
 ///

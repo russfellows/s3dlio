@@ -41,8 +41,6 @@ azure_storage_blob = { version = "1", optional = true }
 
 # Google Cloud Storage SDK
 # 'backend-gcs' enables official gRPC GCS support (google-cloud-rust).
-# 'gcs-community' is an optional legacy alternative (JSON-API, no RAPID support).
-gcloud-storage = { version = "^1.2", optional = true }  # Community GCS client (opt-in only)
 # Development: path = "../google-cloud-rust/src/..."
 # google-cloud-storage = { path = "../google-cloud-rust/src/storage", optional = true }
 # google-cloud-gax = { path = "../google-cloud-rust/src/gax", optional = true }
@@ -50,6 +48,9 @@ gcloud-storage = { version = "^1.2", optional = true }  # Community GCS client (
 google-cloud-storage = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2", optional = true }
 google-cloud-gax = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2", optional = true }
 google-cloud-gax-internal = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2", features = ["_internal-grpc-client"], optional = true }
+# Anonymous credentials for STORAGE_EMULATOR_HOST (src/google_gcs_client.rs) and for the local-server
+# tests; same pinned fork as google-cloud-storage, which already depends on it (no new crate in Cargo.lock).
+google-cloud-auth = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2", default-features = false, optional = true }
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat
@@ -186,9 +187,6 @@ aws-smithy-types = "^1"        # needed for SdkBody::empty() in test fixtures
 rcgen        = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 hyper        = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util   = { version = "0.1", features = ["server", "server-auto", "tokio"] }
-# src/gcs_http_opener_tests.rs: anonymous credentials for the native GCS client pointed at a
-# local test server (same pinned fork as google-cloud-storage, already in Cargo.lock)
-google-cloud-auth = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2", default-features = false }
 
 # (No extra crate needed for the Phase 1 allocation tests — they use a small
 # in-tree peak-tracking wrapper around System, defined in
@@ -218,9 +216,8 @@ native-backends = []                    # Current AWS/Azure implementations -- m
 backend-aws = []
 backend-azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_blob"]
 azure-client-certificate = ["backend-azure", "azure_identity/client_certificate"]  # client-certificate credential for Azure; links OpenSSL (not in full-backends / the default wheel)
-backend-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-gax-internal"]
+backend-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-gax-internal", "dep:google-cloud-auth"]
 full-backends = ["backend-aws", "backend-azure", "backend-gcs"]
-gcs-community = ["backend-gcs", "dep:gcloud-storage"]  # Legacy community GCS client (JSON API, no RAPID support; conflicts with official GCS client)
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend -- mutually exclusive with native-backends, see note above
 parquet       = []  # no-op: always compiled; kept for backward compatibility
 parquet-arrow = []  # no-op: always compiled; kept for backward compatibility

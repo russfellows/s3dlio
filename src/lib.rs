@@ -9,9 +9,6 @@ compile_error!("Enable only one of: native-backends or arrow-backend");
 #[cfg(not(any(feature = "native-backends", feature = "arrow-backend")))]
 compile_error!("Must enable either 'native-backends' or 'arrow-backend' feature");
 
-// The 'gcs-community' feature is a legacy opt-in alternative (JSON API, no RAPID)
-// selected under the shared `backend-gcs` backend gate.
-
 // ===== Core Public API =====
 // This is the main stable API that external users should use
 pub mod api;
@@ -43,10 +40,7 @@ pub mod list_pattern; // (#213): the explicit client-side regex filter for listi
 pub mod mp;
 pub mod multi_endpoint;
 pub mod range_engine_generic; // Universal stream-based range engine (v0.9.2+)
-#[cfg(any(
-    feature = "backend-azure",
-    all(feature = "backend-gcs", not(feature = "gcs-community"))
-))]
+#[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
 pub(crate) mod range_version; // one object version per logical RangeEngine GET (stage G, G-F2)
 pub(crate) mod redact; // credential redaction of URIs shown in messages (one implementation)
                        // The one entry the `s3-cli` binary needs: an error from a store call, made safe to print.
@@ -107,10 +101,7 @@ pub mod tfrecord_index;
 #[cfg(feature = "numa")]
 pub mod numa;
 
-// Google Cloud Storage client - feature-gated backend selection
-#[cfg(feature = "gcs-community")]
-pub mod gcs_client; // Community-maintained gcloud-storage implementation
-
+// Google Cloud Storage client (official google-cloud-storage SDK)
 #[cfg(feature = "backend-gcs")]
 pub mod gcs_constants; // Single source of truth for all GCS/gRPC tuning constants
 #[cfg(feature = "backend-gcs")]

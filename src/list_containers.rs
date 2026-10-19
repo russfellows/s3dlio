@@ -46,28 +46,11 @@ use tracing::{debug, trace};
 use crate::s3_client::run_on_global_rt;
 use crate::s3_utils::{list_buckets_at, s3_server_of_first_segment, BucketInfo, S3Server};
 
-#[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
-static GCS_COMMUNITY_LIST_CLIENT: OnceCell<Arc<crate::gcs_client::GcsClient>> =
-    OnceCell::const_new();
-
-#[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
-async fn get_list_gcs_community_client() -> Result<Arc<crate::gcs_client::GcsClient>> {
-    let client = GCS_COMMUNITY_LIST_CLIENT
-        .get_or_try_init(|| async {
-            let gcs = crate::gcs_client::GcsClient::new()
-                .await
-                .context("Failed to initialise GCS community client")?;
-            Ok::<Arc<crate::gcs_client::GcsClient>, anyhow::Error>(Arc::new(gcs))
-        })
-        .await?;
-    Ok(Arc::clone(client))
-}
-
-#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+#[cfg(feature = "backend-gcs")]
 static GCS_OFFICIAL_LIST_CLIENT: OnceCell<Arc<crate::google_gcs_client::GcsClient>> =
     OnceCell::const_new();
 
-#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+#[cfg(feature = "backend-gcs")]
 async fn get_list_gcs_official_client() -> Result<Arc<crate::google_gcs_client::GcsClient>> {
     let client = GCS_OFFICIAL_LIST_CLIENT
         .get_or_try_init(|| async {
@@ -223,58 +206,12 @@ fn list_gcs_containers() -> Result<Vec<ContainerInfo>> {
     bail!("GCS backend is not enabled in this build. Rebuild with feature 'backend-gcs' or 'full-backends'.")
 }
 
-#[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
-async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
-    use gcloud_storage::http::buckets::list::ListBucketsRequest;
-
-    debug!("GCS LIST BUCKETS (community): project={}", project);
-    let gcs = get_list_gcs_community_client().await?;
-
-    let mut containers = Vec::new();
-    let mut page_token: Option<String> = None;
-
-    loop {
-        let req = ListBucketsRequest {
-            project: project.to_string(),
-            page_token: page_token.clone(),
-            ..Default::default()
-        };
-
-        let resp = gcs
-            .inner_client()
-            .list_buckets(&req)
-            .await
-            .map_err(|e| anyhow::anyhow!("GCS list_buckets failed: {}", e))?;
-
-        for bucket in resp.items {
-            trace!("GCS LIST BUCKETS: bucket={}", bucket.name);
-            let date = bucket
-                .time_created
-                .map(|t| t.to_string())
-                .or_else(|| bucket.updated.map(|t| t.to_string()));
-            containers.push(ContainerInfo {
-                uri: format!("gs://{}", bucket.name),
-                name: bucket.name,
-                creation_date: date,
-            });
-        }
-
-        match resp.next_page_token {
-            Some(token) if !token.is_empty() => page_token = Some(token),
-            _ => break,
-        }
-    }
-
-    debug!("GCS LIST BUCKETS: found {} buckets", containers.len());
-    Ok(containers)
-}
-
 /// A GCS bucket creation time as an RFC 3339 string (#263).
 ///
 /// GCS reports it as Google's `Timestamp`, whose `Debug` form is a struct dump
 /// (`Timestamp { seconds: .., nanos: .. }`), not a date.  Google's `String::from(Timestamp)`
 /// gives RFC 3339 in UTC and keeps the fraction when there is one.  An absent time stays absent.
-#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+#[cfg(feature = "backend-gcs")]
 fn bucket_time_rfc3339<T>(time: Option<T>) -> Option<String>
 where
     T: Into<String>,
@@ -282,7 +219,7 @@ where
     time.map(Into::into)
 }
 
-#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+#[cfg(feature = "backend-gcs")]
 async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     use google_cloud_gax::paginator::ItemPaginator;
 
@@ -444,7 +381,7 @@ mod tests {
 
     /// A bucket whose creation time is parsed from `rfc3339`, built without naming the timestamp
     /// type (it lives in a crate this one does not depend on directly).
-    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    #[cfg(feature = "backend-gcs")]
     fn bucket_created(rfc3339: &str) -> google_cloud_storage::model::Bucket {
         let mut bucket = google_cloud_storage::model::Bucket::default();
         bucket.create_time = Some(rfc3339.try_into().expect("valid timestamp"));
@@ -453,7 +390,7 @@ mod tests {
 
     /// A synthetic UTC creation time is an RFC 3339 string, not a struct dump (#263).
     #[test]
-    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    #[cfg(feature = "backend-gcs")]
     fn utc_bucket_time_is_rfc3339() {
         let bucket = bucket_created("2025-05-16T09:46:12Z");
         assert_eq!(
@@ -464,7 +401,7 @@ mod tests {
 
     /// The fraction is kept, down to the nanosecond.
     #[test]
-    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    #[cfg(feature = "backend-gcs")]
     fn fractional_bucket_time_keeps_its_precision() {
         for (input, want) in [
             ("2025-05-16T09:46:12.5Z", "2025-05-16T09:46:12.5Z"),
@@ -485,7 +422,7 @@ mod tests {
 
     /// The output parses back to the same instant, so nothing but formatting changed.
     #[test]
-    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    #[cfg(feature = "backend-gcs")]
     fn bucket_time_round_trips_to_the_same_instant() {
         let bucket = bucket_created("2031-02-03T04:05:06.007008009Z");
         let text = bucket_time_rfc3339(bucket.create_time).expect("present");
@@ -501,7 +438,7 @@ mod tests {
 
     /// An absent creation time stays absent; it is never an empty string or a zero time.
     #[test]
-    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    #[cfg(feature = "backend-gcs")]
     fn absent_bucket_time_stays_absent() {
         let bucket = google_cloud_storage::model::Bucket::default();
         assert_eq!(bucket_time_rfc3339(bucket.create_time), None);

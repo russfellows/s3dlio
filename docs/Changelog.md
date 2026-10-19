@@ -98,6 +98,20 @@ copying. The few copies that remain are listed, with when they apply and how to 
 
 ### Added
 
+- **GCS custom endpoint and emulator on the official client.** `GCS_ENDPOINT_URL` (a URL, used as given)
+  and `STORAGE_EMULATOR_HOST` (`host:port`, `http://` added when there is no scheme) are read when the
+  first GCS client is built (after the `.env` policy). As in the removed community client, either one
+  means "not Google's production endpoint": the client is built with anonymous credentials. The endpoint is handed to both
+  halves of the client, the HTTP/JSON `Storage` client and the gRPC `StorageControl` client.
+  `GCS_ENDPOINT_URL` wins; an empty value counts as unset (an empty `GCS_ENDPOINT_URL` now falls
+  through to `STORAGE_EMULATOR_HOST`). With neither set the client is built exactly as before. The
+  endpoint is logged once at INFO (embedded `user:password@` is masked). Rust:
+  `google_gcs_client::{resolve_gcs_endpoint, resolve_gcs_endpoint_with, GcsEndpoint,
+  GcsEndpointSource}`; the `google-cloud-auth` crate (already pulled in by `google-cloud-storage`) is
+  now a direct optional dependency of `backend-gcs`. Reads use HTTP/JSON, while upload, stat, list,
+  delete and bucket operations use the Storage gRPC API, so an emulator that serves only the JSON API
+  supports reads only; see `docs/Environment_Variables.md`. Tested against a local stand-in
+  server, not against a real emulator.
 - **`s3dlio.get_into_async(uri, dst, *, expected_len)`** (#264). Reads the whole object at `uri` into
   `dst[:expected_len]` and resolves to `expected_len`. `dst` is any writable, C-contiguous byte
   buffer (item size 1, byte formats such as `B`, `b` and `c`; read-only, strided, pointer and object
@@ -128,9 +142,9 @@ copying. The few copies that remain are listed, with when they apply and how to 
   version ID when versioning is on, the GCS generation). ETags are opaque strings, not MD5 digests.
 - **`s3dlio.object_capabilities(uri)`** returns `{"provider", "get_into", "head"}` from the URI and
   the build alone: no store, credentials, client or network. The default (PyPI) wheel reports `s3`
-  and `az` as supported; builds with the GCS backend add `gs`; `file://`, `direct://`, the Arrow
-  backend and the legacy community GCS client report unsupported. A malformed URI in a known
-  object scheme is a `ValueError`; unknown schemes return provider `"unknown"` and both operations false.
+  and `az` as supported; builds with the GCS backend add `gs`; `file://`, `direct://` and the
+  Arrow backend report unsupported. A malformed URI in a known object scheme is a `ValueError`;
+  unknown schemes return provider `"unknown"` and both operations false.
 - **Three exceptions:** `ObjectNotFoundError` (a `FileNotFoundError`), `LengthMismatchError` (a
   `ValueError`) and `UnsupportedOperationError` (a `NotImplementedError`, raised at once for an
   unsupported build or provider; no fallback download is ever attempted). A malformed URI raises
@@ -186,6 +200,14 @@ copying. The few copies that remain are listed, with when they apply and how to 
 
 ### Changed (BEHAVIOUR CHANGE)
 
+- **The legacy community GCS client is removed.** The `gcs-community` feature and the `gcloud-storage`
+  dependency (and with them `src/gcs_client.rs` and the `gcs-community` test and script variants) are
+  gone. The `GCS_ENDPOINT_URL` and `STORAGE_EMULATOR_HOST` settings are KEPT: they now configure the
+  official client with anonymous credentials, as before (see "Added", "GCS custom endpoint and
+  emulator"). A Rust build that enables `gcs-community` now fails with an unknown-feature
+  error; use `backend-gcs`, the official GCS client (the patched `google-cloud-storage` fork), which
+  the full wheel already uses. No PyPI wheel ever included the community client, so no installed
+  wheel changes.
 - **Strict `put_bytes` / `put_bytes_async` payloads (#261).** Both now use the strict conversion the
   streaming writers (`write_chunk`, `write_owned_bytes`, `MultipartUploadWriter.write`) already
   used: only buffer-protocol objects and objects with `__bytes__()` are accepted. An `int` or `bool`
@@ -312,8 +334,7 @@ copying. The few copies that remain are listed, with when they apply and how to 
 - **RFC 3339 times (#263).** GCS bucket listing (`creation_date`), GCS object metadata (control
   plane and Rapid) and the `file://` and `direct://` stores' modification times are RFC 3339 UTC.
   For files, sub-second precision is kept and a pre-epoch or unrepresentable time is left absent.
-  GCS times use the Google client's own RFC 3339 conversion. The legacy community GCS client is
-  unchanged.
+  GCS times use the Google client's own RFC 3339 conversion.
 
 ### Zero copy (stage G, Rule #1)
 
@@ -413,7 +434,6 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
 - the whole-object buffered streaming writers (S3, Azure, GCS): each borrowed `write_chunk` is copied once
   into the writer's buffer; pass the whole object with `put_bytes` for none (Rust callers can also give the
   writer one owned `Vec` through `write_owned_bytes`);
-- the community GCS client's ranged reads (feature `gcs-community`, not in the PyPI wheels);
 - the Rust `&[u8]` checkpoint API shapes (`IntoShardBytes`), and `RangeEngine::download`.
 
 ### Fixed
@@ -531,9 +551,8 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
   (`VersionChanged`), and a read with a cached size starts over once with a fresh size, as before;
   a body of two versions is never returned. Without a strong ETag (Azure) or a generation (GCS) the
   ranges cannot be pinned, and unpinned ranges are never combined: the object is read as one
-  response instead. The community GCS client (`gcs-community`) reads the object's generation first
-  (one metadata request) and names it in every range request, with the same single-response
-  fallback. Zero copy is unchanged: every range still lands in its window of the one master buffer.
+  response instead. Zero copy is unchanged: every range still lands in its window of the one master
+  buffer.
   Tested against a fake Blob service (`tests/azure_range_version.rs`) and a fake GCS opener driving
   the real range engine (`src/gcs_range_into_tests.rs`), which replace the object between ranges and
   inspect every request.
@@ -571,9 +590,9 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
 
 ### Validation
 
-- Rust: `cargo fmt`, clippy with `-D warnings` in nine feature configurations (default,
-  full-backends, tests, extension-module variants, the community GCS client and the Arrow
-  backend), and the full default-feature test run (1889 tests: 1888 passed and one intermittent
+- Rust: `cargo fmt`, clippy with `-D warnings` in the feature configurations (default,
+  full-backends, tests, extension-module variants and the Arrow backend), and the full
+  default-feature test run (1889 tests: 1888 passed and one intermittent
   request-count failure of a test-harness kind that also occurs on the code before the zero-copy
   stage, tracked in #292), the full-backend library tests (1152 passed) and the Python-extension
   unit tests (1099 passed), including fault-injection tests for the S3, Azure and GCS receive
@@ -593,13 +612,17 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
   an allocation / peak-memory bound) in the Rust unit tests, the integration tests
   (`tests/test_zero_copy_*.rs`) and the installed-wheel suites (`python/tests/test_zero_copy_*.py`).
 - Stage G review corrections (G-F1, G-F2, G-F3), proportionate checks as directed by the maintainer:
-  `cargo fmt`, clippy `-D warnings` (default, extension-module, full-backends, community GCS), the
+  `cargo fmt`, clippy `-D warnings` (default, extension-module, full-backends), the
   library tests (899 default, 1171 full-backends, all passed), the affected integration tests
   (Azure range version 6, zero-copy object store 23, zero-copy file 12) and the reservation tests in
   the Python-extension unit tests; on freshly built 3.12 and 3.13 default wheels the multipart
   writer and zero-copy multipart suites pass (16 each, child-process and live cases skip). Every
   correction's new tests failed on the code before it. The whole-suite and full wheel-matrix runs
   above were not repeated.
+- Community GCS removal and the GCS endpoint override: `cargo fmt`, clippy `-D warnings` (default,
+  full-backends, extension-module, backend-gcs, Arrow backend, and `--tests` with full-backends), the
+  library tests (895 default, 1179 full-backends), and the `.env`, capability, Azure range-version and
+  two loopback endpoint integration tests; not run against a real emulator.
 - **Performance** (Python API, CPython 3.13 x86_64, a local S3-compatible test server on the same
   16-vCPU host whose GET bodies cost it almost nothing; one benchmark process at a time on an idle
   host; `scripts/bench_zero_copy.sh`, ~2 GiB per cell, median of three timed passes after a warm-up;
@@ -626,8 +649,8 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
 
 ### Known limitations
 
-- **Unsupported stores.** `file://`, `direct://`, the Arrow backend and the legacy community GCS
-  client do not offer `get_into_async`/`head_async` and report so through `object_capabilities`.
+- **Unsupported stores.** `file://`, `direct://` and the Arrow backend do not offer
+  `get_into_async`/`head_async` and report so through `object_capabilities`.
   The Rust `MultiEndpointStore` keeps the trait's "unsupported" default for `get_into`/`head`.
 - **HEAD absence is ambiguous on S3 and GCS** (see Added).
 - **Azure trailing dot.** On the tested Azure path, a blob named `name.` and one named `name` are the

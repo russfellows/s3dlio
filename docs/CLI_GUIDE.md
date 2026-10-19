@@ -590,8 +590,8 @@ The account comes from the URI (`az://account/container/key`). Credentials: see
 | Variable | Description |
 |----------|-------------|
 | `GOOGLE_APPLICATION_CREDENTIALS` | Service account key path |
-| `GCS_ENDPOINT_URL` | Custom endpoint |
-| `STORAGE_EMULATOR_HOST` | GCS emulator endpoint |
+| `GCS_ENDPOINT_URL` | Custom endpoint URL for the official GCS client (anonymous credentials; wins over `STORAGE_EMULATOR_HOST`) |
+| `STORAGE_EMULATOR_HOST` | Emulator `host:port` (anonymous credentials). Reads use HTTP/JSON, uploads/stat/list/delete the Storage gRPC API, so a JSON-only emulator supports reads only: see `Environment_Variables.md` (Google Cloud Storage Configuration) |
 
 ### HTTP/2 Configuration
 | Variable | Default | Description |
@@ -659,8 +659,9 @@ s3-cli ls gs://my-bucket/
 # Count objects recursively
 s3-cli ls -rc gs://my-bucket/data/
 
-# With fake-gcs-server
-GCS_ENDPOINT_URL=http://localhost:4443 s3-cli ls gs://testbucket/
+# Against an emulator or test server (anonymous credentials; `ls` uses the Storage gRPC API, so a
+# JSON-only emulator cannot serve it: see Environment_Variables.md)
+STORAGE_EMULATOR_HOST=localhost:4443 s3-cli ls gs://testbucket/
 ```
 
 ### Local Filesystem

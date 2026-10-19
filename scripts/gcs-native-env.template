@@ -14,7 +14,7 @@
 #   source gcs-native-env.local
 
 # No additional environment variables needed for ADC
-# The gcloud-storage SDK will automatically discover credentials
+# The Google Cloud client will automatically discover credentials
 
 echo "GCS Native Authentication (ADC) configured"
 echo "Credentials location: ~/.config/gcloud/application_default_credentials.json"

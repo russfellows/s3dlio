@@ -21,7 +21,7 @@ fn caps(uri: &str) -> Capabilities {
 #[test]
 fn every_scheme_reports_what_this_build_compiled() {
     let azure = NATIVE && cfg!(feature = "backend-azure");
-    let gcs = NATIVE && cfg!(all(feature = "backend-gcs", not(feature = "gcs-community")));
+    let gcs = NATIVE && cfg!(feature = "backend-gcs");
     let table = [
         ("s3://bucket/key", "s3", NATIVE),
         ("az://account/container/key", "az", azure),

@@ -220,10 +220,12 @@ fn probe_child() {
                 Err(_) => "arrow=credentials-seen".to_string(),
             }
         }
-        #[cfg(feature = "gcs-community")]
+        #[cfg(feature = "backend-gcs")]
+        // Reports the chosen URL and which variable it came from; the URL is a test value from the
+        // file.
         "gcs_endpoint" => format!(
             "gcs_endpoint={:?}",
-            s3dlio::gcs_client::resolve_gcs_endpoint()
+            s3dlio::google_gcs_client::resolve_gcs_endpoint().map(|e| (e.url.clone(), e.source))
         ),
         #[cfg(feature = "backend-azure")]
         "azure_config" => format!(
@@ -772,16 +774,30 @@ fn multi_endpoint_store_first_call_sees_the_tls_ports_from_the_file() {
     assert_eq!(p.client, "urls=[Some(\"https://127.0.0.1:9443\")]", "{p:?}");
 }
 
-#[cfg(feature = "gcs-community")]
+#[cfg(feature = "backend-gcs")]
 #[test]
-fn community_gcs_endpoint_resolver_first_call_sees_the_file() {
+fn official_gcs_endpoint_resolver_first_call_sees_the_file() {
     let p = first_call(
         "r9-gcs-endpoint",
         "gcs_endpoint",
         "GCS_ENDPOINT_URL=http://gcs.test:4443\n",
     );
     assert_eq!(
-        p.client, "gcs_endpoint=Some(\"http://gcs.test:4443\")",
+        p.client, "gcs_endpoint=Some((\"http://gcs.test:4443\", EndpointUrl))",
+        "{p:?}"
+    );
+}
+
+#[cfg(feature = "backend-gcs")]
+#[test]
+fn official_gcs_emulator_host_resolver_first_call_sees_the_file() {
+    let p = first_call(
+        "r9-gcs-emulator-host",
+        "gcs_endpoint",
+        "STORAGE_EMULATOR_HOST=emu.test:4443\n",
+    );
+    assert_eq!(
+        p.client, "gcs_endpoint=Some((\"http://emu.test:4443\", EmulatorHost))",
         "{p:?}"
     );
 }

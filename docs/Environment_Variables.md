@@ -688,23 +688,48 @@ sai3-bench util ls az://myaccount/mycontainer/
 | Variable | Description |
 |----------|-------------|
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCS service account JSON key file |
-| `GCS_ENDPOINT_URL` | **Custom GCS endpoint** (e.g., `http://localhost:4443` for fake-gcs-server) |
-| `STORAGE_EMULATOR_HOST` | GCS emulator convention (`host:port`), `http://` prepended if missing |
+| `GCS_ENDPOINT_URL` | **Custom GCS endpoint** for the official client, for example `http://localhost:4443`. The value is used as given, so include the scheme (`http://` or `https://`). Wins over `STORAGE_EMULATOR_HOST` |
+| `STORAGE_EMULATOR_HOST` | GCS emulator convention: `host:port` (`http://` is prepended when the value has no `http://` or `https://` scheme) |
+
+Either variable means "not Google's production endpoint", exactly as the removed community client
+treated any custom endpoint, so the client is built with **anonymous credentials** (no Application
+Default Credentials are looked up, no `Authorization` header is sent). Because the credentials are anonymous, `GCS_ENDPOINT_URL` cannot be used to reach an
+authenticated private route; unset it and use the normal credentials for that.
+
+Both are read when the first GCS client is built, after the `.env` policy (`S3DLIO_LOAD_DOTENV`), and
+apply to the whole process. An empty or blank value counts as unset. With neither set, the client is
+built exactly as before and talks to `storage.googleapis.com`. The chosen endpoint is logged once at
+INFO (any `user:password@` part is replaced by `***@`).
+
+The endpoint is handed to **both** halves of the official client, which speak different protocols. This
+is what s3dlio's code does (read from `src/google_gcs_client.rs`); an endpoint must serve what the
+operation uses:
+
+| Operation | Protocol |
+|-----------|----------|
+| Whole-object and ranged reads (`get`, `get_range`; not the concurrent range engine, which is off by default for GCS and sizes the object first with a gRPC stat) | HTTP/JSON media download |
+| `put` (upload) | Storage gRPC API, `BidiWriteObject` (always, also for ordinary buckets) |
+| `stat` / `head`, `list`, `delete`, bucket create/delete/list | Storage gRPC API (`StorageControl`) |
+
+Limitation: an emulator that serves only the JSON API supports reads only; the operations that use the
+Storage gRPC API fail against it with a connection or protocol error. s3dlio does not choose the
+protocol per endpoint.
+
+What was verified: `tests/gcs_emulator_endpoint.rs` and `tests/gcs_endpoint_url_credentials.rs` run a
+client built from each variable against a local stand-in listener (not a real emulator). The read
+arrives there as `GET /storage/v1/b/<bucket>/o/<object>?alt=media` with no `Authorization` header, and the metadata client opens an HTTP/2 (gRPC) connection to the
+same listener. Nothing was run against a real emulator.
 
 ### GCS Custom Endpoint Examples
 
 ```bash
-# fake-gcs-server (local emulator)
-export GCS_ENDPOINT_URL=http://localhost:4443
-sai3-bench util ls gs://testbucket/
-
-# Using STORAGE_EMULATOR_HOST convention
+# Local emulator or test server (anonymous credentials)
 export STORAGE_EMULATOR_HOST=localhost:4443
+export S3DLIO_GCS_RAPID=0   # standard buckets: skip the bucket-type probe
 sai3-bench util ls gs://testbucket/
 
-# Multi-protocol proxy
-export GCS_ENDPOINT_URL=http://localhost:9002
-sai3-bench util ls gs://testbucket/
+# The same with a full URL
+export GCS_ENDPOINT_URL=http://localhost:4443
 ```
 
 ## Test and Release-Validation Variables

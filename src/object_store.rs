@@ -71,10 +71,7 @@ use futures::stream;
 use std::time::Duration;
 
 // --- GCS - Feature-gated backend selection -------------------
-#[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
-use crate::gcs_client::{parse_gcs_uri, GcsClient, GcsObjectMetadata};
-
-#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+#[cfg(feature = "backend-gcs")]
 use crate::google_gcs_client::{parse_gcs_uri, GcsClient, GcsObjectMetadata};
 
 #[cfg(feature = "backend-gcs")]
@@ -394,10 +391,7 @@ fn unsupported_operation(uri: &str, operation: &str) -> anyhow::Error {
 /// any client is built or any request is sent (the S3 store refuses the same way). Without
 /// it an empty key would address the container or bucket path itself, and a 404 from a `head`
 /// would surface as typed absence of an object that was never asked for.
-#[cfg(any(
-    feature = "backend-azure",
-    all(feature = "backend-gcs", not(feature = "gcs-community"))
-))]
+#[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
 fn empty_key_error(uri: &str, operation: &str) -> anyhow::Error {
     crate::object_error::attach_object_error(
         anyhow!("Cannot {operation}: no key specified in URI: {uri}"),
@@ -2633,10 +2627,7 @@ where
 /// are never combined: the other ranges fail at once, and `one_response` reads the WHOLE object as
 /// a single response instead (`None` in place of the engine's statistics, as no ranges were
 /// planned). The size still comes from the caller, which guards it as for the engine.
-#[cfg(any(
-    feature = "backend-azure",
-    all(feature = "backend-gcs", not(feature = "gcs-community"))
-))]
+#[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
 pub(crate) async fn range_engine_download_versioned<T, F, Fut, S, SFut>(
     config: RangeEngineConfig,
     object_size: u64,
@@ -2665,41 +2656,6 @@ where
             Ok((one_response().await?, None))
         }
         Err(e) => Err(e),
-    }
-}
-
-/// The future a range filler returns: the window it was given and the count of bytes written.
-#[cfg(any(all(feature = "backend-gcs", feature = "gcs-community"), test))]
-type RangeFillFuture =
-    Pin<Box<dyn std::future::Future<Output = Result<(bytes::BytesMut, usize)>> + Send>>;
-
-/// A range filler for a source that can only return each range as `Bytes` (the community GCS
-/// client, which has no receive-into-a-buffer loop): the range is fetched with `get_range` and
-/// copied into its window. That copy (the provider's `Bytes` into the master) is the documented
-/// remaining copy of that client; the official GCS client and Azure receive into the window.
-///
-/// The count returned is the number of bytes the source returned. A source that returns FEWER
-/// than the window leaves the rest of the window untouched, and one that returns MORE than the
-/// window is not copied at all; both are for the range engine to refuse (it checks the count).
-#[cfg(any(all(feature = "backend-gcs", feature = "gcs-community"), test))]
-fn fill_from_get_range<G, Fut>(
-    get_range: G,
-) -> impl Fn(u64, bytes::BytesMut) -> RangeFillFuture + Send + Sync + Clone + 'static
-where
-    G: Fn(u64, u64) -> Fut + Send + Sync + Clone + 'static,
-    Fut: std::future::Future<Output = Result<Bytes>> + Send + 'static,
-{
-    move |offset: u64, mut window: bytes::BytesMut| {
-        let fetched = get_range(offset, window.len() as u64);
-        Box::pin(async move {
-            let bytes = fetched.await?;
-            let n = bytes.len();
-            if let Some(head) = window.get_mut(..n) {
-                // Documented copy: the community client returns an owned `Bytes` per range.
-                head.copy_from_slice(&bytes);
-            }
-            Ok((window, n))
-        })
     }
 }
 
@@ -3964,7 +3920,6 @@ impl GcsObjectStore {
     /// This is one range standing alone: it is of whatever version the object has when it is
     /// read, and its own retries are pinned to that. Several ranges of ONE read must share a
     /// version, which only [`GcsObjectStore::get`] arranges.
-    #[cfg(not(feature = "gcs-community"))]
     pub async fn get_range_into(
         &self,
         uri: &str,
@@ -3985,7 +3940,6 @@ impl GcsObjectStore {
     /// [`GcsObjectStore::get_range_into`] for one range of a read of SEVERAL ranges of the same
     /// object: all of them share `version` and are therefore all of one generation of the object
     /// (stage G review, G-F2). See [`GcsClient::get_object_range_into_versioned`].
-    #[cfg(not(feature = "gcs-community"))]
     pub(crate) async fn get_range_into_versioned(
         &self,
         uri: &str,
@@ -4019,24 +3973,19 @@ impl GcsObjectStore {
     /// `guarded`: the size came from a cache; see [`range_engine_download_into`].
     ///
     /// With the official GCS client every range is received straight into its window of one
-    /// master buffer ([`GcsObjectStore::get_range_into_versioned`]). The community client has no
-    /// receive loop of that kind; its ranges are copied into their windows (documented at
-    /// `fill_from_get_range`).
+    /// master buffer ([`GcsObjectStore::get_range_into_versioned`]).
     ///
     /// # One object version per read
     ///
     /// All ranges are of ONE generation of the object (stage G review, G-F2).
     ///
-    /// * Official client: the first range to start is sent unpinned and reports the generation of
-    ///   its response as soon as the response arrives; every other range, and every retry or
-    ///   repair of it, names that generation. An object replaced between two ranges (by another of
-    ///   the same size included) is a `VersionChanged` error, never a body of two versions. The
-    ///   cost is about one round trip before the other ranges start. A first response with no
-    ///   generation cannot pin anything, and unpinned ranges are never combined: the object is
-    ///   read again as one response.
-    /// * Community client: the generation is read first (one metadata request) and every ranged
-    ///   request names it, so the service itself refuses any other generation. An object without
-    ///   a generation is read as one response.
+    /// The first range to start is sent unpinned and reports the generation of its response as
+    /// soon as the response arrives; every other range, and every retry or repair of it, names
+    /// that generation. An object replaced between two ranges (by another of the same size
+    /// included) is a `VersionChanged` error, never a body of two versions. The cost is about one
+    /// round trip before the other ranges start. A first response with no generation cannot pin
+    /// anything, and unpinned ranges are never combined: the object is read again as one
+    /// response.
     async fn get_with_range_engine(
         &self,
         uri: &str,
@@ -4050,7 +3999,6 @@ impl GcsObjectStore {
             client.get_object(&bucket, &object).await
         };
 
-        #[cfg(not(feature = "gcs-community"))]
         let (bytes, stats) = {
             let uri_owned = uri.to_string();
             let self_clone = self.clone();
@@ -4086,38 +4034,6 @@ impl GcsObjectStore {
             )
             .await?
         };
-        #[cfg(feature = "gcs-community")]
-        let (bytes, stats) = {
-            let (bucket, object) = parse_gcs_uri(uri)?;
-            let client = self.get_client().await?;
-            // The community client's ranged request can name a generation but does not report
-            // the one it served, so the generation is read first and every range names it.
-            let generation = client.object_generation(&bucket, &object).await?;
-            if generation <= 0 {
-                // Nothing to pin the ranges to, and unpinned ranges are never combined.
-                (one_response().await?, None)
-            } else {
-                let fill = fill_from_get_range(move |offset: u64, length: u64| {
-                    let client = client.clone();
-                    let bucket = bucket.clone();
-                    let object = object.clone();
-                    async move {
-                        client
-                            .get_object_range_pinned(&bucket, &object, offset, length, generation)
-                            .await
-                    }
-                });
-                let (bytes, stats) = range_engine_download_into(
-                    self.config.range_engine.clone(),
-                    object_size,
-                    guarded,
-                    fill,
-                )
-                .await?;
-                (bytes, Some(stats))
-            }
-        };
-
         match stats {
             Some(stats) => info!(
                 "RangeEngine (GCS) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
@@ -4201,9 +4117,7 @@ impl ObjectStore for GcsObjectStore {
             .await
     }
 
-    /// Caller-buffer GET (plan §4.5 A1, A8), official GCS client only: the community client
-    /// keeps the `Unsupported` trait default. The row, if any, is the wrapper's.
-    #[cfg(not(feature = "gcs-community"))]
+    /// Caller-buffer GET (plan §4.5 A1, A8), official GCS client. The row, if any, is the wrapper's.
     async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         // An empty object (`gs://bucket/`) is refused before the client is built.
@@ -4224,7 +4138,6 @@ impl ObjectStore for GcsObjectStore {
     /// Typed HEAD, official GCS client only. GCS cannot tell an absent bucket from an absent
     /// object, so both are `Ok(None)`. A 403 and other failures are
     /// errors, never `Ok(None)`.
-    #[cfg(not(feature = "gcs-community"))]
     async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         // An empty object (`gs://bucket/`) is refused before the client is built.
@@ -4247,15 +4160,13 @@ impl ObjectStore for GcsObjectStore {
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, _part_size: Option<usize>) -> Result<()> {
-        // audit #157 bug 5.4 (D5): the community GCS client has no real
-        // chunked/resumable upload implementation (see put_object's doc
-        // comment in gcs_client.rs) — `_part_size` has no effect and is
-        // accepted only to satisfy the ObjectStore trait's shared
-        // signature with the S3/Azure backends, which do support it.
+        // audit #157 bug 5.4 (D5): this route is a simple upload (the object is already
+        // one `Bytes`), so `_part_size` has no effect; it is accepted only to satisfy the
+        // ObjectStore trait's shared signature with the S3/Azure backends, which use it.
         let (bucket, object) = parse_gcs_uri(uri)?;
         debug!(
-            "GcsObjectStore::put_multipart uri='{}', {} bytes (community GCS client has no \
-             chunked upload; routed to simple upload)",
+            "GcsObjectStore::put_multipart uri='{}', {} bytes (routed to simple upload; no chunked \
+             upload on this route)",
             uri,
             data.len()
         );
@@ -4617,10 +4528,9 @@ impl ObjectWriter for GcsBufferedWriter {
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
         let client = get_global_gcs_client().await?;
 
-        // audit #157 bug 5.4 (D5): the community GCS client has no real
-        // chunked/resumable upload — both branches used to call
-        // functions with byte-for-byte identical bodies under different
-        // names. `Bytes::from(Vec<u8>)` transfers ownership without
+        // audit #157 bug 5.4 (D5): this is a simple upload — the chunked and non-chunked
+        // branches used to call functions with byte-for-byte identical bodies under
+        // different names. `Bytes::from(Vec<u8>)` transfers ownership without
         // copying — zero-cost. `std::mem::take` moves the buffer out so
         // the encoder can be dropped too.
         client.put_object(&bucket, &object, payload).await
@@ -7146,9 +7056,7 @@ mod gcs_size_cache_hygiene_tests {
 
     /// GCS cannot run offline (its client needs credentials), so the wiring of the one-version
     /// rule (stage G review, G-F2) is pinned by source: the official client's ranges share an
-    /// `ObjectVersion` and fall back to one response, and the community client, which cannot
-    /// report the generation it served, reads the generation first and names it in every range.
-    /// The behaviour of the official route is tested against a fake in `gcs_range_into_tests.rs`.
+    /// `ObjectVersion` and fall back to one response. The behaviour of the route is tested against a fake in `gcs_range_into_tests.rs`.
     #[test]
     fn the_range_engine_reads_one_generation() {
         let src = include_str!("object_store.rs");
@@ -7168,10 +7076,6 @@ mod gcs_size_cache_hygiene_tests {
         assert!(
             route.contains(".get_range_into_versioned("),
             "the official route's ranges do not share a version"
-        );
-        assert!(
-            route.contains(".object_generation(") && route.contains(".get_object_range_pinned("),
-            "the community route does not pin its ranges to one generation"
         );
     }
 }
@@ -7297,7 +7201,7 @@ mod helper_row_tests {
 
 /// A `gs://` URI that names a bucket but no object is refused before the client is built (no
 /// credentials, no network), with a typed `Other` error: it must never address the bucket path.
-#[cfg(all(test, feature = "backend-gcs", not(feature = "gcs-community")))]
+#[cfg(all(test, feature = "backend-gcs"))]
 mod gcs_empty_object_tests {
     use super::*;
     use crate::object_error::{object_error, ObjectErrorKind};
@@ -7394,70 +7298,5 @@ mod zero_copy_writer_tests {
         let bytes = writer.take_payload().expect("payload");
         assert_eq!(&bytes[..1000], &first[..]);
         assert_eq!(&bytes[1000..], &second[..]);
-    }
-
-    // ---- `fill_from_get_range`: the copy-into-the-window adapter of the community GCS client ----
-
-    use bytes::BytesMut;
-
-    fn source(
-        data: Vec<u8>,
-    ) -> impl Fn(u64, u64) -> std::future::Ready<Result<Bytes>> + Send + Sync + Clone + 'static
-    {
-        move |offset: u64, length: u64| {
-            let start = usize::try_from(offset)
-                .unwrap_or(usize::MAX)
-                .min(data.len());
-            let end = start
-                .saturating_add(usize::try_from(length).unwrap_or(usize::MAX))
-                .min(data.len());
-            std::future::ready(Ok(Bytes::copy_from_slice(&data[start..end])))
-        }
-    }
-
-    #[tokio::test]
-    async fn the_range_filler_copies_the_range_into_its_window() {
-        let data = payload(100);
-        let fill = fill_from_get_range(source(data.clone()));
-        let window = BytesMut::zeroed(30);
-        let origin = window.as_ptr();
-        let (window, n) = fill(20, window).await.expect("fill");
-        assert_eq!(n, 30);
-        assert_eq!(&window[..], &data[20..50]);
-        assert_eq!(window.as_ptr(), origin, "the window itself is returned");
-    }
-
-    /// A source that returns fewer bytes than asked (the range ran past the end): only those
-    /// are copied and counted; the rest of the window stays untouched.
-    #[tokio::test]
-    async fn the_range_filler_reports_a_short_read_and_leaves_the_rest_untouched() {
-        let data = payload(100);
-        let fill = fill_from_get_range(source(data.clone()));
-        let (window, n) = fill(95, BytesMut::zeroed(10)).await.expect("fill");
-        assert_eq!(n, 5);
-        assert_eq!(&window[..5], &data[95..]);
-        assert!(window[5..].iter().all(|b| *b == 0));
-    }
-
-    /// A source that returns MORE than the window (a misbehaving service): nothing is copied
-    /// and the larger count is reported for the engine to refuse.
-    #[tokio::test]
-    async fn the_range_filler_reports_an_over_read_without_copying_it() {
-        let data = payload(100);
-        let fill = fill_from_get_range(move |_offset: u64, _length: u64| {
-            std::future::ready(Ok(Bytes::copy_from_slice(&data[..40])))
-        });
-        let (window, n) = fill(0, BytesMut::zeroed(10)).await.expect("fill");
-        assert_eq!(n, 40);
-        assert!(window.iter().all(|b| *b == 0), "nothing may be copied");
-    }
-
-    #[tokio::test]
-    async fn the_range_filler_passes_a_source_error_on() {
-        let fill = fill_from_get_range(|_offset: u64, _length: u64| {
-            std::future::ready(Err::<Bytes, _>(anyhow!("the source failed")))
-        });
-        let err = fill(0, BytesMut::zeroed(4)).await.expect_err("error");
-        assert!(format!("{err:#}").contains("the source failed"));
     }
 }

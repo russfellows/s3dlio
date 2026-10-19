@@ -14,7 +14,6 @@ use crate::gcs_constants::{
     DEFAULT_WINDOW_MIB, ENV_GCS_GRPC_CHANNELS, ENV_GRPC_INITIAL_WINDOW_MIB,
     GCS_MAX_CONCURRENT_DELETES, GCS_MIN_CHANNELS,
 };
-#[cfg(not(feature = "gcs-community"))]
 use crate::object_error::ObjectErrorKind;
 use crate::read_buffer::ReadBuffer;
 use anyhow::{anyhow, Result};
@@ -37,6 +36,154 @@ static GCS_CONTROL: OnceCell<Arc<StorageControl>> = OnceCell::const_new();
 static EFFECTIVE_GCS_RAPID_MODE: std::sync::OnceLock<RapidMode> = std::sync::OnceLock::new();
 const GCS_FULL_READ_REPAIR_MAX_ATTEMPTS: usize = 4;
 const GCS_FULL_READ_RETRY_MAX_ATTEMPTS: usize = 3;
+
+// ============================================================================
+// Custom endpoint / emulator support (GCS_ENDPOINT_URL, STORAGE_EMULATOR_HOST)
+// ============================================================================
+
+/// Which environment variable named the custom endpoint.  Either way the endpoint is "not Google's
+/// production endpoint" (an emulator, a test server, a proxy): the client is built with anonymous
+/// credentials, as the legacy community client did for any custom endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcsEndpointSource {
+    /// `GCS_ENDPOINT_URL`: the URL is used as given.
+    EndpointUrl,
+    /// `STORAGE_EMULATOR_HOST`: the emulator convention (`host:port`, `http://` added).
+    EmulatorHost,
+}
+
+/// A custom GCS endpoint resolved from the environment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GcsEndpoint {
+    /// The endpoint URL handed to the SDK (`with_endpoint`).  A `STORAGE_EMULATOR_HOST` value
+    /// without a scheme has `http://` prepended.
+    pub url: String,
+    /// The variable it came from.
+    pub source: GcsEndpointSource,
+}
+
+/// `Debug` shows the URL with any embedded credentials masked (see `redact_endpoint_url`), because an
+/// endpoint ends up in logs and assertion messages.  The `url` field itself is the real value.
+impl std::fmt::Debug for GcsEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcsEndpoint")
+            .field("url", &redact_endpoint_url(&self.url))
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// Environment-free resolution of the custom endpoint: `lookup` reads one variable by name.
+///
+/// - `GCS_ENDPOINT_URL` wins; its value is used as given (trimmed).
+/// - else `STORAGE_EMULATOR_HOST` (`host:port`), with `http://` prepended when the value has no
+///   `http://` or `https://` scheme.
+/// - an empty or blank value counts as unset (so an empty `GCS_ENDPOINT_URL` falls through to
+///   `STORAGE_EMULATOR_HOST` instead of selecting an empty endpoint).
+/// - neither set: `None`, and the client is built exactly as it is without this feature.
+pub fn resolve_gcs_endpoint_with(lookup: impl Fn(&str) -> Option<String>) -> Option<GcsEndpoint> {
+    let get = |name: &str| {
+        lookup(name)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(url) = get(crate::constants::ENV_GCS_ENDPOINT_URL) {
+        return Some(GcsEndpoint {
+            url,
+            source: GcsEndpointSource::EndpointUrl,
+        });
+    }
+    get(crate::constants::ENV_STORAGE_EMULATOR_HOST).map(|host| GcsEndpoint {
+        url: if host.starts_with("http://") || host.starts_with("https://") {
+            host
+        } else {
+            format!("http://{host}")
+        },
+        source: GcsEndpointSource::EmulatorHost,
+    })
+}
+
+/// Resolves the custom GCS endpoint from the process environment.
+///
+/// Applies the `.env` policy first (#243): this is a public setting reader, so a `.env` opted
+/// into with `S3DLIO_LOAD_DOTENV` is visible to the very first call.  See
+/// [`resolve_gcs_endpoint_with`] for the rules.  `None` means the default GCS endpoint.
+pub fn resolve_gcs_endpoint() -> Option<GcsEndpoint> {
+    crate::dotenv::apply();
+    resolve_gcs_endpoint_with(|name| std::env::var(name).ok())
+}
+
+/// The endpoint made safe to log.
+///
+/// The authority ends at the first `/`, `?` or `#`.  A `user:password@` in it (up to the LAST `@`)
+/// is replaced by `***@`.  When the authority has no `@` but an `@` follows it, the text after the
+/// authority could carry credentials, so it is masked (`/***`) if the authority is a plain
+/// `host[:port]`, and the whole remainder is masked (`***`) if it is not (for example `u:pa` from
+/// `u:pa/ss@host`, where a password holds a `/`).  A URL with no `@` is returned unchanged.
+fn redact_endpoint_url(url: &str) -> String {
+    let (scheme, rest) = match url.find("://") {
+        Some(i) => url.split_at(i + 3),
+        None => ("", url),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some(at) = authority.rfind('@') {
+        return format!("{scheme}***@{}", &rest[at + 1..]);
+    }
+    if !rest[authority_end..].contains('@') {
+        return url.to_string();
+    }
+    if is_host_and_port(authority) {
+        format!("{scheme}{authority}/***")
+    } else {
+        format!("{scheme}***")
+    }
+}
+
+/// True for `host`, `host:port`, `[v6]` and `[v6]:port` (a port is digits only).
+fn is_host_and_port(authority: &str) -> bool {
+    let all_digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if authority.starts_with('[') {
+        return match authority.find(']') {
+            Some(i) => {
+                let tail = &authority[i + 1..];
+                tail.is_empty() || tail.strip_prefix(':').is_some_and(all_digits)
+            }
+            None => false,
+        };
+    }
+    match authority.rsplit_once(':') {
+        None => true,
+        Some((host, port)) => !host.contains(':') && all_digits(port),
+    }
+}
+
+/// The `Storage` builder: the SDK defaults, plus, for a custom endpoint, the endpoint and
+/// anonymous credentials.  With no endpoint this is `Storage::builder()` unchanged.
+fn storage_builder(
+    endpoint: Option<&GcsEndpoint>,
+) -> google_cloud_storage::builder::storage::ClientBuilder {
+    let builder = Storage::builder();
+    match endpoint {
+        None => builder,
+        Some(e) => builder
+            .with_endpoint(e.url.clone())
+            .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build()),
+    }
+}
+
+/// The `StorageControl` builder, configured exactly like [`storage_builder`].
+fn control_builder(
+    endpoint: Option<&GcsEndpoint>,
+) -> google_cloud_storage::builder::storage_control::ClientBuilder {
+    let builder = StorageControl::builder();
+    match endpoint {
+        None => builder,
+        Some(e) => builder
+            .with_endpoint(e.url.clone())
+            .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build()),
+    }
+}
 
 /// Exponential backoff delay for GCS full-read retry attempts.
 ///
@@ -272,6 +419,8 @@ impl GcsClient {
     /// - gcloud CLI credentials
     pub async fn new() -> Result<Self> {
         crate::dotenv::apply();
+        // Custom endpoint / emulator (None: the SDK defaults, byte for byte as before).
+        let endpoint = resolve_gcs_endpoint();
         let storage = GCS_STORAGE
             .get_or_try_init(|| async {
                 debug!("Initializing GCS Storage client (first time only)");
@@ -331,7 +480,18 @@ impl GcsClient {
                      initial_window={window_mib} MiB"
                 );
 
-                let client = Storage::builder()
+                if let Some(e) = endpoint.as_ref() {
+                    info!(
+                        "GCS custom endpoint: {} (from {}; anonymous credentials)",
+                        redact_endpoint_url(&e.url),
+                        match e.source {
+                            GcsEndpointSource::EndpointUrl => crate::constants::ENV_GCS_ENDPOINT_URL,
+                            GcsEndpointSource::EmulatorHost => crate::constants::ENV_STORAGE_EMULATOR_HOST,
+                        }
+                    );
+                }
+
+                let client = storage_builder(endpoint.as_ref())
                     .with_grpc_subchannel_count(subchannel_count)
                     .build()
                     .await
@@ -346,9 +506,12 @@ impl GcsClient {
             .get_or_try_init(|| async {
                 debug!("Initializing GCS StorageControl client (first time only)");
 
-                let client = StorageControl::builder().build().await.map_err(|e| {
-                    anyhow!("Failed to initialize GCS StorageControl client: {}", e)
-                })?;
+                let client = control_builder(endpoint.as_ref())
+                    .build()
+                    .await
+                    .map_err(|e| {
+                        anyhow!("Failed to initialize GCS StorageControl client: {}", e)
+                    })?;
 
                 info!("GCS StorageControl client initialized successfully");
                 Ok::<Arc<StorageControl>, anyhow::Error>(Arc::new(client))
@@ -1510,7 +1673,6 @@ fn is_retryable_gcs_read_error(message: &str) -> bool {
 /// * everything else is `Other`, in particular HTTP 401 and gRPC `Unauthenticated` (a
 ///   credential problem, not retried), and gRPC `Unknown` and `Cancelled` (no evidence the
 ///   service failed, not retried).
-#[cfg(not(feature = "gcs-community"))]
 pub(crate) fn classify_gcs_failure(e: &google_cloud_gax::error::Error) -> ObjectErrorKind {
     use google_cloud_gax::error::rpc::Code;
     let http = e.http_status_code();
@@ -1553,7 +1715,6 @@ pub(crate) fn classify_gcs_failure(e: &google_cloud_gax::error::Error) -> Object
 /// code name, never from server-supplied text.  The retained source error, reachable through
 /// `{:#}`, `{:?}` or the chain, is the `google_cloud_gax` error itself and is NOT redacted by
 /// this module.
-#[cfg(not(feature = "gcs-community"))]
 pub(crate) fn attach_gcs_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
     if let Some(existing) = crate::object_error::object_error(&err) {
         if pinned && existing.kind == ObjectErrorKind::NotFound {
@@ -1590,7 +1751,6 @@ pub(crate) fn attach_gcs_classification(err: anyhow::Error, pinned: bool) -> any
 /// a length error, and any message text that merely contains a status number are not.  This
 /// is not [`is_retryable_gcs_read_error`] (message text) and not the generic conservative
 /// fallback of `RetryClassify`; it never authorizes combining unpinned responses either.
-#[cfg(not(feature = "gcs-community"))]
 pub(crate) fn gcs_typed_retry_verdict(err: &anyhow::Error) -> bool {
     matches!(
         crate::object_error::object_error(err).map(|o| o.kind),
@@ -1768,7 +1928,6 @@ pub async fn query_gcs_rapid_bucket(bucket_or_uri: &str) -> bool {
 //
 // Every write into `dst` happens in the task that awaits `receive_into`; nothing is spawned.
 // Dropping the future therefore stops every writer.
-#[cfg(not(feature = "gcs-community"))]
 mod caller_buffer {
     use super::*;
     use crate::object_error::{attach_object_error, object_error};
@@ -3811,7 +3970,7 @@ mod zero_copy_tests {
 /// Typed classification and the typed-only retry rule of the new GCS receive loop (plan §4.5
 /// A2). Every error here is built from the gax error's typed constructors; no test relies on
 /// message text.
-#[cfg(all(test, not(feature = "gcs-community")))]
+#[cfg(test)]
 mod object_error_tests {
     use super::*;
     use crate::object_error::object_error;
@@ -4017,21 +4176,26 @@ mod object_error_tests {
 }
 
 // Tests for the typed HEAD decision logic and the #263 object-time conversion.
-#[cfg(all(test, not(feature = "gcs-community")))]
+#[cfg(test)]
 #[path = "gcs_head_typed_tests.rs"]
 mod head_typed_tests;
 
 // Tests of the caller-buffer receive loop, driven by a deterministic fake source.
-#[cfg(all(test, not(feature = "gcs-community")))]
+#[cfg(test)]
 #[path = "gcs_get_into_tests.rs"]
 mod get_into_tests;
 
 // Tests of the ranged receive (the range engine's per-range receive), driven by a small fake.
-#[cfg(all(test, not(feature = "gcs-community")))]
+#[cfg(test)]
 #[path = "gcs_range_into_tests.rs"]
 mod range_into_tests;
 
 // Tests of the real HTTP opener against a local HTTP server (generation, range, size facts).
-#[cfg(all(test, not(feature = "gcs-community")))]
+#[cfg(test)]
 #[path = "gcs_http_opener_tests.rs"]
 mod http_opener_tests;
+
+// Tests of the custom-endpoint / emulator resolution (GCS_ENDPOINT_URL, STORAGE_EMULATOR_HOST).
+#[cfg(test)]
+#[path = "gcs_endpoint_tests.rs"]
+mod endpoint_tests;

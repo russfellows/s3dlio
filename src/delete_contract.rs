@@ -731,7 +731,7 @@ mod tests {
             .is_some_and(|az| az.is_blob_not_found()));
     }
 
-    #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+    #[cfg(feature = "backend-gcs")]
     #[test]
     fn is_not_found_is_false_for_a_version_change_over_a_gcs_404() {
         use crate::object_error::{attach_object_error, ObjectErrorKind};

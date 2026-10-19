@@ -27,8 +27,7 @@
 //                 AWS_SECRET_ACCESS_KEY and AWS_REGION (and, to keep a stray `.env` out of the
 //                 run, S3DLIO_LOAD_DOTENV=0).
 //   `native_gcs`  `gs://$BUCKET/$PREFIX/gs/...`   The official GCS client with Application
-//                 Default Credentials.  Compiled only with `backend-gcs` and without
-//                 `gcs-community`.
+//                 Default Credentials.  Compiled only with `backend-gcs`.
 //
 // Range fan-out (S3 path).  The range threshold, chunk size and concurrency are read ONCE per
 // process (`OnceLock`-latched), so a test cannot change them for itself.  The simplest correct
@@ -904,7 +903,7 @@ macro_rules! live_group {
 
 live_group!(s3_path, "s3");
 
-#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+#[cfg(feature = "backend-gcs")]
 live_group!(native_gcs, "gs");
 
 mod s3_op_log {

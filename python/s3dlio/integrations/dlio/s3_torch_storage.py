@@ -67,7 +67,8 @@ class S3PyTorchConnectorStorage(S3Storage):
 
     GCS (gs://):
         GOOGLE_APPLICATION_CREDENTIALS (path to service account JSON)
-        GCS_ENDPOINT_URL (optional)
+        GCS_ENDPOINT_URL (optional custom endpoint URL, anonymous credentials)
+        STORAGE_EMULATOR_HOST (optional emulator host:port, anonymous credentials)
 
     File/Direct (file://, direct://):
         No credentials needed - uses local filesystem

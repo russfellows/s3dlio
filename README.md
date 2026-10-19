@@ -326,8 +326,6 @@ cargo build --release --features full-backends
 - Repository: https://github.com/russfellows/google-cloud-rust
 - Integration in this repo is pinned in [Cargo.toml](Cargo.toml) (currently via release tag from that fork).
 
-**Legacy note:** `gcs-community` remains as a legacy opt-in path, but the primary supported path is the official Google crates from the patched `russfellows/google-cloud-rust` fork.
-
 ## Quick Start
 
 ### Installation

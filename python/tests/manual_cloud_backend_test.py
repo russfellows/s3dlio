@@ -22,7 +22,7 @@ For Azure Blob (az://):
 
 For GCS (gs://):
     export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
-    # For emulator: export STORAGE_EMULATOR_HOST="localhost:9023"
+    # For emulator: export STORAGE_EMULATOR_HOST="localhost:9023"  (anonymous credentials)
 
 USAGE:
     # Test S3 backend
