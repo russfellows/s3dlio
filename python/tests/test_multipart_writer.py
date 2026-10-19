@@ -30,6 +30,7 @@ import unittest
 import uuid
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import import_module
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import s3dlio
@@ -543,22 +544,17 @@ class TestMultipartWriter(unittest.TestCase):
         )
         self.assert_stored(uri, key, payload)
 
-    def test_reserve_pins_writer_alive_until_commit(self):
-        # Regression test for docs/DESIGN_FFI_BOUNDARY_HARDENING.md §1.3 /
-        # §6.3: reserve() used to return a memoryview via
-        # PyMemoryView_FromMemory, which carries no reference back to the
-        # writer -- dropping the writer while the memoryview was still
-        # held would free pending_buf's allocation out from under a live
-        # memoryview (use-after-free). The fix holds an extra Py<Self>
-        # ("self-pin") for the reserve()..commit() window, observable here
-        # as a +1 refcount delta that releases back to baseline on commit().
+    def test_reserve_view_is_owned_by_its_exporter_not_by_the_writer(self):
+        # Regression test for stage G review G-F1 (and the older
+        # docs/DESIGN_FFI_BOUNDARY_HARDENING.md §1.3 / §6.3): reserve() used
+        # to return a memoryview via PyMemoryView_FromMemory, which carries no
+        # reference to whatever owns the memory. The writer's "self-pin" only
+        # covered the reserve()..commit() window, so a view retained past
+        # commit()/close()/abort()/del could point at freed memory. The view
+        # is now built over an owning exporter (mv.obj); the memory lives as
+        # long as any view does and the writer is NOT pinned any more.
         #
-        # CPython-specific: sys.getrefcount() is a CPython implementation
-        # detail, not part of the Python language spec. s3dlio only ever
-        # targets CPython (extension-module build, no PyPy classifiers in
-        # pyproject.toml), so this is a non-issue in practice -- but a
-        # future contributor extending PyPy support should know to revisit
-        # this test rather than be surprised by it.
+        # sys.getrefcount() is CPython-specific; s3dlio only targets CPython.
         uri, key = self.uri("uaf-regression.bin")
         w = s3dlio.MultipartUploadWriter.from_uri(
             uri, part_size=32 << 20, max_in_flight=4
@@ -567,20 +563,20 @@ class TestMultipartWriter(unittest.TestCase):
         mv = w.reserve(1024)
         self.assertEqual(
             sys.getrefcount(w),
-            baseline + 1,
-            "reserve() must pin an extra strong reference to the writer "
-            "for the duration of the pending buffer",
+            baseline,
+            "reserve() must not hold an extra reference to the writer",
         )
+        self.assertIsInstance(mv.obj, import_module("s3dlio._pymod").ReservedBuffer)
         payload = payload_of(1024, 3)
         mv[:] = payload
+        tail = mv[512:]
         w.commit(1024)
-        self.assertEqual(
-            sys.getrefcount(w),
-            baseline,
-            "the self-pin must be released once the reservation window ends",
-        )
         w.close()
         self.assert_stored(uri, key, payload)
+        # The views outlive the commit, the close and the writer itself.
+        del w
+        del mv
+        self.assertEqual(bytes(tail), payload[512:])
 
 
 @unittest.skipIf(

@@ -3265,7 +3265,9 @@ fn clamp_in_flight(max_in_flight: usize) -> usize {
 /// aborts every task that has not finished, so each payload (which may be a held buffer export)
 /// is dropped at once, and returns the FIRST failure once the aborted tasks are reaped. Only a
 /// write that already runs in a blocking thread cannot be stopped, and only those are waited for
-/// by the completion barrier of the call. The failure returned is the item's own error, not a
+/// by the completion barrier of the call. Items that finished before the failure stay done (the
+/// batch is not transactional), and the FIFO admission above orders STARTS only: with more than
+/// one permit, items finish in any order. The failure returned is the item's own error, not a
 /// barrier error, whenever the drain finishes within `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`.
 ///
 /// A `put` that PANICS is a failure too: the item's task closes the semaphore from a drop guard
@@ -3421,13 +3423,22 @@ where
 /// buffers stay pinned), so every buffer is yours again as soon as the call returns. Exact
 /// `bytes` and `BytesView` payloads are immutable and are never exported.
 ///
-/// # Failure
-/// Items are started in the order of the list. The first failed item ends the batch: no item
-/// that has not been started is started after that failure (the failing item closes the batch
-/// before it frees its slot), the items still queued are dropped (releasing their buffers at
-/// once), and that item's own error is raised. Items that were already being written are not
-/// interrupted; the call waits for them (it never returns while a write still reads one of your
-/// buffers), so a write that is already in progress may complete.
+/// # Failure and partial success
+/// Items are ADMITTED in list order (first in, first out), so the first `max_in_flight` items
+/// start first; with `max_in_flight` above 1 that is the order they start in, not the order
+/// they finish in. The first failed item ends the batch: no item that has not been started is
+/// started after that failure (the failing item closes the batch before it frees its slot), the
+/// items still queued are dropped (releasing their buffers at once), every item still in flight
+/// is ABORTED (its payload is dropped at once, so its request may never complete), and that
+/// item's own error is raised. Only a write that already runs on a blocking thread cannot be
+/// stopped: the call waits for it, and for any other native reader of your buffers, before it
+/// returns (it never returns while a write still reads one of your buffers).
+///
+/// The batch is NOT transactional. Objects whose put completed before the failure stay stored;
+/// an item that was aborted in flight may be absent, complete or (on a store whose put is not
+/// atomic, such as `file://`) partial, and you cannot tell which from the error; items that
+/// never started were not written. After an error, re-check or re-put every object that is not
+/// known to be complete.
 ///
 /// # Examples
 /// ```python
@@ -3510,12 +3521,19 @@ pub fn put_many(
 /// held, so you may reuse the buffers immediately. Exact `bytes`, `BytesView` and other
 /// immutable payloads are never copied in either mode.
 ///
-/// Items are started in the order of the list. The first failed item ends the batch: no item
-/// that has not been started is started after that failure, queued items are dropped at once
-/// (releasing their buffers), and that item's own error is raised. Items
-/// already being written are not interrupted; the awaitable completes only after they are done.
-/// Cancelling the awaitable stops the batch the same way: no item that has not started is
-/// uploaded, and the cancellation completes once the writes already in progress are done.
+/// Items are ADMITTED in list order (first in, first out), so the first `max_in_flight` items
+/// start first; with `max_in_flight` above 1 that is the order they start in, not the order
+/// they finish in. The first failed item ends the batch: no item that has not been started is
+/// started after that failure, queued items are dropped at once (releasing their buffers),
+/// every item still in flight is ABORTED (its payload is dropped at once, so its request may
+/// never complete), and that item's own error is raised. Only a write that already runs on a
+/// blocking thread cannot be stopped: the awaitable completes only after it (and any other
+/// native reader of your buffers) is done. The batch is NOT transactional: objects whose put
+/// completed before the failure stay stored; an item aborted in flight may be absent, complete
+/// or (on a store whose put is not atomic, such as `file://`) partial; items that never started
+/// were not written. Cancelling the awaitable stops the batch the same way: no item that has
+/// not started is uploaded, items in flight are aborted, and the cancellation completes once
+/// the native readers that survive cancellation are done.
 #[pyfunction]
 #[pyo3(signature = (items, max_in_flight = 64, *, borrow = true))]
 pub fn put_many_async<'py>(

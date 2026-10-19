@@ -238,16 +238,14 @@ def vm_size_bytes():
     raise RuntimeError("VmSize not found")
 
 
-def child_commit_does_not_pin_the_reservation():
-    """100 x reserve(64 MiB) / commit(64 KiB), then 30 x reserve(64 MiB) / commit(5 MiB = one
-    part), parts still in flight: the unused capacity of a reservation must not stay pinned
-    (virtual size would grow by GiBs). The 64 KiB commits are copied (below the threshold); the
-    5 MiB commits are parts that are zero-copy slices of the committed buffer, so only the
-    `shrink_to_fit` of the committed Vec keeps each one from pinning its 64 MiB reservation
-    (checked deterministically by the unit test `commit_does_not_pin_the_whole_reservation`)."""
+def child_reservation_lifetime():
+    """8 x reserve(32 MiB) / commit(5 MiB = one part) with the memoryviews KEPT: after close()
+    every view must still be intact (the reservation is owned by its exporter, not by the writer
+    or the upload), and the 8 x 32 MiB stay allocated while the views exist (a short commit pins
+    the whole reservation, as documented) and are given back when the last view is gone."""
     # One server thread: a thread per request would add a malloc arena (64 MiB of address space)
-    # per concurrent part, which swamps the pinning being measured.
-    server = DiscardingS3(part_delay=0.15, threaded=False)
+    # per concurrent part, which swamps the lifetime being measured.
+    server = DiscardingS3(part_delay=0.1, threaded=False)
     try:
         point_client_at(server.url)
         # Warm up: the first upload starts the runtime's threads, whose malloc arenas reserve
@@ -257,32 +255,33 @@ def child_commit_does_not_pin_the_reservation():
         warm.close()
         before = vm_size_bytes()
         w = s3dlio.MultipartUploadWriter(
-            "bkt", "obj", part_size=5 * MIB, max_in_flight=32
+            "bkt", "obj", part_size=5 * MIB, max_in_flight=8
         )
-        for _ in range(100):
-            mv = w.reserve(64 * MIB)
-            mv[:4] = b"abcd"
-            w.commit(64 * 1024)
-            del mv
-        small = vm_size_bytes() - before
-        for _ in range(30):
-            mv = w.reserve(64 * MIB)
-            mv[:4] = b"abcd"
+        views = []
+        for i in range(8):
+            mv = w.reserve(32 * MIB)
+            mv[:8] = bytes([i + 1]) * 8
             w.commit(5 * MIB)
-            del mv
-        mid = vm_size_bytes() - before
+            views.append(mv)
+        del mv
         w.close()
+        assert server.received == 6 * MIB + 8 * 5 * MIB, server.received
+        for i, view in enumerate(views):
+            assert bytes(view[:8]) == bytes([i + 1]) * 8, "a view changed after close()"
+        held = vm_size_bytes() - before
+        del view
+        views.clear()
+        freed = vm_size_bytes() - before
         print(
-            f"commit_pinning: virtual size grew {small >> 20} MiB (100 x 64 KiB commits), "
-            f"{mid >> 20} MiB (+30 x 5 MiB commits)"
+            f"reservation_lifetime: {held >> 20} MiB held while the views exist, "
+            f"{freed >> 20} MiB after the last view is gone"
         )
-        assert small < 512 * MIB, (
-            f"100 small commits pinned {small >> 20} MiB of reservations"
+        assert held >= 192 * MIB, (
+            f"only {held >> 20} MiB held: the views do not own their memory"
         )
-        assert mid < 800 * MIB, (
-            f"30 one-part commits pinned {mid >> 20} MiB of reservations"
+        assert freed < 64 * MIB, (
+            f"{freed >> 20} MiB still allocated after the last view was dropped"
         )
-        assert server.received == 6 * MIB + 100 * 64 * 1024 + 30 * 5 * MIB
     finally:
         server.close()
 
@@ -406,7 +405,7 @@ def child_unsigned_threshold():
 CHILD_SCENARIOS = {
     "rss_bytearray": child_rss_bytearray,
     "rss_small_bytesview": child_rss_small_bytesview,
-    "commit_pinning": child_commit_does_not_pin_the_reservation,
+    "reservation_lifetime": child_reservation_lifetime,
     "bench_small": child_bench_small_writes,
     "immutable_view_twice": child_immutable_view_twice,
     "unsigned_threshold": child_unsigned_threshold,
@@ -541,6 +540,139 @@ class TestStrictServerScenarios(unittest.TestCase):
             w.write(buf)
         buf.extend(b"x")
         self.assertEqual(self.stored("with.bin"), payload)
+
+    # -- reserve() / commit(): the reserved memory is owned by its exporter (G-F1) -----------
+
+    def reserve_and_fill(self, w, size, data):
+        mv = w.reserve(size)
+        mv[: len(data)] = data
+        return mv
+
+    def test_reserve_returns_a_writable_memoryview_owned_by_an_exporter(self):
+        w = self.writer("res-owner.bin")
+        mv = w.reserve(4096)
+        try:
+            self.assertIsInstance(mv, memoryview)
+            self.assertFalse(mv.readonly)
+            self.assertEqual(len(mv), 4096)
+            self.assertIsInstance(mv.obj, CORE.ReservedBuffer)
+            self.assertIs(mv[10:20].obj, mv.obj, "a slice shares the exporter")
+            self.assertEqual(
+                bytes(mv[:4]), bytes(4), "a reservation starts zero-filled"
+            )
+            mv[:4] = b"abcd"
+            self.assertEqual(bytes(memoryview(mv.obj)[:4]), b"abcd")
+        finally:
+            w.abort()
+
+    def test_views_stay_readable_after_commit_and_close(self):
+        from test_multipart_writer import payload_of
+
+        data = payload_of(6 * MIB, 71)
+        w = self.writer("res-close.bin")
+        mv = self.reserve_and_fill(w, 8 * MIB, data)
+        tail = mv[10:20]
+        w.commit(len(data))
+        w.close()
+        self.assertEqual(self.stored("res-close.bin"), data)
+        del mv
+        self.assertEqual(bytes(tail), data[10:20])
+        self.assertEqual(bytes(memoryview(tail.obj)[: len(data)]), data)
+
+    def test_short_commit_uploads_the_prefix_and_leaves_the_view_whole(self):
+        from test_multipart_writer import payload_of
+
+        data = payload_of(100, 72)
+        w = self.writer("res-short.bin")
+        mv = self.reserve_and_fill(w, 8 * MIB, data)
+        w.commit(len(data))
+        w.close()
+        self.assertEqual(self.stored("res-short.bin"), data)
+        self.assertEqual(len(mv), 8 * MIB)
+        self.assertEqual(bytes(mv[: len(data)]), data)
+
+    def test_invalid_commit_length_leaves_the_reservation_pending(self):
+        from test_multipart_writer import payload_of
+
+        data = payload_of(6 * MIB, 73)
+        w = self.writer("res-invalid.bin")
+        mv = self.reserve_and_fill(w, 6 * MIB, data)
+        with self.assertRaises(ValueError):
+            w.commit(6 * MIB + 1)
+        with self.assertRaises(RuntimeError):  # still pending: no second reserve
+            w.reserve(16)
+        self.assertEqual(bytes(mv[:64]), data[:64])
+        w.commit(6 * MIB)
+        w.close()
+        self.assertEqual(self.stored("res-invalid.bin"), data)
+
+    def test_views_stay_readable_after_abort(self):
+        from test_multipart_writer import payload_of
+
+        data = payload_of(6 * MIB, 74)
+        w = self.writer("res-abort.bin")
+        mv = self.reserve_and_fill(w, 8 * MIB, data)
+        w.abort()  # frees the writer's claim, not the memory
+        self.assertNotIn((self.bucket, "res-abort.bin"), self.server.objects)
+        self.assertEqual(bytes(mv[: len(data)]), data)
+
+    def test_views_stay_readable_after_the_writer_is_deleted(self):
+        from test_multipart_writer import payload_of
+
+        data = payload_of(2 * MIB, 75)
+        w = self.writer("res-del.bin")
+        mv = self.reserve_and_fill(w, 4 * MIB, data)
+        tail = mv[100:200]
+        del w
+        del mv
+        self.assertEqual(bytes(tail), data[100:200])
+        self.assertEqual(bytes(memoryview(tail.obj)[: len(data)]), data)
+
+    def test_views_stay_readable_after_leaving_a_with_block(self):
+        from test_multipart_writer import payload_of
+
+        data = payload_of(100, 76)
+        with (
+            self.assertRaises(KeyError),
+            self.writer("res-with-error.bin") as w,
+        ):
+            mv = self.reserve_and_fill(w, 1 * MIB, data)
+            raise KeyError("boom")  # leaves the block by an exception: abort
+        self.assertEqual(bytes(mv[: len(data)]), data)
+        self.assertNotIn((self.bucket, "res-with-error.bin"), self.server.objects)
+
+        written = payload_of(6 * MIB, 77)
+        with self.writer("res-with-ok.bin") as w:
+            w.write(written)
+            mv2 = self.reserve_and_fill(w, 1 * MIB, data)  # never committed
+        self.assertEqual(self.stored("res-with-ok.bin"), written)
+        self.assertEqual(bytes(mv2[: len(data)]), data)
+
+    def test_a_numpy_array_over_the_view_keeps_the_memory_alive(self):
+        from test_multipart_writer import payload_of
+
+        data = payload_of(6 * MIB, 78)
+        w = self.writer("res-numpy.bin")
+        mv = w.reserve(6 * MIB)
+        arr = np.frombuffer(mv, dtype=np.uint8)
+        arr[:] = np.frombuffer(data, dtype=np.uint8)  # fill through numpy
+        del mv
+        w.commit(6 * MIB)
+        w.close()
+        del w
+        self.assertEqual(self.stored("res-numpy.bin"), data)
+        self.assertEqual(arr.tobytes(), data)
+
+    def test_a_zero_byte_reservation_works(self):
+        w = self.writer("res-zero.bin")
+        mv = w.reserve(0)
+        self.assertEqual(len(mv), 0)
+        with self.assertRaises(ValueError):
+            w.commit(1)
+        w.commit(0)
+        w.write(bytes(6 * MIB))
+        w.close()
+        self.assertEqual(len(self.stored("res-zero.bin")), 6 * MIB)
 
     def test_small_bytesview_write_shares_the_view(self):
         view = s3dlio.generate_data(2 * MIB)
@@ -741,8 +873,8 @@ class TestParent:
     @pytest.mark.skipif(
         not os.path.exists("/proc/self/status"), reason="needs Linux /proc"
     )
-    def test_commit_does_not_pin_the_reservation(self):
-        proc = run_child("commit_pinning")
+    def test_reserved_memory_lives_as_long_as_its_views(self):
+        proc = run_child("reservation_lifetime")
         print(proc.stdout.strip())
         assert proc.returncode == 0, "child failed:\n" + proc.stdout + proc.stderr
 
@@ -773,6 +905,14 @@ class TestParent:
             doc = func.__doc__ or ""
             assert "ExportStillReferencedError" in doc, doc
             assert "precedence" in doc, doc
+
+    def test_reserve_and_commit_docstrings_state_the_ownership_contract(self):
+        reserve_doc = s3dlio.MultipartUploadWriter.reserve.__doc__ or ""
+        assert "ReservedBuffer" in reserve_doc, reserve_doc
+        assert "short commit" in reserve_doc.lower(), reserve_doc
+        assert "data-integrity" in reserve_doc, reserve_doc
+        commit_doc = s3dlio.MultipartUploadWriter.commit.__doc__ or ""
+        assert "ValueError" in commit_doc and "pending" in commit_doc, commit_doc
 
     def test_write_docstring_states_the_borrow_contract(self):
         doc = s3dlio.MultipartUploadWriter.write.__doc__

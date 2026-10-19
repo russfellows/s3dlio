@@ -10,10 +10,11 @@
 // Local only: no network, no credentials.
 
 use super::caller_buffer::{
-    receive_span, ChunkStream, ObjectFacts, OpenRequest, Opened, ReadOpener, ReceiveConfig,
+    receive_span, ChunkStream, ObjectFacts, OpenRequest, Opened, ReadOpener, ReceiveConfig, SpanOf,
 };
 use super::*;
 use crate::object_error::{object_error, ObjectErrorKind};
+use crate::range_version::ObjectVersion;
 use crate::receive_progress::ReceiveProgress;
 use async_trait::async_trait;
 use google_cloud_gax::error::Error as Gax;
@@ -34,10 +35,16 @@ struct State {
     break_first_after: Option<usize>,
     /// The object is replaced (new size, same generation reported) before the second open.
     replace_before_second: Option<Vec<u8>>,
+    /// The object is replaced by this content and generation just BEFORE the n-th open (counting
+    /// from 1) is answered, so open n and every later one see the new version.
+    replace_at_open: Option<(usize, Vec<u8>, i64)>,
+    /// The first open fails with a 403 (not retryable).
+    fail_first_open: bool,
     /// `(start, limit, generation)` of every open.
     requests: Vec<(u64, Option<u64>, Option<i64>)>,
 }
 
+#[derive(Clone)]
 struct Fake(Arc<Mutex<State>>);
 
 impl Fake {
@@ -48,6 +55,8 @@ impl Fake {
             chunk,
             break_first_after: None,
             replace_before_second: None,
+            replace_at_open: None,
+            fail_first_open: false,
             requests: Vec::new(),
         })))
     }
@@ -86,6 +95,23 @@ impl ReadOpener for Fake {
             if let Some(data) = st.replace_before_second.take() {
                 st.data = data;
             }
+        }
+        if st
+            .replace_at_open
+            .as_ref()
+            .is_some_and(|(n, _, _)| *n == st.requests.len())
+        {
+            if let Some((_, data, generation)) = st.replace_at_open.take() {
+                st.data = data;
+                st.generation = generation;
+            }
+        }
+        if st.fail_first_open && st.requests.len() == 1 {
+            return Err(Gax::http(
+                403,
+                http::HeaderMap::new(),
+                Bytes::from_static(b"denied"),
+            ));
         }
         let start = usize::try_from(request.start)
             .expect("start")
@@ -158,7 +184,13 @@ struct Outcome {
 async fn run(fake: &Fake, base: u64, n: usize) -> Outcome {
     let mut buf = vec![FILL; n + CANARY];
     let progress = ReceiveProgress::new();
-    let result = receive_span(fake, WHAT, base, true, &mut buf[..n], &progress, &config()).await;
+    // One range standing alone: its own version.
+    let version = ObjectVersion::new();
+    let span = SpanOf::Window {
+        base,
+        version: &version,
+    };
+    let result = receive_span(fake, WHAT, span, &mut buf[..n], &progress, &config()).await;
     Outcome {
         result,
         buf,
@@ -280,4 +312,224 @@ async fn a_window_starting_at_the_end_is_a_length_mismatch() {
         "{kind:?}"
     );
     out.assert_canary_intact();
+}
+
+// ---- one object version per logical GET (Blue stage G review, item G-F2) -----------------------
+//
+// The range engine reads an object as several independent ranged requests. Each used to start
+// unpinned, so replacing the object with another of the SAME length between two ranges gave a
+// successful body that was part one version and part the other. These tests run the real range
+// engine over the real ranged receive against a fake that replaces the object (new generation,
+// same length) just before a chosen open, and inspect EVERY open's requested generation.
+
+const GEN_B: i64 = 88;
+const OBJECT_LEN: usize = 100;
+const RANGE_LEN: usize = 25;
+
+fn engine_config() -> crate::range_engine_generic::RangeEngineConfig {
+    crate::range_engine_generic::RangeEngineConfig {
+        chunk_size: RANGE_LEN,
+        max_concurrent_ranges: 4,
+        min_split_size: 1,
+        range_timeout: Duration::from_secs(10),
+    }
+}
+
+/// One logical GET of the whole fake object through the range engine, the way
+/// `GcsObjectStore::get_with_range_engine` does it. `one_response` is the fallback for an object
+/// with no generation: here it opens the object once, unranged, through the fake and drains it.
+async fn logical_get(fake: &Fake) -> Result<Bytes> {
+    let version = Arc::new(ObjectVersion::<i64>::new());
+    let fill = {
+        let fake = fake.clone();
+        let version = Arc::clone(&version);
+        move |offset: u64, mut window: bytes::BytesMut| {
+            let fake = fake.clone();
+            let version = Arc::clone(&version);
+            async move {
+                let progress = ReceiveProgress::new();
+                let span = SpanOf::Window {
+                    base: offset,
+                    version: &version,
+                };
+                let written =
+                    receive_span(&fake, WHAT, span, &mut window[..], &progress, &config()).await?;
+                Ok((window, written))
+            }
+        }
+    };
+    let one_response = || async {
+        let opened = fake
+            .open(&OpenRequest {
+                start: 0,
+                limit: None,
+                generation: None,
+            })
+            .await
+            .map_err(|e| anyhow!("single response failed: {e}"))?;
+        let mut stream = opened.stream;
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next_chunk().await {
+            body.extend_from_slice(&chunk.map_err(|e| anyhow!("single response body: {e}"))?);
+        }
+        Ok(Bytes::from(body))
+    };
+    let (bytes, _) = crate::object_store::range_engine_download_versioned(
+        engine_config(),
+        OBJECT_LEN as u64,
+        false,
+        &version,
+        fill,
+        one_response,
+    )
+    .await?;
+    Ok(bytes)
+}
+
+/// The result is an error or the complete bytes of exactly one of the two versions.
+fn assert_not_mixed(result: &Result<Bytes>, a: &[u8], b: &[u8], fake: &Fake) {
+    if let Ok(body) = result {
+        assert!(
+            body.as_ref() == a || body.as_ref() == b,
+            "RED: a successful GET returned bytes of two versions; opens: {:?}",
+            fake.requests()
+        );
+    }
+}
+
+/// The object is replaced by another of the same length and a new generation as the SECOND open
+/// is answered: the first range saw version A, the others would see B. No success may mix them,
+/// and every open after the first must name version A's generation.
+#[tokio::test]
+async fn a_same_size_replacement_between_ranges_is_never_a_mixed_body() {
+    let a = pattern(OBJECT_LEN);
+    let b: Vec<u8> = a.iter().map(|byte| byte.wrapping_add(1) % 200).collect();
+    let fake = Fake::new(a.clone(), 7);
+    fake.0.lock().expect("lock").replace_at_open = Some((2, b.clone(), GEN_B));
+
+    let result = tokio::time::timeout(Duration::from_secs(20), logical_get(&fake))
+        .await
+        .expect("the logical GET finishes");
+    assert_not_mixed(&result, &a, &b, &fake);
+
+    let opens = fake.requests();
+    assert!(opens.len() >= 2, "several ranges were requested: {opens:?}");
+    assert_eq!(
+        opens[0].2, None,
+        "RED: the first range establishes the version and names none: {opens:?}"
+    );
+    for (i, open) in opens.iter().enumerate().skip(1) {
+        assert_eq!(
+            open.2,
+            Some(GEN),
+            "RED: open {} of a logical GET is not pinned to the first response's generation: {opens:?}",
+            i + 1
+        );
+    }
+    // The range engine reports a failed range as text, so the type is not available here (the
+    // typed `VersionChanged` of a pinned range is asserted by the receive-loop tests).
+    let err = result.expect_err("the pinned generation was replaced, so the read must fail");
+    assert!(
+        format!("{err:#}").contains("version changed"),
+        "the error says the version changed: {err:#}"
+    );
+}
+
+/// An unchanged object is read completely with one open per range, the first unpinned and every
+/// other one pinned to the generation the first reported.
+#[tokio::test]
+async fn an_unchanged_object_pins_every_later_range_to_the_first_generation() {
+    let a = pattern(OBJECT_LEN);
+    let fake = Fake::new(a.clone(), 7);
+    let got = logical_get(&fake).await.expect("read");
+    assert_eq!(got.as_ref(), a.as_slice());
+    let opens = fake.requests();
+    assert_eq!(opens.len(), OBJECT_LEN / RANGE_LEN, "{opens:?}");
+    assert_eq!(opens[0].2, None, "{opens:?}");
+    assert!(
+        opens[1..].iter().all(|open| open.2 == Some(GEN)),
+        "{opens:?}"
+    );
+}
+
+/// An object whose first response carries no generation cannot be pinned, and unpinned ranges are
+/// never combined: the other ranges fail at once and the object is read again as ONE unranged
+/// response. A replacement as the second open is answered gives the whole new object (the one
+/// response), never a mix, and no sibling range is ever opened.
+#[tokio::test]
+async fn without_a_generation_the_object_is_read_as_one_response() {
+    let a = pattern(OBJECT_LEN);
+    let b: Vec<u8> = a.iter().map(|byte| byte.wrapping_add(1) % 200).collect();
+    let fake = Fake::new(a.clone(), 7);
+    {
+        let mut st = fake.0.lock().expect("lock");
+        st.generation = 0;
+        st.replace_at_open = Some((2, b.clone(), 0));
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(20), logical_get(&fake))
+        .await
+        .expect("the logical GET finishes");
+    assert_not_mixed(&result, &a, &b, &fake);
+
+    let opens = fake.requests();
+    assert_eq!(
+        opens.first().map(|open| open.2),
+        Some(None),
+        "the first range names no generation: {opens:?}"
+    );
+    assert!(
+        opens.iter().all(|open| open.2.is_none()),
+        "there is no generation to name: {opens:?}"
+    );
+    assert_eq!(
+        opens.last(),
+        Some(&(0, None, None)),
+        "RED: the object was not read again as one unranged response: {opens:?}"
+    );
+    assert_eq!(
+        opens.len(),
+        2,
+        "the first range and the one whole-object response, no sibling range: {opens:?}"
+    );
+    assert_eq!(
+        result.expect("the single response succeeds").as_ref(),
+        b.as_slice(),
+        "the single response is the object as it is now"
+    );
+}
+
+/// A first range that fails (a 403, not retryable) releases the other ranges with its reason: the
+/// read fails promptly, it does not wait for ever for a generation that will never arrive, and
+/// no later range is opened.
+#[tokio::test]
+async fn a_failed_first_range_fails_the_read_without_hanging() {
+    let fake = Fake::new(pattern(OBJECT_LEN), 7);
+    fake.0.lock().expect("lock").fail_first_open = true;
+    let result = tokio::time::timeout(Duration::from_secs(20), logical_get(&fake))
+        .await
+        .expect("RED: the read hung waiting for the first range");
+    let err = result.expect_err("the first range failed");
+    assert!(
+        format!("{err:#}").contains("forbidden"),
+        "the error carries the failed range's reason, whichever range reports it: {err:#}"
+    );
+    assert_eq!(
+        fake.requests().len(),
+        1,
+        "no other range is opened after the first failed: {:?}",
+        fake.requests()
+    );
+}
+
+/// An object that has not been replaced is not affected by the pinning: the same bytes, and the
+/// pinned requests are exactly the ones a standalone range would make.
+#[tokio::test]
+async fn a_single_range_standing_alone_is_unpinned_and_unchanged() {
+    let data = pattern(OBJECT_LEN);
+    let fake = Fake::new(data.clone(), 7);
+    let out = run(&fake, 25, 25).await;
+    assert_eq!(out.result.as_ref().expect("received"), &25);
+    assert_eq!(&out.buf[..25], &data[25..50]);
+    assert_eq!(fake.requests(), vec![(25, Some(25), None)]);
 }

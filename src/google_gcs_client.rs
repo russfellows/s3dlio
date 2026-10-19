@@ -1773,6 +1773,7 @@ mod caller_buffer {
     use super::*;
     use crate::object_error::{attach_object_error, object_error};
     use crate::object_store::HeadMetadata;
+    use crate::range_version::{Leader, ObjectVersion, Role};
     use crate::receive_progress::{ReceiveProgress, SpanMark};
     use async_trait::async_trait;
     use google_cloud_gax::error::rpc::Code;
@@ -2048,30 +2049,122 @@ mod caller_buffer {
         progress: &ReceiveProgress,
         cfg: &ReceiveConfig,
     ) -> Result<()> {
-        receive_span(opener, what, 0, false, dst, progress, cfg)
+        receive_span(opener, what, SpanOf::Whole, dst, progress, cfg)
             .await
             .map(|_| ())
     }
 
-    /// [`receive_into`] for a span of the object: the bytes `base..base + dst.len()`.
+    /// Which part of the object one receive covers, and how it is tied to one version of it.
+    pub(super) enum SpanOf<'a> {
+        /// The whole object, exactly as [`receive_into`].
+        Whole,
+        /// The bytes `base..base + dst.len()`, one range of a read of several (or the only one):
+        /// every range of the same logical GET shares `version`.
+        Window {
+            base: u64,
+            version: &'a ObjectVersion<i64>,
+        },
+    }
+
+    /// What [`receive_planned`] is told about its span.
+    struct Plan<'a> {
+        base: u64,
+        ranged: bool,
+        /// The generation every request must name from the first one on; `None` for a request
+        /// that learns it from its own first response.
+        pinned: Option<i64>,
+        /// Set when this receive is the leader of a read of several ranges: the generation of
+        /// its first response is reported through it (as soon as the response arrives).
+        leader: Option<&'a Leader<'a, i64>>,
+    }
+
+    /// [`receive_into`] for a span of the object.
     ///
-    /// * `ranged == false`: the whole object (`base == 0`), exactly as [`receive_into`]: the
+    /// * [`SpanOf::Whole`]: the whole object (`base == 0`), exactly as [`receive_into`]: the
     ///   object's size must equal `dst.len()` and exactly that many bytes are written.
-    /// * `ranged == true` (the range engine, stage G R3): every request names its window
+    /// * [`SpanOf::Window`] (the range engine, stage G R3): every request names its window
     ///   (`start`, `limit`), the object must be at least `base` bytes long, and the bytes that
     ///   exist in the window are written (`min(dst.len(), size - base)`; the service clamps a
     ///   range to the end of the object). The count written is returned and the caller decides
     ///   whether a short answer is an error. Retries and repairs are pinned to the first
     ///   response's generation and size exactly as for the whole object.
+    ///
+    /// All the windows of one logical GET share one [`ObjectVersion`] (stage G review, G-F2):
+    /// the first window to start is sent unpinned and reports its response's generation as soon
+    /// as the response arrives; every other window waits for that, and every one of its requests
+    /// names that generation, so an object replaced between two windows (by another of the same
+    /// size included) is a `VersionChanged` error and never a body of two versions. A first
+    /// response with no usable generation fails the other windows at once (the caller then reads
+    /// the object as one response, see [`ObjectVersion::is_unavailable`]); a first window that
+    /// fails releases them with its reason.
     pub(super) async fn receive_span<O: ReadOpener + ?Sized>(
         opener: &O,
         what: &str,
-        base: u64,
-        ranged: bool,
+        span: SpanOf<'_>,
         dst: &mut [u8],
         progress: &ReceiveProgress,
         cfg: &ReceiveConfig,
     ) -> Result<usize> {
+        match span {
+            SpanOf::Whole => {
+                let plan = Plan {
+                    base: 0,
+                    ranged: false,
+                    pinned: None,
+                    leader: None,
+                };
+                receive_planned(opener, what, plan, dst, progress, cfg).await
+            }
+            SpanOf::Window { base, version } => {
+                // A window with nothing in it makes no request and takes no part in the version.
+                if dst.is_empty() {
+                    return Ok(0);
+                }
+                match version.join().await? {
+                    Role::Follower(generation) => {
+                        let plan = Plan {
+                            base,
+                            ranged: true,
+                            pinned: Some(generation),
+                            leader: None,
+                        };
+                        receive_planned(opener, what, plan, dst, progress, cfg).await
+                    }
+                    Role::Leader(leader) => {
+                        let plan = Plan {
+                            base,
+                            ranged: true,
+                            pinned: None,
+                            leader: Some(&leader),
+                        };
+                        let result = receive_planned(opener, what, plan, dst, progress, cfg).await;
+                        if let Err(e) = &result {
+                            // Releases the other windows with the reason (a no-op once the
+                            // generation was reported). Only the classification is passed on.
+                            leader.fail(loggable(e));
+                        }
+                        result
+                    }
+                }
+            }
+        }
+    }
+
+    /// The receive loop of [`receive_span`], for a span whose version handling is settled.
+    async fn receive_planned<O: ReadOpener + ?Sized>(
+        opener: &O,
+        what: &str,
+        plan: Plan<'_>,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        cfg: &ReceiveConfig,
+    ) -> Result<usize> {
+        let Plan {
+            base,
+            ranged,
+            pinned: initial_pin,
+            leader,
+        } = plan;
         let len = dst.len();
         let expected = to_u64(len)?;
         if ranged && len == 0 {
@@ -2079,7 +2172,7 @@ mod caller_buffer {
         }
         let mut span = SpanMark::new(progress);
         let mut cursor = 0usize;
-        let mut pinned: Option<i64> = None;
+        let mut pinned: Option<i64> = initial_pin;
         let mut first_size: Option<u64> = None;
         let mut budget = Budget::default();
         // A Rapid zero-length read is answered by the descriptor alone: no data range is
@@ -2150,8 +2243,17 @@ mod caller_buffer {
                     return Err(version_changed(what, "response generation differs"));
                 }
                 Some(_) => {}
-                None if opened.facts.generation > 0 => pinned = Some(opened.facts.generation),
-                None => {}
+                None if opened.facts.generation > 0 => {
+                    pinned = Some(opened.facts.generation);
+                    if let Some(leader) = leader {
+                        leader.publish(opened.facts.generation);
+                    }
+                }
+                None => {
+                    if let Some(leader) = leader {
+                        leader.unavailable();
+                    }
+                }
             }
 
             let size = size_to_u64(opened.facts.size, what)?;
@@ -2505,6 +2607,9 @@ mod caller_buffer {
         /// that starts at or past the end is a `LengthMismatch`. Rapid buckets use the Rapid route,
         /// others HTTP; retries and repairs are pinned to the first response's generation (see
         /// [`receive_span`]). `progress` counts the positions written.
+        ///
+        /// This is one range standing alone (its own version). The ranges of ONE logical GET go
+        /// through [`Self::get_object_range_into_versioned`] so that they share a version.
         pub async fn get_object_range_into(
             &self,
             bucket: &str,
@@ -2513,10 +2618,40 @@ mod caller_buffer {
             dst: &mut [u8],
             progress: &ReceiveProgress,
         ) -> Result<usize> {
+            self.get_object_range_into_versioned(
+                bucket,
+                object,
+                offset,
+                dst,
+                progress,
+                &ObjectVersion::new(),
+            )
+            .await
+        }
+
+        /// [`Self::get_object_range_into`] for one range of a read of SEVERAL ranges of the same
+        /// object (the range engine, stage G review G-F2): all of them share `version`, the
+        /// generation of the first response to arrive. The first range to start is sent
+        /// unpinned; every other range names that generation in every request it makes, so an
+        /// object replaced between two ranges is a `VersionChanged` error, never a body of two
+        /// versions. See [`receive_span`] for the rest.
+        pub(crate) async fn get_object_range_into_versioned(
+            &self,
+            bucket: &str,
+            object: &str,
+            offset: u64,
+            dst: &mut [u8],
+            progress: &ReceiveProgress,
+            version: &ObjectVersion<i64>,
+        ) -> Result<usize> {
             let what = format!("gs://{bucket}/{object}");
             let bucket_name = format_bucket_name(bucket);
             let rapid = self.is_rapid_bucket(bucket).await;
             let cfg = read_config(rapid, dst.len())?;
+            let span = SpanOf::Window {
+                base: offset,
+                version,
+            };
             if rapid {
                 debug!(
                     "GCS GET RANGE INTO (gRPC): {what}, offset={offset}, {} bytes",
@@ -2528,7 +2663,7 @@ mod caller_buffer {
                     object,
                     attempt_timeout: gcs_bidi_attempt_timeout(),
                 };
-                receive_span(&opener, &what, offset, true, dst, progress, &cfg).await
+                receive_span(&opener, &what, span, dst, progress, &cfg).await
             } else {
                 debug!(
                     "GCS GET RANGE INTO (HTTP): {what}, offset={offset}, {} bytes",
@@ -2539,7 +2674,7 @@ mod caller_buffer {
                     bucket_name: &bucket_name,
                     object,
                 };
-                receive_span(&opener, &what, offset, true, dst, progress, &cfg).await
+                receive_span(&opener, &what, span, dst, progress, &cfg).await
             }
         }
 

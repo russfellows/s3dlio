@@ -1046,7 +1046,10 @@ impl ObjectWriter for DirectIOWriter {
         // for its duration (a borrowed slice cannot be moved to another thread without a copy).
         crate::file_store::write_borrowed_blocking(&file, data)?;
         if self.config.sync_writes {
-            tokio::task::spawn_blocking(move || file.sync_all()).await??;
+            // Inline like the write above, NOT a detached `spawn_blocking`: this method then has
+            // no await point after the write, so a dropped caller future cannot abandon an fsync
+            // whose error nobody would see, or let it run beside the next write.
+            blocking_io(|| file.sync_all())?;
         }
         Ok(())
     }
@@ -3469,5 +3472,38 @@ mod direct_io_chunking_tests {
                 .expect_err("range of u64::MAX bytes");
             assert!(e.to_string().contains("too large"), "{e}");
         }
+    }
+}
+
+/// G-F3 (stage G review), same defect class as the owned write in `file_store.rs`: a
+/// `write_chunk` future that can be dropped between its write and its fsync lets the fsync
+/// detach.
+#[cfg(test)]
+mod write_chunk_cancel_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    /// With `sync_writes` the write and its fsync complete inside ONE poll: there is no await
+    /// point between them at which a dropped future could abandon the fsync (and its error).
+    #[tokio::test]
+    async fn buffered_write_chunk_with_sync_writes_has_no_await_point_after_the_write() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("w.bin");
+        let cfg = FileSystemConfig {
+            sync_writes: true,
+            direct_io: false,
+            ..FileSystemConfig::default()
+        };
+        let mut writer = DirectIOWriter::new(path.clone(), cfg)
+            .await
+            .expect("writer");
+        let data = vec![0x5A_u8; 8192];
+        let outcome = writer.write_chunk(&data).now_or_never();
+        assert!(
+            matches!(outcome, Some(Ok(()))),
+            "write_chunk did not finish in one poll: {outcome:?}"
+        );
+        assert_eq!(std::fs::read(&path).expect("read file"), data);
+        Box::new(writer).finalize().await.expect("finalize");
     }
 }

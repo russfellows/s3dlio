@@ -201,6 +201,16 @@ pub struct FileSystemWriter {
     hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
+    /// The blocking write of an owned chunk that has been submitted and not yet seen to finish.
+    ///
+    /// It lives HERE, not in the `write_owned_bytes` future: a caller may drop that future, and
+    /// a write that nobody tracks any more could run beside the next write (same cursor, wrong
+    /// order, wrong checksum) or outlive `finalize`'s sync. Every operation that touches the
+    /// file first calls `drain_pending`, which waits for it and reports its error.
+    pending_write: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    /// Test-only gate: the blocking write of an owned chunk waits here (see `tests::WriteGate`).
+    #[cfg(test)]
+    write_gate: Option<Arc<tests::WriteGate>>,
 }
 
 impl FileSystemWriter {
@@ -242,7 +252,28 @@ impl FileSystemWriter {
             hasher: Crc32c::new(),
             compression,
             compressor,
+            pending_write: None,
+            #[cfg(test)]
+            write_gate: None,
         })
+    }
+
+    /// Wait for the owned write still in flight, if any, and report its outcome (an I/O error,
+    /// or the failure of the blocking task itself).
+    ///
+    /// The handle is awaited by reference and cleared only after it completed: if the caller
+    /// drops THIS future mid-wait, the write stays tracked and the next call drains it.  The
+    /// outcome is reported once; the call that observes it consumes it.
+    async fn drain_pending(&mut self) -> Result<()> {
+        let Some(handle) = self.pending_write.as_mut() else {
+            return Ok(());
+        };
+        let joined = handle.await;
+        self.pending_write = None;
+        joined
+            .map_err(|e| anyhow::anyhow!("owned file write task did not complete: {e}"))?
+            .context("owned file write failed")?;
+        Ok(())
     }
 }
 
@@ -256,6 +287,8 @@ impl ObjectWriter for FileSystemWriter {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
+        // An earlier owned write (possibly abandoned by its caller) must finish first, in order.
+        self.drain_pending().await?;
 
         // Update checksum with original data (before compression)
         self.hasher.update(chunk);
@@ -291,6 +324,9 @@ impl ObjectWriter for FileSystemWriter {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
+        // The previous owned write, if any, finishes (and reports its error) first; this must
+        // come before the counters and the checksum change, so a dropped wait changes nothing.
+        self.drain_pending().await?;
         if self.compressor.is_some() {
             // Compression path: the encoder consumes the slice (a transform).
             return self.write_chunk(&data).await;
@@ -300,8 +336,18 @@ impl ObjectWriter for FileSystemWriter {
         };
         self.hasher.update(&data);
         self.bytes_written += data.len() as u64;
-        tokio::task::spawn_blocking(move || write_all_std(&file, &data)).await??;
-        Ok(())
+        #[cfg(test)]
+        let gate = self.write_gate.clone();
+        // The Vec is moved into the job: no copy.  The handle is kept in the writer (not only
+        // in this future), so dropping this future cannot detach the write unseen.
+        self.pending_write = Some(tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.pass()?;
+            }
+            write_all_std(&file, &data)
+        }));
+        self.drain_pending().await
     }
 
     async fn finalize(mut self: Box<Self>) -> Result<()> {
@@ -309,6 +355,9 @@ impl ObjectWriter for FileSystemWriter {
         if self.finalized {
             return Ok(());
         }
+
+        // Never sync (or return) while an earlier owned write is still running.
+        self.drain_pending().await?;
 
         if let Some(file) = self.file.take() {
             // Finalize compression if enabled
@@ -368,6 +417,11 @@ impl ObjectWriter for FileSystemWriter {
 
     async fn cancel(mut self: Box<Self>) -> Result<()> {
         self.finalized = true;
+        // Let a running write finish before the file is removed, so it cannot outlive the
+        // cleanup; its outcome no longer matters.
+        if let Err(e) = self.drain_pending().await {
+            debug!("FileSystemWriter::cancel: discarding the failure of a pending write: {e:#}");
+        }
         if let Some(_file) = self.file.take() {
             // File will be closed when dropped
         }
@@ -1142,5 +1196,299 @@ mod modified_time_tests {
             None
         );
         assert_eq!(modified_time_rfc3339(at(10_000_000_000_000, 0)), None);
+    }
+}
+
+/// Tests for the ordering and completion tracking of an owned write (stage G review, G-F3).
+///
+/// A blocking write is held at a gate so the tests control exactly when it can finish: no test
+/// here depends on how long a write takes. The "must not overtake" checks wait a fixed
+/// interval, which can only make a regression pass by luck of slowness, never fail a correct
+/// implementation.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
+
+    /// A short wait for something that must NOT happen.
+    const NEGATIVE_WAIT: Duration = Duration::from_millis(300);
+    /// The deadline for everything that must happen; a regression fails instead of hanging.
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Holds the blocking write of an owned chunk until the test releases it.
+    pub(super) struct WriteGate {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<bool>>,
+    }
+
+    impl WriteGate {
+        /// Runs on the blocking thread: announce arrival, then wait for the test's verdict
+        /// (`true` = go on and write, `false` = fail). A dropped test (sender gone) or a stuck
+        /// one (20 s) also fails the write, so no blocking thread outlives a failing test.
+        pub(super) fn pass(&self) -> std::io::Result<()> {
+            self.entered
+                .send(())
+                .map_err(|_| std::io::Error::other("write gate: test is gone"))?;
+            let release = self
+                .release
+                .lock()
+                .map_err(|_| std::io::Error::other("write gate poisoned"))?;
+            match release.recv_timeout(Duration::from_secs(20)) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(std::io::Error::other("injected write failure")),
+                Err(_) => Err(std::io::Error::other("write gate: never released")),
+            }
+        }
+    }
+
+    struct Rig {
+        writer: FileSystemWriter,
+        entered: UnboundedReceiver<()>,
+        release: std::sync::mpsc::Sender<bool>,
+        dir: tempfile::TempDir,
+    }
+
+    impl Rig {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut writer = FileSystemWriter::new_with_compression(
+                dir.path().join("out.bin"),
+                CompressionConfig::None,
+            )
+            .await
+            .expect("writer");
+            let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            writer.write_gate = Some(Arc::new(WriteGate {
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+            }));
+            Self {
+                writer,
+                entered,
+                release,
+                dir,
+            }
+        }
+
+        fn file(&self) -> PathBuf {
+            self.dir.path().join("out.bin")
+        }
+
+        /// Submit an owned write and DROP its future while the blocking job is held at the gate.
+        async fn submit_and_drop(&mut self, data: Vec<u8>) {
+            // `timeout` polls the future once before it looks at the clock: the write is
+            // submitted, cannot complete (it is gated), and the future is dropped.
+            let outcome =
+                tokio::time::timeout(Duration::ZERO, self.writer.write_owned_bytes(data)).await;
+            assert!(outcome.is_err(), "a gated write must not complete");
+            self.arrived().await;
+        }
+
+        /// Wait until a blocking write job has reached the gate.
+        async fn arrived(&mut self) {
+            tokio::time::timeout(DEADLINE, self.entered.recv())
+                .await
+                .expect("a write job reached the gate in time")
+                .expect("gate channel open");
+        }
+
+        fn fail_next(&self) {
+            self.release.send(false).expect("gate open");
+        }
+    }
+
+    /// No further job may have reached the gate.
+    fn assert_no_second_job(entered: &mut UnboundedReceiver<()>, what: &str) {
+        assert_eq!(
+            entered.try_recv(),
+            Err(TryRecvError::Empty),
+            "{what}: a second write job started while the first was still pending"
+        );
+    }
+
+    fn allow(release: &std::sync::mpsc::Sender<bool>) {
+        release.send(true).expect("gate open");
+    }
+
+    fn crc_label(data: &[u8]) -> String {
+        format!("crc32c:{:08x}", crc32c::crc32c(data))
+    }
+
+    /// A second write must wait for a dropped write, and then land after it.
+    #[tokio::test]
+    async fn next_write_waits_for_a_dropped_owned_write_and_keeps_order() {
+        let mut rig = Rig::new().await;
+        let go = rig.release.clone();
+        let first = vec![0xAA_u8; 1000];
+        let second = vec![0xBB_u8; 777];
+        rig.submit_and_drop(first.clone()).await;
+
+        let mut next = Box::pin(rig.writer.write_owned_bytes(second.clone()));
+        assert!(
+            tokio::time::timeout(NEGATIVE_WAIT, &mut next)
+                .await
+                .is_err(),
+            "the next write finished while the first was still blocked"
+        );
+        assert_no_second_job(&mut rig.entered, "write_owned_bytes");
+
+        allow(&go); // the first write
+        allow(&go); // the second write
+        tokio::time::timeout(DEADLINE, next)
+            .await
+            .expect("second write finished")
+            .expect("second write succeeded");
+
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+        assert_eq!(rig.writer.bytes_written(), expected.len() as u64);
+        assert_eq!(rig.writer.checksum(), Some(crc_label(&expected)));
+        let path = rig.file();
+        tokio::time::timeout(DEADLINE, Box::new(rig.writer).finalize())
+            .await
+            .expect("finalize finished")
+            .expect("finalize succeeded");
+        assert_eq!(std::fs::read(path).expect("read file"), expected);
+    }
+
+    /// The borrowed-slice write path honors the same ordering.
+    #[tokio::test]
+    async fn borrowed_write_waits_for_a_dropped_owned_write() {
+        let mut rig = Rig::new().await;
+        let go = rig.release.clone();
+        let first = vec![0x11_u8; 4096];
+        let second = vec![0x22_u8; 123];
+        rig.submit_and_drop(first.clone()).await;
+
+        {
+            let mut next = Box::pin(rig.writer.write_chunk(&second));
+            assert!(
+                tokio::time::timeout(NEGATIVE_WAIT, &mut next)
+                    .await
+                    .is_err(),
+                "write_chunk finished while the owned write was still blocked"
+            );
+            allow(&go); // the owned write
+            tokio::time::timeout(DEADLINE, next)
+                .await
+                .expect("write_chunk finished")
+                .expect("write_chunk succeeded");
+        }
+
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+        assert_eq!(rig.writer.checksum(), Some(crc_label(&expected)));
+        let path = rig.file();
+        tokio::time::timeout(DEADLINE, Box::new(rig.writer).finalize())
+            .await
+            .expect("finalize finished")
+            .expect("finalize succeeded");
+        assert_eq!(std::fs::read(path).expect("read file"), expected);
+    }
+
+    /// `finalize` must not sync and return while an earlier write is still running; a write
+    /// whose caller was dropped while it waited never started and so never lands.
+    #[tokio::test]
+    async fn finalize_waits_for_a_dropped_owned_write_and_a_dropped_drain_keeps_tracking() {
+        let mut rig = Rig::new().await;
+        let go = rig.release.clone();
+        let first = vec![0xC3_u8; 2048];
+        rig.submit_and_drop(first.clone()).await;
+
+        // A second write is dropped while it waits for the first: its drain is cancelled.
+        let outcome =
+            tokio::time::timeout(NEGATIVE_WAIT, rig.writer.write_owned_bytes(vec![0xEE; 64])).await;
+        assert!(outcome.is_err(), "second write must still be waiting");
+        assert_no_second_job(&mut rig.entered, "write_owned_bytes");
+
+        let path = rig.file();
+        let mut finalize = Box::pin(Box::new(rig.writer).finalize());
+        assert!(
+            tokio::time::timeout(NEGATIVE_WAIT, &mut finalize)
+                .await
+                .is_err(),
+            "finalize returned while the owned write was still blocked"
+        );
+        allow(&go);
+        tokio::time::timeout(DEADLINE, finalize)
+            .await
+            .expect("finalize finished")
+            .expect("finalize succeeded");
+        assert_eq!(std::fs::read(path).expect("read file"), first);
+    }
+
+    /// An error of a write whose caller was dropped is reported by the next call, whichever it is.
+    #[tokio::test]
+    async fn error_of_a_dropped_owned_write_reaches_the_next_owned_write() {
+        let mut rig = Rig::new().await;
+        rig.submit_and_drop(vec![1_u8; 100]).await;
+        rig.fail_next();
+        let err = tokio::time::timeout(DEADLINE, rig.writer.write_owned_bytes(vec![2_u8; 10]))
+            .await
+            .expect("write returned")
+            .expect_err("the earlier failure must be reported");
+        assert!(
+            format!("{err:#}").contains("injected write failure"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_of_a_dropped_owned_write_reaches_the_next_borrowed_write() {
+        let mut rig = Rig::new().await;
+        rig.submit_and_drop(vec![1_u8; 100]).await;
+        rig.fail_next();
+        let err = tokio::time::timeout(DEADLINE, rig.writer.write_chunk(&[2_u8; 10]))
+            .await
+            .expect("write returned")
+            .expect_err("the earlier failure must be reported");
+        assert!(
+            format!("{err:#}").contains("injected write failure"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_of_a_dropped_owned_write_reaches_finalize() {
+        let mut rig = Rig::new().await;
+        rig.submit_and_drop(vec![1_u8; 100]).await;
+        rig.fail_next();
+        let err = tokio::time::timeout(DEADLINE, Box::new(rig.writer).finalize())
+            .await
+            .expect("finalize returned")
+            .expect_err("finalize must not report success after a failed write");
+        assert!(
+            format!("{err:#}").contains("injected write failure"),
+            "{err:#}"
+        );
+    }
+
+    /// `cancel` deletes the partial file only after the running write is done, so the write
+    /// cannot re-create or outlive the cleanup.
+    #[tokio::test]
+    async fn cancel_waits_for_a_dropped_owned_write_then_removes_the_file() {
+        let mut rig = Rig::new().await;
+        let go = rig.release.clone();
+        rig.submit_and_drop(vec![9_u8; 512]).await;
+        let path = rig.file();
+        let mut cancel = Box::pin(Box::new(rig.writer).cancel());
+        assert!(
+            tokio::time::timeout(NEGATIVE_WAIT, &mut cancel)
+                .await
+                .is_err(),
+            "cancel returned while the owned write was still blocked"
+        );
+        assert!(
+            path.exists(),
+            "the file is removed only after the write is done"
+        );
+        allow(&go);
+        tokio::time::timeout(DEADLINE, cancel)
+            .await
+            .expect("cancel finished")
+            .expect("cancel succeeded");
+        assert!(!path.exists(), "cancel removes the partial file");
     }
 }

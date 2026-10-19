@@ -2594,7 +2594,7 @@ fn gcs_size_key(uri: &str) -> String {
 /// any request): the caller's fresh-size retry settles it, and a size just learned from the
 /// service (`guarded == false`) stays a legitimate empty read.
 #[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
-async fn range_engine_download_into<F, Fut>(
+pub(crate) async fn range_engine_download_into<F, Fut>(
     config: RangeEngineConfig,
     object_size: u64,
     guarded: bool,
@@ -2614,6 +2614,58 @@ where
     RangeEngine::new(config)
         .download_into_master(object_size, guarded, fill, None)
         .await
+}
+
+/// [`range_engine_download_into`] for a read whose ranges all share ONE object version
+/// (`version`), with the fallback for an object that has no usable version identity (stage G
+/// review, G-F2).
+///
+/// The RangeEngine starts its ranges independently, and a pin that holds inside one range does
+/// not hold across its siblings: an object replaced by another of the SAME size between two
+/// ranges would be assembled from both and no size check could see it. `fill` therefore takes
+/// part in `version`: the first range to start is sent unpinned and reports the identity of its
+/// response (an Azure strong ETag, a GCS generation), and every other range is sent pinned to it
+/// (see [`crate::range_version`]), so the service itself refuses another version and the read
+/// fails or, if a failed read is retried by the caller, starts over; a body of two versions is
+/// never returned.
+///
+/// When the first response carries no identity, nothing can pin the ranges and unpinned ranges
+/// are never combined: the other ranges fail at once, and `one_response` reads the WHOLE object as
+/// a single response instead (`None` in place of the engine's statistics, as no ranges were
+/// planned). The size still comes from the caller, which guards it as for the engine.
+#[cfg(any(
+    feature = "backend-azure",
+    all(feature = "backend-gcs", not(feature = "gcs-community"))
+))]
+pub(crate) async fn range_engine_download_versioned<T, F, Fut, S, SFut>(
+    config: RangeEngineConfig,
+    object_size: u64,
+    guarded: bool,
+    version: &crate::range_version::ObjectVersion<T>,
+    fill: F,
+    one_response: S,
+) -> Result<(
+    Bytes,
+    Option<crate::range_engine_generic::RangeDownloadStats>,
+)>
+where
+    T: Clone,
+    F: Fn(u64, bytes::BytesMut) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Result<(bytes::BytesMut, usize)>> + Send,
+    S: FnOnce() -> SFut,
+    SFut: std::future::Future<Output = Result<Bytes>>,
+{
+    match range_engine_download_into(config, object_size, guarded, fill).await {
+        Ok((bytes, stats)) => Ok((bytes, Some(stats))),
+        Err(e) if version.is_unavailable() => {
+            debug!(
+                "range read of {object_size} bytes: the first response carried no version \
+                 identity ({e:#}); reading the object as one response"
+            );
+            Ok((one_response().await?, None))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The future a range filler returns: the window it was given and the count of bytes written.
@@ -3085,6 +3137,28 @@ impl AzureObjectStore {
         cli.get_range_into(&key, offset, dst, progress).await
     }
 
+    /// [`AzureObjectStore::get_range_into`] for one range of a read of SEVERAL ranges of the
+    /// same blob: all of them share `version` and are therefore all of one version of the blob
+    /// (stage G review, G-F2). See [`AzureBlob::get_range_into_versioned`].
+    pub(crate) async fn get_range_into_versioned(
+        &self,
+        uri: &str,
+        offset: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        version: &crate::range_version::ObjectVersion<String>,
+    ) -> Result<usize> {
+        let (cli, key) = Self::client_for_object(uri, "GET")?;
+        debug!(
+            "AzureObjectStore::get_range_into_versioned uri='{}', offset={}, len={}",
+            uri,
+            offset,
+            dst.len()
+        );
+        cli.get_range_into_versioned(&key, offset, dst, progress, version)
+            .await
+    }
+
     /// Download using RangeEngine for concurrent range requests
     ///
     /// This method uses the generic RangeEngine to split large Azure blobs into
@@ -3099,8 +3173,20 @@ impl AzureObjectStore {
     /// `guarded`: the size came from a cache; see [`range_engine_download_into`].
     ///
     /// Every range is received straight into its window of one master buffer
-    /// ([`AzureObjectStore::get_range_into`]): the SDK chunk is copied once, into its final
-    /// place, and nothing is copied again when the ranges are joined.
+    /// ([`AzureObjectStore::get_range_into_versioned`]): the SDK chunk is copied once, into its
+    /// final place, and nothing is copied again when the ranges are joined.
+    ///
+    /// # One blob version per read
+    ///
+    /// All ranges are of ONE version of the blob (stage G review, G-F2): the first range to
+    /// start is sent unpinned and reports the strong ETag of its reply as soon as the headers
+    /// arrive, and every other range is sent with `If-Match` of that ETag. A blob replaced
+    /// between two ranges (by another of the same size included) is refused by the service
+    /// (`412`) and the read fails with a version error; it is never assembled from two versions.
+    /// The cost is about one round trip before the other ranges start, not one range's transfer.
+    /// A blob whose first reply has no strong ETag cannot be pinned, and unpinned ranges are never
+    /// combined: it is read again as one response through the SDK path, which itself falls back
+    /// to a single request without an ETag.
     async fn get_with_range_engine(
         &self,
         uri: &str,
@@ -3110,34 +3196,66 @@ impl AzureObjectStore {
         // Create closure that captures uri for the range receives
         let uri_owned = uri.to_string();
         let self_clone = self.clone();
+        let version = Arc::new(crate::range_version::ObjectVersion::<String>::new());
 
-        let fill = move |offset: u64, mut window: bytes::BytesMut| {
-            let uri = uri_owned.clone();
-            let store = self_clone.clone();
-            async move {
-                let progress = ReceiveProgress::new();
-                let written = store
-                    .get_range_into(&uri, offset, &mut window[..], &progress)
-                    .await?;
-                Ok((window, written))
+        let fill = {
+            let version = Arc::clone(&version);
+            move |offset: u64, mut window: bytes::BytesMut| {
+                let uri = uri_owned.clone();
+                let store = self_clone.clone();
+                let version = Arc::clone(&version);
+                async move {
+                    let progress = ReceiveProgress::new();
+                    let written = store
+                        .get_range_into_versioned(
+                            &uri,
+                            offset,
+                            &mut window[..],
+                            &progress,
+                            &version,
+                        )
+                        .await?;
+                    Ok((window, written))
+                }
             }
         };
 
-        let (bytes, stats) = range_engine_download_into(
+        // The blob has no strong ETag: one response, through the SDK path (its first request
+        // learns the length from the reply, so a stale size hint decides nothing).
+        let one_response = || async {
+            let (cli, _account, _container, key) = Self::client_for_uri(uri)?;
+            cli.get_with_sdk_concurrency_sized(
+                &key,
+                Some(self.config.sdk_download_concurrency),
+                Some(self.config.sdk_download_part_size),
+                Some(object_size),
+            )
+            .await
+        };
+
+        let (bytes, stats) = range_engine_download_versioned(
             self.config.range_engine.clone(),
             object_size,
             guarded,
+            &version,
             fill,
+            one_response,
         )
         .await?;
 
-        info!(
-            "RangeEngine (Azure) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
-            stats.bytes_downloaded,
-            stats.ranges_processed,
-            stats.throughput_mbps(),
-            stats.throughput_gbps()
-        );
+        match stats {
+            Some(stats) => info!(
+                "RangeEngine (Azure) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
+                stats.bytes_downloaded,
+                stats.ranges_processed,
+                stats.throughput_mbps(),
+                stats.throughput_gbps()
+            ),
+            None => info!(
+                "RangeEngine (Azure): no strong ETag, downloaded {} bytes as one response",
+                bytes.len()
+            ),
+        }
 
         Ok(bytes)
     }
@@ -3842,6 +3960,10 @@ impl GcsObjectStore {
     /// clamps it); a range that starts past the end is an error. Each chunk is copied once,
     /// into its place in `dst`. Not a method of the [`ObjectStore`] trait: a logging wrapper
     /// would otherwise answer `Unsupported` for it.
+    ///
+    /// This is one range standing alone: it is of whatever version the object has when it is
+    /// read, and its own retries are pinned to that. Several ranges of ONE read must share a
+    /// version, which only [`GcsObjectStore::get`] arranges.
     #[cfg(not(feature = "gcs-community"))]
     pub async fn get_range_into(
         &self,
@@ -3849,6 +3971,28 @@ impl GcsObjectStore {
         offset: u64,
         dst: &mut [u8],
         progress: &ReceiveProgress,
+    ) -> Result<usize> {
+        self.get_range_into_versioned(
+            uri,
+            offset,
+            dst,
+            progress,
+            &crate::range_version::ObjectVersion::new(),
+        )
+        .await
+    }
+
+    /// [`GcsObjectStore::get_range_into`] for one range of a read of SEVERAL ranges of the same
+    /// object: all of them share `version` and are therefore all of one generation of the object
+    /// (stage G review, G-F2). See [`GcsClient::get_object_range_into_versioned`].
+    #[cfg(not(feature = "gcs-community"))]
+    pub(crate) async fn get_range_into_versioned(
+        &self,
+        uri: &str,
+        offset: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        version: &crate::range_version::ObjectVersion<i64>,
     ) -> Result<usize> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         if object.is_empty() {
@@ -3862,7 +4006,7 @@ impl GcsObjectStore {
         );
         let client = self.get_client().await?;
         client
-            .get_object_range_into(&bucket, &object, offset, dst, progress)
+            .get_object_range_into_versioned(&bucket, &object, offset, dst, progress, version)
             .await
     }
 
@@ -3875,53 +4019,118 @@ impl GcsObjectStore {
     /// `guarded`: the size came from a cache; see [`range_engine_download_into`].
     ///
     /// With the official GCS client every range is received straight into its window of one
-    /// master buffer ([`GcsObjectStore::get_range_into`]). The community client has no receive
-    /// loop of that kind; its ranges are copied into their windows (documented at
+    /// master buffer ([`GcsObjectStore::get_range_into_versioned`]). The community client has no
+    /// receive loop of that kind; its ranges are copied into their windows (documented at
     /// `fill_from_get_range`).
+    ///
+    /// # One object version per read
+    ///
+    /// All ranges are of ONE generation of the object (stage G review, G-F2).
+    ///
+    /// * Official client: the first range to start is sent unpinned and reports the generation of
+    ///   its response as soon as the response arrives; every other range, and every retry or
+    ///   repair of it, names that generation. An object replaced between two ranges (by another of
+    ///   the same size included) is a `VersionChanged` error, never a body of two versions. The
+    ///   cost is about one round trip before the other ranges start. A first response with no
+    ///   generation cannot pin anything, and unpinned ranges are never combined: the object is
+    ///   read again as one response.
+    /// * Community client: the generation is read first (one metadata request) and every ranged
+    ///   request names it, so the service itself refuses any other generation. An object without
+    ///   a generation is read as one response.
     async fn get_with_range_engine(
         &self,
         uri: &str,
         object_size: u64,
         guarded: bool,
     ) -> Result<Bytes> {
-        // Create closure that captures uri for the range receives
-        let uri_owned = uri.to_string();
-        let self_clone = self.clone();
+        // The object read as one response: the fallback of an object that cannot be pinned.
+        let one_response = || async {
+            let (bucket, object) = parse_gcs_uri(uri)?;
+            let client = self.get_client().await?;
+            client.get_object(&bucket, &object).await
+        };
 
         #[cfg(not(feature = "gcs-community"))]
-        let fill = move |offset: u64, mut window: bytes::BytesMut| {
-            let uri = uri_owned.clone();
-            let store = self_clone.clone();
-            async move {
-                let progress = ReceiveProgress::new();
-                let written = store
-                    .get_range_into(&uri, offset, &mut window[..], &progress)
-                    .await?;
-                Ok((window, written))
-            }
+        let (bytes, stats) = {
+            let uri_owned = uri.to_string();
+            let self_clone = self.clone();
+            let version = Arc::new(crate::range_version::ObjectVersion::<i64>::new());
+            let fill = {
+                let version = Arc::clone(&version);
+                move |offset: u64, mut window: bytes::BytesMut| {
+                    let uri = uri_owned.clone();
+                    let store = self_clone.clone();
+                    let version = Arc::clone(&version);
+                    async move {
+                        let progress = ReceiveProgress::new();
+                        let written = store
+                            .get_range_into_versioned(
+                                &uri,
+                                offset,
+                                &mut window[..],
+                                &progress,
+                                &version,
+                            )
+                            .await?;
+                        Ok((window, written))
+                    }
+                }
+            };
+            range_engine_download_versioned(
+                self.config.range_engine.clone(),
+                object_size,
+                guarded,
+                &version,
+                fill,
+                one_response,
+            )
+            .await?
         };
         #[cfg(feature = "gcs-community")]
-        let fill = fill_from_get_range(move |offset: u64, length: u64| {
-            let store = self_clone.clone();
-            let uri = uri_owned.clone();
-            async move { store.get_range(&uri, offset, Some(length)).await }
-        });
+        let (bytes, stats) = {
+            let (bucket, object) = parse_gcs_uri(uri)?;
+            let client = self.get_client().await?;
+            // The community client's ranged request can name a generation but does not report
+            // the one it served, so the generation is read first and every range names it.
+            let generation = client.object_generation(&bucket, &object).await?;
+            if generation <= 0 {
+                // Nothing to pin the ranges to, and unpinned ranges are never combined.
+                (one_response().await?, None)
+            } else {
+                let fill = fill_from_get_range(move |offset: u64, length: u64| {
+                    let client = client.clone();
+                    let bucket = bucket.clone();
+                    let object = object.clone();
+                    async move {
+                        client
+                            .get_object_range_pinned(&bucket, &object, offset, length, generation)
+                            .await
+                    }
+                });
+                let (bytes, stats) = range_engine_download_into(
+                    self.config.range_engine.clone(),
+                    object_size,
+                    guarded,
+                    fill,
+                )
+                .await?;
+                (bytes, Some(stats))
+            }
+        };
 
-        let (bytes, stats) = range_engine_download_into(
-            self.config.range_engine.clone(),
-            object_size,
-            guarded,
-            fill,
-        )
-        .await?;
-
-        info!(
-            "RangeEngine (GCS) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
-            stats.bytes_downloaded,
-            stats.ranges_processed,
-            stats.throughput_mbps(),
-            stats.throughput_gbps()
-        );
+        match stats {
+            Some(stats) => info!(
+                "RangeEngine (GCS) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
+                stats.bytes_downloaded,
+                stats.ranges_processed,
+                stats.throughput_mbps(),
+                stats.throughput_gbps()
+            ),
+            None => info!(
+                "RangeEngine (GCS): no generation to pin, downloaded {} bytes as one response",
+                bytes.len()
+            ),
+        }
 
         Ok(bytes)
     }
@@ -6932,6 +7141,37 @@ mod gcs_size_cache_hygiene_tests {
         assert!(
             get.contains("fresh_object_size(uri)"),
             "no fresh-size retry"
+        );
+    }
+
+    /// GCS cannot run offline (its client needs credentials), so the wiring of the one-version
+    /// rule (stage G review, G-F2) is pinned by source: the official client's ranges share an
+    /// `ObjectVersion` and fall back to one response, and the community client, which cannot
+    /// report the generation it served, reads the generation first and names it in every range.
+    /// The behaviour of the official route is tested against a fake in `gcs_range_into_tests.rs`.
+    #[test]
+    fn the_range_engine_reads_one_generation() {
+        let src = include_str!("object_store.rs");
+        let start = src
+            .find("impl GcsObjectStore {")
+            .expect("impl GcsObjectStore");
+        let body = &src[start..];
+        let a = body
+            .find("async fn get_with_range_engine(")
+            .expect("get_with_range_engine");
+        let end = body[a..].find("\n    }\n").expect("end") + a;
+        let route = &body[a..end];
+        assert!(
+            route.contains("range_engine_download_versioned("),
+            "the official route does not use the shared-version fan-out"
+        );
+        assert!(
+            route.contains(".get_range_into_versioned("),
+            "the official route's ranges do not share a version"
+        );
+        assert!(
+            route.contains(".object_generation(") && route.contains(".get_object_range_pinned("),
+            "the community route does not pin its ranges to one generation"
         );
     }
 }

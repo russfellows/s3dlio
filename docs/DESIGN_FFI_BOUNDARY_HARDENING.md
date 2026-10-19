@@ -100,6 +100,10 @@ all. That gap is what §3 proposes to close.
 
 ### 1.3 `reserve()` use-after-free fix (`python_advanced_api.rs`) — DONE, needs live-test sign-off
 
+> **Superseded (stage G review, G-F1).** The self-pin described below protected only the reservation window and
+> left a memoryview retained past `commit()`/`close()`/`abort()` unprotected. `reserve()` now returns a memoryview
+> over an owning exporter (`s3dlio.ReservedBuffer`) and the self-pin is gone; see `docs/PYTHON_API_GUIDE.md`.
+
 This one is implemented and passes the full local gate (see below), but
 **could not be exercised against a live S3 endpoint in this session** — s3-ultra
 is not currently running in this sandbox. Flagging clearly per

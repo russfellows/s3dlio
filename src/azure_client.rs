@@ -15,6 +15,7 @@ use crate::azure_credential::{self, CredentialMode};
 use crate::data_loader::parallel_fetch::DropCancel;
 use crate::object_error::ObjectErrorKind;
 use crate::object_store::HeadMetadata;
+use crate::range_version::{Leader, ObjectVersion, Role};
 use crate::read_buffer::ReadBuffer;
 use crate::receive_progress::{ReceiveProgress, SpanMark};
 
@@ -726,6 +727,18 @@ fn usable_etag(etag: Option<&azure_core::http::Etag>) -> Option<String> {
     (!text.is_empty() && !text.starts_with("W/")).then(|| text.to_string())
 }
 
+/// How one ranged request relates to the version of the blob (stage G review, G-F2).
+enum RangeVersion<'a> {
+    /// No version is checked: a request that is the whole read, or that stands alone.
+    Unpinned,
+    /// The request carries `If-Match: etag` and its reply must carry the same strong ETag.
+    Pinned(&'a str),
+    /// The first range of a read of several: sent unpinned, and the strong ETag of its reply (as
+    /// soon as the headers arrive, before the body) is reported to the other ranges through the
+    /// leader, or "unavailable" when the reply has none.
+    Lead(&'a Leader<'a, String>),
+}
+
 /// The blob's sizes as a first partition reports them, for a blob larger than that partition.
 #[derive(Clone, Copy)]
 struct LargeBlob {
@@ -1042,21 +1055,67 @@ impl AzureBlob {
         }
         let blob = self.blob_client(key)?;
         let mut span = SpanMark::new(progress);
-        self.fetch_range_into(&blob, start, dst, &mut span, None)
+        self.fetch_range_into(&blob, start, dst, &mut span, RangeVersion::Unpinned)
             .await
     }
 
+    /// [`Self::get_range_into`] for one range of a read of SEVERAL ranges of the same blob (the
+    /// range engine, stage G review G-F2): all of them share `version`, so they are all of ONE
+    /// version of the blob.
+    ///
+    /// The first range to ask leads: it is sent unpinned and reports the strong ETag of its reply
+    /// as soon as the headers arrive. Every other range waits for that and is sent with
+    /// `If-Match` of that ETag, so a blob replaced by another (of any size, the same size
+    /// included) between two ranges is refused by the service (`412`) or, should a reply carry
+    /// another ETag, by the check in [`Self::fetch_range_into`]: a `VersionChanged` error, never a
+    /// body of two versions. A first reply with no strong ETag cannot pin anything: the other
+    /// ranges fail at once (see [`ObjectVersion::is_unavailable`]) and the caller reads the blob as
+    /// one response. Nothing else differs from [`Self::get_range_into`]; each chunk is still
+    /// copied once, into its place in `dst`.
+    pub(crate) async fn get_range_into_versioned(
+        &self,
+        key: &str,
+        start: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        version: &ObjectVersion<String>,
+    ) -> Result<usize> {
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        let blob = self.blob_client(key)?;
+        let mut span = SpanMark::new(progress);
+        match version.join().await? {
+            Role::Follower(etag) => self
+                .fetch_range_into(&blob, start, dst, &mut span, RangeVersion::Pinned(&etag))
+                .await
+                .map_err(|e| attach_azure_classification(e, true)),
+            Role::Leader(leader) => {
+                let result = self
+                    .fetch_range_into(&blob, start, dst, &mut span, RangeVersion::Lead(&leader))
+                    .await;
+                if let Err(e) = &result {
+                    // Releases the other ranges with the reason (a no-op once it has reported).
+                    leader.fail(format!("{e:#}"));
+                }
+                result
+            }
+        }
+    }
+
     /// One ranged request for `start..start + dst.len()` and its checked receive into `dst`;
-    /// returns the number of bytes written (see [`Self::get_range_into`]). `if_match` pins the
-    /// request to a version: the service answers 412 for another one, and a reply that does not
-    /// carry the same strong ETag is a `VersionChanged`.
+    /// returns the number of bytes written (see [`Self::get_range_into`]). `version` says how the
+    /// request relates to the blob's version: `Pinned` sends `If-Match` (the service answers 412
+    /// for another version, and a reply that does not carry the same strong ETag is a
+    /// `VersionChanged`), `Lead` reports the reply's strong ETag to the other ranges of the read,
+    /// `Unpinned` checks nothing.
     async fn fetch_range_into(
         &self,
         blob: &BlobClient,
         start: u64,
         dst: &mut [u8],
         span: &mut SpanMark<'_>,
-        if_match: Option<&str>,
+        version: RangeVersion<'_>,
     ) -> Result<usize> {
         let wanted = len_u64(dst.len())?;
         start
@@ -1070,22 +1129,33 @@ impl AzureBlob {
             range: Some(HttpRange::new(start, wanted)),
             parallel: NonZeroUsize::new(1),
             partition_size: Some(partition_size),
-            if_match: if_match.map(azure_core::http::Etag::from),
+            if_match: match version {
+                RangeVersion::Pinned(pinned) => Some(azure_core::http::Etag::from(pinned)),
+                RangeVersion::Unpinned | RangeVersion::Lead(_) => None,
+            },
             ..Default::default()
         };
         let resp = blob
             .download(Some(options))
             .await
             .map_err(|e| self.auth_err(e))?;
-        if let Some(pinned) = if_match {
-            if usable_etag(resp.properties.etag.as_ref()).as_deref() != Some(pinned) {
-                return Err(crate::object_error::attach_object_error(
-                    anyhow!("the blob's ETag changed between requests"),
-                    ObjectErrorKind::VersionChanged,
-                    "az",
-                    "response ETag differs from the pinned one",
-                ));
+        let response_etag = usable_etag(resp.properties.etag.as_ref());
+        match version {
+            RangeVersion::Unpinned => {}
+            RangeVersion::Pinned(pinned) => {
+                if response_etag.as_deref() != Some(pinned) {
+                    return Err(crate::object_error::attach_object_error(
+                        anyhow!("the blob's ETag changed between requests"),
+                        ObjectErrorKind::VersionChanged,
+                        "az",
+                        "response ETag differs from the pinned one",
+                    ));
+                }
             }
+            RangeVersion::Lead(leader) => match response_etag {
+                Some(etag) => leader.publish(etag),
+                None => leader.unavailable(),
+            },
         }
         let content_range = resp
             .headers
@@ -1394,7 +1464,7 @@ impl AzureBlob {
         let progress = ReceiveProgress::new();
         let mut span = SpanMark::new(&progress);
         let received = self
-            .fetch_range_into(blob, at, part, &mut span, Some(etag))
+            .fetch_range_into(blob, at, part, &mut span, RangeVersion::Pinned(etag))
             .await
             .map_err(|e| attach_azure_classification(e, true))?;
         if received != wanted {

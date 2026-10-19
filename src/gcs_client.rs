@@ -141,9 +141,62 @@ impl GcsClient {
         offset: u64,
         length: Option<u64>,
     ) -> Result<Bytes> {
+        self.get_object_range_generation(bucket, object, offset, length, None)
+            .await
+    }
+
+    /// Get `length` bytes of an object from `offset`, of generation `generation` only (stage G
+    /// review, G-F2): the request names the generation, so the service answers an error instead
+    /// of the bytes of any other generation. The range engine reads all the ranges of one
+    /// object with the same generation (see [`GcsClient::object_generation`]), so the ranges
+    /// cannot be of two versions.
+    pub async fn get_object_range_pinned(
+        &self,
+        bucket: &str,
+        object: &str,
+        offset: u64,
+        length: u64,
+        generation: i64,
+    ) -> Result<Bytes> {
+        self.get_object_range_generation(bucket, object, offset, Some(length), Some(generation))
+            .await
+    }
+
+    /// The generation of the object now, from its metadata; `<= 0` when the service gave none.
+    /// One metadata request; the range engine uses it to pin all the ranges of one read to the
+    /// same version.
+    pub async fn object_generation(&self, bucket: &str, object: &str) -> Result<i64> {
+        debug!("GCS GENERATION: bucket={}, object={}", bucket, object);
+        let obj = self
+            .client
+            .get_object(&GetObjectRequest {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "GCS GENERATION failed for gs://{}/{}: {}",
+                    bucket,
+                    object,
+                    e
+                )
+            })?;
+        Ok(obj.generation)
+    }
+
+    async fn get_object_range_generation(
+        &self,
+        bucket: &str,
+        object: &str,
+        offset: u64,
+        length: Option<u64>,
+        generation: Option<i64>,
+    ) -> Result<Bytes> {
         debug!(
-            "GCS GET RANGE: bucket={}, object={}, offset={}, length={:?}",
-            bucket, object, offset, length
+            "GCS GET RANGE: bucket={}, object={}, offset={}, length={:?}, generation={:?}",
+            bucket, object, offset, length, generation
         );
 
         // audit #152 finding 2.7 (bug B4): same zero-length short-circuit as
@@ -168,6 +221,7 @@ impl GcsClient {
                 &GetObjectRequest {
                     bucket: bucket.to_string(),
                     object: object.to_string(),
+                    generation,
                     ..Default::default()
                 },
                 &range,

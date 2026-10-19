@@ -794,12 +794,18 @@ when the call was made. They now read every buffer in place, like `put_bytes`:
   buffer, taken when the call is made, so you may reuse the buffers immediately.
 * `bytes`, `bytes` subclasses, `memoryview` of `bytes` and `BytesView` are never copied in either mode.
 
-**A failure stops the rest.** The first item that fails ends the batch: items that have not started never start,
-items still queued are dropped at once (releasing their buffers), and that item's own error is raised, not a
-generic "batch stopped" error. Writes that are already running cannot be interrupted, so the call (or awaitable)
-waits for them, and an object that was being written when another failed may still be completed. Cancelling the
-`put_many_async` awaitable stops the batch the same way: nothing that has not started is uploaded, and the
-cancellation is delivered once the writes already running are done.
+**A failure stops the rest.** Items are admitted in list order (first in, first out), so the first `max_in_flight`
+items start first; with `max_in_flight` above 1 that is the order they *start* in, not the order they finish in. The
+first item that fails ends the batch: items that have not started never start, items still queued are dropped at once
+(releasing their buffers), every item still in flight is **aborted** (its payload is dropped at once, so its request
+may never complete), and that item's own error is raised, not a generic "batch stopped" error. Only a write that
+already runs on a blocking thread cannot be stopped; the call (or awaitable) waits for it and for any other native
+reader of your buffers before it returns. The batch is **not transactional**: objects whose put completed before the
+failure stay stored; an item aborted in flight may be absent, complete or (on a store whose put is not atomic, such
+as `file://`) partial, and the error does not say which; items that never started were not written. After an error,
+re-check or re-put every object that is not known to be complete. Cancelling the `put_many_async` awaitable stops
+the batch the same way: nothing that has not started is uploaded, items in flight are aborted, and the cancellation
+is delivered once the native readers that survive cancellation are done.
 
 ```python
 # List of (uri, data) tuples
@@ -1165,11 +1171,20 @@ with s3dlio.MultipartUploadWriter.from_uri("s3://bucket/big.bin") as w:
   and over an exception propagating out of the `with` block (in `__exit__`): the upload error is quoted in its message
   ("the upload itself failed: ..."). `abort()` cancels the parts still in flight before waiting. Leaving a `with` block
   because of an exception aborts the upload.
-* **`reserve(size)` / `commit(nbytes)`** (the highest-throughput path) hands you a Rust-owned buffer to fill. `commit`
-  gives that buffer to the writer (shrunk to `nbytes` first, so a short commit does not pin the whole reservation) and
-  you must not use the memoryview afterwards. A commit smaller than the threshold is copied once into the part buffer
-  (and the reserved buffer is freed); a larger one is sliced into parts with no copy. Nothing of yours is borrowed, so
-  there is nothing to wait for.
+* **`reserve(size)` / `commit(nbytes)`** (the highest-throughput path) hands you a Rust-owned buffer to fill. The
+  memoryview it returns is backed by an exporter object (`mv.obj`, an `s3dlio.ReservedBuffer`) that owns the memory:
+  the memory never moves, and it stays allocated while ANY view, slice or NumPy array over it exists, while the writer
+  holds the reservation, and while the upload still reads it. `close()`, `abort()`, leaving a `with` block, deleting
+  the writer and `commit()` therefore never leave a view you retain pointing at freed memory; reading it stays safe.
+  `commit(nbytes)` validates `nbytes` first: a length larger than the reservation raises `ValueError` and the
+  reservation stays pending (still committable). On success the upload takes the first `nbytes` bytes straight out of
+  the reserved memory, with no copy (a commit smaller than the threshold is copied once into the part buffer instead,
+  like any small write). Two consequences, both by design: a **short commit keeps the whole reservation allocated**
+  until its part is uploaded and every view is gone (it is not shrunk: shrinking can relocate the memory), so reserve
+  what you will fill; and **writing through a retained view after `commit()` changes the payload in flight**, so the
+  object contains whatever the upload happened to read, or a signed part is rejected for a payload checksum mismatch
+  (a data-integrity contract, like a borrowed `write()`; it can
+  never corrupt memory). Nothing of yours is borrowed, so `close()` has no buffer of yours to wait for.
 
 ---
 

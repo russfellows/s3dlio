@@ -1898,19 +1898,14 @@ pub(crate) struct WriterTestGuard(mpsc::Receiver<PartMsg>);
 
 #[cfg(all(test, feature = "extension-module"))]
 impl WriterTestGuard {
-    /// `(length, allocation capacity)` of every single-chunk part queued so far. A part that is
-    /// a slice of a bigger allocation reports the whole allocation's capacity.
-    pub(crate) fn part_capacities(&mut self) -> Vec<(usize, usize)> {
+    /// Every chunk of every part queued so far, taken out of the channel. They are the very
+    /// `Bytes` the writer queued (same allocation, nothing copied), so a test can compare
+    /// addresses and owner counts.
+    pub(crate) fn take_chunks(&mut self) -> Vec<Bytes> {
         let mut out = Vec::new();
         while let Ok(msg) = self.0.try_recv() {
             if let PartMsg::Part { data, .. } = msg {
-                for chunk in data.chunks {
-                    let len = chunk.len();
-                    match chunk.try_into_mut() {
-                        Ok(owned) => out.push((len, owned.capacity())),
-                        Err(_) => out.push((len, usize::MAX)),
-                    }
-                }
+                out.extend(data.chunks);
             }
         }
         out

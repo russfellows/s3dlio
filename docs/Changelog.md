@@ -517,6 +517,46 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
   use `download`), and documentation examples that passed `get` an output path now use `download`.
 - Test scripts and three legacy Python tests read the Azure account from `AZURE_BLOB_ACCOUNT`
   instead of naming one. Test-only; no library change.
+- **Azure and GCS RangeEngine reads no longer return a body of two versions (stage G review G-F2).**
+  The RangeEngine reads one object as several independent ranged requests, and each range was sent
+  unpinned: pinning a range's own retries did not pin its siblings, so replacing the object with
+  another of the SAME length between two ranges gave a successful `get` whose bytes were part one
+  version and part the other, which neither the size check nor the cached-size guard could see
+  (inherited from the previous range path; it affected the selected RangeEngine route, not the Azure
+  SDK managed download). Now all ranges of one read share one object version: the first range to
+  start is sent unpinned and reports the strong ETag (Azure) or generation (official GCS) of its
+  response as soon as the headers arrive, and every other range waits for that (about one round trip)
+  and is sent pinned to it: `If-Match` on Azure, the generation on every request and repair on GCS.
+  A replaced object is refused by the service or, should a reply name another version, by the check
+  (`VersionChanged`), and a read with a cached size starts over once with a fresh size, as before;
+  a body of two versions is never returned. Without a strong ETag (Azure) or a generation (GCS) the
+  ranges cannot be pinned, and unpinned ranges are never combined: the object is read as one
+  response instead. The community GCS client (`gcs-community`) reads the object's generation first
+  (one metadata request) and names it in every range request, with the same single-response
+  fallback. Zero copy is unchanged: every range still lands in its window of the one master buffer.
+  Tested against a fake Blob service (`tests/azure_range_version.rs`) and a fake GCS opener driving
+  the real range engine (`src/gcs_range_into_tests.rs`), which replace the object between ranges and
+  inspect every request.
+- **`MultipartUploadWriter.reserve()` views can no longer point at freed memory (stage G review G-F1;
+  present since `reserve()` was added).** The memoryview that `reserve()` returned had no owner: once
+  `commit()` (even one rejected for a bad length), `close()`, `abort()`, leaving a `with` block or
+  deleting the writer released the buffer, a memoryview or slice the caller still held pointed at
+  freed memory. The reservation is now a fixed allocation owned by an exporter object (`mv.obj`, an
+  `s3dlio.ReservedBuffer`) that every view and slice keeps alive; it is never moved or resized and is
+  freed only when the writer, every view and the upload are all done with it. `commit()` hands the
+  upload the same memory with no copy, and validates `nbytes` first: a length larger than the
+  reservation raises `ValueError` and leaves the reservation pending. The shrink of a short commit is
+  gone (a realloc may move memory a view points at), so a short commit keeps the whole reservation
+  allocated until its part is uploaded and its views are gone. Writing through a retained view after
+  `commit()` changes the payload in flight (or makes a signed part fail its checksum); it can never
+  corrupt memory. The writer no longer pins itself while a reservation is pending.
+- **A cancelled owned write to a `file://` writer can no longer be overtaken (stage G review G-F3;
+  introduced in this release).** `FileSystemWriter::write_owned_bytes` runs the write on a blocking
+  thread; if the caller dropped its future, the write went on untracked, so a later write could run
+  beside it on the same file and `finalize` could sync and report success before it finished. The
+  writer now keeps the pending write itself: every later write, `finalize` and `cancel` waits for it
+  first and reports its error. `direct://` writes with `sync_writes` no longer leave their fsync on a
+  detached task either. The data is still moved to the blocking thread, not copied.
 
 ### Changed (dependencies)
 
@@ -552,6 +592,14 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
 - Stage G (zero copy): every removed copy has a failing-before test (pointer identity, owner check or
   an allocation / peak-memory bound) in the Rust unit tests, the integration tests
   (`tests/test_zero_copy_*.rs`) and the installed-wheel suites (`python/tests/test_zero_copy_*.py`).
+- Stage G review corrections (G-F1, G-F2, G-F3), proportionate checks as directed by the maintainer:
+  `cargo fmt`, clippy `-D warnings` (default, extension-module, full-backends, community GCS), the
+  library tests (899 default, 1171 full-backends, all passed), the affected integration tests
+  (Azure range version 6, zero-copy object store 23, zero-copy file 12) and the reservation tests in
+  the Python-extension unit tests; on freshly built 3.12 and 3.13 default wheels the multipart
+  writer and zero-copy multipart suites pass (16 each, child-process and live cases skip). Every
+  correction's new tests failed on the code before it. The whole-suite and full wheel-matrix runs
+  above were not repeated.
 - **Performance** (Python API, CPython 3.13 x86_64, a local S3-compatible test server on the same
   16-vCPU host whose GET bodies cost it almost nothing; one benchmark process at a time on an idle
   host; `scripts/bench_zero_copy.sh`, ~2 GiB per cell, median of three timed passes after a warm-up;

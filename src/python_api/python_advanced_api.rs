@@ -5,12 +5,14 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use bytes::Bytes;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyDictMethods};
 use pyo3::Bound;
 use std::os::raw::c_char;
+use std::ptr::NonNull;
 
 // Project crates
 use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
@@ -119,6 +121,165 @@ impl HeldExports {
     }
 }
 
+// ---------------------------------------------------------------------------
+// reserve(): the owned allocation and its buffer exporter
+// ---------------------------------------------------------------------------
+
+/// The zero-filled allocation behind a `reserve()`: a fixed block of bytes that is never moved,
+/// resized or reused, and is freed exactly once, when the LAST owner is gone.
+///
+/// Owners are `Arc` clones: the writer (while the reservation is pending), the
+/// [`PyReservedBuffer`] exporter that every memoryview points at, and the zero-copy `Bytes` that
+/// `commit()` hands to the upload. Nothing else frees or reallocates it, which is what lets a
+/// view outlive `commit()`, `close()`, `abort()` and the writer itself.
+///
+/// It is a raw allocation rather than a `Vec` so that nothing (a `shrink_to_fit`, a `push`) can
+/// ever relocate it while a Python view or an in-flight part still points into it, and so that
+/// an allocation failure is an error to report, not an abort.
+pub(crate) struct ReservedBlock {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: a plain heap allocation of bytes with no thread affinity. Python code may write to it
+// through a retained view while an upload reads it: that is the documented data-integrity
+// contract of `reserve()` (the payload in flight changes), the same as for a borrowed
+// `write()`, and it never affects memory safety.
+unsafe impl Send for ReservedBlock {}
+unsafe impl Sync for ReservedBlock {}
+
+impl ReservedBlock {
+    /// A zero-filled block of `size` bytes, or `None` when the size cannot be allocated.
+    fn zeroed(size: usize) -> Option<Self> {
+        if size == 0 {
+            // Nothing to allocate (and a zero-size allocation is not allowed): a dangling,
+            // well-aligned pointer is valid for a zero-length view.
+            return Some(Self {
+                ptr: NonNull::dangling(),
+                len: 0,
+            });
+        }
+        let layout = std::alloc::Layout::array::<u8>(size).ok()?;
+        // SAFETY: `layout` has a non-zero size.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        NonNull::new(raw).map(|ptr| Self { ptr, len: size })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for ReservedBlock {
+    fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        // The layout was valid when the block was allocated, so it is valid again here.
+        if let Ok(layout) = std::alloc::Layout::array::<u8>(self.len) {
+            // SAFETY: `ptr` came from `alloc_zeroed` with this exact layout and is freed once.
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+        }
+    }
+}
+
+/// `Bytes` owner that shares a [`ReservedBlock`]: how `commit()` gives the upload the reserved
+/// memory without copying it. Dropping the last `Bytes` slice drops this reference.
+struct ReservedOwner(Arc<ReservedBlock>);
+
+impl AsRef<[u8]> for ReservedOwner {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the block is `len` initialised (zero-filled) bytes that stay allocated while
+        // this `Arc` lives. Python may write to them concurrently (documented data contract).
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr(), self.0.len()) }
+    }
+}
+
+/// The owner behind the memoryview that `reserve()` returns (``mv.obj``).
+///
+/// A memoryview built from this object by `PyMemoryView_FromObject` holds a reference to it for
+/// as long as the view, any slice or sub-view of it, or any object exporting from it exists, and
+/// it holds the allocation: the memory therefore cannot be freed under a retained view. It is
+/// writable, and never moves.
+#[pyclass(name = "ReservedBuffer", module = "s3dlio")]
+pub struct PyReservedBuffer {
+    block: Arc<ReservedBlock>,
+    /// `shape[0]` for the buffer protocol; lives in this heap object so the pointer handed to
+    /// the view stays valid as long as the view holds a reference to this object.
+    shape_len: isize,
+}
+
+impl PyReservedBuffer {
+    fn new(block: Arc<ReservedBlock>) -> Self {
+        // A `Vec`-sized allocation never exceeds `isize::MAX` (`Layout::array` rejects it).
+        let shape_len = block.len() as isize;
+        Self { block, shape_len }
+    }
+}
+
+#[pymethods]
+impl PyReservedBuffer {
+    fn __len__(&self) -> usize {
+        self.block.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ReservedBuffer({} bytes)", self.block.len())
+    }
+
+    /// Writable buffer protocol over the reservation. Every request succeeds (the buffer is
+    /// always writable and C-contiguous); the view keeps this object, and so the allocation,
+    /// alive by holding a reference to it in `view.obj`.
+    unsafe fn __getbuffer__(
+        slf: PyRef<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        if view.is_null() {
+            return Err(pyo3::exceptions::PyBufferError::new_err("null Py_buffer"));
+        }
+        // Unit stride: 1 byte per element, a 'static address.
+        static UNIT_STRIDE: isize = 1;
+        // SAFETY: `view` is the valid `Py_buffer` CPython passed in; every pointer stored in
+        // it stays valid while `view.obj` (this object) is alive, and CPython keeps it alive.
+        unsafe {
+            (*view).buf = slf.block.as_ptr().cast::<std::os::raw::c_void>();
+            (*view).len = slf.shape_len;
+            (*view).readonly = 0;
+            (*view).itemsize = 1;
+            (*view).ndim = 1;
+            (*view).format = if (flags & ffi::PyBUF_FORMAT) != 0 {
+                c"B".as_ptr() as *mut c_char
+            } else {
+                std::ptr::null_mut()
+            };
+            (*view).shape = if (flags & ffi::PyBUF_ND) != 0 {
+                &slf.shape_len as *const isize as *mut isize
+            } else {
+                std::ptr::null_mut()
+            };
+            (*view).strides = if (flags & ffi::PyBUF_STRIDES) != 0 {
+                &UNIT_STRIDE as *const isize as *mut isize
+            } else {
+                std::ptr::null_mut()
+            };
+            (*view).suboffsets = std::ptr::null_mut();
+            (*view).internal = std::ptr::null_mut();
+            (*view).obj = slf.as_ptr();
+            ffi::Py_INCREF((*view).obj);
+        }
+        Ok(())
+    }
+
+    /// Nothing to release: CPython drops the reference taken in `__getbuffer__`, and the
+    /// allocation is freed only when no owner is left.
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
+}
+
 /// Streaming S3 multipart uploader.
 ///
 /// - Fully streaming (no temp files by default)
@@ -130,33 +291,13 @@ impl HeldExports {
 #[pyclass(name = "MultipartUploadWriter", module = "s3dlio")]
 pub struct PyMultipartUploadWriter {
     inner: Option<MultipartUploadSink>,
-    pending_buf: Option<Vec<u8>>, // Rust-owned buffer between reserve() and commit()
-    // Self-referencing strong handle, held only while `pending_buf` is `Some`
-    // (i.e. between reserve() and commit()/abort()/close()/__exit__()).
-    //
-    // reserve() hands Python a memoryview built via `PyMemoryView_FromMemory`,
-    // which — unlike `PyMemoryView_FromObject` routed through the buffer
-    // protocol (see `PyBytesView::__getbuffer__`'s doc comment for the same
-    // class of bug, already fixed there once) — never sets `view.obj` and so
-    // carries **no reference** back to this writer. Without this field,
-    // dropping the last Python reference to the writer while its memoryview
-    // is still held frees `pending_buf`'s heap allocation out from under a
-    // live memoryview: a use-after-free. Holding an extra `Py<Self>` here
-    // keeps the writer (and thus `pending_buf`) alive for the whole
-    // reserve()..commit() window regardless of what the caller does with the
-    // writer's own Python reference. Cleared via `clear_pending_reservation`
-    // wherever `pending_buf` is cleared, so it never outlives the reservation
-    // it protects.
-    //
-    // Trade-off: if a caller calls reserve() and then abandons the writer
-    // without ever calling commit()/abort()/close()/using it as a context
-    // manager, this self-reference is never cleared and the writer leaks for
-    // the life of the process (PyMultipartUploadWriter does not implement
-    // PyO3's GC protocol, so Python's cyclic collector cannot break this
-    // cycle). A leak is a strict improvement over the use-after-free it
-    // replaces, and the existing docstring already documents reserve() as
-    // requiring a paired commit() call.
-    self_pin_while_pending: Option<Py<PyMultipartUploadWriter>>,
+    /// The reservation between `reserve()` and `commit()`: the writer's OWN reference to the
+    /// allocation behind the memoryview that `reserve()` returned. The memoryview's exporter
+    /// ([`PyReservedBuffer`]) holds another one, and `commit()` hands the upload a third (a
+    /// zero-copy `Bytes`), so the memory lives until the writer, every Python view and every
+    /// part in flight are all done with it. Dropping this field (`close`, `abort`, `__exit__`,
+    /// deleting the writer) therefore never frees memory a view can still reach.
+    pending_reservation: Option<Arc<ReservedBlock>>,
     /// Completion barriers of the borrowed buffer exports behind `write()` (zero-copy default):
     /// the parts still reference the caller's memory until they are uploaded, so `close()` /
     /// `abort()` / `__exit__` wait on every latch (bounded) before they return.
@@ -164,13 +305,11 @@ pub struct PyMultipartUploadWriter {
 }
 
 impl PyMultipartUploadWriter {
-    /// Clear any pending reserve() buffer and the self-pin that keeps this
-    /// writer alive while a reservation is outstanding. Idempotent. Must be
-    /// called wherever `pending_buf` is consumed or the writer is closed, so
-    /// `self_pin_while_pending` never leaks past the reservation it guards.
+    /// Drop the writer's reference to a pending `reserve()` allocation. Idempotent. Only the
+    /// WRITER's reference goes: a memoryview (or slice of one) the caller still holds keeps the
+    /// memory alive through its exporter, so this can never leave a view dangling.
     fn clear_pending_reservation(&mut self) {
-        self.pending_buf = None;
-        self.self_pin_while_pending = None;
+        self.pending_reservation = None;
     }
 
     /// Wait until every buffer export borrowed by `write()` has really been released, i.e. no
@@ -246,8 +385,7 @@ impl PyMultipartUploadWriter {
             .map_err(|e| py_err(e.context("Multipart init failed")))?;
         Ok(Self {
             inner: Some(inner),
-            pending_buf: None,
-            self_pin_while_pending: None,
+            pending_reservation: None,
             held: HeldExports::new(),
         })
     }
@@ -292,8 +430,7 @@ impl PyMultipartUploadWriter {
             .map_err(|e| py_err(e.context("Multipart init failed")))?;
         Ok(Self {
             inner: Some(inner),
-            pending_buf: None,
-            self_pin_while_pending: None,
+            pending_reservation: None,
             held: HeldExports::new(),
         })
     }
@@ -452,113 +589,93 @@ impl PyMultipartUploadWriter {
 
     /// Reserve a Rust-owned buffer and return a writable Python `memoryview`.
     ///
-    /// Fill the memoryview in Python, then call `commit(nbytes)`. Do not reuse
-    /// the memoryview after `commit()`. Only one pending buffer is allowed.
+    /// Fill the memoryview in Python (``mv[:n] = ...``, ``f.readinto(mv)``,
+    /// ``np.frombuffer(mv)``), then call `commit(nbytes)`. Only one pending buffer is allowed.
+    ///
+    /// The memory is owned by an exporter object (``mv.obj``, a ``s3dlio.ReservedBuffer``) that
+    /// every view and every slice of it keeps alive. It is never moved or resized, and it is
+    /// freed only when the writer, every view and the upload itself are all done with it:
+    /// ``close()``, ``abort()``, leaving a ``with`` block, deleting the writer, and
+    /// ``commit()`` never invalidate a view you still hold; reading it stays safe.
+    ///
+    /// After ``commit()`` the bytes you committed are being uploaded straight out of this
+    /// memory (zero copy). Do not write through a retained view after ``commit()``: that
+    /// changes the payload in flight, so the object contains whatever the upload happened to
+    /// read, or a signed part is rejected for a payload checksum mismatch (a data-integrity
+    /// contract, like a borrowed ``write()``; it can never corrupt memory).
+    /// A SHORT commit keeps the whole reservation allocated until its part is uploaded and
+    /// every view is gone (the allocation is not shrunk, which would be a realloc that may
+    /// move it): reserve what you will fill.
     ///
     /// Args:
-    ///     size: number of bytes to reserve
+    ///     size: number of bytes to reserve (zero-filled; ``MemoryError`` if unavailable)
     ///
     /// Returns:
     ///     memoryview: writable view into the reserved buffer
     #[pyo3(text_signature = "(self, size, /)")]
-    fn reserve(mut slf: PyRefMut<'_, Self>, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {
+    fn reserve(&mut self, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {
         // Disallow overlapping reserves
-        if slf.pending_buf.is_some() {
+        if self.pending_reservation.is_some() {
             return Err(PyRuntimeError::new_err(
                 "reserve() called while a previous buffer is pending; call commit() first",
             ));
         }
-
-        // Pin ourselves alive for the whole reserve()..commit() window — see
-        // `self_pin_while_pending`'s field doc for why this is required for
-        // memory safety, not just cleanliness. Built from a borrowed pointer
-        // (Py_INCREF under the hood), so this is zero-copy: no data is
-        // duplicated, only a Python reference count changes.
-        let self_pin: Py<Self> = unsafe { Py::from_borrowed_ptr(py, slf.as_ptr()) };
-
-        // reserve(): treat size==0 as no-op (avoids odd memoryviews)
-        if size == 0 {
-            slf.pending_buf = Some(Vec::new());
-            slf.self_pin_while_pending = Some(self_pin);
-            // Return a 0-length memoryview (still legal)
-            let ptr = std::ptr::null_mut::<std::os::raw::c_char>();
-            let mv_ptr =
-                unsafe { pyo3::ffi::PyMemoryView_FromMemory(ptr, 0, pyo3::ffi::PyBUF_WRITE) };
-            if mv_ptr.is_null() {
-                slf.clear_pending_reservation();
-                return Err(PyErr::fetch(py));
-            }
-            return Ok(unsafe { Py::<PyAny>::from_owned_ptr(py, mv_ptr) });
-        }
-
-        // Allocate Rust-owned buffer and keep it alive in self.pending_buf so the
-        // memoryview's pointer stays valid until commit() (or close/abort).
-        let mut buf = vec![0u8; size];
-
-        // Create a writable memoryview that points directly at our Vec's memory.
-        // Safety:
-        // - We pass a valid pointer/length for the Vec.
-        // - We keep the Vec alive (self.pending_buf = Some(buf)) so the memory doesn't move.
-        // - We won't reallocate this Vec (we never push; commit() only shrinks len).
-        // - We keep `self` (the writer) alive via `self_pin_while_pending` so the
-        //   above holds even if the caller drops every other Python reference
-        //   to the writer before calling commit() — see the field doc comment.
-        let ptr = buf.as_mut_ptr() as *mut c_char;
-        let len = buf.len() as ffi::Py_ssize_t;
-        let flags = ffi::PyBUF_WRITE; // writable view
-
-        let mv_ptr = unsafe { ffi::PyMemoryView_FromMemory(ptr, len, flags) };
-        if mv_ptr.is_null() {
-            // Convert the current Python error (if any) into a PyErr.
+        let block = ReservedBlock::zeroed(size).map(Arc::new).ok_or_else(|| {
+            pyo3::exceptions::PyMemoryError::new_err(format!("cannot reserve {size} bytes"))
+        })?;
+        let exporter = Py::new(py, PyReservedBuffer::new(Arc::clone(&block)))?;
+        // `PyMemoryView_FromObject` goes through the buffer protocol, so the memoryview (and
+        // every slice or sub-view derived from it) holds a reference to `exporter` in
+        // `view.obj`, and the exporter holds the allocation. Nothing here can outlive that.
+        // SAFETY: `exporter` is a live, exclusively typed Python object that implements the
+        // buffer protocol; the returned pointer is a new reference or null with an error set.
+        let raw = unsafe { ffi::PyMemoryView_FromObject(exporter.as_ptr()) };
+        if raw.is_null() {
             return Err(PyErr::fetch(py));
         }
-
-        // Convert the owned PyObject* into a safe PyObject handle.
-        let mv = unsafe { Py::<PyAny>::from_owned_ptr(py, mv_ptr) };
-
-        // Stash the Vec and the self-pin; this guarantees both the pointer
-        // and the writer object itself remain valid until commit().
-        slf.pending_buf = Some(buf);
-        slf.self_pin_while_pending = Some(self_pin);
+        // SAFETY: `raw` is a non-null owned reference.
+        let mv = unsafe { Py::<PyAny>::from_owned_ptr(py, raw) };
+        self.pending_reservation = Some(block);
         Ok(mv)
     }
 
     /// Commit the previously reserved buffer.
     ///
+    /// The first ``nbytes`` bytes become the next piece of the object. They are uploaded
+    /// straight out of the reserved memory, with no copy (a commit below the small-write
+    /// threshold is copied once into the part buffer instead, like any small write). The
+    /// reservation stays allocated until the upload and every memoryview of it are gone; see
+    /// ``reserve()`` for what that means for a short commit and for writing through a view
+    /// after this call.
+    ///
     /// Args:
     ///     nbytes: number of bytes actually written into the reserved buffer
     ///
-    /// Errors if `nbytes` exceeds the reserved size or if no buffer is pending.
+    /// Errors if no buffer is pending (``RuntimeError``) or if `nbytes` exceeds the reserved
+    /// size (``ValueError``; the reservation then stays pending and can still be committed
+    /// with a valid length).
     #[pyo3(text_signature = "(self, nbytes, /)")]
     fn commit(&mut self, py: Python<'_>, nbytes: usize) -> PyResult<()> {
         let inner = self
             .inner
             .as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("writer is closed"))?;
-        let mut buf = self.pending_buf.take().ok_or_else(|| {
+        let block = self.pending_reservation.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("no pending buffer; call reserve() first")
         })?;
-        // The reservation window is over now that pending_buf is taken —
-        // release the self-pin (see `self_pin_while_pending`'s field doc).
-        self.self_pin_while_pending = None;
-        if nbytes > buf.len() {
+        // Validate BEFORE consuming anything: a bad length leaves the reservation pending.
+        if nbytes > block.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "commit(nbytes={nbytes}) exceeds reserved size {}",
-                buf.len()
+                block.len()
             )));
         }
-        unsafe {
-            buf.set_len(nbytes);
-        }
-        // A commit much smaller than the reservation must not pin the whole reserved capacity
-        // for as long as its part is in flight (`Bytes::from(Vec)` keeps the allocation):
-        // shrink it first. This is a realloc of the allocation (the kernel remaps big blocks), not
-        // a copy of the payload. Commits below the small-write threshold are copied once into
-        // the part buffer by the sink, and this buffer is freed.
-        if buf.capacity() > buf.len() {
-            buf.shrink_to_fit();
-        }
-        py.detach(|| inner.write_owned_blocking(buf))
+        // The upload shares ownership of the allocation (an `Arc` clone, no copy of the
+        // payload) and is sliced to what was filled.
+        let bytes = Bytes::from_owner(ReservedOwner(Arc::clone(block))).slice(..nbytes);
+        // The reservation is consumed from here on, whatever the sink does with it.
+        self.pending_reservation = None;
+        py.detach(|| inner.write_bytes_blocking(bytes))
             .map_err(|e| py_err(e.context("commit failed")))
     }
 
@@ -594,9 +711,8 @@ impl PyMultipartUploadWriter {
     ///     }
     #[pyo3(text_signature = "(self)")]
     fn close(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        // Release any outstanding reserve() buffer and its self-pin (see
-        // `self_pin_while_pending`'s field doc) — otherwise a reserve()
-        // that was never commit()'d would leak the writer permanently.
+        // Drop the writer's reference to an outstanding reserve() allocation. A memoryview
+        // the caller still holds keeps the memory alive through its exporter.
         self.clear_pending_reservation();
         let inner = self
             .inner
@@ -648,9 +764,8 @@ impl PyMultipartUploadWriter {
     /// After abort, the writer is unusable.
     #[pyo3(text_signature = "(self)")]
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
-        // Release any outstanding reserve() buffer and its self-pin (see
-        // `self_pin_while_pending`'s field doc) — otherwise a reserve()
-        // that was never commit()'d would leak the writer permanently.
+        // Drop the writer's reference to an outstanding reserve() allocation. A memoryview
+        // the caller still holds keeps the memory alive through its exporter.
         self.clear_pending_reservation();
         let mut aborted: PyResult<()> = Ok(());
         if let Some(mut inner) = self.inner.take() {
@@ -704,9 +819,8 @@ impl PyMultipartUploadWriter {
         _v: Py<PyAny>,
         _tb: Py<PyAny>,
     ) -> PyResult<()> {
-        // Release any outstanding reserve() buffer and its self-pin (see
-        // `self_pin_while_pending`'s field doc) — otherwise a reserve()
-        // that was never commit()'d would leak the writer permanently.
+        // Drop the writer's reference to an outstanding reserve() allocation. A memoryview
+        // the caller still holds keeps the memory alive through its exporter.
         self.clear_pending_reservation();
         let mut result: PyResult<()> = Ok(());
         let mut outcome = "the writer was closed".to_string();
@@ -752,6 +866,7 @@ fn _mpu_coalesce_below(bytes: Option<usize>) -> usize {
 pub fn register_advanced_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Multipart upload writer
     m.add_class::<PyMultipartUploadWriter>()?;
+    m.add_class::<PyReservedBuffer>()?;
     m.add_function(wrap_pyfunction!(_mpu_coalesce_below, m)?)?;
 
     // TODO: Add checkpoint system when re-enabled
@@ -766,8 +881,8 @@ pub fn register_advanced_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests: the reuse guard and the commit shrink, driven through the real `write()` /
-// `commit()` methods on a writer whose sink has no S3 behind it.
+// Unit tests: the reuse guard and the ownership of `reserve()` memory, driven through the real
+// `write()` / `reserve()` / `commit()` methods on a writer whose sink has no S3 behind it.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod writer_tests {
@@ -785,8 +900,7 @@ mod writer_tests {
         let (sink, guard) = MultipartUploadSink::for_writer_test(part_size, coalesce_below);
         let w = PyMultipartUploadWriter {
             inner: Some(sink),
-            pending_buf: None,
-            self_pin_while_pending: None,
+            pending_reservation: None,
             held: HeldExports::new(),
         };
         (Bound::new(py, w).expect("writer object"), guard)
@@ -854,31 +968,349 @@ mod writer_tests {
         });
     }
 
-    /// `commit(n)` of a small part of a large reservation must not pin the reservation: the
-    /// unused capacity is given back (a realloc, not a copy of the payload). Without it each
-    /// queued part is a slice that keeps its whole 64 MiB allocation alive.
+    // -- reserve() / commit(): who owns the memory a view points at (stage G review, G-F1) ----
+    //
+    // Every check below is about OWNERSHIP, read from the `Arc` of the allocation through a
+    // `Weak` (which does not perturb it): no test relies on a use of freed memory happening to
+    // crash.
+
+    /// A look at the allocation behind a reservation that does not keep it alive itself.
+    struct Probe {
+        weak: std::sync::Weak<ReservedBlock>,
+        ptr: usize,
+    }
+
+    impl Probe {
+        /// Taken while the writer holds the reservation.
+        fn of(w: &Bound<'_, PyMultipartUploadWriter>) -> Self {
+            let borrowed = w.borrow();
+            let block = borrowed
+                .pending_reservation
+                .as_ref()
+                .expect("a pending reservation");
+            Self {
+                weak: Arc::downgrade(block),
+                ptr: block.as_ptr() as usize,
+            }
+        }
+
+        /// Owners right now: the writer while pending, each exporter, each queued slice.
+        fn owners(&self) -> usize {
+            self.weak.strong_count()
+        }
+
+        fn freed(&self) -> bool {
+            self.weak.upgrade().is_none()
+        }
+    }
+
+    fn reserve<'py>(w: &Bound<'py, PyMultipartUploadWriter>, size: usize) -> Bound<'py, PyAny> {
+        w.call_method1("reserve", (size,)).expect("reserve")
+    }
+
+    fn fill(mv: &Bound<'_, PyAny>, at: usize, data: &[u8]) {
+        let py = mv.py();
+        mv.set_item(
+            pyo3::types::PySlice::new(py, at as isize, (at + data.len()) as isize, 1),
+            pyo3::types::PyBytes::new(py, data),
+        )
+        .expect("write through the view");
+    }
+
+    fn read(mv: &Bound<'_, PyAny>, from: usize, to: usize) -> Vec<u8> {
+        slice_of(mv, from, to)
+            .call_method0("tobytes")
+            .and_then(|b| b.extract())
+            .expect("read through the view")
+    }
+
+    fn pending(w: &Bound<'_, PyMultipartUploadWriter>) -> bool {
+        w.borrow().pending_reservation.is_some()
+    }
+
+    /// `reserve()` still returns a writable `memoryview`; its `.obj` is the exporter that owns
+    /// the memory, and a slice of it shares that exporter.
     #[test]
-    fn commit_does_not_pin_the_whole_reservation() {
+    fn reserve_returns_a_memoryview_owned_by_the_exporter() {
         Python::initialize();
         Python::attach(|py| {
-            // Commits of exactly one part (2 MiB): each becomes a part that is a zero-copy slice
-            // of its Vec, so the Vec stays alive as long as the part does.
-            let (w, mut guard) = writer(py, 2 * MIB, MIB);
-            for _ in 0..4 {
-                let mv = w.call_method1("reserve", (64 * MIB,)).expect("reserve");
-                w.call_method1("commit", (2 * MIB,)).expect("commit");
-                drop(mv);
-            }
-            let parts = guard.part_capacities();
-            assert_eq!(parts.len(), 4);
-            for (len, capacity) in parts {
-                assert_eq!(len, 2 * MIB);
-                assert!(
-                    capacity <= 4 * MIB,
-                    "a {len}-byte part pins a {} MiB allocation",
-                    capacity >> 20
-                );
-            }
+            let (w, _guard) = writer(py, 2 * MIB, 0);
+            let mv = reserve(&w, 4096);
+            let probe = Probe::of(&w);
+            assert_eq!(probe.owners(), 2, "the writer and the exporter");
+            let type_name = mv.get_type().name().expect("type name").to_string();
+            assert_eq!(type_name, "memoryview");
+            assert!(!mv.getattr("readonly").unwrap().is_truthy().unwrap());
+            assert_eq!(mv.len().unwrap(), 4096);
+            let exporter = mv.getattr("obj").expect("memoryview.obj");
+            assert!(exporter.is_instance_of::<PyReservedBuffer>());
+            assert!(
+                slice_of(&mv, 10, 20).getattr("obj").unwrap().is(&exporter),
+                "a slice shares the exporter"
+            );
+            assert_eq!(
+                probe.owners(),
+                2,
+                "views add references to the exporter only"
+            );
+            // The ordinary uses of the view keep working.
+            fill(&mv, 0, b"abcd");
+            assert_eq!(read(&mv, 0, 4), b"abcd");
+            assert_eq!(
+                read(&mv, 4, 8),
+                [0u8; 4],
+                "a reservation starts zero-filled"
+            );
+        });
+    }
+
+    /// A successful commit gives the upload the very same allocation (no copy); the memory
+    /// stays until the upload's slice AND the view are gone, in either order.
+    #[test]
+    fn successful_commit_shares_the_allocation_with_the_upload() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (w, mut guard) = writer(py, 2 * MIB, 0);
+            let mv = reserve(&w, 2 * MIB);
+            let probe = Probe::of(&w);
+            fill(&mv, 0, b"abcdefgh");
+            w.call_method1("commit", (2 * MIB,)).expect("commit");
+            assert!(!pending(&w), "the reservation was consumed");
+            let chunks = guard.take_chunks();
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].as_ptr() as usize, probe.ptr, "zero-copy");
+            assert_eq!(&chunks[0][..8], b"abcdefgh");
+            assert_eq!(probe.owners(), 2, "the exporter and the queued part");
+            // The view still reads and the memory is still there after the part is gone.
+            drop(chunks);
+            assert_eq!(probe.owners(), 1);
+            assert_eq!(read(&mv, 0, 8), b"abcdefgh");
+            let exporter = mv.getattr("obj").unwrap();
+            drop(mv);
+            assert!(!probe.freed(), "the exporter object is still referenced");
+            drop(exporter);
+            assert!(probe.freed(), "freed once every owner is gone");
+        });
+    }
+
+    /// A short commit slices the same allocation (it is NOT shrunk or moved) and pins the whole
+    /// reservation while its part is in flight; the view stays valid throughout.
+    #[test]
+    fn short_commit_keeps_the_whole_allocation_in_place() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (w, mut guard) = writer(py, 2 * MIB, 0);
+            let mv = reserve(&w, 8 * MIB);
+            let probe = Probe::of(&w);
+            fill(&mv, 0, b"short");
+            w.call_method1("commit", (5,)).expect("short commit");
+            assert!(!pending(&w));
+            // The 5 bytes wait in the sink for the rest of their part until flush().
+            assert_eq!(
+                probe.owners(),
+                2,
+                "the exporter and the sink's pending slice"
+            );
+            w.call_method0("flush").expect("flush");
+            let chunks = guard.take_chunks();
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].len(), 5);
+            assert_eq!(
+                chunks[0].as_ptr() as usize,
+                probe.ptr,
+                "not moved, not copied"
+            );
+            assert_eq!(&chunks[0][..], b"short");
+            assert_eq!(probe.owners(), 2);
+            assert_eq!(read(&mv, 0, 5), b"short", "the view is still valid");
+            drop(chunks);
+            assert_eq!(probe.owners(), 1);
+            drop(mv);
+            assert!(probe.freed());
+        });
+    }
+
+    /// An invalid length is a `ValueError` that consumes nothing: the reservation stays
+    /// pending, its memory untouched, and a valid commit still works.
+    #[test]
+    fn invalid_length_commit_leaves_the_reservation_pending() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (w, mut guard) = writer(py, MIB, 0);
+            let mv = reserve(&w, MIB);
+            let probe = Probe::of(&w);
+            fill(&mv, 0, b"keep");
+            let err = w
+                .call_method1("commit", (MIB + 1,))
+                .expect_err("longer than the reservation");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyValueError>(py),
+                "{err}"
+            );
+            assert!(pending(&w), "still pending");
+            assert_eq!(probe.owners(), 2, "writer and exporter still own it");
+            assert_eq!(read(&mv, 0, 4), b"keep");
+            // A second reserve() is still refused, and the valid commit goes through.
+            assert!(w.call_method1("reserve", (16,)).is_err());
+            w.call_method1("commit", (MIB,)).expect("valid commit");
+            let chunks = guard.take_chunks();
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].as_ptr() as usize, probe.ptr);
+            assert_eq!(&chunks[0][..4], b"keep");
+        });
+    }
+
+    /// Whichever way the writer lets go of a pending reservation, a view the caller holds (and
+    /// a slice that outlives the original memoryview) stays backed by live, correct memory.
+    fn views_survive(py: Python<'_>, release: impl FnOnce(Bound<'_, PyMultipartUploadWriter>)) {
+        let (w, _guard) = writer(py, MIB, 0);
+        let mv = reserve(&w, 4096);
+        let probe = Probe::of(&w);
+        fill(&mv, 100, b"still here");
+        let tail = slice_of(&mv, 100, 110);
+        release(w);
+        assert_eq!(probe.owners(), 1, "only the exporter is left");
+        assert_eq!(read(&mv, 100, 110), b"still here");
+        // The original view goes; the derived slice alone keeps the memory.
+        drop(mv);
+        assert!(
+            !probe.freed(),
+            "a derived slice outlives the original memoryview"
+        );
+        assert_eq!(
+            tail.call_method0("tobytes")
+                .unwrap()
+                .extract::<Vec<u8>>()
+                .unwrap(),
+            b"still here"
+        );
+        fill(&tail, 0, b"STILL");
+        assert_eq!(read(&tail, 0, 10), b"STILL here");
+        drop(tail);
+        assert!(probe.freed(), "freed with the last view");
+    }
+
+    #[test]
+    fn close_with_a_pending_reservation_leaves_views_backed() {
+        Python::initialize();
+        Python::attach(|py| {
+            views_survive(py, |w| {
+                // The test sink has no coordinator, so the upload itself reports an error;
+                // the reservation is released either way.
+                assert!(w.call_method0("close").is_err());
+                assert!(!pending(&w));
+            })
+        });
+    }
+
+    #[test]
+    fn abort_with_a_pending_reservation_leaves_views_backed() {
+        Python::initialize();
+        Python::attach(|py| {
+            views_survive(py, |w| {
+                w.call_method0("abort").expect("abort");
+                assert!(!pending(&w));
+            })
+        });
+    }
+
+    #[test]
+    fn context_exit_with_a_pending_reservation_leaves_views_backed() {
+        Python::initialize();
+        Python::attach(|py| {
+            // Leaving the `with` block on an exception aborts.
+            views_survive(py, |w| {
+                let exc = py
+                    .get_type::<pyo3::exceptions::PyValueError>()
+                    .call1(("boom",))
+                    .expect("exception");
+                let exc_type = exc.get_type();
+                w.call_method1("__exit__", (exc_type, exc, py.None()))
+                    .expect("exit after an exception aborts");
+                assert!(!pending(&w));
+            });
+            // Leaving it normally closes (the test sink then reports its missing coordinator).
+            views_survive(py, |w| {
+                assert!(w
+                    .call_method1("__exit__", (py.None(), py.None(), py.None()))
+                    .is_err());
+                assert!(!pending(&w));
+            });
+        });
+    }
+
+    #[test]
+    fn deleting_the_writer_with_a_pending_reservation_leaves_views_backed() {
+        Python::initialize();
+        Python::attach(|py| {
+            views_survive(py, |w| drop(w));
+        });
+    }
+
+    /// After a commit the view and the writer can go in any order: the upload's slice, the view
+    /// and the writer each hold the memory, and it is freed with the last of them.
+    #[test]
+    fn views_and_parts_outlive_the_writer_after_a_commit() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (w, mut guard) = writer(py, MIB, 0);
+            let mv = reserve(&w, MIB);
+            let probe = Probe::of(&w);
+            fill(&mv, 0, b"payload");
+            w.call_method1("commit", (MIB,)).expect("commit");
+            let tail = slice_of(&mv, 0, 7);
+            drop(w);
+            drop(mv);
+            let chunks = guard.take_chunks();
+            assert_eq!(&chunks[0][..7], b"payload");
+            assert_eq!(
+                probe.owners(),
+                2,
+                "the queued part and the exporter (via the slice)"
+            );
+            drop(tail);
+            assert_eq!(probe.owners(), 1, "the part alone");
+            assert_eq!(&chunks[0][..7], b"payload", "the part's memory is intact");
+            drop(chunks);
+            assert!(probe.freed());
+        });
+    }
+
+    /// `reserve(0)` works: an empty view, and `commit(0)` (but not `commit(1)`).
+    #[test]
+    fn a_zero_byte_reservation_works() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (w, _guard) = writer(py, MIB, 0);
+            let mv = reserve(&w, 0);
+            assert_eq!(mv.len().unwrap(), 0);
+            assert!(mv
+                .getattr("obj")
+                .unwrap()
+                .is_instance_of::<PyReservedBuffer>());
+            assert_eq!(read(&mv, 0, 0), b"");
+            let err = w.call_method1("commit", (1,)).expect_err("1 > 0");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert!(pending(&w));
+            w.call_method1("commit", (0,)).expect("commit(0)");
+            assert!(!pending(&w));
+        });
+    }
+
+    /// A reservation that cannot be allocated is a `MemoryError`, not an abort.
+    #[test]
+    fn an_impossible_reservation_is_a_memory_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (w, _guard) = writer(py, MIB, 0);
+            let err = w
+                .call_method1("reserve", (usize::MAX / 2,))
+                .expect_err("cannot allocate");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyMemoryError>(py),
+                "{err}"
+            );
+            assert!(!pending(&w));
         });
     }
 }

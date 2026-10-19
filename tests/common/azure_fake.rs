@@ -14,6 +14,8 @@
 //! failure), optionally changing the blob afterwards. A scripted GET can also answer a status
 //! (429, 503, 507 ...), close the connection without a reply, or stall after some bytes. A flag
 //! strips `Content-Range` from ranged replies (a 206 that does not say which part it carries).
+//! `replace_before_get` swaps the blob (same size, another ETag) just before the n-th GET is
+//! answered, to test a replacement between the ranges of one logical read.
 //!
 //! Include with `#[path = "common/azure_fake.rs"] mod azure_fake;`.
 
@@ -156,6 +158,13 @@ pub struct Fake {
     pub strip_content_range: bool,
     /// Scripted GET failures (see [`GetFault`]).
     pub get_faults: VecDeque<GetFault>,
+    /// GET requests that reached an existing blob so far (HEAD and listings are not counted).
+    pub gets_seen: usize,
+    /// `(n, content, etag)`: the blob a GET names is replaced by `content` and `etag` just BEFORE
+    /// the `n`-th GET (counting from 1) is answered, so GET `n` and every later one see the new
+    /// version and earlier ones saw the old one (a same-size replacement between the ranges of
+    /// one logical read).
+    pub replace_before_get: Vec<(usize, Vec<u8>, String)>,
 }
 
 impl Default for Fake {
@@ -175,6 +184,8 @@ impl Default for Fake {
             ignore_if_match: false,
             strip_content_range: false,
             get_faults: VecDeque::new(),
+            gets_seen: 0,
+            replace_before_get: Vec::new(),
         }
     }
 }
@@ -336,6 +347,20 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Body> {
             }
         }
         Method::GET | Method::HEAD => {
+            if method == Method::GET && fake.blobs.contains_key(&path) {
+                fake.gets_seen += 1;
+                let seen = fake.gets_seen;
+                let due: Vec<(Vec<u8>, String)> = fake
+                    .replace_before_get
+                    .iter()
+                    .filter(|(n, _, _)| *n == seen)
+                    .map(|(_, content, etag)| (content.clone(), etag.clone()))
+                    .collect();
+                for (content, etag) in due {
+                    fake.blobs.insert(path.clone(), content);
+                    fake.etags.insert(path.clone(), etag);
+                }
+            }
             let Some(data) = fake.blobs.get(&path).cloned() else {
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
@@ -577,6 +602,16 @@ pub fn set_version_id(state: &State, key: &str, version: &str) {
         .unwrap()
         .version_ids
         .insert(format!("acct/ctr/{key}"), version.to_string());
+}
+
+/// Replace the blob a GET names by `content` with `etag` just before the `n`-th GET of an
+/// existing blob is answered (see [`Fake::replace_before_get`]).
+pub fn replace_before_get(state: &State, n: usize, content: Vec<u8>, etag: &str) {
+    state
+        .lock()
+        .unwrap()
+        .replace_before_get
+        .push((n, content, etag.to_string()));
 }
 
 /// Queue a scripted body cut (see [`GetFault::Cut`]).

@@ -43,6 +43,11 @@ pub mod list_pattern; // (#213): the explicit client-side regex filter for listi
 pub mod mp;
 pub mod multi_endpoint;
 pub mod range_engine_generic; // Universal stream-based range engine (v0.9.2+)
+#[cfg(any(
+    feature = "backend-azure",
+    all(feature = "backend-gcs", not(feature = "gcs-community"))
+))]
+pub(crate) mod range_version; // one object version per logical RangeEngine GET (stage G, G-F2)
 pub(crate) mod redact; // credential redaction of URIs shown in messages (one implementation)
                        // The one entry the `s3-cli` binary needs: an error from a store call, made safe to print.
 #[doc(hidden)]
