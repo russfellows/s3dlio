@@ -1,6 +1,6 @@
 # s3dlio Changelog
 
-## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
+## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; zero copy everywhere (Rule #1); stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 
 This release adds a new public API surface (#264) and fixes twenty-three issues (#224, #230,
 #233, #235, #261, #263, #269, #270, #271, #272, #277, #278, #279, #280, #281, #282, #283, #284,
@@ -11,11 +11,53 @@ object straight into memory the caller owns (a `bytearray`, a NumPy array, an `m
 array, ...), look up an object's size and version identity without reading it, and say, from the URI
 alone, whether this build supports them. They work on S3 and S3-compatible services (including
 GCS through its S3 endpoint), Azure Blob and native GCS (`gs://`, in builds with the GCS backend,
-which the PyPI wheels do not include). The existing APIs are unchanged except for the fixes listed
-under "Changed (BEHAVIOUR CHANGE)".
+which the PyPI wheels do not include). The existing APIs are unchanged except for the fixes and the
+zero-copy changes listed under "Changed (BEHAVIOUR CHANGE)".
+
+**Zero copy everywhere (stage G, Rule #1).** The maintainer made zero copy the first rule of the
+repository: s3dlio exists to be faster than libraries that copy payload data around, so a copy of
+payload bytes is a defect unless it is a documented exception. This release removes every avoidable
+copy that two audits of the write and read paths found: asynchronous writes borrow the caller's buffer
+by default, checkpoint saves read any buffer in place, S3 and Azure reads receive into one buffer,
+the range engine receives each range straight into the final buffer, `file://` and `direct://`
+no longer copy through tokio's internal buffer, loader items and the NPZ reader read in place, and the
+Python wrappers (s3torchconnector compatibility, the DLIO storage classes, the torch datasets) stopped
+copying. The few copies that remain are listed, with when they apply and how to avoid them, under
+"Remaining copies" below and in "Remaining copies (Rule #1)" of the Python API guide.
 
 **Read the behaviour changes before upgrading.** Each one is described in full below:
 
+- **Asynchronous writes borrow your buffer by default (stage G).** `put_bytes_async`,
+  `put_many_async` and the `MultiEndpointStore` `put`, `put_to_endpoint` and `put_all_endpoints` now
+  take `borrow=True`: a mutable buffer (`bytearray`, `memoryview`, NumPy array, ...) is read in place,
+  with no copy, until the awaitable completes. **Do not modify, resize or free the buffer until the
+  `await` has finished**: a `bytearray` raises `BufferError` if resized meanwhile, and changing its
+  contents is a data race (the uploaded bytes are undefined). Code that reuses the buffer right after
+  the call returns must pass `borrow=False` (one snapshot copy, the old behaviour). `bytes`, `bytes`
+  subclasses, `memoryview` of `bytes` and `BytesView` are never copied in either mode. The Python 3.11
+  `asyncio.wait_for` limitation (#288) now applies to these default calls too.
+- **`MultipartUploadWriter.write()` borrows a large buffer until `close()` (stage G).** A buffer of at least the
+  threshold (the part size for a signed upload, 2 KiB for an unsigned one) is no longer copied: it stays borrowed
+  until `close()`, `abort()` or leaving the `with` block has returned, so **do not modify, resize or free it before
+  then**. Smaller writes are copied once into the part buffer and borrow nothing; `copy=True` is an independent
+  snapshot; `bytes` and `BytesView` are shared and never held. `write()` raises `BufferError` if the buffer overlaps
+  memory that is still borrowed (a `readinto(buf); write(buf)` loop needs `copy=True` or a fresh buffer per write).
+- **`put_many` and `put_many_async` stop on the first failure.** The first item that fails ends the
+  batch (nothing that has not started is started) and its own error is raised; cancelling
+  `put_many_async` stops the batch the same way. The blocking `put_many` holds every buffer for the
+  call (no copy) and does not return until all of them are released.
+- **Checkpoint saves accept any buffer and read it in place.** `save_checkpoint`,
+  `save_distributed_shard`, `PyCheckpointStore.save`, `PyCheckpointWriter.save_distributed_shard`
+  and `PyCheckpointStream.write_chunk` take `bytes`, `bytearray`, `memoryview`, NumPy arrays and
+  `BytesView`; the call blocks until the data is written, so the buffer is yours again when it
+  returns. `load_checkpoint_with_validation` still returns `bytes` (one documented copy); the new
+  `load_checkpoint_with_validation_view` returns a `BytesView` (zero copies).
+- **Rust: checkpoint writer calls are generic over `IntoShardBytes`.** `Writer::{put_shard,
+  put_shard_with_key, save_checkpoint, save_distributed_shard}` and `CheckpointStore::save` take
+  `impl IntoShardBytes` instead of `&[u8]`. `Bytes` and `Vec<u8>` are zero copy; `&[u8]` and the other
+  borrowed forms still compile and copy once. Rust no longer auto-dereferences a reference into
+  `&[u8]` for a generic parameter, so a call that passed a reference to a type outside the list in the
+  trait documentation (`&&[u8]`, `&String`, `&Rc<[u8]>`, ...) needs `.as_slice()` or `&x[..]`.
 - **`put_bytes` and `put_bytes_async` payloads are strict (#261).** They raise `TypeError` for an
   `int`, a `bool` or an arbitrary iterable instead of writing a payload made from it
   (`put_bytes(uri, 42)` used to write 42 zero bytes), as the streaming writers already did. Buffers
@@ -100,6 +142,25 @@ under "Changed (BEHAVIOUR CHANGE)".
   Internal ranges, retries and size probes are not extra rows. The GET byte count is the number of
   distinct destination positions filled, so a retried range is not counted twice; it does not mean
   the data is valid. A HEAD row's byte count is the object size. The TSV schema is unchanged.
+- **`s3dlio.load_checkpoint_with_validation_view(uri, validate_integrity=True)`** (stage G). The same
+  read, validation and errors as `load_checkpoint_with_validation`, returning a `BytesView` over the
+  fetched buffer instead of a copy (`memoryview(view)` and `np.frombuffer(view)` read it in place).
+- **`borrow` on the batch and multi-endpoint writes** (stage G). `put_many_async(items, max_in_flight=64,
+  *, borrow=True)`, `MultiEndpointStore.put(uri, data, *, borrow=True)`, `put_to_endpoint(index, uri,
+  data, *, borrow=True)` and `put_all_endpoints(uri, data, *, borrow=True)`; see "Changed (BEHAVIOUR
+  CHANGE)".
+- **Loader items read in place** (stage G). `PyObjectItem` (from `.items()` and `collect_batch`) and the
+  Parquet items support `memoryview(item)` and `np.frombuffer(item)` (read-only, zero copy) and a `.data`
+  property that returns a read-only `BytesView` over the same buffer. `bytes(item)` is the documented
+  copy.
+- **Rust:** `checkpoint::IntoShardBytes`, the trait behind the generic checkpoint writer calls (see
+  "Read the behaviour changes before upgrading"): implemented for `Bytes`, `&Bytes` and `Vec<u8>` (zero
+  copy) and for `&[u8]`, `&mut [u8]`, `&Vec<u8>`, `&mut Vec<u8>`, `&[u8; N]`, `&Box<[u8]>`,
+  `&Arc<[u8]>`, `&Cow<[u8]>` and `&BytesMut` (one copy, made only where a `Bytes` is needed: a
+  compressing writer reads a slice and copies nothing). New `RangeEngine::download_into_master`, which
+  receives every range straight into its segment of one buffer; `RangeEngine::download` keeps its
+  `Bytes`-returning closure shape and its per-range copy. `AzureObjectStore::get_range_into` and
+  `GcsObjectStore::get_range_into` (official client) read a range into a caller buffer.
 - **Rust:** two provided methods on `ObjectStore`, `get_into(uri, &mut [u8], &ReceiveProgress)` and
   `head(uri) -> Option<HeadMetadata>`. Both default to "unsupported", so existing implementations
   compile unchanged; the S3, Azure and GCS stores and the logged wrapper implement them. New public
@@ -152,9 +213,92 @@ under "Changed (BEHAVIOUR CHANGE)".
   (`MultiEndpointStore`); now every buffer-protocol object and `__bytes__` object is accepted, and an
   `int`, a `bool` or an arbitrary iterable raises `TypeError`. Every item is converted before the
   first request, so one bad item writes nothing, and the error names the failing item and its URI
-  (the exception type and original message are kept). Each payload is copied once with the GIL held
-  (exact `bytes` and `BytesView` are not copied), so the call never reads the caller's buffer after
-  it returns.
+  (the exception type and original message are kept). (Stage G, later in this release: the payloads
+  are no longer copied once with the GIL held; they are borrowed. See "Borrowed asynchronous writes"
+  below.)
+- **Borrowed asynchronous writes (stage G, Rule #1).** `put_bytes_async`, `put_many_async`,
+  `MultiEndpointStore.put`, `put_to_endpoint` and `put_all_endpoints` took a private copy of a mutable
+  buffer (`bytearray`, `memoryview`, NumPy, ...) before returning; now `borrow=True` is the default
+  and the buffer is read in place until the awaitable completes. Until then you must not modify,
+  resize or free it: `bytearray` raises `BufferError` on a resize, a write to the contents is a data
+  race (the uploaded bytes are undefined). The awaitable keeps the completion barrier of the earlier
+  `put_bytes_async(borrow=True)`: it never completes, whatever the cancellation, while a native reader
+  of any buffer remains or before every export is released, and `put_many_async` counts all of its
+  buffers on one barrier. `borrow=False` restores the previous behaviour at the price of one copy of
+  each mutable buffer (taken with the GIL released above 256 KiB for `put_bytes_async`, held for the
+  batch and endpoint calls). Immutable sources are never copied in either mode: exact `bytes`, any
+  `bytes` subclass, `memoryview(bytes)` (also nested and sliced) and `BytesView`. A read-only view of a
+  mutable object (`memoryview(bytearray).toreadonly()`, a read-only `mmap`, a non-writeable NumPy view)
+  is not treated as immutable and is still snapshotted by `borrow=False`. `put_all_endpoints` reads
+  one buffer for all endpoints. The blocking `put_many` holds every buffer for the call, with no copy,
+  and (like `put_bytes`) raises `ExportStillReferencedError` if a backend still references a buffer
+  after `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`.
+- **`MultipartUploadWriter.write()` borrows large buffers until `close()` (stage G, Rule #1).** Until now `write()`
+  held your buffer only for the call and the sink copied it into its part buffers. A write of at least the
+  threshold is now sliced into parts and uploaded straight out of your memory, asynchronously, after `write()` has
+  returned; the Python buffer export is kept until every part that uses it has been uploaded. `close()`, `abort()`
+  and `__exit__` wait for that and release the buffers before they return, and raise `ExportStillReferencedError`
+  (and keep the buffers pinned) if a backend still references one after `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`; that
+  error takes precedence over an upload failure and over an exception leaving the `with` block, and quotes the
+  upload error in its message ("the upload itself failed: ..."). `abort()` cancels the parts in flight first.
+  Until `close()` returns you must not modify, resize or free the buffer: a `bytearray` raises `BufferError` on a
+  resize, and a write to its contents is a data race (the object holds undefined bytes). **Threshold.** The
+  threshold is the part size for a signed upload (the default) and 2 KiB for an unsigned one
+  (`S3DLIO_UNSIGNED_PAYLOAD`); a write below it is copied once into the part buffer and nothing is borrowed, so
+  there is no lock and the buffer can be reused at once. Measured (`python/tests/test_zero_copy_multipart.py` with
+  `S3DLIO_ZC_BENCH=1`; 16 MiB parts, 128 MiB per case, best of 3, write loop plus `close()`; time borrowing / time
+  copying): signed, 1.07-1.25 at 1 KiB and below and 0.87-1.04 from 2 KiB up (typically about 0.93, a gain of at
+  most about 7%, which is about the run-to-run noise); unsigned, 0.72-0.93 for 2-32 KiB, 0.94-1.10 from 64 KiB up
+  and 1.05-1.19 at 1 KiB and below. For signed uploads borrowing a sub-part write cannot avoid the copy (a part is
+  made of several writes and must be one contiguous body), so the part size is kept as the threshold; unsigned
+  uploads send a straddling part without a gather, so borrowing from 2 KiB is genuinely zero copy and was
+  measurably faster. **Reuse guard.** `write()` raises `BufferError` ("buffer reused while still borrowed; pass
+  copy=True or use a fresh buffer") when the buffer overlaps memory of an earlier write that has not been uploaded
+  yet; the writer stays usable and can be aborted. **`copy=True`** takes one independent snapshot (GIL held).
+  `bytes` and `BytesView` are shared with the parts and never copied (below the threshold they are copied once like
+  any small write). **Straddling parts.** A part that lies inside one write is a slice; writes that are multiples
+  of the part size never copy. A signed upload gathers a part that spans two writes (and the final short part, if
+  it spans writes) once: one copy of at most `part_size` bytes. An unsigned upload sends it as a multi-chunk body
+  with no copy (see "Zero copy" below for the connector). **`reserve()` / `commit()`.** `commit` gives the
+  reserved buffer to the writer, shrunk to the committed length first (a short commit does not pin the whole
+  reservation); a commit below the threshold is coalesced into the part buffer. A new hidden test and benchmark
+  hook, `s3dlio._mpu_coalesce_below`, sets the threshold for writers created afterwards.
+- **`put_many` and `put_many_async` stop at the first failure (stage G).** They used to start every
+  remaining item and, after the first error, returned it while the other items kept uploading in the
+  background (their tasks were detached). The first failed item now ends the batch: the semaphore is
+  closed so items waiting for a slot never start, queued items are dropped at once (releasing their
+  buffers), and that item's own error is raised, not a generic "stopped" error. Writes already running
+  cannot be interrupted and are waited for (an object being written when another item failed may still
+  be completed). Cancelling the `put_many_async` awaitable stops the batch the same way. A bad payload
+  still raises before any request is sent.
+- **Checkpoint saves read any buffer in place (stage G).** `save_checkpoint`, `save_distributed_shard`,
+  `PyCheckpointStore.save`, `PyCheckpointWriter.save_distributed_shard` and `PyCheckpointStream.write_chunk`
+  now accept `bytes`, `bytearray`, `memoryview`, NumPy arrays and `BytesView` (any buffer-protocol
+  object) instead of `bytes` only, and no longer copy the payload (the writer used to `to_vec()` it and
+  copy it again into a `Bytes`). The call blocks, with the GIL released, until the data is written: the
+  buffer is exported for the whole call (a `bytearray` raises `BufferError` on a resize, and no thread
+  may modify its contents), and the call returns or raises only after every native reader is done and
+  the export is released; if a backend still references it after `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`
+  the call raises `ExportStillReferencedError` and the buffer stays pinned. A non-contiguous array is
+  gathered once, and an object that only has `__bytes__()` is converted once. Compression (zstd) is a
+  transform: the encoder reads your buffer. An unsupported payload (an `int`, a `bool`, an iterable, a
+  pointer buffer) raises `TypeError`, and for `PyCheckpointStream.write_chunk` it does so before the
+  lazily-created shard is opened, so a rejected first chunk leaves no shard behind.
+- **`load_checkpoint_with_validation` copies once, not twice (stage G).** It still returns `bytes`
+  (a compatibility API: a Python `bytes` owns its memory, so building one is one documented copy), but
+  the intermediate `Vec` is gone. `load_checkpoint_with_validation_view` returns the fetched buffer as a
+  `BytesView` with no copy. A `.zst` shard is decoded into an output buffer pre-sized from the zstd
+  frame header when it records the content size (the header is trusted only up to zstd's maximum
+  expansion and the reservation is fallible); frames written by the streaming encoder carry no size
+  and grow as before.
+- **Zero range-engine chunk size (stage G).** A `RangeEngineConfig` `chunk_size` of 0 (Rust
+  configuration) is an error before any range is planned; it used to plan empty ranges for ever and
+  exhaust memory.
+- **`direct://` `get_range` past the end (stage G).** `get_range(uri, offset, 2**64 - 1)`, and any length
+  past the end of the file, reads to the end of the file on `direct://` (buffered mode), as on `file://`;
+  an offset at or past the end returns an empty result. Before, only exactly `2**64 - 1` meant "to the
+  end" and any other length past the end was an error or an allocation failure. A length that cannot be
+  allocated is an error, not a panic.
 - **Pointer buffers refused (#282).** The check that refuses buffers of memory addresses recognised
   only the `O` and `P` format codes. It now also refuses `&` (`POINTER(T)`), `z` / `Z`
   (`c_char_p` / `c_wchar_p`) and `X` (function pointers), anywhere in the format, including inside
@@ -170,6 +314,107 @@ under "Changed (BEHAVIOUR CHANGE)".
   For files, sub-second precision is kept and a pre-epoch or unrepresentable time is left absent.
   GCS times use the Google client's own RFC 3339 conversion. The legacy community GCS client is
   unchanged.
+
+### Zero copy (stage G, Rule #1)
+
+Each removal below is proven by a test that fails with the copy present (pointer identity, an owner
+check, or an allocation / peak-memory bound), not by a claim. No throughput number is claimed for
+this stage in this entry.
+
+- **S3 `get` and `get_range` receive into one pre-sized buffer.** The response body used to be
+  collected chunk by chunk and then joined into a second buffer (two copies of the object live at the
+  peak). The destination is now allocated once from the response's `Content-Length` and each chunk is
+  copied into it as it arrives and freed (peak about 1x the object, one chunk-to-destination copy). A
+  body longer or shorter than its `Content-Length` is an error, and an absurd announced length is an
+  error, not an allocation abort. A response without `Content-Length` cannot be pre-sized: its
+  chunks are kept and joined once (a 2x peak, rare; S3 sends the header on every GET). Two neighbouring
+  S3 paths follow the same rule: the dataset range mode receives its parts into pre-split segments of
+  one buffer and joins them without a copy (it used to copy each part into the output), and
+  `put_object_multipart_on` slices an owned `Bytes` into parts instead of copying it.
+- **Azure large blobs are received into one buffer.** `get` of a blob larger than one partition used
+  to copy every SDK partition into a buffer of its own and then into the result (two copies of every
+  byte, twice the blob live). The first ranged response now goes into the front of one buffer of the
+  blob's size and the other partitions are read in ranged requests (`concurrency` at a time), each
+  straight into its own slice and pinned to the first response's ETag with `If-Match`: exactly one copy
+  per byte. The requests are futures of the call, so dropping or cancelling it, or the first failed
+  partition, stops all of them (the SDK's `download_into` is not used because its manager task keeps
+  requesting after the caller is gone). A blob whose first response has no strong ETag cannot be pinned
+  and is read in one request; a first response without `Content-Range` that is exactly as long as the
+  partition asked for is an error, because it cannot be told from a truncated blob. Header-derived
+  lengths use checked arithmetic.
+- **The range engine receives each range straight into the final buffer.** `download_into_master`
+  gives every range its own window of ONE master buffer and joins the windows in order without copying;
+  Azure, the official GCS client, `file://`, buffered `direct://` and O_DIRECT `direct://` (see the
+  bounce below) use it, and the S3 range paths already receive into windows of one buffer. The previous path allocated a `Bytes` per
+  range and copied each into the master. `RangeEngineConfig::chunk_size = 0` is a configuration error.
+- **`file://` and `direct://` no longer copy through tokio's internal buffer.** Whole-object GETs,
+  `get_range`, and the streaming writers use plain `std::fs` positional reads and `write(2)` calls
+  straight to and from the caller's memory (`tokio::fs::File` copied every byte, up to 2 MiB at a
+  time). On a multi-thread runtime the borrowed-slice write is off-loaded with `block_in_place`; on a
+  current-thread runtime (Rust embedders only) it runs inline and blocks that thread for the write,
+  because a borrowed slice cannot be moved to another thread without the copy Rule #1 forbids. Owned
+  data (`write_owned_bytes` from Rust) uses `spawn_blocking`.
+- **`direct://` `get_range` returns a slice of the aligned read buffer** when that buffer is private to
+  the read (no copy); a buffer leased from the bounce pool is copied out once because it must go back to
+  the pool. The O_DIRECT range-engine download copies each range once from the aligned buffer into its
+  window (the bounce for unaligned memory), where it used to copy pool buffer to a fresh `BytesMut` to
+  the window.
+- **Buffered writers hand the store their own allocation.** The S3, Azure and GCS whole-object writers
+  give the accumulated buffer to the store as the `Bytes` of that same allocation (the Azure writer used
+  to `clone()` the whole buffer). The Rust `write_owned_bytes(Vec<u8>)` moves the `Vec` into an empty,
+  uncompressed writer with no copy; a second chunk is appended (the accumulation copy of the
+  whole-object design, not redesigned in this release). From Python, `write_owned_bytes` goes through
+  the borrowed path and so does not avoid that copy.
+- **NPZ.** `read_npz` slices a stored (uncompressed) member out of the fetched archive in place and
+  checks it against the CRC-32 the archive recorded (the zip layer used to read it into a new buffer).
+  The one copy is the `float32` format decode. A hostile NPY header (a shape that overflows, a `)` before
+  the `(`) is an error, not a crash.
+- **Loader items.** `PyObjectItem` and the Parquet items expose the buffer protocol and `.data` (see
+  Added); `bytes(item)` is the copy.
+- **Python wrappers stopped copying.** The s3torchconnector compatibility writers (`S3Checkpoint.writer`
+  and `S3Client.put_object`) upload `getbuffer()` of their `BytesIO` read in place instead of
+  `bytes(...)` / `read()`; after a failed upload `close()` raises and keeps the data, so `close()` can be
+  retried (the buffer is closed only after a successful upload). The DLIO storage classes
+  (`S3dlioStorage`, `S3PyTorchConnectorStorage`) pass `BytesIO.getbuffer()` instead of `getvalue()` and
+  slice parts as `memoryview` views. `ObjectStoreMapDataset(return_type="reader")` wraps the fetched
+  buffer without the `bytes(...)` copy it used to make; `return_type="bytes"` remains the documented
+  copy.
+
+- **Multipart uploads.** The multipart sink slices owned data (`Bytes`, a `Vec`, a `BytesView`, a borrowed Python
+  buffer) into parts and never copies it, apart from two bounded, documented gathers: a part that straddles two
+  writes in a SIGNED upload (one copy of at most `part_size` bytes), and writes below the coalescing threshold
+  (copied once into the part buffer; measured, see the behaviour-change entry above). The previous sink copied every
+  borrowed write into its part buffers (and a `BytesView` below 8 MiB), and the buffered-tail path copied a second
+  time once a tail was buffered.
+- **The HTTP connector streams multi-segment request bodies.** A request body made of several refcounted segments
+  (an unsigned multipart part that straddles writes) would have been collected into one buffer by the connector
+  before it was sent. The connector now keeps the segments as they are (`RequestBody`, a list of `Bytes`) and sends them as a streaming body
+  with an exact `Content-Length` (no chunked encoding); a one-segment body, which is every ordinary PUT, takes the
+  old path unchanged. An SDK retry and the connector's own retry (the h2c probe) resend the same segments.
+
+#### Remaining copies
+
+Everything else that still copies payload bytes is a documented exception, commented at its site and
+listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API guide:
+
+- the one network / SDK chunk copy into the destination (including the 2x peak of an S3 response
+  without `Content-Length`);
+- transforms: zstd compression and decoding, the `read_npz` `float32` decode, inflating a compressed
+  NPZ member;
+- the O_DIRECT bounce for unaligned memory (`direct://` PUTs, the O_DIRECT range-engine windows, and a
+  `get_range` served from the pooled bounce buffers);
+- a non-contiguous array (gathered once) and an object that only offers `__bytes__()`;
+- APIs that return `bytes` for compatibility: `load_checkpoint_with_validation`, `bytes(item)`,
+  `ObjectStoreMapDataset(return_type="bytes")`, and the Rust `ObjectStore::load_checkpoint_with_validation`
+  (`Vec<u8>`, taken over from the fetched buffer without a copy when it is the sole owner);
+- copies you opt into: `borrow=False`, `write_owned_bytes(copy=True)`, `writable=True`;
+- multipart writer: the signed straddling-part gather (at most `part_size` bytes) and the coalescing copy of
+  writes below the threshold (measured faster; see the behaviour-change entry);
+- the whole-object buffered streaming writers (S3, Azure, GCS): each borrowed `write_chunk` is copied once
+  into the writer's buffer; pass the whole object with `put_bytes` for none (Rust callers can also give the
+  writer one owned `Vec` through `write_owned_bytes`);
+- the community GCS client's ranged reads (feature `gcs-community`, not in the PyPI wheels);
+- the Rust `&[u8]` checkpoint API shapes (`IntoShardBytes`), and `RangeEngine::download`.
 
 ### Fixed
 
@@ -286,23 +531,50 @@ under "Changed (BEHAVIOUR CHANGE)".
 
 ### Validation
 
-- Rust: `cargo fmt`, clippy with `-D warnings` in seven feature configurations, and the full
-  default-feature test run (1812 passed, 0 failed), the full-backend library tests (1113 passed)
-  and the Python-extension unit tests (1050 passed), including fault-injection tests for the S3,
-  Azure and GCS receive paths (exact request counts, version pinning, wrong lengths, mid-stream
-  failures, cancellation, no whole-object allocation), the download-layout safety tests and the
-  checkpoint validation tests.
+- Rust: `cargo fmt`, clippy with `-D warnings` in nine feature configurations (default,
+  full-backends, tests, extension-module variants, the community GCS client and the Arrow
+  backend), and the full default-feature test run (1889 tests: 1888 passed and one intermittent
+  request-count failure of a test-harness kind that also occurs on the code before the zero-copy
+  stage, tracked in #292), the full-backend library tests (1152 passed) and the Python-extension
+  unit tests (1099 passed), including fault-injection tests for the S3, Azure and GCS receive
+  paths (exact request counts, version pinning, wrong lengths, mid-stream failures, cancellation,
+  no whole-object allocation), the download-layout safety tests and the checkpoint validation
+  tests.
 - Installed wheels (x86_64; CPython 3.11 default build, 3.12 and 3.13 default and full builds): the
-  caller-buffer suite, the borrowed-PUT barrier suite and the new stage tests (295 tests) pass on
-  every wheel, including the Python 3.11 cancellation cases; the curated regression set passes on
-  3.11, 3.12 and 3.13; the whole `python/tests` directory runs with no failures and no collection
-  errors on 3.11 and 3.13 with all cloud credentials removed (tests that need a live endpoint skip
-  with a reason). The release workflow also builds aarch64 wheels, which were not run here.
+  caller-buffer suite, the borrowed-PUT barrier suite, the stage F tests and the zero-copy suites
+  (473-475 tests per wheel) pass on every wheel, including the Python 3.11 cancellation cases; the
+  whole `python/tests` directory runs with no failures and no collection errors on 3.11 (938
+  passed) and 3.13 full (941 passed) with all cloud credentials removed (tests that need a live
+  endpoint skip with a reason). The release workflow also builds aarch64 wheels, which were not run here.
 - Live: GCS (through its S3 endpoint and natively, including `%` and `\` keys) and Azure Blob, from
   Rust and from Python through the installed wheels, with isolated prefixes and nothing left behind.
   The GCS Rapid (zonal bucket) route was not run live (see Known limitations).
-- **Not measured:** throughput, memory use and GIL behaviour against the existing allocating GET.
-  This release makes no performance claim for the new calls.
+- Stage G (zero copy): every removed copy has a failing-before test (pointer identity, owner check or
+  an allocation / peak-memory bound) in the Rust unit tests, the integration tests
+  (`tests/test_zero_copy_*.rs`) and the installed-wheel suites (`python/tests/test_zero_copy_*.py`).
+- **Performance** (Python API, CPython 3.13 x86_64, a local S3-compatible test server on the same
+  16-vCPU host whose GET bodies cost it almost nothing; one benchmark process at a time on an idle
+  host; `scripts/bench_zero_copy.sh`, ~2 GiB per cell, median of three timed passes after a warm-up;
+  0.9.128 from PyPI against this release). GB/s; "extra" is peak resident memory beyond the
+  payload already in Python.
+
+  | Workload | Size, in flight | 0.9.128 | 0.10.0 | Extra memory, 0.9.128 → 0.10.0 |
+  |---|---|---|---|---|
+  | `put_bytes_async` (default) | 256 MiB, 4 | 1.54 | 3.11 | ~1 GiB → 0 |
+  | `put_bytes_async` (default) | 16 MiB, 8 | 4.13 | 4.91 | 129 MiB → 2 MiB |
+  | `put_many`, bytes | 256 MiB, 4 | 1.19 | 3.0 | 2 GiB → 0 |
+  | `put_many`, numpy | 256 MiB, 4 | 0.03 | 3.0 | 2 GiB → 0 |
+  | `put_many`, numpy | 16 MiB, 8 | 0.03 | 5.0 | 2 GiB → 0 |
+  | `get` | 16 MiB, 1 | 1.75 | 3.09 | — |
+  | `get_async` | 16 MiB, 1 / 8 | 2.44 / 11.2 | 5.06 / 13.7 | — |
+  | `get_range` | 256 MiB, 1 / 4 | 1.63 / 4.09 | 3.46 / 6.93 | — |
+  | `get_into_async` (new) | 16 MiB, 8 | — | 20.5 | caller's buffer |
+  | `get_into_async` (new) | 256 MiB, 4 | — | 12.8 (`get_async`: 4.8) | caller's buffer |
+
+  `put_bytes` (already zero-copy) and single-stream GETs of objects above the range threshold are
+  unchanged. The 0.9.128 `put_many` of numpy arrays converted every element; 0.10.0 reads the
+  array in place. These are single-host loopback numbers with a near-free server; they show where
+  copies were removed, not what a remote store will deliver.
 
 ### Known limitations
 
@@ -332,6 +604,24 @@ under "Changed (BEHAVIOUR CHANGE)".
   ignores further cancellations (the Python API guide shows one) before touching the buffer. Python
   3.12 and 3.13 (tested) are not affected; plain `await`, `asyncio.timeout()`, and a `wait_for`
   cancelled at most once and before its deadline are safe on every supported version.
+- **Borrowed writes and the Python 3.11 `wait_for` limitation (#288).** `put_bytes_async`,
+  `put_many_async` and the `MultiEndpointStore` writes borrow by default since stage G, so the 3.11
+  `wait_for` caveat above applies to them without any argument; use `asyncio.timeout()`, the
+  wait-in-a-loop helper from the Python API guide, or `borrow=False` on 3.11.
+- **Borrowed multipart buffers stay pinned until `close()`.** A buffer passed to `MultipartUploadWriter.write()`
+  cannot be reused until `close()` / `abort()` returns, so a long upload that wants to recycle one buffer must use
+  `copy=True`; the reuse guard refuses an overlapping buffer rather than letting it corrupt parts in flight.
+- **Whole-object streaming writers are not redesigned.** `create_s3_writer` and `create_azure_writer`
+  (and the Rust GCS writer) keep the whole object in one buffer, so each borrowed `write_chunk` is
+  copied once into it (see "Remaining copies"). Use `put_bytes` to upload an object with no copy.
+- **Azure SDK parser overflow (debug builds only).** `azure_storage_blob` 1.1.0 computes `end + 1` on
+  the end of a response's `Content-Range` without a check (`models/http_ranges.rs`). A hostile or broken
+  reply with an end of `usize::MAX` panics inside the SDK in a debug build; a release build (the PyPI
+  wheels) wraps instead. s3dlio's own handling of those headers uses checked arithmetic.
+- **`file://` and `direct://` streaming writers on a current-thread Tokio runtime** (Rust embedders;
+  Python uses the multi-thread runtime). A borrowed chunk is written inline and blocks that thread for
+  the write, because moving it to another thread would need the copy Rule #1 forbids. On a multi-thread
+  runtime the write is off-loaded with `block_in_place`.
 - **Pointer detection is format-based (#282).** A ctypes `Union` containing a pointer reports a
   plain byte format, and a `:` inside a ctypes structure field name can hide a following pointer
   code, so neither can be detected from the buffer format.

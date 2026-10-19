@@ -2,7 +2,20 @@
 
 **Version:** 0.10.0
 
-**Last Updated:** October 18, 2026
+**Last Updated:** October 19, 2026
+
+> **Upgrading to 0.10.0 (read this first): asynchronous writes now BORROW your buffer.**
+> `put_bytes_async`, `put_many_async` and the `MultiEndpointStore` writes (`put`, `put_to_endpoint`,
+> `put_all_endpoints`) no longer take a private copy of a mutable buffer (`bytearray`, `memoryview`,
+> NumPy array, ...). They read your memory in place (`borrow=True`, the new default) until the
+> awaitable completes, so **do not modify, resize or free the buffer until the `await` has finished**:
+> a `bytearray` raises `BufferError` if you resize it meanwhile, and changing its contents is a data
+> race (the uploaded bytes are undefined). To keep the old behaviour (reuse the buffer the moment the
+> call returns) pass `borrow=False`: it costs one copy. `bytes`, `bytes` subclasses, `memoryview` of
+> `bytes` and `BytesView` are immutable and are never copied in either mode. Details:
+> [put_bytes()](#put_bytes--upload-data), [put_many()](#put_many--batch-upload-v0950),
+> [Multi-Endpoint](#multi-endpoint-load-balancing). Every copy that remains anywhere in the library is
+> listed in [Remaining copies (Rule #1)](#remaining-copies-rule-1).
 
 ## Table of Contents
 
@@ -11,7 +24,7 @@
 3. [S3 Connection Configuration](#s3-connection-configuration)
 4. [Architecture](#architecture)
 4. [Core Storage Operations](#core-storage-operations)
-5. [Zero-Copy Data Flow](#zero-copy-data-flow)
+5. [Zero-Copy Data Flow](#zero-copy-data-flow) (includes [Remaining copies (Rule #1)](#remaining-copies-rule-1))
 6. [Batch Operations](#batch-operations)
 7. [Multi-Backend Support](#multi-backend-support)
 8. [Multi-Endpoint Load Balancing](#multi-endpoint-load-balancing)
@@ -253,19 +266,34 @@ s3dlio.put_bytes("s3://bucket/key", b"data")
 with open("local_file.bin", "rb") as f:
     s3dlio.put_bytes("s3://bucket/key", f.read())
 
-# Async version (for use with asyncio)
-await s3dlio.put_bytes_async("s3://bucket/key", b"data")
+# Async version (for use with asyncio). Since 0.10.0 it BORROWS a mutable buffer (borrow=True):
+# do not modify, resize or free `buf` until this await has finished.
+await s3dlio.put_bytes_async("s3://bucket/key", buf)
+
+# Opt-in snapshot: one copy now, `buf` is yours again as soon as the call returns
+await s3dlio.put_bytes_async("s3://bucket/key", buf, borrow=False)
 ```
+
+**BEHAVIOUR CHANGE in 0.10.0 (zero copy is Rule #1).** `put_bytes_async` used to take a private snapshot of a
+mutable buffer by default; it now **borrows** it by default (`borrow=True`). The same default applies to
+`put_many_async` and the `MultiEndpointStore` writes (`put`, `put_to_endpoint`, `put_all_endpoints`), which used to
+copy each mutable payload once with the GIL held. Code that modifies, resizes or frees the buffer right after
+`put_bytes_async(...)` returns, before the awaitable has completed, must either wait for the awaitable or pass
+`borrow=False`. See "Contract for buffers that are read in place" below.
 
 **What is copied** (`put_bytes` / `put_bytes_async`), by input type. "Copies" counts copies made *by s3dlio*
 between your memory and the storage client:
 
-| Input | `put_bytes` | `put_bytes_async` (default) | `put_bytes_async(..., borrow=True)` |
+| Input | `put_bytes` | `put_bytes_async` (default, `borrow=True`) | `put_bytes_async(..., borrow=False)` |
 |---|---|---|---|
-| `s3dlio.BytesView`, exact `bytes` | 0 | 0 | 0 |
-| any other **C-contiguous** buffer, any item type (`bytearray`, `memoryview`, numpy `uint8`/`float32`/`bool`/..., `array.array`, ctypes arrays, `mmap`) | 0 | 1 (a snapshot, taken before the call returns, GIL released) | 0 |
+| `s3dlio.BytesView`, exact `bytes`, a `bytes` subclass, a `memoryview` of `bytes` (immutable) | 0 | 0 | 0 |
+| any other **C-contiguous** buffer, any item type (`bytearray`, `memoryview`, numpy `uint8`/`float32`/`bool`/..., `array.array`, ctypes arrays, `mmap`) | 0 | 0 (read in place until the awaitable completes) | 1 (a snapshot, taken before the call returns, GIL released above 256 KiB) |
 | non-contiguous view (strided, reversed, transposed) | 1 (gathered in logical order by Python, GIL held) | 1 | 1 |
 | object with only `__bytes__()` | 1 (made by Python) | 1 | 1 |
+
+A read-only view does not count as immutable unless its base is a `bytes` object: `memoryview(bytearray).toreadonly()`,
+a read-only `mmap` and a non-writeable NumPy view can still change through another handle, so `borrow=False` still
+snapshots them.
 
 The buffer is read **in place with the GIL released**, so other Python threads keep running during a large
 upload (a 512 MiB PUT used to stall every other thread for about 0.3 s).
@@ -282,8 +310,8 @@ objects of at least `min_io_size` (4 KiB) on a store with the range engine off (
 `s3dlio.get("direct://...")` followed by `put_bytes("direct://...", data)` needs no bounce copy of the body
 (only that final padded block). Smaller objects use buffered I/O.
 
-**Contract for buffers that are read in place** (`put_bytes`, and `put_bytes_async(borrow=True)` until the
-awaitable completes):
+**Contract for buffers that are read in place** (`put_bytes` and `put_many` for the whole call; `put_bytes_async`,
+`put_many_async` and the `MultiEndpointStore` writes by default, until the awaitable completes):
 
 * the source is *exported*: resizing it from another thread (`bytearray.extend()` / `clear()` / `del ba[:]`)
   raises `BufferError` until the call (or awaitable) is finished;
@@ -291,16 +319,18 @@ awaitable completes):
   prevents it, and it is a **data race**: the bytes uploaded are undefined (and the behaviour is undefined in the
   Rust sense). The memory is never freed or resized meanwhile because the buffer stays exported, but that does not
   make a concurrent write safe;
-* with `borrow=True` you additionally promise not to free the memory (for example ctypes/pinned host memory) until
-  the awaitable has completed, successfully or not;
+* with a borrowing async write (the default) you additionally promise not to free the memory (for example
+  ctypes/pinned host memory) until the awaitable has completed, successfully or not;
 * **completion is a safe-reuse point, cancellation included, on every backend (exact statement).** The awaitable
-  of `put_bytes_async(..., borrow=True)` is a `Future` that **never reaches a terminal state - result, exception
+  of a borrowing async write (`put_bytes_async`, `put_many_async`, the `MultiEndpointStore` writes, with
+  `borrow=True`, the default) is a `Future` that **never reaches a terminal state - result, exception
   or cancelled - while any native reader of the buffer remains or before the export has actually been released**
   (`PyBuffer_Release` has run, so a resize no longer raises `BufferError`). A native reader is any clone of the
   payload, wherever it lives: a store task, an SDK/HTTP task, a detached file write. The supported consumer
   operations cannot change that: `await`, `fut.cancel()`, `Task.cancel()` (once or repeatedly), `asyncio.timeout()`
   and `asyncio.wait_for()` all leave the awaiting task pending until the future ends - with one Python 3.11
-  exception for `wait_for`, described below (#288). The guarantee covers
+  exception for `wait_for`, described below (#288). For `put_many_async` the barrier covers every buffer of the batch
+  at once. The guarantee covers
   those consumer operations only: the future belongs to s3dlio, so calling its producer methods
   (`set_result`, `set_exception`, or the base-class `asyncio.Future.set_result` / `cancel`) is unsupported and ends
   it at once, whether or not a native reader remains. `cancel()` cancels the put, but a running native write cannot
@@ -317,7 +347,8 @@ awaitable completes):
   `Task` cancellation (an awaiting task whose cancellation was refused turns any exception into a plain
   `CancelledError`/`TimeoutError`). If your code must bound the wait, use the counter or the warning to detect it
   and treat the buffer as owned by s3dlio until the future ends; do not wrap it in `asyncio.shield`;
-* **blocking `put_bytes` keeps `s3dlio.ExportStillReferencedError`.** Its wait is bounded by the same timeout and is
+* **blocking `put_bytes` keeps `s3dlio.ExportStillReferencedError`** (the blocking `put_many` and the checkpoint saves
+  behave the same). Its wait is bounded by the same timeout and is
   not interruptible by signals / `KeyboardInterrupt` (the buffer must not be released while it can still be read).
   If a backend still holds the payload after that, the call raises `ExportStillReferencedError` (data may or may
   not have been written; the message names the timeout and what the put itself did, including the text of the put's own error if it failed). The exception is raised directly in the calling thread's own stack: no Future or Task
@@ -338,7 +369,9 @@ awaitable completes):
   deadline has fired (or it has been cancelled once), it cancels the s3dlio future and waits for it in a way that a
   further `Task.cancel()` interrupts. The awaiting task then ends while the future is still pending and s3dlio may
   still read (or, for `get_into_async`, write) the buffer, so the buffer is **not** safe to reuse at that point
-  (for `head_async`, the request may still be running). Python 3.12 and 3.13 (tested) are not affected. On 3.11,
+  (for `head_async`, the request may still be running). This now applies to the DEFAULT `put_bytes_async`,
+  `put_many_async` and `MultiEndpointStore` writes as well, because they borrow by default (pass `borrow=False`, or
+  use the loop below). Python 3.12 and 3.13 (tested) are not affected. On 3.11,
   use `asyncio.timeout()` instead of `wait_for` (it has no such gap, however many times the task is cancelled), or,
   if a `wait_for`-wrapped task can be cancelled, keep a reference to the s3dlio future and wait for it in a loop
   that a further cancellation cannot cut short before touching the buffer:
@@ -364,13 +397,15 @@ awaitable completes):
   path. NumPy complex formats (`Zf`, `Zd`, `Zg`) are accepted. A structured numpy dtype with padding is uploaded as its raw memory, padding bytes
   included (they are whatever was in memory).
 
-The default `put_bytes_async` takes a snapshot instead, so the buffer can be reused or resized as soon as the call
-returns. The one obligation: do not write to it from another thread *during that copy*. Up to 256 KiB the copy runs
-with the GIL held, so Python threads cannot interleave; above that it runs with the GIL released (so large copies do
-not stall other threads), and a Python thread, a C extension or a device that writes to the buffer at that moment is
-a **data race** with the copy (the snapshot is then undefined, and the behaviour is undefined in the Rust sense).
-Multi-threaded callers that mutate shared buffers must therefore serialise the call with their writers.
-`borrow` is keyword-only: `await s3dlio.put_bytes_async(uri, buf, borrow=True)`.
+`borrow=False` (the opt-in snapshot) takes ONE copy of a mutable buffer instead, so the buffer can be reused or
+resized as soon as the call returns. This copy is the documented price of not borrowing. The one obligation: do not
+write to the buffer from another thread *during that copy*. Up to 256 KiB the copy runs with the GIL held, so Python
+threads cannot interleave; above that it runs with the GIL released (so large copies do not stall other threads),
+and a Python thread, a C extension or a device that writes to the buffer at that moment is a **data race** with the
+copy (the snapshot is then undefined, and the behaviour is undefined in the Rust sense). Multi-threaded callers that
+mutate shared buffers must therefore serialise the call with their writers. Immutable sources (`bytes`, `bytes`
+subclasses, `memoryview` of `bytes`, `BytesView`) are never copied, in either mode.
+`borrow` is keyword-only: `await s3dlio.put_bytes_async(uri, buf, borrow=False)`.
 
 ### get() — Download Data
 
@@ -394,6 +429,32 @@ chunk = s3dlio.get_range("s3://bucket/key", offset=1024, length=4096)
 # Fetch from offset to end of object
 tail = s3dlio.get_range("s3://bucket/key", offset=1024)
 ```
+
+#### What a read copies (0.10.0: zero copy is Rule #1)
+
+Every byte received from the network is copied exactly once, into the buffer that `get()` returns; nothing
+copies it again on the way to Python. The bytes you get back are a `BytesView` over that buffer.
+
+* **S3 `get` / `get_range`.** The response body is received into ONE buffer allocated up front from the
+  response's `Content-Length`, and each network chunk is freed as soon as it is copied in. Peak memory is about
+  1x the object (it was about 2x: every chunk was kept and then joined into a second buffer). A body longer or
+  shorter than its `Content-Length` is an error. A response with no `Content-Length` (chunked) cannot be
+  pre-sized: its chunks are kept and joined once, a 2x peak that S3 itself does not produce.
+* **Large objects fetched as parallel ranges** (S3, Azure, the official GCS client, `file://`, buffered
+  `direct://`) are received range by range straight into that range's window of ONE final buffer; the windows are
+  joined without copying. There is no per-range buffer and no copy into the result.
+* **Azure large blobs.** `get` of a blob larger than one partition receives the first response into the front of one
+  buffer of the blob's size and every other partition straight into its own slice, pinned to the first response's
+  ETag with `If-Match`: exactly one copy of each byte and no second buffer. Dropping or cancelling the
+  call stops every request. A blob whose first response has no strong ETag cannot be pinned, so it is read again as
+  one request. A first response with no `Content-Range` that is exactly as long as the partition asked for is an
+  error, because it cannot be told from the first partition of a larger blob whose header was stripped.
+* **`file://` and `direct://`.** Reads use positional reads straight into the destination. They no longer pass
+  through tokio's internal buffer, which copied every byte (up to 2 MiB at a time) before the caller's buffer.
+* **`direct://` `get_range`** returns a slice of the aligned buffer the kernel filled (no copy) when that buffer is
+  private to the read. A buffer taken from the shared bounce pool must go back to the pool, so that range is
+  copied out once (see "Remaining copies"). `get_range(uri, offset, 2**64 - 1)` reads to the end of the file, as
+  on `file://`; an offset at or past the end returns an empty result.
 
 ### get_into_async() / head_async() — Read Into Your Own Buffer ✨ New in v0.10.0
 
@@ -662,7 +723,47 @@ raw = bytes(data)
 | `torch.frombuffer(data)` | 0 | Shares Rust memory |
 | `bytes(data)` | 1 | Explicit copy to Python heap |
 | `s3dlio.put_bytes(uri, pydata)` | 0 | Any C-contiguous buffer is read in place with the GIL released (1 copy only for strided views and `__bytes__()`-only objects); see "put_bytes() — Upload Data" for per-backend details, including `direct://` |
-| `s3dlio.put_bytes_async(uri, pydata)` | 0 or 1 | `bytes`/`BytesView`: 0. Other buffers: 1 snapshot copy (GIL released), or 0 with `borrow=True` |
+| `s3dlio.put_bytes_async(uri, pydata)` | 0 | Borrows the buffer until the awaitable completes (`borrow=True`, the default since 0.10.0); `borrow=False` takes 1 snapshot copy of a mutable buffer; `bytes`/`BytesView` and other immutable sources: 0 either way |
+| `s3dlio.put_many(items)` / `put_many_async(items)` | 0 | Every buffer is read in place (held for the call / until the awaitable completes); `put_many_async(borrow=False)`: 1 snapshot per mutable buffer |
+| `MultiEndpointStore.put` / `put_to_endpoint` / `put_all_endpoints` | 0 | Borrow by default, `borrow=False` for 1 snapshot; `put_all_endpoints` reads the one buffer for all endpoints |
+| `s3dlio.save_checkpoint(...)`, `PyCheckpointStore.save`, `save_distributed_shard`, `PyCheckpointStream.write_chunk` | 0 | Any buffer (`bytes`, `bytearray`, `memoryview`, NumPy, `BytesView`) is read in place; the call blocks until written (compression is a transform) |
+| `s3dlio.load_checkpoint_with_validation_view(uri)` | 0 | Returns a `BytesView`; `load_checkpoint_with_validation(uri)` returns `bytes`: 1 (documented) |
+| `memoryview(item)`, `np.frombuffer(item)`, `item.data` on `loader.items()` / Parquet items | 0 | `bytes(item)`: 1 (documented) |
+
+### Remaining copies (Rule #1)
+
+s3dlio is zero copy everywhere unless this section says otherwise: **a copy of payload bytes that is not listed
+here is a defect** (please report it). Every copy below is also commented at the place in the code where it is
+made. "Copy" means a copy made by s3dlio of the payload bytes; what the SDKs and the operating system do inside
+themselves is outside s3dlio.
+
+| # | Copy | When it applies | How to avoid it |
+|---|------|-----------------|-----------------|
+| 1 | **Network / SDK chunk into the destination.** Each chunk the transport hands up is copied once into its final place (the buffer `get()` returns, a window of the range-engine buffer, or your buffer in `get_into_async`) | Every read from `s3://`, `az://`, `gs://`. This is the one unavoidable copy: the chunk belongs to the transport. s3dlio makes it exactly once per byte and never again | Cannot be avoided. `get_into_async` makes it straight into memory you own |
+| 1a | The same, for an S3 response **without `Content-Length`** (chunked body): the chunks are kept and joined once, so the peak is 2x the body | Rare (S3 sends `Content-Length` on every GET) | Nothing to do; a body with a `Content-Length` peaks at 1x |
+| 2 | **Transforms.** zstd compression when writing a shard or stream with a compression option; zstd decoding of a `.zst` checkpoint shard; the little-endian `float32` decode of `read_npz` (the stored member is sliced out of the archive in place and CRC-checked, then each element is decoded into the aligned array NumPy takes over, because the member's bytes are only 1-byte aligned inside the archive); inflating a compressed NPZ member | Only when you use compression or `read_npz` | Write checkpoints uncompressed to skip the encoder and decoder. The zstd decoder pre-sizes its output when the frame header records the size (frames written with a known size); frames from the streaming encoder carry no size, so their output grows as it is read |
+| 3 | **O_DIRECT bounce for unaligned memory.** `direct://` cannot use unaligned memory with `O_DIRECT`, so (a) a PUT from a source whose address is not page-aligned is copied once through a reused aligned bounce buffer, and the last partial block is always bounced; (b) a range-engine read of a large `direct://` object copies each range once from the aligned read buffer into its window of the (unaligned) result; (c) a `direct://` `get_range` served from the shared bounce pool is copied out once, because the pool buffer is reused | `direct://` with O_DIRECT (what `direct://` uses unless configured otherwise) | Use page-aligned memory for PUTs (a `BytesView` from `s3dlio.get("direct://...")` is aligned). A `get_range` whose read buffer is private to the call is returned as a slice with no copy. Buffered `direct://` (O_DIRECT off) has none of these |
+| 4 | **Non-contiguous source.** A strided, reversed or transposed array/view must be gathered into logical order | Any write that is given such an array | Pass a C-contiguous array (make it contiguous once, up front, with `np.ascontiguousarray`) |
+| 5 | **Object with only `__bytes__()`.** Python builds one `bytes` for it | A payload that is neither a buffer nor `bytes` | Expose the buffer protocol (or pass a `bytes`/`BytesView`) |
+| 6 | **`bytes`-returning compatibility APIs.** A Python `bytes` owns its memory, so building one from a fetched buffer is one copy: `load_checkpoint_with_validation` (returns `bytes`), `bytes(item)` / `bytes(view)`, `ObjectStoreMapDataset(return_type="bytes")`, and `read()` of the file-like reader of `return_type="reader"` (it returns `bytes` slices, as file objects do; the reader itself holds the fetched buffer without copying it) | Only when you call them | `load_checkpoint_with_validation_view` (a `BytesView`), `memoryview(item)` / `np.frombuffer(item)` / `item.data`, `return_type="tensor"` |
+| 7 | **Copies you opt into.** `put_bytes_async(..., borrow=False)`, `put_many_async(..., borrow=False)` and the `MultiEndpointStore` `borrow=False` writes (one snapshot per mutable buffer); `write_owned_bytes(..., copy=True)`; `ObjectStoreMapDataset(..., writable=True)` (one copy per item) | Only when you pass them | Leave them at their defaults and keep the buffer unchanged until the call or awaitable completes |
+| 8 | **Whole-object buffered streaming writers.** `create_s3_writer` and `create_azure_writer` (and the Rust GCS writer) keep the whole object in one buffer until `finalize()` (then the allocation is handed to the store, with no copy): each `write_chunk()` is copied once into that buffer. `write_owned_bytes()` from Python goes through the same path, so it does not avoid it. These writers are not redesigned in this release | Writing through those three writers | `put_bytes` (the object is already in one buffer: 0 copies) or `MultipartUploadWriter` (borrows large writes, see "MultipartUploadWriter.write()" under the Streaming API). `create_filesystem_writer` and `create_direct_filesystem_writer` write straight from your buffer (the O_DIRECT bounce, #3, still applies to the latter) |
+| 9 | **Community GCS client** (feature `gcs-community`; not in the PyPI wheels). Its ranged reads return an owned `Bytes` per range, which is copied into the final buffer, and its PUT copies once | Only in a build with `gcs-community` | Use the official GCS client (the default `backend-gcs`) |
+| 10 | **Rust API compatibility shapes.** `Writer` / `CheckpointStore::save` take `impl IntoShardBytes`: `Bytes` and `Vec<u8>` are zero copy, while `&[u8]` and the other borrowed forms are copied once, only when the object is stored uncompressed (the encoder reads a slice without a copy). `RangeEngine::download` (closures that return `Bytes`) copies each range into the master buffer; `RangeEngine::download_into_master` has no such copy. `ObjectStore::load_checkpoint_with_validation` returns `Vec<u8>` (taken over from the fetched buffer without a copy when it is the sole owner, otherwise moved or copied once) | Rust callers only | Pass `Bytes`; use `download_into_master`; use `get_with_validation` for a `Bytes` result |
+| 11 | **Multipart writer: signed straddling part.** In a signed upload (the default) a part that spans two `MultipartUploadWriter.write()` calls, and the final short part of an object that spans writes, must be one contiguous request body, so it is gathered once: one copy of at most `part_size` bytes. Writes that are multiples of the part size never copy | `MultipartUploadWriter.write()` of writes that are not multiples of the part size, signed upload | Write multiples of the part size, use `reserve()` / `commit()` with part-sized buffers, or set `S3DLIO_UNSIGNED_PAYLOAD` (the part is then sent as a multi-chunk body with no gather) |
+| 12 | **Multipart writer: sub-threshold coalescing.** A `write()` smaller than the threshold (the part size for a signed upload, 2 KiB for an unsigned one) is copied once into the part buffer instead of being borrowed; so is a `bytes`, `BytesView` or `commit()` smaller than the threshold. This copy is bounded and was measured: for signed sub-part writes borrowing gave no gain beyond run-to-run noise (it was slower at 1 KiB and below), and coalescing needs no lock and no pinned buffer | Small writes through `MultipartUploadWriter` | Write buffers of at least the threshold (borrowed, no copy), or use `reserve()` / `commit()` |
+
+
+Notes:
+
+* **Azure SDK.** The Azure SDK's own partition buffers are outside s3dlio, which is why s3dlio drives the large-blob
+  ranged reads itself (see "What a read copies"). One SDK defect is worth knowing about: a hostile or broken server
+  reply with a `Content-Range` whose end is `usize::MAX` overflows `end + 1` inside the SDK's parser
+  (`azure_storage_blob` 1.1.0, `models/http_ranges.rs`). That panics in a debug build of the library only; a
+  release build (the PyPI wheels) wraps instead, and s3dlio checks every length it derives from such headers with
+  checked arithmetic.
+* **Proof.** Each removed copy has a test that fails with the copy present: a pointer-identity or owner check,
+  or an allocation / peak-memory bound.
 
 ---
 
@@ -674,8 +775,31 @@ Upload multiple objects in a single call with parallel execution. Each `data` ma
 object (`bytearray`, `memoryview`, a NumPy array, ...) or an object with `__bytes__()`; since v0.10.0 (#272) an
 `int`, a `bool`, a list of ints or any other iterable raises `TypeError` (wrap byte values in `bytes(...)`).
 Every item is converted before the first request, so one bad item writes nothing, and the error names the item
-(index and URI). Each payload is copied once when the call is made (exact `bytes` are not copied), so you may
-reuse the buffers as soon as `put_many` returns or `put_many_async` is called. Both resolve to `None`.
+(index and URI). Both resolve to `None`.
+
+**Buffers are borrowed, not copied (0.10.0, BEHAVIOUR CHANGE).** Both calls used to copy each mutable payload once
+when the call was made. They now read every buffer in place, like `put_bytes`:
+
+* **`put_many(items)`** blocks until every object is written and holds every buffer for the whole call: a
+  `bytearray` cannot be resized meanwhile (`BufferError`) and no thread may modify any buffer (a data race: the
+  uploaded bytes are undefined). It returns, or raises, only after every native reader of every buffer is done and
+  the buffers are released, so each buffer is yours again as soon as the call returns. If a backend still holds a
+  buffer after `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (30 s by default) the call raises `ExportStillReferencedError`
+  and the buffers stay pinned: do not modify, resize or free them. No copy is made.
+* **`put_many_async(items, max_in_flight=64, *, borrow=True)`** borrows by default: do not modify, resize or free any
+  buffer until the awaitable has completed (successfully or not). It never completes (result, error or
+  cancellation) while any buffer is still read or before every export is released, so the usual `await`,
+  `Task.cancel()` and `asyncio.timeout()` are safe; do not wrap it in `asyncio.shield` (see "Contract for buffers
+  that are read in place" under `put_bytes()`). `borrow=False` is the opt-in snapshot: one copy of each MUTABLE
+  buffer, taken when the call is made, so you may reuse the buffers immediately.
+* `bytes`, `bytes` subclasses, `memoryview` of `bytes` and `BytesView` are never copied in either mode.
+
+**A failure stops the rest.** The first item that fails ends the batch: items that have not started never start,
+items still queued are dropped at once (releasing their buffers), and that item's own error is raised, not a
+generic "batch stopped" error. Writes that are already running cannot be interrupted, so the call (or awaitable)
+waits for them, and an object that was being written when another failed may still be completed. Cancelling the
+`put_many_async` awaitable stops the batch the same way: nothing that has not started is uploaded, and the
+cancellation is delivered once the writes already running are done.
 
 ```python
 # List of (uri, data) tuples
@@ -686,8 +810,11 @@ items = [
 ]
 s3dlio.put_many(items)
 
-# Async version
+# Async version: leave the buffers alone until the await finishes
 await s3dlio.put_many_async(items)
+
+# Opt-in snapshot: reuse the buffers right away at the cost of one copy per mutable buffer
+await s3dlio.put_many_async(items, borrow=False)
 ```
 
 ### get_many() — Batch Download
@@ -903,6 +1030,23 @@ asyncio.run(main())
 - `"round_robin"` — Even distribution, lowest overhead
 - `"least_connections"` — Routes to endpoint with fewest active requests
 
+**Writes borrow your buffer (0.10.0, BEHAVIOUR CHANGE).** `put(uri, data, *, borrow=True)`,
+`put_to_endpoint(index, uri, data, *, borrow=True)` and `put_all_endpoints(uri, data, *, borrow=True)` accept the
+same payloads as `put_bytes`. By default a mutable buffer (`bytearray`, `memoryview`, NumPy array, ...) is read in
+place, with no copy, until the awaitable completes: do not modify, resize or free it before then (a `bytearray`
+raises `BufferError` on resize; a write to the bytes is a data race and the uploaded bytes are undefined). The
+awaitable never completes while a native reader of the buffer remains (see "Contract for buffers that are read in
+place" under `put_bytes()`). `put_all_endpoints` reads the one buffer for every endpoint, with no per-endpoint copy.
+`borrow=False` is the opt-in snapshot: one copy of a mutable buffer, taken when the call is made, so the buffer can
+be reused immediately. `bytes`, `bytes` subclasses, `memoryview` of `bytes` and `BytesView` are never copied in
+either mode. Before 0.10.0 each mutable payload was copied once with the GIL held.
+
+```python
+buf = bytearray(payload)
+await store.put("s3://bucket-1/data.bin", buf)                 # borrows buf: leave it alone until done
+await store.put("s3://bucket-1/data.bin", buf, borrow=False)   # snapshot: reuse buf immediately
+```
+
 ---
 
 ## Streaming API
@@ -930,9 +1074,10 @@ print(f"Wrote {stats['bytes_written']} bytes")
 
 ### Buffer ownership of the write calls
 
-`write_chunk(data)`, `write_owned_bytes(data, *, copy=False)` and
-`MultipartUploadWriter.write(data, *, copy=False)` **borrow your buffer without copying it** (zero copy is the
-default for every C-contiguous buffer: `bytearray`, `memoryview`, NumPy of any dtype, `array.array`, ctypes, mmap):
+`write_chunk(data)` and `write_owned_bytes(data, *, copy=False)` **borrow your buffer for the duration of the call,
+without copying it** (zero copy is the default for every C-contiguous buffer: `bytearray`, `memoryview`, NumPy of any
+dtype, `array.array`, ctypes, mmap). `MultipartUploadWriter.write()` borrows for much longer; it has its own contract,
+see "MultipartUploadWriter.write(): the buffer is borrowed until close()" below.
 
 * the call reads your memory in place, with the GIL **released**, so other Python threads keep running;
 * the buffer is *exported* while the call runs (`bytearray.extend()` / `clear()` from another thread raises
@@ -940,7 +1085,7 @@ default for every C-contiguous buffer: `bytearray`, `memoryview`, NumPy of any d
   and the bytes written are undefined (undefined behaviour in the Rust sense, not just torn data);
 * the export is released **before the call returns**, so the buffer is yours again right after;
 * exact `bytes` and `s3dlio.BytesView` are immutable: they never race and are never copied, in any mode;
-* **`copy=True`** (`write_owned_bytes` and `MultipartUploadWriter.write` only) first takes ONE snapshot of a mutable
+* **`copy=True`** (`write_owned_bytes`; `MultipartUploadWriter.write` has it too) first takes ONE snapshot of a mutable
   buffer with the GIL held and releases the export, so you may modify or reuse your buffer as soon as the call has
   started. Use it when another Python thread may write to the buffer during the call. The snapshot is atomic only
   against writers that **hold the GIL** (pure-Python code): a writer that releases the GIL (a large NumPy
@@ -951,6 +1096,80 @@ default for every C-contiguous buffer: `bytearray`, `memoryview`, NumPy of any d
 **Behaviour change in 0.9.128.** In 0.9.126 and earlier `write_owned_bytes()` copied a mutable buffer under the GIL
 before writing; it now borrows it exactly like `write_chunk()`. If your code relied on the old snapshot (for
 example another thread refills the same `bytearray` while a write is in flight), pass `copy=True`.
+
+**Which streaming writers copy (0.10.0).** `create_filesystem_writer` (`file://`) writes straight from your buffer
+with plain `write(2)` calls: it no longer copies each chunk into tokio's internal buffer first. The same holds for
+`create_direct_filesystem_writer` in buffered mode; with O_DIRECT the bounce rules of `put_bytes()` apply.
+Compression (`options.compression`) is a transform: the encoder reads your buffer and its output is new data.
+`create_s3_writer` and `create_azure_writer` keep the whole object in one buffer until `finalize()`, so each
+`write_chunk()` is copied once into it (and `write_owned_bytes()` from Python takes the same path); at `finalize()`
+that buffer is handed to the store without a further copy (it used to be duplicated for Azure). To upload an object
+with no copy at all, use `put_bytes` or `MultipartUploadWriter`. This whole-object buffering is a documented exception, not redesigned in this
+release; see "Remaining copies (Rule #1)" under "Zero-Copy Data Flow".
+
+#### MultipartUploadWriter.write(): the buffer is borrowed until close()
+
+**BEHAVIOUR CHANGE in 0.10.0.** `MultipartUploadWriter.write(data, *, copy=False)` used to hold your buffer only for
+the duration of the call and copy it into its part buffers. A write that is large enough is now **borrowed**: the
+parts are uploaded straight out of your memory, asynchronously, after `write()` has returned, and the buffer stays
+borrowed until `close()` (or `abort()`, or leaving the `with` block) has returned. **Do not modify, resize or free a
+buffer you passed to `write()` until then.** A `bytearray` raises `BufferError` if you resize it meanwhile; changing
+its contents is a data race and the object holds undefined bytes. Allocate a fresh buffer for each `write()`, or pass
+`copy=True`.
+
+```python
+with s3dlio.MultipartUploadWriter.from_uri("s3://bucket/big.bin") as w:      # part_size defaults to 16 MiB
+    for _ in range(n_chunks):
+        chunk = bytearray(chunk_size)          # a FRESH buffer per write
+        f.readinto(chunk)
+        w.write(chunk)                         # borrowed until the with-block exits
+# every borrowed buffer is released when the block has exited
+
+# Reusing ONE buffer for a readinto loop: take a snapshot of each write instead
+buf = bytearray(chunk_size)
+with s3dlio.MultipartUploadWriter.from_uri("s3://bucket/big.bin") as w:
+    while f.readinto(buf):
+        w.write(buf, copy=True)                # one copy, buf is yours again at once
+```
+
+* **Which writes are borrowed (the threshold).** A write of at least the threshold is borrowed; a smaller write is
+  copied ONCE into the part buffer and nothing is borrowed (no lock, no `BufferError`, you may reuse the buffer at
+  once). The threshold is the **part size for a signed upload** (the default) and **2 KiB for an unsigned upload**
+  (`S3DLIO_UNSIGNED_PAYLOAD`). Why: a signed part must be one contiguous request body, and a part is made of many
+  writes, so borrowing a write smaller than a part would not avoid the copy; in the benchmark (16 MiB parts,
+  128 MiB per case, best of 3, write loop plus `close()`, time with borrowing / time with copying) borrowing was
+  slower by up to 1.25x at 1 KiB and below and faster by at most about 7% from 2 KiB up, which is about the
+  run-to-run noise, so the lock and the pinned buffers were not worth it. An unsigned upload sends a part that spans
+  writes as a multi-chunk body with no gather (below), so borrowing small writes really is zero copy there: it
+  measured 0.72-0.93x the copying time for 2-32 KiB writes, parity from 64 KiB up and slower below 2 KiB, which is
+  why unsigned uploads switch at 2 KiB.
+* **Reusing a buffer that is still borrowed is refused.** `write()` raises `BufferError` ("buffer reused while still
+  borrowed; pass copy=True or use a fresh buffer") when the new buffer overlaps memory of an earlier `write()` whose
+  parts have not been uploaded yet, because overwriting it would corrupt the earlier parts. The writer stays usable
+  and can still be aborted. The classic loop `readinto(buf); write(buf)` therefore needs `copy=True` (or a fresh
+  buffer per write, as above). Distinct buffers, and non-overlapping slices of one buffer, are fine.
+* **`copy=True`** takes one independent snapshot of a mutable buffer (GIL held, export released before the call
+  returns). `bytes` and `BytesView` are immutable: they are shared with the parts, never held under a lock, and (when
+  they are at least the threshold) never copied.
+* **Straddling parts.** Parts are cut from consecutive writes. A part that lies inside one write is a plain slice (no
+  copy); writes that are multiples of the part size never copy. A part that **spans two writes** (the unfinished tail
+  of the previous write plus the head of this one) is, in a **signed** upload, gathered once into one contiguous body:
+  one copy of at most `part_size` bytes (the final short part of an object that spans writes is gathered the same
+  way). In an **unsigned** upload (`S3DLIO_UNSIGNED_PAYLOAD`) it is sent as a multi-chunk body of known length, with
+  no copy: the HTTP connector streams the segments instead of gathering them (an SDK or connector retry resends the
+  same segments).
+* **`close()`, `abort()` and `__exit__`.** They return only after every part that reads one of your buffers is done and
+  the buffers are released. If a storage backend still references a buffer after
+  `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (30 s) they raise `s3dlio.ExportStillReferencedError` and the buffers stay
+  pinned (do not modify, resize or free them). That error **takes precedence** over an upload failure (in `close()`)
+  and over an exception propagating out of the `with` block (in `__exit__`): the upload error is quoted in its message
+  ("the upload itself failed: ..."). `abort()` cancels the parts still in flight before waiting. Leaving a `with` block
+  because of an exception aborts the upload.
+* **`reserve(size)` / `commit(nbytes)`** (the highest-throughput path) hands you a Rust-owned buffer to fill. `commit`
+  gives that buffer to the writer (shrunk to `nbytes` first, so a short commit does not pin the whole reservation) and
+  you must not use the memoryview afterwards. A commit smaller than the threshold is copied once into the part buffer
+  (and the reserved buffer is freed); a larger one is sliced into parts with no copy. Nothing of yours is borrowed, so
+  there is nothing to wait for.
 
 ---
 
@@ -980,6 +1199,12 @@ the server form `s3://host:port/bucket/...`) the key is the full key from the bu
 (`s3://bkt/dir/` lists `dir/x`); for `file://` and `direct://` it is the path below the dataset root
 (`sub/b.bin`, or just the file name when the URI names one file). `s3dlio.create_dataset(uri).uris()` gives the URI
 that fetches each item.
+
+**What the items copy (0.10.0).** `return_type="tensor"` (the default) is a read-only `uint8` tensor over the fetched
+buffer, with no copy (`writable=True` makes one copy per item). `return_type="reader"` wraps the fetched buffer in a
+file-like object without copying it (it used to call `bytes(...)` first); its `read()` returns `bytes` slices, as file
+objects do. `return_type="bytes"` returns a Python `bytes`, which is one copy by definition (a documented
+compatibility copy).
 
 ### JAX Integration
 
@@ -1081,6 +1306,18 @@ assert (d["sampler_type"], d["sampler_rank"], d["sampler_world_size"]) == ("dist
 
 Key APIs: `PyDataset.from_uris()` · `PyBytesAsyncDataLoader.items()` · `PyObjectDataLoaderSyncIter.collect_batch(n)` · `PyObjectItem`
 
+**Reading an item without copying it (0.10.0).** A `PyObjectItem` (from `.items()` and `collect_batch`) and a
+Parquet item (`PyParquetItem`, with `file_uri`, `rg_idx` and `byte_count`) expose the fetched object through the
+buffer protocol and through `.data`. They are read-only (a writable request raises `BufferError`), and the buffer
+lives as long as any view of it:
+
+```python
+mv  = memoryview(item)            # zero copy, read-only
+arr = np.frombuffer(item, dtype=np.uint8)   # zero copy
+view = item.data                  # a read-only BytesView over the same buffer, zero copy
+raw = bytes(item)                 # a Python bytes: ONE copy, kept for compatibility
+```
+
 📖 **[Python_Data-Loader.md — Object DataLoader section](Python_Data-Loader.md#object-data-loader-general-purpose)**
 
 ---
@@ -1125,6 +1362,20 @@ print(len(npz))    # ~146,800,000 bytes
 
 **Returns:** `BytesView` — zero-copy buffer supporting Python buffer protocol. Pass directly to `MultipartUploadWriter.write()`, `put_bytes()`, or any buffer-accepting API.
 
+### `read_npz()` — Read an NPZ array
+
+```python
+arr = s3dlio.read_npz("s3://bucket/train/sample_000001.npz", array_name="x")   # numpy float32 array
+```
+
+`read_npz(uri, array_name=None)` fetches the object and returns the named array (the first one when
+`array_name` is omitted) as a NumPy `float32` array (only little-endian `<f4`, C-order arrays are supported; any other dtype is an error). Since 0.10.0 a stored (uncompressed) member is sliced out of the
+fetched archive in place and checked against the CRC-32 the archive recorded, so it is never copied out of the
+archive; the one copy is the format decode (the little-endian `float32` payload is decoded into the aligned array
+NumPy takes over, because the member's bytes are only 1-byte aligned inside the archive). A compressed member is
+inflated into a new buffer (a transform). A malformed or hostile array header (an out-of-range shape, a misplaced
+parenthesis) is an error, not a crash.
+
 ### Upload NPZ zero-copy
 
 ```python
@@ -1138,7 +1389,7 @@ def upload(i):
     with s3dlio.MultipartUploadWriter.from_uri(
         f"s3://my-bucket/train/sample_{i:06d}.npz"
     ) as w:
-        w.write(buf)  # BytesView fast path: Arc clone only, GIL released
+        w.write(buf)  # BytesView: shared with the parts, never copied (140 MiB >= the 16 MiB part size)
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
     list(pool.map(upload, range(1000)))
@@ -1217,7 +1468,9 @@ import torch
 
 checkpoint = S3Checkpoint(region="us-east-1")
 
-# Save — torch.save() writes to in-memory buffer, then uploads via put_bytes()
+# Save — torch.save() writes to an in-memory buffer, then close() uploads that buffer via
+# put_bytes() read in place (no copy; before 0.10.0 close() copied it with bytes(...)).
+# If the upload fails, close() raises and the data stays in the writer, so close() can be retried.
 with checkpoint.writer("s3://bucket/model.pt") as writer:
     torch.save(model.state_dict(), writer)
 
@@ -1237,7 +1490,8 @@ client = S3Client(
     s3client_config=S3ClientConfig(force_path_style=True)
 )
 
-# Upload
+# Upload: close() uploads the accumulated data read in place (no copy); if the upload fails,
+# close() raises and the data stays in the writer so close() can be retried
 writer = client.put_object("my-bucket", "key.bin")
 writer.write(b"data")
 writer.close()
@@ -1262,6 +1516,16 @@ objects. The DLIO storage classes use a full-URI name exactly the same way, but 
 normalisation of a name relative to the configured namespace (`/train/f.npz` under `s3://b/base` is the
 key `base/train/f.npz`).
 
+### DLIO storage integration
+
+`s3dlio.integrations.dlio.s3dlio_storage.S3dlioStorage` and
+`s3dlio.integrations.dlio.s3_torch_storage.S3PyTorchConnectorStorage` (`put_data`) no longer copy the payload
+(0.10.0). A `BytesIO` (what `numpy.save` and `torch.save` write into) is passed on as `getbuffer()`, a view of its own
+memory, instead of `getvalue()`, which copied it into a new `bytes`; objects uploaded in parts are sliced as
+`memoryview` views, not as `bytes` slices (slicing `bytes` copies). A generic stream that only offers `read()` can
+hand its bytes over only by reading them, which is one copy (stream to memory); an object that only offers
+`getvalue()` copies as that method does.
+
 ### Advantages over s3torchconnector
 
 | Feature | s3torchconnector | s3dlio compat |
@@ -1280,7 +1544,8 @@ For complete migration instructions, see [S3TORCHCONNECTOR_MIGRATION.md](S3TORCH
 ## Checkpoint System
 
 A checkpoint lives under a base URI (`s3://`, `gs://`, `az://`, `file://`, ...). Data is
-always `bytes` (serialize your state first, e.g. `torch.save` into a `BytesIO`), and every
+any bytes-like object (serialize your state first, e.g. `torch.save` into a `BytesIO`, then pass
+`bio.getbuffer()`; see "Checkpoint payloads and copies" below), and every
 checkpoint is identified by `step`, `epoch` and a `framework` tag.
 
 > **`user_meta` is optional** (default `None`) in `save_checkpoint`, `PyCheckpointStore.save`
@@ -1330,7 +1595,13 @@ state_bytes = bytes(view)   # or memoryview(view) for zero-copy access
 # after (best effort). See "Deleting a checkpoint" below.
 data = s3dlio.load_checkpoint_with_validation(
     "s3://bucket/checkpoints/run1/shards/<ckpt-id>/rank-0.bin", validate_integrity=True
+)   # bytes: ONE documented copy (a Python bytes owns its memory)
+
+# The same read, same validation, same errors, but ZERO copies: returns a BytesView
+view = s3dlio.load_checkpoint_with_validation_view(
+    "s3://bucket/checkpoints/run1/shards/<ckpt-id>/rank-0.bin", validate_integrity=True
 )
+mv = memoryview(view)                       # or np.frombuffer(view, dtype=...)
 ```
 
 For more control use `PyCheckpointStore`:
@@ -1345,6 +1616,34 @@ store.load_latest()                                   # -> BytesView | None
 store.list_checkpoints()                              # -> [PyCheckpointInfo]
 store.delete_checkpoint(step)                         # -> bool
 ```
+
+#### Checkpoint payloads and copies (0.10.0)
+
+`save_checkpoint`, `save_distributed_shard`, `PyCheckpointStore.save`, `PyCheckpointWriter.save_distributed_shard`
+and `PyCheckpointStream.write_chunk` accept `bytes`, `bytearray`, `memoryview`, NumPy arrays, `BytesView` (and any
+other buffer-protocol object) and **read the payload in place: no copy**. They used to require `bytes` and copied it
+once or twice.
+
+* **The call blocks until the data is written**, with the GIL released. The buffer is held (exported) for the whole call:
+  a `bytearray` cannot be resized meanwhile (`BufferError`), and no thread may modify its bytes until the call returns
+  (a data race: the stored bytes are undefined). The call does not return, normally or with an error, until every
+  native reader of the buffer is done and the export is released, so the buffer is yours again as soon as it returns.
+  If a storage backend still holds the buffer after `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (30 s by default) the call
+  raises `ExportStillReferencedError` (the data may or may not have been written); the buffer stays pinned, so do not
+  modify, resize or free it.
+* A **non-contiguous** array (strided, transposed, ...) is gathered once into logical order, with the GIL held; pass a
+  C-contiguous array to avoid that copy. An object that only has `__bytes__()` costs one copy made by Python.
+* **Compression is a transform.** With `compression_level` set the encoder reads your buffer and writes new data; it
+  is not counted as a copy of your payload.
+* **A rejected payload creates nothing.** An `int`, a `bool`, an arbitrary iterable or a pointer-bearing buffer raises
+  `TypeError`; for `PyCheckpointStream.write_chunk` that happens before the shard is created, so a later `finalize()`
+  still reports that no data was written.
+* **Reading.** `load_checkpoint_with_validation_view` returns a `BytesView` (zero copies);
+  `load_checkpoint_with_validation` keeps returning `bytes` for compatibility (one documented copy). A `.zst` shard is
+  decoded by a transform either way, into a buffer pre-sized from the frame header when it records the size.
+
+The Rust API follows the same rule: `Writer::{put_shard, put_shard_with_key, save_checkpoint,
+save_distributed_shard}` and `CheckpointStore::save` take `impl IntoShardBytes` (see the Changelog).
 
 #### Deleting a checkpoint
 
@@ -1798,12 +2097,13 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `create_multi_endpoint_store_from_file(path, strategy)` | Create from file |
 
 **MultiEndpointStore Methods** (all async). Since v0.10.0 the write methods (`put`, `put_to_endpoint`,
-`put_all_endpoints`) accept the same payloads as `put_bytes` (#281), copied once when the call is made, and every
+`put_all_endpoints`) accept the same payloads as `put_bytes` (#281), take a keyword-only `borrow=True` (the buffer is
+read in place until the awaitable completes; `borrow=False` copies a mutable buffer once, now), and every
 method returning `Coroutine[None]` resolves to `None`, not `()` (#271):
 
 | Method | Returns |
 |--------|---------|
-| `put(uri, data)` | Coroutine[None] |
+| `put(uri, data, *, borrow=True)` | Coroutine[None] |
 | `get(uri)` | Coroutine[BytesView] |
 | `get_range(uri, offset, length)` | Coroutine[BytesView] |
 | `list(uri, recursive)` | Coroutine[List[Dict]] |
@@ -1822,8 +2122,10 @@ method returning `Coroutine[None]` resolves to `None`, not `()` (#271):
 | `create_filesystem_writer(uri, opts)` | Local filesystem writer |
 | `create_direct_filesystem_writer(uri, opts)` | Direct I/O writer |
 
-The write calls borrow the buffer for the duration of the call; see "Buffer ownership of the write calls" in the
-Streaming API section (`copy=True` for a snapshot).
+`write_chunk` and `write_owned_bytes` borrow the buffer for the duration of the call; `MultipartUploadWriter.write`
+borrows a large buffer until `close()` / `abort()` returns. See "Buffer ownership of the write calls" and
+"MultipartUploadWriter.write(): the buffer is borrowed until close()" in the Streaming API section (`copy=True` for a
+snapshot).
 
 ### s3torchconnector Compat Classes
 
@@ -1849,10 +2151,11 @@ Streaming API section (`copy=True` for a snapshot).
 
 | Function | Description |
 |----------|-------------|
-| `save_checkpoint(uri, step, epoch, framework, data, user_meta=None)` | Save single-rank checkpoint; returns manifest key |
+| `save_checkpoint(uri, step, epoch, framework, data, user_meta=None)` | Save single-rank checkpoint; returns manifest key. `data` is any bytes-like object, read in place (zero copy); the call blocks until written |
 | `load_checkpoint(uri)` | Load latest checkpoint; returns `BytesView` or `None` |
-| `load_checkpoint_with_validation(uri, validate_integrity=True)` | Read one checkpoint shard by URI; returns `bytes`. `validate_integrity=True` verifies the returned bytes against the checksum the manifest recorded at write time and raises on a mismatch, an unlisted shard, a missing recorded checksum, or a non-shard URI; `False` reads unverified |
-| `save_distributed_shard(uri, step, epoch, framework, data, world_size, rank)` | Save this rank's shard; returns shard-meta dict |
+| `load_checkpoint_with_validation_view(uri, validate_integrity=True)` | Same read, validation and errors as `load_checkpoint_with_validation`, but returns a `BytesView` (zero copies) |
+| `load_checkpoint_with_validation(uri, validate_integrity=True)` | Read one checkpoint shard by URI; returns `bytes` (one documented copy; use the `_view` form for none). `validate_integrity=True` verifies the returned bytes against the checksum the manifest recorded at write time and raises on a mismatch, an unlisted shard, a missing recorded checksum, or a non-shard URI; `False` reads unverified |
+| `save_distributed_shard(uri, step, epoch, framework, data, world_size, rank)` | Save this rank's shard; returns shard-meta dict. `data` as for `save_checkpoint` |
 | `finalize_distributed_checkpoint(uri, step, epoch, framework, shard_metas, world_size, rank, user_meta=None)` | Rank 0 publishes the manifest; returns manifest key |
 | `PyCheckpointStore(uri, strategy=None, multipart_threshold=None, compression_level=None)` | Store: `save`, `load_latest`, `list_checkpoints`, `delete_checkpoint`, `writer(world_size, rank)`, `reader()` |
 | `PyCheckpointWriter` (`store.writer(world_size, rank)`) | `save_distributed_shard(step, epoch, framework, data)`, `get_distributed_shard_stream(step, epoch, framework)`, `finalize_distributed_checkpoint(step, epoch, framework, shard_metas, user_meta=None)` |
