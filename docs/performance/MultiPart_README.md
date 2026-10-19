@@ -41,7 +41,7 @@ Key properties:
 
 * **Streaming**: no staging to temp files by default.
 * **Concurrent**: multiple in‑flight `UploadPart` calls, limited by a semaphore.
-* **Zero‑copy (Python)**: `reserve()` exposes a Rust‑owned buffer as a writable Python `memoryview`; `commit()` hands the buffer to the uploader without copying.
+* **Zero‑copy (Python)**: `reserve()` exposes a Rust‑owned buffer as a writable Python `memoryview`; `commit()` hands the buffer to the uploader without copying (a commit below the small-write threshold is copied once into the part buffer; see the Python API guide).
 * **Robust finish**: `close()` / `finish_blocking()` joins outstanding part tasks and issues `CompleteMultipartUpload`.
 
 ---
@@ -420,7 +420,7 @@ export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
 ---
 ## Operational guidance
 
-* **Don’t reuse** the memoryview returned by `reserve()` after `commit()`.
+* **Don’t write through** the memoryview returned by `reserve()` after `commit()`: it changes the payload in flight. Reading it stays safe (the memory lives as long as any view of it).
 * Ensure **contiguous** and **CPU‑resident** buffers when using `write()` with framework tensors.
 * Buckets/objects are created in whatever region/endpoint your s3dlio client is configured for (see project README for env vars).
 

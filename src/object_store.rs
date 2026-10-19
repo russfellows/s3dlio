@@ -71,10 +71,7 @@ use futures::stream;
 use std::time::Duration;
 
 // --- GCS - Feature-gated backend selection -------------------
-#[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
-use crate::gcs_client::{parse_gcs_uri, GcsClient, GcsObjectMetadata};
-
-#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+#[cfg(feature = "backend-gcs")]
 use crate::google_gcs_client::{parse_gcs_uri, GcsClient, GcsObjectMetadata};
 
 #[cfg(feature = "backend-gcs")]
@@ -90,6 +87,24 @@ async fn get_global_gcs_client() -> Result<GcsClient> {
 
 /// Provider-neutral object metadata. For now this aliases S3's metadata.
 pub type ObjectMetadata = S3ObjectStat;
+
+/// Progress of one caller-buffer receive; see [`ObjectStore::get_into`].
+pub use crate::receive_progress::ReceiveProgress;
+
+/// Metadata from a typed HEAD ([`ObjectStore::head`]).
+///
+/// The Rust name differs from the [`ObjectMetadata`] alias, which is the provider-neutral result
+/// of [`ObjectStore::stat`]. Only what a HEAD establishes safely is here: the size, and the
+/// opaque identity (ETag, version) of the object it described.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadMetadata {
+    /// The object size in bytes.
+    pub size: u64,
+    /// The entity tag, exactly as the provider reports it. Opaque: not assumed to be an MD5.
+    pub etag: Option<String>,
+    /// The provider's version identifier (S3 version id, GCS generation), when it reports one.
+    pub version_id: Option<String>,
+}
 
 // -----------------------------------------------------------------------------
 // Performance Configuration Helpers
@@ -267,7 +282,7 @@ pub enum Scheme {
     Gcs,
     Unknown,
 }
-/// Object properties for metadata update operations (v0.10.0+)
+/// Object properties for metadata update operations
 ///
 /// Used with `update_properties()` to modify object metadata without re-uploading data.
 /// Only non-None fields will be updated. For cloud backends, this typically requires
@@ -309,7 +324,14 @@ pub struct ObjectProperties {
 /// blob path, `s3://backups/mirror/acct.blob.core.windows.net/file.dat` --
 /// misrouting it to the Azure backend. Restrict the check to the authority
 /// component only, and require it as a suffix rather than a substring.
-fn is_azure_blob_host(uri: &str) -> bool {
+///
+/// This is only the classifier behind [`infer_scheme`] and the pure Azure parser
+/// (`capabilities::parse_azure_uri_pure`); both call this one function, so they cannot disagree
+/// about what is an Azure host URL. It deliberately does NOT refuse userinfo or a backslash in
+/// the authority: such a URI is still an Azure URL, so it is classified Azure and the parser then
+/// refuses it with a clear error. Classifying it as "not Azure" instead would turn a smuggling
+/// attempt into a silent `"unknown"` scheme. The account is never taken from this function.
+pub(crate) fn is_azure_blob_host(uri: &str) -> bool {
     let Some(after_scheme_idx) = uri.find("://") else {
         return false;
     };
@@ -338,6 +360,45 @@ pub fn infer_scheme(uri: &str) -> Scheme {
     } else {
         Scheme::Unknown
     }
+}
+
+/// The provider name the URI's scheme implies, as [`crate::object_error::ObjectError`] and
+/// [`crate::capabilities::Capabilities`] spell it.
+fn provider_for_uri(uri: &str) -> &'static str {
+    match infer_scheme(uri) {
+        Scheme::S3 => "s3",
+        Scheme::Azure => "az",
+        Scheme::Gcs => "gs",
+        Scheme::File => "file",
+        Scheme::Direct => "direct",
+        Scheme::Unknown => "unknown",
+    }
+}
+
+/// The error the default [`ObjectStore::get_into`] and [`ObjectStore::head`] return: kind
+/// [`ObjectErrorKind::Unsupported`], attached over a plain description.
+fn unsupported_operation(uri: &str, operation: &str) -> anyhow::Error {
+    crate::object_error::attach_object_error(
+        anyhow!("this store does not implement {operation}"),
+        crate::object_error::ObjectErrorKind::Unsupported,
+        provider_for_uri(uri),
+        format!("{operation} is not supported by this store"),
+    )
+}
+
+/// The error a caller-buffer `get_into` or `head` returns for an `az://` or `gs://` URI that
+/// names a container or bucket but no object: kind [`ObjectErrorKind::Other`], returned before
+/// any client is built or any request is sent (the S3 store refuses the same way). Without
+/// it an empty key would address the container or bucket path itself, and a 404 from a `head`
+/// would surface as typed absence of an object that was never asked for.
+#[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
+fn empty_key_error(uri: &str, operation: &str) -> anyhow::Error {
+    crate::object_error::attach_object_error(
+        anyhow!("Cannot {operation}: no key specified in URI: {uri}"),
+        crate::object_error::ObjectErrorKind::Other,
+        provider_for_uri(uri),
+        format!("{operation} names no object"),
+    )
 }
 
 #[async_trait]
@@ -456,6 +517,45 @@ pub trait ObjectStore: Send + Sync {
         Ok(self.stat(uri).await.is_ok())
     }
 
+    /// Read the whole object into the caller's buffer.
+    ///
+    /// `dst.len()` is the expected length. `Ok(())` means exactly `dst.len()` bytes were
+    /// written and the whole-object size equals it; any other outcome is an error, with
+    /// the typed classification [`crate::object_error::object_error`] reports.
+    /// `progress` reports the distinct destination positions filled, while the read runs
+    /// and after it fails or is cancelled. It says which positions were touched, never
+    /// that their data is valid.
+    ///
+    /// Every write into `dst` happens inside the returned future, so dropping it stops
+    /// every writer.
+    ///
+    /// The default returns an error of kind
+    /// [`ObjectErrorKind::Unsupported`](crate::object_error::ObjectErrorKind::Unsupported).
+    /// It never falls back to a temporary download plus a copy. A store that supports the
+    /// operation overrides it, and so must any wrapper that should forward it.
+    async fn get_into(
+        &self,
+        uri: &str,
+        _dst: &mut [u8],
+        _progress: &ReceiveProgress,
+    ) -> Result<()> {
+        Err(unsupported_operation(uri, "get_into"))
+    }
+
+    /// Typed HEAD: the size and identity of an object, or `None` when it does not exist.
+    ///
+    /// Absence is `Ok(None)`. A provider that cannot tell an absent bucket from an absent object
+    /// reports both as `Ok(None)`: S3's bodyless HEAD 404 and GCS's `NotFound` carry no such
+    /// distinction, and no extra probe is made to manufacture one. A missing container that the
+    /// provider does distinguish (Azure `ContainerNotFound`) is an error, as are a refusal (403),
+    /// a transport failure and every other failure.
+    ///
+    /// The default returns an error of kind
+    /// [`ObjectErrorKind::Unsupported`](crate::object_error::ObjectErrorKind::Unsupported).
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        Err(unsupported_operation(uri, "head"))
+    }
+
     /// Get object with integrity validation.
     ///
     /// `expected_checksum` is `<algorithm>:<hex>` (what writers report and manifests
@@ -514,8 +614,18 @@ pub trait ObjectStore: Send + Sync {
             crate::checksum::verify_crc32c(&data, expected, checkpoint_uri)?;
         }
 
-        // Convert Bytes to Vec<u8> for backward compatibility
-        Ok(data.to_vec())
+        // This public trait method has returned `Vec<u8>` since it was introduced and
+        // `ObjectStore` is implemented outside this crate (and by `LoggedObjectStore` and
+        // several test doubles), so the return type cannot change without breaking every
+        // implementor (RULE #1 exception: an API that returns an owned `Vec<u8>` for
+        // compatibility). `Vec::from(Bytes)` takes the allocation over WITHOUT a copy whenever
+        // the `Bytes` is the sole owner of a `Vec`-backed buffer, which is what every store's
+        // `get` returns. When that `Bytes` has been sliced from the front (a nonzero offset) the
+        // data is moved to the start of the same allocation with one in-place `memmove` (still
+        // one pass over the payload, but no second allocation); only a shared or non-`Vec`
+        // buffer is copied into a new `Vec`. A caller that must never copy calls
+        // `get_with_validation`, which returns the `Bytes` itself.
+        Ok(Vec::from(data))
     }
 
     /// `true` only when this store's [`ObjectStore::copy`] is a NATIVE operation of the
@@ -792,7 +902,7 @@ pub trait ObjectStore: Send + Sync {
     }
 
     // =========================================================================
-    // Metadata Operations (v0.10.0+)
+    // Metadata Operations
     // =========================================================================
 
     /// Create a directory.
@@ -995,6 +1105,13 @@ pub trait ObjectWriter: Send + Sync {
 
     /// Write owned bytes for zero-copy optimization.
     /// Takes ownership of the data to avoid copying.
+    ///
+    /// The default implementation calls [`ObjectWriter::write_chunk`] with a borrow, which
+    /// copies into whatever the writer accumulates. Writers that buffer the whole object
+    /// (`BufferedObjectWriter`, the S3, Azure and GCS buffered writers) override it: into an
+    /// empty, uncompressed writer the `Vec` is MOVED in (no copy at all); once the writer
+    /// already holds data, `data` is appended to it (one copy, the accumulation copy that the
+    /// whole-object buffering design requires; it is not redesigned in this release).
     async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
         // Default implementation: convert to slice and call write_chunk
         self.write_chunk(&data).await
@@ -1040,6 +1157,22 @@ pub trait ObjectWriter: Send + Sync {
     }
 }
 
+/// Add an owned chunk to a writer's accumulation buffer (see [`ObjectWriter::write_owned_bytes`]).
+///
+/// An empty buffer ADOPTS `data`: the allocation is moved, nothing is copied, and the writer's
+/// final `put` hands that same allocation to the store. A buffer that already holds data must
+/// append: the whole-object buffered writers keep ONE contiguous allocation, so the second and
+/// later chunks are copied into it. That accumulation copy is unavoidable without a rope-shaped
+/// buffer, a redesign the maintainer deferred; callers who want none pass the whole object in a
+/// single `write_owned_bytes`, or use `put` / the multipart writers.
+fn adopt_owned_chunk(buffer: &mut Vec<u8>, data: Vec<u8>) {
+    if buffer.is_empty() {
+        *buffer = data;
+    } else {
+        buffer.extend_from_slice(&data);
+    }
+}
+
 /// Default buffered implementation that collects chunks and calls put()
 pub struct BufferedObjectWriter<'a> {
     uri: String,
@@ -1069,9 +1202,21 @@ impl<'a> ObjectWriter for BufferedObjectWriter<'a> {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
+        // Accumulation copy of a BORROWED chunk into the writer's single buffer: unavoidable
+        // (the caller keeps its slice); `write_owned_bytes` moves an owned Vec in instead.
         self.buffer.extend_from_slice(chunk);
         self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
+        Ok(())
+    }
+
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.hasher.update(&data);
+        self.bytes_written += data.len() as u64;
+        adopt_owned_chunk(&mut self.buffer, data);
         Ok(())
     }
 
@@ -1080,6 +1225,7 @@ impl<'a> ObjectWriter for BufferedObjectWriter<'a> {
             return Ok(());
         }
         self.finalized = true;
+        // `Bytes::from(Vec)` moves the allocation: the store receives the writer's buffer.
         self.store
             .put(&self.uri, Bytes::from(std::mem::take(&mut self.buffer)))
             .await
@@ -1499,12 +1645,10 @@ impl ObjectStore for S3ObjectStore {
                     .send()
                     .await
                     .sdk_context(format!("S3 GET failed for '{}'", uri))?;
-                let data = resp
-                    .body
-                    .collect()
+                // One pre-sized buffer, one chunk-to-destination copy (stage G, R2).
+                crate::s3_utils::receive_get_output_body(resp)
                     .await
-                    .context("Failed to read S3 GET response body")?;
-                Ok::<_, anyhow::Error>(data.into_bytes())
+                    .context("Failed to read S3 GET response body")
             })
             .await?;
             return Ok(data);
@@ -1571,18 +1715,59 @@ impl ObjectStore for S3ObjectStore {
                     .send()
                     .await
                     .sdk_context(format!("S3 range GET failed for '{}'", uri))?;
-                let data = resp
-                    .body
-                    .collect()
+                // One pre-sized buffer, one chunk-to-destination copy (stage G, R2).
+                crate::s3_utils::receive_get_output_body(resp)
                     .await
-                    .context("Failed to read S3 range GET response body")?;
-                Ok::<_, anyhow::Error>(data.into_bytes())
+                    .context("Failed to read S3 range GET response body")
             })
             .await?;
             return Ok(data);
         }
 
         s3_get_object_range_uri_async(uri, offset, length).await
+    }
+
+    /// Caller-buffer GET (plan §4.5 A1, A6, A8). A per-endpoint store reads through its OWN
+    /// client and writes no row; a store on the process-wide client passes `self.rows()`, so
+    /// only a helper-row store (an endpoint store of a `MultiEndpointStore`) writes the S3
+    /// helper row. Otherwise the caller (`LoggedObjectStore`) writes the one logical row.
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        debug!(
+            "S3ObjectStore::get_into uri='{}', expected_len={}",
+            uri,
+            dst.len()
+        );
+        // Issue #197: a URI naming another server is an error, never run here.
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+
+        match &self.client {
+            Some(client) => {
+                crate::s3_utils::get_into_with_client(client, &bucket, &key, dst, progress).await
+            }
+            None => {
+                crate::s3_utils::get_into_global(&bucket, &key, dst, progress, self.rows()).await
+            }
+        }
+    }
+
+    /// Typed HEAD: `Ok(None)` only for typed absence. S3's bodyless HEAD 404 cannot tell an
+    /// absent bucket from an absent key, so both are `Ok(None)`. A 403 and every other
+    /// failure are errors, never `Ok(None)`. Client choice and row ownership
+    /// are those of [`S3ObjectStore::get_into`].
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        debug!("S3ObjectStore::head uri='{}'", uri);
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+
+        match &self.client {
+            Some(client) => crate::s3_utils::head_typed_with_client(client, &bucket, &key).await,
+            None => crate::s3_utils::head_typed(&bucket, &key, self.rows()).await,
+        }
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
@@ -2226,6 +2411,14 @@ impl S3BufferedWriter {
         self.compressed_bytes = self.buffer.len() as u64;
         Ok(())
     }
+
+    /// Close the compression frame and hand the accumulated buffer over as `Bytes`: the
+    /// `Vec`'s allocation becomes the `Bytes` with no copy, so the store receives the very
+    /// buffer the writer accumulated.
+    fn take_payload(&mut self) -> Result<Bytes> {
+        self.seal_compression()?;
+        Ok(Bytes::from(std::mem::take(&mut self.buffer)))
+    }
 }
 
 #[async_trait]
@@ -2245,10 +2438,27 @@ impl ObjectWriter for S3BufferedWriter {
             let compressed = compressor.get_mut();
             self.buffer.append(compressed);
         } else {
-            // No compression - direct to buffer
+            // No compression - direct to buffer. Accumulation copy of a BORROWED chunk into
+            // the writer's single buffer: unavoidable (the caller keeps its slice). Whole-
+            // object buffering is not redesigned in this release; `write_owned_bytes` moves an
+            // owned Vec in without a copy while the buffer is empty.
             self.buffer.extend_from_slice(chunk);
         }
 
+        Ok(())
+    }
+
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if self.compressor.is_some() {
+            // Compression is a transform: the input is read, never kept.
+            return self.write_chunk(&data).await;
+        }
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.hasher.update(&data);
+        self.bytes_written += data.len() as u64;
+        adopt_owned_chunk(&mut self.buffer, data);
         Ok(())
     }
 
@@ -2258,7 +2468,7 @@ impl ObjectWriter for S3BufferedWriter {
         }
         self.finalized = true;
 
-        self.seal_compression()?;
+        let payload = self.take_payload()?;
 
         // Append compression extension if needed
         let final_uri = self.compression.stored_name(&self.uri);
@@ -2271,19 +2481,14 @@ impl ObjectWriter for S3BufferedWriter {
                 &target.client,
                 &target.bucket,
                 &key,
-                Bytes::from(std::mem::take(&mut self.buffer)),
+                payload,
                 None,
             )
             .await;
         }
 
         // Use S3 multipart upload for the buffered data
-        s3_put_object_multipart_uri_async(
-            &final_uri,
-            Bytes::from(std::mem::take(&mut self.buffer)),
-            None,
-        )
-        .await
+        s3_put_object_multipart_uri_async(&final_uri, payload, None).await
     }
 
     fn bytes_written(&self) -> u64 {
@@ -2365,28 +2570,33 @@ fn gcs_size_key(uri: &str) -> String {
         .unwrap_or_else(|_| uri.to_string())
 }
 
-/// Run the s3dlio RangeEngine for `object_size` bytes.
+/// Run the s3dlio RangeEngine for `object_size` bytes, every range received straight into its
+/// own window of ONE master buffer (stage G, R3): no per-range `Bytes` and no copy into the
+/// master afterwards.
 ///
-/// The engine plans its ranges from `object_size` and treats any short or over read as an
-/// error. When `guarded` (the size came from a cache and may be stale) the LAST range asks for
-/// one byte more than planned, so a blob that has grown makes that range an over read, and one
-/// that has shrunk a short read or a range error: the caller sees an error instead of a silently
-/// truncated body, at no extra request. An unchanged blob returns exactly the planned bytes.
+/// `fill(offset, window)` fills `window` and returns it with the number of bytes written (see
+/// [`RangeEngine::download_into_master`]). The engine plans its ranges from `object_size` and
+/// treats any short or over read as an error. When `guarded` (the size came from a cache and may
+/// be stale) the engine's tail probe applies: the LAST window is one byte longer than the range,
+/// so a blob that has grown fills the probe byte and is refused as an over read, and one that
+/// has shrunk answers fewer bytes (or a range error): the caller sees an error instead of a
+/// silently truncated body, at no extra request. An unchanged blob returns exactly the planned
+/// bytes (the service clamps the range to its end).
 ///
 /// An object below `min_split_size` is one request, and the engine holds that request to the
 /// same exact length. A CACHED size of 0 is an error too (the engine would return empty without
 /// any request): the caller's fresh-size retry settles it, and a size just learned from the
 /// service (`guarded == false`) stays a legitimate empty read.
 #[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
-async fn range_engine_download<F, Fut>(
+pub(crate) async fn range_engine_download_into<F, Fut>(
     config: RangeEngineConfig,
     object_size: u64,
     guarded: bool,
-    get_range: F,
+    fill: F,
 ) -> Result<(Bytes, crate::range_engine_generic::RangeDownloadStats)>
 where
-    F: Fn(u64, u64) -> Fut + Send + Sync + Clone + 'static,
-    Fut: std::future::Future<Output = Result<Bytes>> + Send,
+    F: Fn(u64, bytes::BytesMut) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Result<(bytes::BytesMut, usize)>> + Send,
 {
     // The engine reads a zero size as an empty object WITHOUT a request. That is right for a size
     // just learned from the service, but a cached zero may be stale (the object may have grown),
@@ -2395,69 +2605,78 @@ where
     if guarded && object_size == 0 {
         bail!("cached object size 0 cannot be verified without a request; refresh the size");
     }
-    let engine = RangeEngine::new(config);
-    let get_range = move |offset: u64, length: u64| {
-        let ask = if guarded && offset.checked_add(length) == Some(object_size) {
-            length.saturating_add(1)
-        } else {
-            length
-        };
-        get_range(offset, ask)
-    };
-    engine.download(object_size, get_range, None).await
+    RangeEngine::new(config)
+        .download_into_master(object_size, guarded, fill, None)
+        .await
 }
 
+/// [`range_engine_download_into`] for a read whose ranges all share ONE object version
+/// (`version`), with the fallback for an object that has no usable version identity (stage G
+/// review, G-F2).
+///
+/// The RangeEngine starts its ranges independently, and a pin that holds inside one range does
+/// not hold across its siblings: an object replaced by another of the SAME size between two
+/// ranges would be assembled from both and no size check could see it. `fill` therefore takes
+/// part in `version`: the first range to start is sent unpinned and reports the identity of its
+/// response (an Azure strong ETag, a GCS generation), and every other range is sent pinned to it
+/// (see [`crate::range_version`]), so the service itself refuses another version and the read
+/// fails or, if a failed read is retried by the caller, starts over; a body of two versions is
+/// never returned.
+///
+/// When the first response carries no identity, nothing can pin the ranges and unpinned ranges
+/// are never combined: the other ranges fail at once, and `one_response` reads the WHOLE object as
+/// a single response instead (`None` in place of the engine's statistics, as no ranges were
+/// planned). That read does not use the caller's size: each provider's whole-response path takes
+/// the object's current size from its own response (for Azure the size is passed only as a hint).
+#[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
+pub(crate) async fn range_engine_download_versioned<T, F, Fut, S, SFut>(
+    config: RangeEngineConfig,
+    object_size: u64,
+    guarded: bool,
+    version: &crate::range_version::ObjectVersion<T>,
+    fill: F,
+    one_response: S,
+) -> Result<(
+    Bytes,
+    Option<crate::range_engine_generic::RangeDownloadStats>,
+)>
+where
+    T: Clone,
+    F: Fn(u64, bytes::BytesMut) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Result<(bytes::BytesMut, usize)>> + Send,
+    S: FnOnce() -> SFut,
+    SFut: std::future::Future<Output = Result<Bytes>>,
+{
+    match range_engine_download_into(config, object_size, guarded, fill).await {
+        Ok((bytes, stats)) => Ok((bytes, Some(stats))),
+        Err(e) if version.is_unavailable() => {
+            debug!(
+                "range read of {object_size} bytes: the first response carried no version \
+                 identity ({e:#}); reading the object as one response"
+            );
+            Ok((one_response().await?, None))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Split an Azure URI into `(account, container, key)`.
+///
+/// - `az://{account}/{container}/{key...}`
+/// - `http(s)://{account}.blob.core.windows.net/{container}/{key...}`
+///
+/// The STRUCTURE (account, container and key, an empty container refused per #224, unsafe
+/// account characters refused) is validated by the environment-free
+/// [`crate::capabilities::parse_azure_uri_pure`], which this delegates to. This function then adds
+/// the endpoint-dependent step: it canonicalises the account according to the configured
+/// endpoint (lower-cased for Azure, kept as written for an emulator, length-checked for Azure).
+/// The pure parser is structural validation, not full parity with this function.
 #[cfg(feature = "backend-azure")]
 fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
-    // Supports:
-    // - az://{account}/{container}/{key...}
-    // - http(s)://{account}.blob.core.windows.net/{container}/{key...}
-    if let Some(rest) = uri.strip_prefix("az://") {
-        let mut it = rest.splitn(3, '/');
-        let account = it
-            .next()
-            .ok_or_else(|| anyhow!("missing account in az:// URI"))?;
-        let container = it
-            .next()
-            .ok_or_else(|| anyhow!("missing container in az:// URI"))?;
-        let key = it.next().unwrap_or("").to_string();
-        // Refuse an account that could redirect the request before anything uses it.
-        let account = crate::azure_client::canonical_account_name(account)?;
-        return Ok((account, container.to_string(), key));
-    }
-
-    if is_azure_blob_host(uri) {
-        // audit #154 bug 4.2 (E1): this previously hard-required a
-        // "https://" prefix via strip_prefix, so a URL that `infer_scheme`
-        // had already routed here as Azure (e.g.
-        // "http://myacct.blob.core.windows.net/container/key") failed with
-        // a confusing "expected https:// for Azure URL" instead of parsing.
-        // Accept any scheme prefix once the host is confirmed to be an
-        // Azure Blob Storage host -- the scheme doesn't change which
-        // account/container/key the URL names.
-        let after_scheme = uri
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .ok_or_else(|| anyhow!("expected a scheme (http:// or https://) for Azure URL"))?;
-        let mut host_and_path = after_scheme.splitn(2, '/');
-        let host = host_and_path.next().unwrap_or("");
-        let path = host_and_path.next().unwrap_or("");
-        let account = host
-            .split('.')
-            .next()
-            .ok_or_else(|| anyhow!("bad Azure host"))?;
-        // The first path segment is the container; the single `/` after it is the
-        // separator, and the rest is the key exactly as written (issue #198), like the
-        // `az://` form above: `c//k` is the container `c` and the key `/k`.
-        let (container, key) = path.split_once('/').unwrap_or((path, ""));
-        if container.is_empty() {
-            bail!("missing container in URL path");
-        }
-        let account = crate::azure_client::canonical_account_name(account)?;
-        return Ok((account, container.to_string(), key.to_string()));
-    }
-
-    bail!("not a recognized Azure URI: {}", uri)
+    let (account, container, key) = crate::capabilities::parse_azure_uri_pure(uri)?;
+    // Refuse an account that could redirect the request before anything uses it.
+    let account = crate::azure_client::canonical_account_name(&account)?;
+    Ok((account, container, key))
 }
 
 /// `delete_batch` grouping key for Azure URIs: `((account, container), key)`.
@@ -2838,6 +3057,65 @@ impl AzureObjectStore {
         Self::client_for_uri(uri_prefix)
     }
 
+    /// The client and key of a URI that must name ONE object, for the caller-buffer
+    /// `get_into` and `head`. An empty key (`az://acct/ctr`, `az://acct/ctr/`) is refused with a
+    /// typed `Other` error BEFORE the client is built, so no request can reach the container
+    /// path. `operation` is `"GET"` or `"HEAD"`, for the message.
+    fn client_for_object(uri: &str, operation: &str) -> Result<(AzureBlob, String)> {
+        let (account, container, key) = parse_azure_uri(uri)?;
+        if key.is_empty() {
+            return Err(empty_key_error(uri, operation));
+        }
+        let cli = AzureBlob::with_default_credential(&account, &container)?;
+        Ok((cli, key))
+    }
+
+    /// Read the bytes `offset..offset + dst.len()` of a blob straight into the caller's buffer
+    /// and return how many were written (stage G, R3).
+    ///
+    /// The count is `dst.len()` unless the range runs past the end of the blob, which Azure
+    /// answers with only the bytes that exist; a range that starts at or past the end is an
+    /// error. Each SDK chunk is copied once, into its place in `dst`. Not a method of the
+    /// [`ObjectStore`] trait: a logging wrapper would otherwise answer `Unsupported` for it.
+    pub async fn get_range_into(
+        &self,
+        uri: &str,
+        offset: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+    ) -> Result<usize> {
+        let (cli, key) = Self::client_for_object(uri, "GET")?;
+        debug!(
+            "AzureObjectStore::get_range_into uri='{}', offset={}, len={}",
+            uri,
+            offset,
+            dst.len()
+        );
+        cli.get_range_into(&key, offset, dst, progress).await
+    }
+
+    /// [`AzureObjectStore::get_range_into`] for one range of a read of SEVERAL ranges of the
+    /// same blob: all of them share `version` and are therefore all of one version of the blob
+    /// (stage G review, G-F2). See [`AzureBlob::get_range_into_versioned`].
+    pub(crate) async fn get_range_into_versioned(
+        &self,
+        uri: &str,
+        offset: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        version: &crate::range_version::ObjectVersion<String>,
+    ) -> Result<usize> {
+        let (cli, key) = Self::client_for_object(uri, "GET")?;
+        debug!(
+            "AzureObjectStore::get_range_into_versioned uri='{}', offset={}, len={}",
+            uri,
+            offset,
+            dst.len()
+        );
+        cli.get_range_into_versioned(&key, offset, dst, progress, version)
+            .await
+    }
+
     /// Download using RangeEngine for concurrent range requests
     ///
     /// This method uses the generic RangeEngine to split large Azure blobs into
@@ -2849,38 +3127,92 @@ impl AzureObjectStore {
     /// Concurrent ranges hide per-request latency on large blobs. (An earlier version of this
     /// comment quoted percentage speed-ups; they were never measured and are removed.)
     ///
-    /// `guarded`: the size came from a cache; see [`range_engine_download`].
+    /// `guarded`: the size came from a cache; see [`range_engine_download_into`].
+    ///
+    /// Every range is received straight into its window of one master buffer
+    /// ([`AzureObjectStore::get_range_into_versioned`]): the SDK chunk is copied once, into its
+    /// final place, and nothing is copied again when the ranges are joined.
+    ///
+    /// # One blob version per read
+    ///
+    /// All ranges are of ONE version of the blob (stage G review, G-F2): the first range to
+    /// start is sent unpinned and reports the strong ETag of its reply as soon as the headers
+    /// arrive, and every other range is sent with `If-Match` of that ETag. A blob replaced
+    /// between two ranges (by another of the same size included) is refused by the service
+    /// (`412`) and the read fails with a version error; it is never assembled from two versions.
+    /// The cost is about one round trip before the other ranges start, not one range's transfer.
+    /// A blob whose first reply has no strong ETag cannot be pinned, and unpinned ranges are never
+    /// combined: it is read again as one response through the SDK path, which itself falls back
+    /// to a single request without an ETag.
     async fn get_with_range_engine(
         &self,
         uri: &str,
         object_size: u64,
         guarded: bool,
     ) -> Result<Bytes> {
-        // Create closure that captures uri for get_range calls
+        // Create closure that captures uri for the range receives
         let uri_owned = uri.to_string();
         let self_clone = self.clone();
+        let version = Arc::new(crate::range_version::ObjectVersion::<String>::new());
 
-        let get_range_fn = move |offset: u64, length: u64| {
-            let uri = uri_owned.clone();
-            let store = self_clone.clone();
-            async move { store.get_range(&uri, offset, Some(length)).await }
+        let fill = {
+            let version = Arc::clone(&version);
+            move |offset: u64, mut window: bytes::BytesMut| {
+                let uri = uri_owned.clone();
+                let store = self_clone.clone();
+                let version = Arc::clone(&version);
+                async move {
+                    let progress = ReceiveProgress::new();
+                    let written = store
+                        .get_range_into_versioned(
+                            &uri,
+                            offset,
+                            &mut window[..],
+                            &progress,
+                            &version,
+                        )
+                        .await?;
+                    Ok((window, written))
+                }
+            }
         };
 
-        let (bytes, stats) = range_engine_download(
+        // The blob has no strong ETag: one response, through the SDK path (its first request
+        // learns the length from the reply, so a stale size hint decides nothing).
+        let one_response = || async {
+            let (cli, _account, _container, key) = Self::client_for_uri(uri)?;
+            cli.get_with_sdk_concurrency_sized(
+                &key,
+                Some(self.config.sdk_download_concurrency),
+                Some(self.config.sdk_download_part_size),
+                Some(object_size),
+            )
+            .await
+        };
+
+        let (bytes, stats) = range_engine_download_versioned(
             self.config.range_engine.clone(),
             object_size,
             guarded,
-            get_range_fn,
+            &version,
+            fill,
+            one_response,
         )
         .await?;
 
-        info!(
-            "RangeEngine (Azure) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
-            stats.bytes_downloaded,
-            stats.ranges_processed,
-            stats.throughput_mbps(),
-            stats.throughput_gbps()
-        );
+        match stats {
+            Some(stats) => info!(
+                "RangeEngine (Azure) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
+                stats.bytes_downloaded,
+                stats.ranges_processed,
+                stats.throughput_mbps(),
+                stats.throughput_gbps()
+            ),
+            None => info!(
+                "RangeEngine (Azure): no strong ETag, downloaded {} bytes as one response",
+                bytes.len()
+            ),
+        }
 
         Ok(bytes)
     }
@@ -2958,6 +3290,25 @@ impl ObjectStore for AzureObjectStore {
             .transpose()?;
         let b = cli.get_range(&key, offset, end).await?; // Bytes - return directly for zero-copy
         Ok(b)
+    }
+
+    /// Caller-buffer GET (plan §4.5 A1, A8): the URI goes through the same parser as every
+    /// other Azure operation. The row, if any, is the `LoggedObjectStore` wrapper's.
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        let (cli, key) = Self::client_for_object(uri, "GET")?;
+        debug!(
+            "AzureObjectStore::get_into uri='{}', expected_len={}",
+            uri,
+            dst.len()
+        );
+        cli.get_into(&key, dst, progress).await
+    }
+
+    /// Typed HEAD: `Ok(None)` only for a typed missing blob (a missing container is an error).
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        let (cli, key) = Self::client_for_object(uri, "HEAD")?;
+        debug!("AzureObjectStore::head uri='{}'", uri);
+        cli.head_typed(&key).await
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
@@ -3279,6 +3630,14 @@ impl AzureBufferedWriter {
         self.compressed_bytes = self.buffer.len() as u64;
         Ok(())
     }
+
+    /// Close the compression frame and hand the accumulated buffer over as `Bytes`: the
+    /// `Vec`'s allocation becomes the `Bytes` with no copy, so the store receives the very
+    /// buffer the writer accumulated.
+    fn take_payload(&mut self) -> Result<Bytes> {
+        self.seal_compression()?;
+        Ok(Bytes::from(std::mem::take(&mut self.buffer)))
+    }
 }
 
 #[async_trait]
@@ -3299,10 +3658,27 @@ impl ObjectWriter for AzureBufferedWriter {
             let compressed = compressor.get_mut();
             self.buffer.append(compressed);
         } else {
-            // No compression - direct to buffer
+            // No compression - direct to buffer. Accumulation copy of a BORROWED chunk into
+            // the writer's single buffer: unavoidable (the caller keeps its slice). Whole-
+            // object buffering is not redesigned in this release; `write_owned_bytes` moves an
+            // owned Vec in without a copy while the buffer is empty.
             self.buffer.extend_from_slice(chunk);
         }
 
+        Ok(())
+    }
+
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if self.compressor.is_some() {
+            // Compression is a transform: the input is read, never kept.
+            return self.write_chunk(&data).await;
+        }
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.hasher.update(&data);
+        self.bytes_written += data.len() as u64;
+        adopt_owned_chunk(&mut self.buffer, data);
         Ok(())
     }
 
@@ -3312,15 +3688,16 @@ impl ObjectWriter for AzureBufferedWriter {
         }
         self.finalized = true;
 
-        self.seal_compression()?;
+        let payload = self.take_payload()?;
 
         // Append compression extension if needed
         let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
         let final_key = self.compression.stored_name(&key);
 
         // Use Azure multipart upload for the buffered data
-        cli.put(&final_key, Bytes::from(self.buffer.clone()), true)
-            .await
+        // `Bytes::from(Vec)` takes ownership of the allocation: no copy. (This was
+        // `self.buffer.clone()`, a full duplicate of the object.)
+        cli.put(&final_key, payload, true).await
     }
 
     fn bytes_written(&self) -> u64 {
@@ -3533,44 +3910,144 @@ impl GcsObjectStore {
         Ok(client.clone())
     }
 
+    /// Read the bytes `offset..offset + dst.len()` of an object straight into the caller's
+    /// buffer and return how many were written (stage G, R3), official GCS client only.
+    ///
+    /// The count is `dst.len()` unless the range runs past the end of the object (the service
+    /// clamps it); a range that starts past the end is an error. Each chunk is copied once,
+    /// into its place in `dst`. Not a method of the [`ObjectStore`] trait: a logging wrapper
+    /// would otherwise answer `Unsupported` for it.
+    ///
+    /// This is one range standing alone: it is of whatever version the object has when it is
+    /// read, and its own retries are pinned to that. Several ranges of ONE read must share a
+    /// version, which only [`GcsObjectStore::get`] arranges.
+    pub async fn get_range_into(
+        &self,
+        uri: &str,
+        offset: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+    ) -> Result<usize> {
+        self.get_range_into_versioned(
+            uri,
+            offset,
+            dst,
+            progress,
+            &crate::range_version::ObjectVersion::new(),
+        )
+        .await
+    }
+
+    /// [`GcsObjectStore::get_range_into`] for one range of a read of SEVERAL ranges of the same
+    /// object: all of them share `version` and are therefore all of one generation of the object
+    /// (stage G review, G-F2). See [`GcsClient::get_object_range_into_versioned`].
+    pub(crate) async fn get_range_into_versioned(
+        &self,
+        uri: &str,
+        offset: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        version: &crate::range_version::ObjectVersion<i64>,
+    ) -> Result<usize> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        if object.is_empty() {
+            return Err(empty_key_error(uri, "GET"));
+        }
+        debug!(
+            "GcsObjectStore::get_range_into uri='{}', offset={}, len={}",
+            uri,
+            offset,
+            dst.len()
+        );
+        let client = self.get_client().await?;
+        client
+            .get_object_range_into_versioned(&bucket, &object, offset, dst, progress, version)
+            .await
+    }
+
     /// Download using RangeEngine for concurrent range requests
     ///
     /// This method uses the generic RangeEngine to split large GCS objects into
     /// concurrent range requests, hiding per-request latency. (An earlier version of this
     /// comment quoted percentage speed-ups; they were never measured and are removed.)
     ///
-    /// `guarded`: the size came from a cache; see [`range_engine_download`].
+    /// `guarded`: the size came from a cache; see [`range_engine_download_into`].
+    ///
+    /// With the official GCS client every range is received straight into its window of one
+    /// master buffer ([`GcsObjectStore::get_range_into_versioned`]).
+    ///
+    /// # One object version per read
+    ///
+    /// All ranges are of ONE generation of the object (stage G review, G-F2).
+    ///
+    /// The first range to start is sent unpinned and reports the generation of its response as
+    /// soon as the response arrives; every other range, and every retry or repair of it, names
+    /// that generation. An object replaced between two ranges (by another of the same size
+    /// included) is a `VersionChanged` error, never a body of two versions. The cost is about one
+    /// round trip before the other ranges start. A first response with no generation cannot pin
+    /// anything, and unpinned ranges are never combined: the object is read again as one
+    /// response.
     async fn get_with_range_engine(
         &self,
         uri: &str,
         object_size: u64,
         guarded: bool,
     ) -> Result<Bytes> {
-        // Create closure that captures uri for get_range calls
-        let uri_owned = uri.to_string();
-        let self_clone = self.clone();
-
-        let get_range_fn = move |offset: u64, length: u64| {
-            let uri = uri_owned.clone();
-            let store = self_clone.clone();
-            async move { store.get_range(&uri, offset, Some(length)).await }
+        // The object read as one response: the fallback of an object that cannot be pinned.
+        let one_response = || async {
+            let (bucket, object) = parse_gcs_uri(uri)?;
+            let client = self.get_client().await?;
+            client.get_object(&bucket, &object).await
         };
 
-        let (bytes, stats) = range_engine_download(
-            self.config.range_engine.clone(),
-            object_size,
-            guarded,
-            get_range_fn,
-        )
-        .await?;
-
-        info!(
-            "RangeEngine (GCS) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
-            stats.bytes_downloaded,
-            stats.ranges_processed,
-            stats.throughput_mbps(),
-            stats.throughput_gbps()
-        );
+        let (bytes, stats) = {
+            let uri_owned = uri.to_string();
+            let self_clone = self.clone();
+            let version = Arc::new(crate::range_version::ObjectVersion::<i64>::new());
+            let fill = {
+                let version = Arc::clone(&version);
+                move |offset: u64, mut window: bytes::BytesMut| {
+                    let uri = uri_owned.clone();
+                    let store = self_clone.clone();
+                    let version = Arc::clone(&version);
+                    async move {
+                        let progress = ReceiveProgress::new();
+                        let written = store
+                            .get_range_into_versioned(
+                                &uri,
+                                offset,
+                                &mut window[..],
+                                &progress,
+                                &version,
+                            )
+                            .await?;
+                        Ok((window, written))
+                    }
+                }
+            };
+            range_engine_download_versioned(
+                self.config.range_engine.clone(),
+                object_size,
+                guarded,
+                &version,
+                fill,
+                one_response,
+            )
+            .await?
+        };
+        match stats {
+            Some(stats) => info!(
+                "RangeEngine (GCS) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
+                stats.bytes_downloaded,
+                stats.ranges_processed,
+                stats.throughput_mbps(),
+                stats.throughput_gbps()
+            ),
+            None => info!(
+                "RangeEngine (GCS): no generation to pin, downloaded {} bytes as one response",
+                bytes.len()
+            ),
+        }
 
         Ok(bytes)
     }
@@ -3641,6 +4118,38 @@ impl ObjectStore for GcsObjectStore {
             .await
     }
 
+    /// Caller-buffer GET (plan §4.5 A1, A8), official GCS client. The row, if any, is the wrapper's.
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        // An empty object (`gs://bucket/`) is refused before the client is built.
+        if object.is_empty() {
+            return Err(empty_key_error(uri, "GET"));
+        }
+        debug!(
+            "GcsObjectStore::get_into uri='{}', expected_len={}",
+            uri,
+            dst.len()
+        );
+        let client = self.get_client().await?;
+        client
+            .get_object_into(&bucket, &object, dst, progress)
+            .await
+    }
+
+    /// Typed HEAD, official GCS client only. GCS cannot tell an absent bucket from an absent
+    /// object, so both are `Ok(None)`. A 403 and other failures are
+    /// errors, never `Ok(None)`.
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        // An empty object (`gs://bucket/`) is refused before the client is built.
+        if object.is_empty() {
+            return Err(empty_key_error(uri, "HEAD"));
+        }
+        debug!("GcsObjectStore::head uri='{}'", uri);
+        let client = self.get_client().await?;
+        client.head_typed(&bucket, &object).await
+    }
+
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         debug!("GcsObjectStore::put uri='{}', {} bytes", uri, data.len());
@@ -3652,15 +4161,13 @@ impl ObjectStore for GcsObjectStore {
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, _part_size: Option<usize>) -> Result<()> {
-        // audit #157 bug 5.4 (D5): the community GCS client has no real
-        // chunked/resumable upload implementation (see put_object's doc
-        // comment in gcs_client.rs) — `_part_size` has no effect and is
-        // accepted only to satisfy the ObjectStore trait's shared
-        // signature with the S3/Azure backends, which do support it.
+        // audit #157 bug 5.4 (D5): this route is a simple upload (the object is already
+        // one `Bytes`), so `_part_size` has no effect; it is accepted only to satisfy the
+        // ObjectStore trait's shared signature with the S3/Azure backends, which use it.
         let (bucket, object) = parse_gcs_uri(uri)?;
         debug!(
-            "GcsObjectStore::put_multipart uri='{}', {} bytes (community GCS client has no \
-             chunked upload; routed to simple upload)",
+            "GcsObjectStore::put_multipart uri='{}', {} bytes (routed to simple upload; no chunked \
+             upload on this route)",
             uri,
             data.len()
         );
@@ -3955,6 +4462,14 @@ impl GcsBufferedWriter {
         self.compressed_bytes = self.buffer.len() as u64;
         Ok(())
     }
+
+    /// Close the compression frame and hand the accumulated buffer over as `Bytes`: the
+    /// `Vec`'s allocation becomes the `Bytes` with no copy, so the store receives the very
+    /// buffer the writer accumulated.
+    fn take_payload(&mut self) -> Result<Bytes> {
+        self.seal_compression()?;
+        Ok(Bytes::from(std::mem::take(&mut self.buffer)))
+    }
 }
 
 #[async_trait]
@@ -3975,10 +4490,27 @@ impl ObjectWriter for GcsBufferedWriter {
             let compressed = compressor.get_mut();
             self.buffer.append(compressed);
         } else {
-            // No compression - direct to buffer
+            // No compression - direct to buffer. Accumulation copy of a BORROWED chunk into
+            // the writer's single buffer: unavoidable (the caller keeps its slice). Whole-
+            // object buffering is not redesigned in this release; `write_owned_bytes` moves an
+            // owned Vec in without a copy while the buffer is empty.
             self.buffer.extend_from_slice(chunk);
         }
 
+        Ok(())
+    }
+
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if self.compressor.is_some() {
+            // Compression is a transform: the input is read, never kept.
+            return self.write_chunk(&data).await;
+        }
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.hasher.update(&data);
+        self.bytes_written += data.len() as u64;
+        adopt_owned_chunk(&mut self.buffer, data);
         Ok(())
     }
 
@@ -3988,7 +4520,7 @@ impl ObjectWriter for GcsBufferedWriter {
         }
         self.finalized = true;
 
-        self.seal_compression()?;
+        let payload = self.take_payload()?;
 
         // Append compression extension if needed
         let final_uri = self.compression.stored_name(&self.uri);
@@ -3997,19 +4529,12 @@ impl ObjectWriter for GcsBufferedWriter {
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
         let client = get_global_gcs_client().await?;
 
-        // audit #157 bug 5.4 (D5): the community GCS client has no real
-        // chunked/resumable upload — both branches used to call
-        // functions with byte-for-byte identical bodies under different
-        // names. `Bytes::from(Vec<u8>)` transfers ownership without
+        // audit #157 bug 5.4 (D5): this is a simple upload — the chunked and non-chunked
+        // branches used to call functions with byte-for-byte identical bodies under
+        // different names. `Bytes::from(Vec<u8>)` transfers ownership without
         // copying — zero-cost. `std::mem::take` moves the buffer out so
         // the encoder can be dropped too.
-        client
-            .put_object(
-                &bucket,
-                &object,
-                Bytes::from(std::mem::take(&mut self.buffer)),
-            )
-            .await
+        client.put_object(&bucket, &object, payload).await
     }
 
     fn bytes_written(&self) -> u64 {
@@ -5023,7 +5548,7 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
             }
             Ok(Err(e)) => {
                 summary.failed += 1;
-                warn!("Upload task failed: {}", e);
+                warn!("Upload task failed: {}", crate::sanitized_error(&e));
             }
             Err(e) => {
                 summary.failed += 1;
@@ -5054,23 +5579,41 @@ pub async fn generic_download_objects(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
-    let summary = generic_download_objects_with_summary(
+    let (summary, reasons) = download_with_reasons(
         src_uri,
         dest_dir,
         max_in_flight,
         recursive,
+        None,
         progress_callback,
     )
     .await?;
     if summary.failed > 0 {
-        bail!(
-            "Download completed with failures: attempted={}, succeeded={}, failed={}",
-            summary.attempted,
-            summary.succeeded,
-            summary.failed
-        );
+        bail!("{}", download_failure_message(&summary, &reasons));
     }
     Ok(())
+}
+
+/// How many failure reasons (object URI and cause) the error of [`generic_download_objects`]
+/// repeats; the log has all of them.
+const REPORTED_DOWNLOAD_FAILURES: usize = 3;
+
+/// The error text of a download that ended with failures: the counts, then the first
+/// [`REPORTED_DOWNLOAD_FAILURES`] reasons, then how many more there were.
+fn download_failure_message(summary: &TransferSummary, reasons: &[String]) -> String {
+    let mut msg = format!(
+        "Download completed with failures: attempted={}, succeeded={}, failed={}",
+        summary.attempted, summary.succeeded, summary.failed
+    );
+    if !reasons.is_empty() {
+        msg.push_str(": ");
+        msg.push_str(&reasons.join("; "));
+    }
+    let more = summary.failed.saturating_sub(reasons.len() as u64);
+    if more > 0 {
+        msg.push_str(&format!(" (and {more} more; see the log)"));
+    }
+    msg
 }
 
 /// Generic download function with detailed transfer summary.
@@ -5080,6 +5623,11 @@ pub async fn generic_download_objects(
 /// `name.bak`, a trailing `/` a directory, `*` / `**` an explicit glob.
 /// Use [`generic_download_objects_matching_with_summary`] to narrow the selection with an
 /// explicit regex.
+///
+/// Issue #284: each object is written to `<dest_dir>/<key relative to the listing base>`
+/// (parent directories are created), never only to its last key segment. An object whose
+/// relative key is unsafe, collides with another, or would be written through a symlink is
+/// counted in `failed` and not written; see [`crate::download_layout`] for the rules.
 pub async fn generic_download_objects_with_summary(
     src_uri: &str,
     dest_dir: &Path,
@@ -5115,6 +5663,28 @@ pub async fn generic_download_objects_matching_with_summary(
     pattern: Option<&crate::list_pattern::ListPattern>,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<TransferSummary> {
+    let (summary, _reasons) = download_with_reasons(
+        src_uri,
+        dest_dir,
+        max_in_flight,
+        recursive,
+        pattern,
+        progress_callback,
+    )
+    .await?;
+    Ok(summary)
+}
+
+/// The download implementation: the summary, and the first [`REPORTED_DOWNLOAD_FAILURES`]
+/// failure reasons (redacted object URI and cause) for callers that return an error.
+async fn download_with_reasons(
+    src_uri: &str,
+    dest_dir: &Path,
+    max_in_flight: usize,
+    recursive: bool,
+    pattern: Option<&crate::list_pattern::ListPattern>,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<(TransferSummary, Vec<String>)> {
     // Issue #211: a limit of 0 builds a semaphore with no permits and hangs.  This is the
     // implementation every backend-aware download funnels through (and a public entry of
     // its own), so the guard lives here: before the store is chosen, anything is listed or
@@ -5124,11 +5694,17 @@ pub async fn generic_download_objects_matching_with_summary(
     // per-endpoint store, whose entries come back in bucket form; a store built from such an
     // entry would use the process-wide client (another server).  The per-endpoint store
     // accepts the bucket-form URIs of its own bucket and uses its own client for them.
-    let store: Arc<dyn ObjectStore> =
-        Arc::from(store_for_uri_with_logger(src_uri, global_logger())?);
+    let store: Arc<dyn ObjectStore> = Arc::from(
+        store_for_uri_with_logger(src_uri, global_logger())
+            .map_err(|e| crate::redact::sanitized_error(&e))?,
+    );
 
-    // List objects to download
-    let mut keys = store.list(src_uri, recursive).await?;
+    // List objects to download. The listing error may carry a provider message with signed
+    // URLs or userinfo: it is sanitised (its typed classification, if any, is kept).
+    let mut keys = store
+        .list(src_uri, recursive)
+        .await
+        .map_err(|e| crate::redact::sanitized_error(&e))?;
     if let Some(pattern) = pattern {
         pattern.retain(src_uri, &mut keys);
     }
@@ -5146,7 +5722,7 @@ pub async fn generic_download_objects_matching_with_summary(
     info!(
         "Starting download of {} object(s) from {} to {:?} (jobs={})",
         keys.len(),
-        src_uri,
+        crate::redact::redact_and_escape(src_uri),
         dest_dir,
         effective_jobs
     );
@@ -5154,50 +5730,59 @@ pub async fn generic_download_objects_matching_with_summary(
     let sem = Arc::new(Semaphore::new(effective_jobs));
     let mut futs = FuturesUnordered::new();
 
-    for uri in keys.clone() {
+    // Issue #284: every object keeps its key path relative to the listing base; the local
+    // path of each is decided (and collisions settled) before anything is fetched.
+    let mut summary = TransferSummary::default();
+    let mut reasons: Vec<String> = Vec::new();
+    for planned in crate::download_layout::plan_downloads(src_uri, &keys) {
+        summary.attempted += 1;
+        let uri = planned.entry;
+        let comps = match planned.target {
+            Ok(comps) => comps,
+            Err(e) => {
+                summary.failed += 1;
+                // The cause chain may quote the raw remote key: redact every URI in it, escape the
+                // final text.
+                let reason = crate::redact::redact_and_escape_text(&format!("{e:#}"));
+                warn!("Download refused: {}", reason);
+                if reasons.len() < REPORTED_DOWNLOAD_FAILURES {
+                    reasons.push(reason);
+                }
+                continue;
+            }
+        };
         let sem = sem.clone();
         let store = Arc::clone(&store);
         let progress = progress_callback.clone();
         let out_dir = dest_dir.to_path_buf();
+        let shown = crate::redact::redact_and_escape(&uri);
 
         futs.push(tokio::spawn(async move {
-            debug!("starting download of {} → {:?}", uri, out_dir);
-            let _permit = sem.acquire_owned().await.unwrap();
+            debug!("starting download of {} → {:?}", shown, out_dir);
+            let fetched_and_written = async {
+                let _permit = sem.acquire_owned().await?;
 
-            // Skip "directories" (URIs that end with slash)
-            if uri.ends_with('/') {
-                return Ok::<(), anyhow::Error>(());
+                // Download the object
+                let bytes = store.get(&uri).await?;
+                let byte_count = bytes.len() as u64;
+
+                // Write to disk below the destination, never outside it
+                let out_path =
+                    crate::download_layout::write_object(&out_dir, &comps, bytes).await?;
+
+                debug!("finished download of {} → {:?}", shown, out_path);
+
+                // Update progress if callback provided
+                if let Some(ref progress) = progress {
+                    progress.object_completed(byte_count);
+                }
+                Ok::<(), anyhow::Error>(())
             }
-
-            // Download the object
-            let bytes = store.get(&uri).await?;
-            let byte_count = bytes.len() as u64;
-
-            // Extract filename from URI
-            let fname = uri
-                .split('/')
-                .next_back()
-                .ok_or_else(|| anyhow!("Cannot extract filename from URI: {}", uri))?;
-            let out_path = out_dir.join(fname);
-
-            // Write to disk
-            tokio::fs::write(&out_path, bytes).await?;
-
-            debug!("finished download of {} → {:?}", uri, out_path);
-
-            // Update progress if callback provided
-            if let Some(ref progress) = progress {
-                progress.object_completed(byte_count);
-            }
-
-            Ok::<(), anyhow::Error>(())
+            .await;
+            // The failure carries the object it belongs to (the redacted URI).
+            fetched_and_written.map_err(|e| e.context(crate::redact::redact_and_escape(&uri)))
         }));
     }
-
-    let mut summary = TransferSummary {
-        attempted: keys.iter().filter(|k| !k.ends_with('/')).count() as u64,
-        ..Default::default()
-    };
 
     // Wait for all downloads to complete
     while let Some(join_res) = futs.next().await {
@@ -5207,11 +5792,26 @@ pub async fn generic_download_objects_matching_with_summary(
             }
             Ok(Err(e)) => {
                 summary.failed += 1;
-                warn!("Download task failed: {}", e);
+                // The store's own error quotes the raw remote key and may carry a provider
+                // message with signed URLs or userinfo: redact every URI in the final text,
+                // then escape it.
+                let reason = crate::redact::redact_and_escape_text(&format!("{e:#}"));
+                warn!("Download task failed: {}", reason);
+                if reasons.len() < REPORTED_DOWNLOAD_FAILURES {
+                    reasons.push(reason);
+                }
             }
             Err(e) => {
                 summary.failed += 1;
-                warn!("Download task join failed: {}", e);
+                warn!(
+                    "Download task join failed: {}",
+                    crate::redact::redact_and_escape_text(&e.to_string())
+                );
+                if reasons.len() < REPORTED_DOWNLOAD_FAILURES {
+                    reasons.push(crate::redact::redact_and_escape_text(&format!(
+                        "download task failed: {e}"
+                    )));
+                }
             }
         }
     }
@@ -5226,7 +5826,7 @@ pub async fn generic_download_objects_matching_with_summary(
             .bytes_transferred
             .load(std::sync::atomic::Ordering::Relaxed);
     }
-    Ok(summary)
+    Ok((summary, reasons))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5311,7 +5911,7 @@ mod s3_object_store_tests {
     use super::*;
 
     /// Mutex to serialize tests that manipulate AWS credential env vars.
-    static CRED_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static CRED_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     // ── Tests that need NO credentials / NO network ──────────────────────────
 
@@ -5485,6 +6085,22 @@ mod s3_object_store_tests {
         assert_eq!(account, "myacct", "the host's account is lowercased");
     }
 
+    // A URI that carries userinfo or a backslash in its authority is still classified Azure (so
+    // it reaches the parser, which refuses it) and is never read as an account.
+    #[test]
+    fn azure_host_urls_with_a_smuggling_authority_are_classified_azure_and_refused() {
+        for uri in [
+            "https://abc.def@real.blob.core.windows.net/c/k",
+            "https://evil.example\\@real.blob.core.windows.net/c/k",
+        ] {
+            assert_eq!(infer_scheme(uri), Scheme::Azure, "{uri}");
+            assert!(
+                crate::capabilities::parse_azure_uri_pure(uri).is_err(),
+                "{uri}"
+            );
+        }
+    }
+
     #[cfg(feature = "backend-azure")]
     #[test]
     fn parse_azure_https_uri_container_only_has_an_empty_key() {
@@ -5510,6 +6126,49 @@ mod s3_object_store_tests {
             "https://acct.blob.core.windows.net//k",
         ] {
             assert!(parse_azure_uri(uri).is_err(), "{uri}");
+        }
+    }
+
+    // Issue #224: `az://account//key` has an EMPTY container. It used to parse (container "",
+    // key "key") and reach the client builder; it must now be refused by parsing alone, like the
+    // https form above.
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_az_uri_with_an_empty_container_is_an_error() {
+        for uri in [
+            "az://account//key",
+            "az://account//",
+            "az://account/",
+            "az://account",
+            "az://account///key",
+        ] {
+            let err = parse_azure_uri(uri).expect_err(uri);
+            assert!(format!("{err:#}").contains("container"), "{uri}: {err:#}");
+        }
+    }
+
+    // The valid forms #224 must not disturb: roots, nested keys, percent signs, and keys that
+    // are literal (`%2F` stays three characters).
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_az_uri_valid_roots_and_literal_keys_still_parse() {
+        for (uri, want) in [
+            ("az://account/cont", ("account", "cont", "")),
+            ("az://account/cont/", ("account", "cont", "")),
+            ("az://account/cont/k", ("account", "cont", "k")),
+            ("az://account/cont//k", ("account", "cont", "/k")),
+            ("az://account/cont/a%2Fb", ("account", "cont", "a%2Fb")),
+            (
+                "az://account/cont/100%25/x%",
+                ("account", "cont", "100%25/x%"),
+            ),
+        ] {
+            let (account, container, key) = parse_azure_uri(uri).expect(uri);
+            assert_eq!(
+                (account.as_str(), container.as_str(), key.as_str()),
+                want,
+                "{uri}"
+            );
         }
     }
 
@@ -6394,5 +7053,251 @@ mod gcs_size_cache_hygiene_tests {
             get.contains("fresh_object_size(uri)"),
             "no fresh-size retry"
         );
+    }
+
+    /// GCS cannot run offline (its client needs credentials), so the wiring of the one-version
+    /// rule (stage G review, G-F2) is pinned by source: the official client's ranges share an
+    /// `ObjectVersion` and fall back to one response. The behaviour of the route is tested against a fake in `gcs_range_into_tests.rs`.
+    #[test]
+    fn the_range_engine_reads_one_generation() {
+        let src = include_str!("object_store.rs");
+        let start = src
+            .find("impl GcsObjectStore {")
+            .expect("impl GcsObjectStore");
+        let body = &src[start..];
+        let a = body
+            .find("async fn get_with_range_engine(")
+            .expect("get_with_range_engine");
+        let end = body[a..].find("\n    }\n").expect("end") + a;
+        let route = &body[a..end];
+        assert!(
+            route.contains("range_engine_download_versioned("),
+            "the official route does not use the shared-version fan-out"
+        );
+        assert!(
+            route.contains(".get_range_into_versioned("),
+            "the official route's ranges do not share a version"
+        );
+    }
+}
+
+/// The unit-test mock S3 server is the one the integration tests use (`tests/common`), included
+/// by path: the helper-row tests below must reach `pub(crate)` items, which an integration
+/// test cannot, and need a real HTTP server behind the process-wide client.
+#[cfg(test)]
+#[path = "../tests/common/mock_s3_server.rs"]
+#[allow(dead_code)] // the shared mock serves many test binaries; this one uses a subset
+mod unit_test_mock_s3;
+
+/// `get_into` and `head` on a store built with `with_helper_rows()` (the endpoint stores of a
+/// `MultiEndpointStore` on bucket-form S3 URIs, which no `LoggedObjectStore` wraps): each call
+/// writes exactly ONE S3 helper row, and a store without the flag writes none. The process-wide
+/// client, the mock server and the op-log are process-global; this is the only lib test that
+/// touches them, and it holds the credential lock for its whole run.
+#[cfg(test)]
+mod helper_row_tests {
+    use super::unit_test_mock_s3::{ensure_mock_s3_server, unique_test_key, MockObject};
+    use super::*;
+
+    const BUCKET: &str = "helper-row-bucket";
+
+    /// The `(op, file)` columns of every row of a finalized op-log.
+    fn rows_of(path: &std::path::Path) -> Vec<(String, String)> {
+        let raw = std::fs::read(path).expect("the op-log file exists");
+        let text = String::from_utf8(
+            zstd::decode_all(raw.as_slice()).expect("the op-log is a complete zstd stream"),
+        )
+        .expect("the op-log is UTF-8");
+        text.lines()
+            .skip(1)
+            .map(|line| {
+                let cols: Vec<&str> = line.split('\t').collect();
+                assert_eq!(cols.len(), 13, "a 13-column row: {line}");
+                (cols[2].to_string(), cols[7].to_string())
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_helper_row_store_writes_one_row_per_get_into_and_per_head() {
+        let _guard = s3_object_store_tests::CRED_LOCK.lock().await;
+        for name in ["S3DLIO_OPLOG_BUF", "S3DLIO_OPLOG_LOSSLESS"] {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("S3DLIO_LOAD_DOTENV", "0");
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+        let (_, server) = ensure_mock_s3_server();
+
+        let helper_key = unique_test_key("helper-rows");
+        let plain_key = unique_test_key("plain-rows");
+        for (key, seed) in [(&helper_key, 3u8), (&plain_key, 5u8)] {
+            let body: Vec<u8> = (0..700usize)
+                .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+                .collect();
+            server.put_object(BUCKET, key, MockObject::new(body));
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.tsv.zst");
+        crate::s3_logger::init_op_logger(oplog.to_str().expect("utf-8 path"))
+            .expect("init the op-log");
+
+        let with_rows = S3ObjectStore::new().with_helper_rows();
+        let uri = format!("s3://{BUCKET}/{helper_key}");
+        let mut dst = vec![0u8; 700];
+        with_rows
+            .get_into(&uri, &mut dst, &ReceiveProgress::new())
+            .await
+            .expect("get_into");
+        let meta = with_rows
+            .head(&uri)
+            .await
+            .expect("head")
+            .expect("the object is present");
+        assert_eq!(meta.size, 700);
+
+        // The same two calls on a store without the flag: the caller's wrapper would write the
+        // row, so the store itself writes none.
+        let without_rows = S3ObjectStore::new();
+        let plain_uri = format!("s3://{BUCKET}/{plain_key}");
+        without_rows
+            .get_into(&plain_uri, &mut dst, &ReceiveProgress::new())
+            .await
+            .expect("get_into");
+        without_rows
+            .head(&plain_uri)
+            .await
+            .expect("head")
+            .expect("the object is present");
+
+        crate::s3_logger::finalize_op_logger();
+        let rows = rows_of(&oplog);
+
+        let of = |key: &str, op: &str| {
+            rows.iter()
+                .filter(|(o, file)| o == op && file.contains(key))
+                .count()
+        };
+        assert_eq!(of(&helper_key, "GET"), 1, "one GET row: {rows:?}");
+        assert_eq!(of(&helper_key, "HEAD"), 1, "one HEAD row: {rows:?}");
+        assert_eq!(
+            rows.iter().filter(|(_, f)| f.contains(&plain_key)).count(),
+            0,
+            "a store without helper rows writes none: {rows:?}"
+        );
+        assert_eq!(rows.len(), 2, "nothing else is recorded: {rows:?}");
+
+        // Each row stands for one request: no hidden retry or extra HEAD.
+        let seen = |key: &str, method: &str| {
+            server
+                .requests_for(BUCKET, key)
+                .iter()
+                .filter(|r| r.method == method)
+                .count()
+        };
+        assert_eq!(seen(&helper_key, "GET"), 1);
+        assert_eq!(seen(&helper_key, "HEAD"), 1);
+    }
+}
+
+/// A `gs://` URI that names a bucket but no object is refused before the client is built (no
+/// credentials, no network), with a typed `Other` error: it must never address the bucket path.
+#[cfg(all(test, feature = "backend-gcs"))]
+mod gcs_empty_object_tests {
+    use super::*;
+    use crate::object_error::{object_error, ObjectErrorKind};
+
+    fn assert_refused(err: &anyhow::Error, uri: &str) {
+        let typed = object_error(err).unwrap_or_else(|| panic!("{uri}: an untyped error: {err:#}"));
+        assert_eq!(typed.kind, ObjectErrorKind::Other, "{uri}");
+        assert!(
+            format!("{err:#}").contains("no key specified"),
+            "{uri}: the refusal says why: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bucket_with_no_object_is_refused_before_the_client_is_built() {
+        let store = GcsObjectStore::new();
+        for uri in ["gs://bucket/", "gcs://bucket/", "gs://bucket"] {
+            let mut dst = [0u8; 4];
+            let err = store
+                .get_into(uri, &mut dst, &ReceiveProgress::new())
+                .await
+                .expect_err(uri);
+            assert_refused(&err, uri);
+            assert_eq!(dst, [0u8; 4], "{uri}: nothing was written");
+            let err = store.head(uri).await.expect_err(uri);
+            assert_refused(&err, uri);
+        }
+        assert!(
+            store.client.get().is_none(),
+            "a client was built for a URI that names no object"
+        );
+    }
+}
+
+/// Stage G (RULE #1): the buffered writers hand the buffer they accumulated to the store as the
+/// `Bytes` of that very allocation, and `write_owned_bytes` moved the caller's `Vec` into it.
+#[cfg(test)]
+mod zero_copy_writer_tests {
+    use super::*;
+
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// RED on the pre-fix code: `write_owned_bytes` fell back to `write_chunk(&data)`, which
+    /// copied the Vec into the writer's own buffer, so the `Bytes` pointer differed.
+    #[tokio::test]
+    async fn s3_writer_gives_the_store_the_callers_allocation() {
+        let data = payload(3 << 20);
+        let origin = data.as_ptr();
+        let mut writer = S3BufferedWriter::new("s3://bucket/key".to_string());
+        writer.write_owned_bytes(data).await.expect("write");
+        let bytes = writer.take_payload().expect("payload");
+        assert_eq!(bytes.len(), 3 << 20);
+        assert_eq!(bytes.as_ptr(), origin, "the owned Vec was copied");
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[tokio::test]
+    async fn azure_writer_gives_the_store_the_callers_allocation() {
+        let data = payload(3 << 20);
+        let origin = data.as_ptr();
+        let mut writer = AzureBufferedWriter::new("az://acct/ctr/key".to_string());
+        writer.write_owned_bytes(data).await.expect("write");
+        let bytes = writer.take_payload().expect("payload");
+        assert_eq!(bytes.as_ptr(), origin, "the owned Vec was copied");
+    }
+
+    #[cfg(feature = "backend-gcs")]
+    #[tokio::test]
+    async fn gcs_writer_gives_the_store_the_callers_allocation() {
+        let data = payload(3 << 20);
+        let origin = data.as_ptr();
+        let mut writer = GcsBufferedWriter::new("gs://bucket/key".to_string());
+        writer.write_owned_bytes(data).await.expect("write");
+        let bytes = writer.take_payload().expect("payload");
+        assert_eq!(bytes.as_ptr(), origin, "the owned Vec was copied");
+    }
+
+    /// A second owned chunk is appended (the documented accumulation copy); the data is intact.
+    #[tokio::test]
+    async fn a_second_owned_chunk_is_appended_in_order() {
+        let first = payload(1000);
+        let second: Vec<u8> = payload(500).iter().map(|b| b.wrapping_add(1)).collect();
+        let mut writer = S3BufferedWriter::new("s3://bucket/key".to_string());
+        writer
+            .write_owned_bytes(first.clone())
+            .await
+            .expect("first");
+        writer
+            .write_owned_bytes(second.clone())
+            .await
+            .expect("second");
+        let bytes = writer.take_payload().expect("payload");
+        assert_eq!(&bytes[..1000], &first[..]);
+        assert_eq!(&bytes[1000..], &second[..]);
     }
 }

@@ -20,7 +20,7 @@
 #         export AWS_REGION=us-central1          # your bucket region
 #         export GOOGLE_CLOUD_PROJECT=my-project # required for gs:// test
 #
-#  Native GCS test (optional, requires gcs-community or gcs-official feature):
+#  Native GCS test (optional, requires the backend-gcs feature):
 #    Application Default Credentials:
 #         gcloud auth application-default login
 #         export GOOGLE_CLOUD_PROJECT=my-project
@@ -117,7 +117,7 @@ echo ""
 # TEST 2 — Native GCS path (gs://)
 # =======================================================================
 echo "=== TEST 2: list-buckets via gs:// (native GCS client) ==="
-info "Requires: GOOGLE_CLOUD_PROJECT, gcs-community or gcs-official feature, ADC credentials"
+info "Requires: GOOGLE_CLOUD_PROJECT, the backend-gcs feature, ADC credentials"
 info ""
 
 if [[ -z "${GOOGLE_CLOUD_PROJECT:-}" && -z "${GCLOUD_PROJECT:-}" ]]; then
@@ -130,8 +130,8 @@ else
 
     OUTPUT=$("$S3DLIO_BIN" list-buckets gs:// 2>&1) || true
 
-    if echo "$OUTPUT" | grep -q "GCS support is not compiled in"; then
-        skip "GCS native client feature not compiled — build with --features gcs-community or gcs-official"
+    if echo "$OUTPUT" | grep -q "GCS backend is not enabled in this build"; then
+        skip "GCS native client feature not compiled — build with --features backend-gcs"
     elif echo "$OUTPUT" | grep -qiE "error|Error|failed|Failed"; then
         fail "list-buckets gs:// returned an error:"
         info "  $OUTPUT"

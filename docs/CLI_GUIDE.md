@@ -15,7 +15,7 @@
    - [upload - Upload Files](#upload---upload-files)
    - [download - Download Objects](#download---download-objects)
    - [delete - Delete Objects](#delete---delete-objects)
-   - [get - High-Performance Download](#get---high-performance-download)
+   - [get - High-Performance Read](#get---high-performance-read)
    - [put - High-Performance Upload](#put---high-performance-upload)
 6. [Regex Pattern Filtering](#regex-pattern-filtering)
 7. [Operation Logging](#operation-logging)
@@ -233,6 +233,54 @@ sees `sub/c.npz`. The pattern is compiled before anything is listed: an invalid 
 sent and no directory created. `--pattern` works on every backend (`file://` and `direct://` included);
 the selection rule is implemented for `s3://` only.
 
+**Local layout (issue #284).** A download keeps each object's key path relative to the listing base:
+`download -r s3://b/dl/ ./out/` writes `dl/a/x.bin` to `./out/a/x.bin` and `dl/b/x.bin` to `./out/b/x.bin`,
+creating directories as needed. The listing base is the directory the URI selects (`dl/` for `dl/` and `dl`,
+the directory before the first `*` for a glob, and the parent directory for a single exact object, so
+`download s3://b/dir/file.txt ./out/` writes `./out/file.txt`). Zero-length "folder" objects (keys ending in
+`/`) are skipped: no directory is created for them and they are not counted. `s3-cli cp -r <URI> <dir>` uses the
+same layout.
+
+An object is **refused** (counted as `failed` in the `DOWNLOAD summary` line, the command exits non-zero, and
+nothing is written for it) when its relative key is empty or absolute, has an empty (`a//b`), `.` or `..`
+component, contains a NUL byte or a component that is exactly a drive designator (`C:`; `a:b`, `x:y` and `v:1/x`
+are ordinary names), or lies outside the listing base; a backslash counts as a separator on every platform, so
+`..\evil` is refused too. The reason for each is logged as a WARN line
+(the Python `download()` and the Rust `generic_download_objects` also repeat the first three in their error). Two objects that map to the
+same local path are never merged: the first in listing order
+is written and each later one fails with a collision error (an object and a directory of one name: below). A symlink that already exists below the
+destination directory is not followed; the object fails instead, and on Unix the file itself is opened with
+`O_NOFOLLOW`, so a symlink planted there between the check and the write is refused too. (An intermediate
+directory swapped for a symlink by another local process in that instant is not detected. Names that differ
+only in case can still merge on a case-insensitive file system, a file left by an earlier run is overwritten,
+and a write that fails after its directories were created leaves those directories behind, empty.)
+
+**Scope of these protections.** They reject ordinary hostile remote KEYS (traversal, absolute and drive-letter
+forms, collisions, a pre-existing symlink). They are not containment against a hostile LOCAL directory, and they
+are not a Windows file-name mapping: Windows is not a supported or tested platform of the release (the release
+matrix is Linux), and alternate data streams, reserved device names and path aliases are not handled. Download
+only to a destination whose directory entries are not being modified by an untrusted actor.
+
+The base is one for the whole listing. `download -r s3://b/dl ./out/` where `dl` is both an object (typically a
+zero-byte folder marker) and a directory (`dl/a`, `dl/b/c`) places everything relative to the parent: `dl/a`
+goes to `./out/dl/a` and `dl/b/c` to `./out/dl/b/c`, never to `./out/a`. A file system cannot hold the
+object `dl` and the directory `dl/`, so **the directory wins**: only the single object `dl` is refused (one
+failed object, with the reason "object 'dl' and directory 'dl/' cannot both exist locally; ... fetch the
+object alone (non-recursively), or use 's3://b/dl/' to download only the directory"). The same holds for a glob that
+selects both. To get only the directory, add the trailing slash (`s3://b/dl/` writes `./out/a` and
+`./out/b/c`); to get only the object, download it without `-r`. Only a directory with at least one downloadable object counts: if EVERY child under `dl/` is refused (unsafe key, collision), the object `dl` is downloaded as an ordinary file; in a chain (`p`, `p/q`, `p/q/r`) every object that has a valid child (`p` and `p/q`) is refused and only `p/q/r` is downloaded. `--pattern` is applied BEFORE this decision:
+the layout base and the exact-object check see only the objects the pattern kept, so a pattern that filters
+out `dl` itself makes the directory the base (`dl/a` goes to `./out/a`). `gs://`, `gcs://`, `az://` and the
+Azure `https://<account>.blob.core.windows.net/<container>/...` spellings of a source all give the same
+layout. For `gs://` and `az://` the listing is by RAW KEY PREFIX (the `s3://` selection rule is not implemented
+there, tracked in #220), so `download -r gs://b/dl` can also list a sibling such as `dl.bak`; it is written
+to `./out/dl.bak`, beside the directory's own files. Use `gs://b/dl/` to select the directory only. A file
+that was only partly written (disk full, interrupted write) is NOT removed: the object fails, the command
+exits non-zero, and the partial file stays in the destination for you to delete or overwrite. The CLI refuses per object (the rest is downloaded, the exit status is non-zero); the Rust library helpers
+`s3dlio::s3_copy::download_objects*` are fail-fast: one bad key (or an object and directory of one name)
+refuses the whole call before anything is created or fetched. Control characters in a remote key (newline,
+ESC, bidi and other invisible format characters) are shown escaped (`\n`, `\u{1b}`, `\u{202e}`) in the error text, the failure reasons and the log lines of a download, including the cause text of a failed fetch, and credentials are redacted from every `scheme://` URI in that text (userinfo, signed query strings), not only from the object URI. This covers what `s3-cli download` and `s3-cli cp <uri> <dir>` print for a failed listing or a failed fetch, and the failure of the Rust `s3_copy::upload_files` and `download_objects*` helpers. Documented limits of the redaction: a schemeless `user:password@host` in the text is not recognised; a password containing whitespace or multiple slashes is not fully removed; one slash is handled for `http(s)` only, with the exceptions documented in the Python API guide. Raw `?` or `#` inside HTTP(S) userinfo removes that userinfo and the rest of the word; combining either character with a slash can leave part of the password; everything up to the last `@` of the authority (the text after `://` up to the first whitespace or `/`) is treated as userinfo, so a bare-host URI directly followed by text with an `@` and no whitespace (`https://h,user=a@b`) is over-redacted and `abfs://container@account` loses `container@`; a credential parameter is cut from `http(s)` URIs by dropping the whole query, but from other schemes (`s3://`, `gs://`, `az://`) only when it is one of the well-known names (`sig`, `signature`, `token`, `x-amz-*`, `x-goog-*`); and a cut query runs to the next whitespace, quote, backtick or angle bracket (`)`, `]`, `}`, `,` and `;` do not end it), the text after that boundary is kept, so compact JSON / XML keep their other fields. The same redaction and escaping is applied to ALL `s3-cli` error output (`ls`, `get`, `stat`, `put`, `delete`, `create-bucket`, `cp` upload, ...): the final error of every command is rendered through it before `main` prints it (`Error: ...` on stderr, non-zero exit status), and so are the per-object `GET failed` / `PUT failed` and `Failed to create bucket` log lines.
+
 ```bash
 s3-cli download [OPTIONS] <SOURCE_URI> <LOCAL_PATH>
 ```
@@ -375,13 +423,15 @@ mean "everything under".
 
 ---
 
-### get - High-Performance Download
+### get - High-Performance Read
 
-Download objects with advanced options for maximum throughput.
+Read objects with concurrency for maximum throughput. `get` fetches the object bytes and reports the
+byte count and throughput; it does **not** write them to a file and has no `--output` option. To save
+objects to a local path use [download](#download---download-objects).
 
 On `s3://` the URI selects as described under [ls](#ls---list-objects): `s3-cli get s3://b/file.txt`
-downloads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` downloads everything under `dl/`
-(never `dl2/`); `get 's3://b/file.txt*'` downloads `file.txt`, `file.txt.bak` and `file.txt2`. To filter
+reads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` reads everything under `dl/`
+(never `dl2/`); `get 's3://b/file.txt*'` reads `file.txt`, `file.txt.bak` and `file.txt2`. To filter
 with a regex use `-p/--pattern`, applied after the selection and matched against the name relative to
 the listing base (for `s3://b/dl/` and the key `dl/sub/c.npz` the pattern sees `sub/c.npz`). An invalid
 pattern fails before any request is sent. `--pattern` cannot be combined with `--keylist` or
@@ -389,15 +439,21 @@ pattern fails before any request is sent. `--pattern` cannot be combined with `-
 follow it (tracked in #220).
 
 ```bash
-s3-cli get [OPTIONS] <URI>
+s3-cli get [OPTIONS] [URI]
 ```
 
-**Options:**
+**Options** (exactly the options `s3-cli get --help` lists):
 | Option | Description |
 |--------|-------------|
-| `-j, --jobs <N>` | Concurrent downloads (default: 64) |
-| `-p, --pattern <REGEX>` | Regex (client-side) that narrows the selection; matched against each entry relative to the listing base |
-| `-o, --output <PATH>` | Output path (default: current directory) |
+| `[URI]` | A full key, a directory ending with `/`, or a `*` / `**` glob; optional when `--keylist` is given |
+| `-p, --pattern <REGEX>` | Regex (client-side) that narrows the selection; matched against each entry relative to the listing base. Not valid with `--keylist` or `--offset/--length` |
+| `-j, --jobs <JOBS>` | Maximum concurrent GET requests (default: 64, max 4096; accepts `k` and `m` suffixes) |
+| `--concurrent <CONCURRENT>` | Alternative to `--jobs`, for `mp` compatibility (max 4096) |
+| `--keylist <KEYLIST>` | File containing a list of URIs to read, one per line |
+| `-r, --recursive` | Perform the operation recursively |
+| `--offset <OFFSET>` | Byte offset for a range request (single-object GET only) |
+| `--length <LENGTH>` | Number of bytes to read for a range request (to the end if omitted) |
+| `--endpoints <HOST:PORT[,HOST:PORT...]>` | Comma-separated S3 endpoints for multi-endpoint GET, round-robin; requires an `s3://` URI |
 
 ```bash
 # Only the .bin objects under data/
@@ -534,8 +590,8 @@ The account comes from the URI (`az://account/container/key`). Credentials: see
 | Variable | Description |
 |----------|-------------|
 | `GOOGLE_APPLICATION_CREDENTIALS` | Service account key path |
-| `GCS_ENDPOINT_URL` | Custom endpoint |
-| `STORAGE_EMULATOR_HOST` | GCS emulator endpoint |
+| `GCS_ENDPOINT_URL` | Custom endpoint URL for the official GCS client (anonymous credentials; wins over `STORAGE_EMULATOR_HOST`) |
+| `STORAGE_EMULATOR_HOST` | Emulator `host:port` (anonymous credentials). Reads use HTTP/JSON, uploads/stat/list/delete the Storage gRPC API, so a JSON-only emulator supports reads only: see `Environment_Variables.md` (Google Cloud Storage Configuration) |
 
 ### HTTP/2 Configuration
 | Variable | Default | Description |
@@ -603,8 +659,9 @@ s3-cli ls gs://my-bucket/
 # Count objects recursively
 s3-cli ls -rc gs://my-bucket/data/
 
-# With fake-gcs-server
-GCS_ENDPOINT_URL=http://localhost:4443 s3-cli ls gs://testbucket/
+# Against an emulator or test server (anonymous credentials; `ls` uses the Storage gRPC API, so a
+# JSON-only emulator cannot serve it: see Environment_Variables.md)
+STORAGE_EMULATOR_HOST=localhost:4443 s3-cli ls gs://testbucket/
 ```
 
 ### Local Filesystem

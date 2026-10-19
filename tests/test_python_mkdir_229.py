@@ -104,8 +104,7 @@ def test_direct_mkdir_and_create_node_create_real_directories(tmp_path):
         f"direct://{root}/via_torch/y",
     )
     assert out["mkdir"] == "None" and out["mkdir_again"] == "None"
-    # mkdir_async resolves to () today (pre-existing, not part of #229): accept it.
-    assert out["mkdir_async"] in ("None", "()")
+    assert out["mkdir_async"] == "None"
     assert out["create_node"] is True and out["create_node_torch"] is True
     assert (root / "a/b/c").is_dir()
     assert (root / "via_adapter/x").is_dir()
@@ -121,8 +120,7 @@ def test_s3_mkdir_and_create_node_succeed_and_send_zero_requests(mock):
         env=env_for(mock),
     )
     assert out["mkdir"] == "None" and out["mkdir_again"] == "None"
-    # mkdir_async resolves to () today (pre-existing, not part of #229): accept it.
-    assert out["mkdir_async"] in ("None", "()")
+    assert out["mkdir_async"] == "None"
     assert out["create_node"] is True and out["create_node_torch"] is True
     assert mock.render() == "", f"mkdir sent requests:\n    {mock.render()}"
     assert sorted(mock.keys) == sorted(SEEDED), "mkdir changed the stored keys"

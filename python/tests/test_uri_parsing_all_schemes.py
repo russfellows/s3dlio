@@ -16,6 +16,7 @@ Run with: python -m pytest python/tests/test_uri_parsing_all_schemes.py -v
 Or directly: python python/tests/test_uri_parsing_all_schemes.py
 """
 
+import pytest
 import s3dlio
 from s3dlio import _pymod as _core
 import sys
@@ -155,30 +156,62 @@ def test_cloud_uri_format_validation():
 
 
 def test_deprecated_aliases_exist():
-    """Test that deprecated class aliases still exist for backward compatibility."""
-    print("\n--- Test: Deprecated Aliases ---")
+    """The deprecated S3JaxIterable alias exists next to its generic name.
 
-    # These should exist (deprecated but functional)
+    ``s3dlio.jax_tf`` needs only numpy at import time (TensorFlow is imported lazily), so
+    these two are available whenever numpy is.
+    """
+    print("\n--- Test: Deprecated Aliases (JAX/TF) ---")
+    pytest.importorskip("numpy")
+
+    for name, cls in [
+        ("S3JaxIterable", s3dlio.S3JaxIterable),  # deprecated alias
+        ("JaxIterable", s3dlio.JaxIterable),  # generic name
+    ]:
+        assert cls is not None, f"{name} is None!"
+        print(f"  ✓ {name} exists")
+
+
+def test_deprecated_torch_aliases_exist():
+    """The PyTorch datasets, deprecated aliases and generic names, exist when torch does.
+
+    ``s3dlio/__init__.py`` deliberately binds all four to ``None`` when ``import torch``
+    fails (PyTorch integration is optional), so without torch there is nothing to check.
+    """
+    print("\n--- Test: Deprecated Aliases (PyTorch) ---")
+    pytest.importorskip("torch")
+
     deprecated = [
         ("S3IterableDataset", s3dlio.S3IterableDataset),
         ("S3MapDataset", s3dlio.S3MapDataset),
-        ("S3JaxIterable", s3dlio.S3JaxIterable),
     ]
-
-    for name, cls in deprecated:
-        assert cls is not None, f"{name} is None!"
-        print(f"  ✓ {name} exists (deprecated alias)")
-
-    # New generic names should also exist
     generic = [
         ("ObjectStoreIterableDataset", s3dlio.ObjectStoreIterableDataset),
         ("ObjectStoreMapDataset", s3dlio.ObjectStoreMapDataset),
-        ("JaxIterable", s3dlio.JaxIterable),
     ]
-
-    for name, cls in generic:
+    for name, cls in deprecated + generic:
         assert cls is not None, f"{name} is None!"
-        print(f"  ✓ {name} exists (generic name)")
+        print(f"  ✓ {name} exists")
+    assert issubclass(s3dlio.S3IterableDataset, s3dlio.ObjectStoreIterableDataset)
+    assert issubclass(s3dlio.S3MapDataset, s3dlio.ObjectStoreMapDataset)
+
+
+def test_torch_datasets_are_none_without_torch():
+    """Without torch the optional PyTorch datasets are the documented ``None`` fallback."""
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        pytest.skip("torch is installed; the fallback does not apply")
+    assert s3dlio._HAS_TORCH is False
+    for name in (
+        "S3IterableDataset",
+        "S3MapDataset",
+        "ObjectStoreIterableDataset",
+        "ObjectStoreMapDataset",
+    ):
+        assert getattr(s3dlio, name) is None, name
 
 
 def run_all_tests():
@@ -196,9 +229,14 @@ def run_all_tests():
         ("Local file backend", test_local_file_backend),
         ("Cloud URI format", test_cloud_uri_format_validation),
         ("Deprecated aliases", test_deprecated_aliases_exist),
+        ("Deprecated torch aliases", test_deprecated_torch_aliases_exist),
+        ("Torch fallback", test_torch_datasets_are_none_without_torch),
     ]:
         try:
             test()
+            results.append((name, True))
+        except pytest.skip.Exception as e:
+            print(f"SKIPPED: {name}: {e}")
             results.append((name, True))
         except AssertionError as e:
             print(f"FAILED: {name}: {e}")

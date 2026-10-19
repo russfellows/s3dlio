@@ -4,6 +4,14 @@
 
 set -e
 
+# Live legs are opt-in: there are no default buckets. Each leg runs only when its
+# variable names a bucket/container you own (it must hold hello.txt / test.txt):
+#   S3  : S3DLIO_TEST_BUCKET  (+ AWS credentials)
+#   GCS : S3DLIO_TEST_GCS_BUCKET (+ gcloud auth)
+#   Azure: AZURE_BLOB_ACCOUNT + S3DLIO_TEST_AZURE_CONTAINER
+S3_BUCKET="${S3DLIO_TEST_BUCKET:-}"
+GCS_BUCKET="${S3DLIO_TEST_GCS_BUCKET:-}"
+
 CLI="./target/release/s3-cli"
 
 echo "========================================"
@@ -34,20 +42,20 @@ test_result() {
 # S3 Backend Tests
 # ====================
 echo "=== S3 Backend Tests ==="
-if [ -n "$AWS_ACCESS_KEY_ID" ]; then
-    echo "Test: ls s3://signal65-public/"
-    $CLI ls s3://signal65-public/ > /dev/null
+if [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$S3_BUCKET" ]; then
+    echo "Test: ls s3://$S3_BUCKET/"
+    $CLI ls s3://$S3_BUCKET/ > /dev/null
     test_result
     
     echo "Test: ls with pattern (*.txt)"
-    $CLI ls s3://signal65-public/ -p '.*\.txt$' > /dev/null
+    $CLI ls s3://$S3_BUCKET/ -p '.*\.txt$' > /dev/null
     test_result
     
-    echo "Test: stat s3://signal65-public/hello.txt"
-    $CLI stat s3://signal65-public/hello.txt > /dev/null
+    echo "Test: stat s3://$S3_BUCKET/hello.txt"
+    $CLI stat s3://$S3_BUCKET/hello.txt > /dev/null
     test_result
 else
-    echo "⏭️  Skipped (no AWS credentials)"
+    echo "⏭️  Skipped (needs AWS credentials and S3DLIO_TEST_BUCKET)"
 fi
 echo ""
 
@@ -80,20 +88,20 @@ echo ""
 # GCS Backend Tests
 # ====================
 echo "=== GCS Backend Tests ==="
-if command -v gcloud &> /dev/null && gcloud auth list 2>&1 | grep -q "ACTIVE"; then
-    echo "Test: ls gs://signal65-russ-b1/"
-    $CLI ls gs://signal65-russ-b1/ > /dev/null 2>&1
+if [ -n "$GCS_BUCKET" ] && command -v gcloud &> /dev/null && gcloud auth list 2>&1 | grep -q "ACTIVE"; then
+    echo "Test: ls gs://$GCS_BUCKET/"
+    $CLI ls gs://$GCS_BUCKET/ > /dev/null 2>&1
     test_result
     
     echo "Test: ls with pattern (*.txt)"
-    $CLI ls gs://signal65-russ-b1/ -p '.*\.txt$' > /dev/null 2>&1
+    $CLI ls gs://$GCS_BUCKET/ -p '.*\.txt$' > /dev/null 2>&1
     test_result
     
-    echo "Test: stat gs://signal65-russ-b1/test.txt"
-    $CLI stat gs://signal65-russ-b1/test.txt > /dev/null 2>&1
+    echo "Test: stat gs://$GCS_BUCKET/test.txt"
+    $CLI stat gs://$GCS_BUCKET/test.txt > /dev/null 2>&1
     test_result
 else
-    echo "⏭️  Skipped (no GCS auth)"
+    echo "⏭️  Skipped (needs gcloud auth and S3DLIO_TEST_GCS_BUCKET)"
 fi
 echo ""
 
@@ -125,8 +133,8 @@ echo ""
 # Azure Backend Tests
 # ====================
 echo "=== Azure Backend Tests ==="
-if [ -n "$AZURE_BLOB_ACCOUNT" ] && [ -n "$AZURE_BLOB_CONTAINER" ]; then
-    AZURE_URI="az://${AZURE_BLOB_ACCOUNT}/${AZURE_BLOB_CONTAINER}/"
+if [ -n "$AZURE_BLOB_ACCOUNT" ] && [ -n "$S3DLIO_TEST_AZURE_CONTAINER" ]; then
+    AZURE_URI="az://${AZURE_BLOB_ACCOUNT}/${S3DLIO_TEST_AZURE_CONTAINER}/"
     
     echo "Test: ls $AZURE_URI"
     $CLI ls $AZURE_URI > /dev/null 2>&1
@@ -140,7 +148,7 @@ if [ -n "$AZURE_BLOB_ACCOUNT" ] && [ -n "$AZURE_BLOB_CONTAINER" ]; then
     $CLI stat ${AZURE_URI}test.txt > /dev/null 2>&1
     test_result
 else
-    echo "⏭️  Skipped (no Azure credentials)"
+    echo "⏭️  Skipped (needs AZURE_BLOB_ACCOUNT and S3DLIO_TEST_AZURE_CONTAINER)"
 fi
 echo ""
 
@@ -148,12 +156,12 @@ echo ""
 # Deprecation Warning Test
 # ====================
 echo "=== Deprecation Warning Test ==="
-if [ -n "$AWS_ACCESS_KEY_ID" ]; then
+if [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$S3_BUCKET" ]; then
     echo "Test: list command shows deprecation warning"
-    $CLI list s3://signal65-public/ 2>&1 | grep -q "WARNING.*deprecated"
+    $CLI list s3://$S3_BUCKET/ 2>&1 | grep -q "WARNING.*deprecated"
     test_result
 else
-    echo "⏭️  Skipped (no AWS credentials)"
+    echo "⏭️  Skipped (needs AWS credentials and S3DLIO_TEST_BUCKET)"
 fi
 echo ""
 

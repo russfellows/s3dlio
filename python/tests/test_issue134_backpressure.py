@@ -19,7 +19,7 @@ These tests verify the contract of the correct fix:
 Run against real MinIO (from s3dlio/.env):
   cd ~/Documents/Code/s3dlio && source .venv/bin/activate
   set -a && source .env && set +a
-  S3DLIO_TEST_BUCKET=perf-s3dlio \
+  S3DLIO_TEST_BUCKET=<your-bucket> \
   python python/tests/test_issue134_backpressure.py
 
 Run against local s3-ultra (no multipart support yet):
@@ -28,7 +28,7 @@ Run against local s3-ultra (no multipart support yet):
   export AWS_SECRET_ACCESS_KEY=minioadmin
   export AWS_REGION=us-east-1
   export S3DLIO_H2C=0
-  export S3DLIO_TEST_BUCKET=sai3bench-1k
+  export S3DLIO_TEST_BUCKET=<your-bucket>
   python python/tests/test_issue134_backpressure.py
 """
 
@@ -49,14 +49,14 @@ except ImportError:
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-BUCKET = (
-    os.environ.get("S3DLIO_TEST_BUCKET")
-    or os.environ.get("S3_BUCKET")
-    or "perf-s3dlio"
-)
+# Explicit opt-in: no default bucket (unset => every live test is skipped).
+BUCKET = os.environ.get("S3DLIO_TEST_BUCKET", "").strip()
+
 
 def _skip_if_no_server():
     """Return a skip reason string if the S3 endpoint is unreachable, else None."""
+    if not BUCKET:
+        return "S3DLIO_TEST_BUCKET not set (live S3 test; set it to a writable bucket)"
     endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
     if not endpoint:
         return "AWS_ENDPOINT_URL not set"
@@ -70,8 +70,8 @@ def _skip_if_no_server():
 
 # ── test cases ─────────────────────────────────────────────────────────────
 
-class TestIssue134Backpressure(unittest.TestCase):
 
+class TestIssue134Backpressure(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.skip_reason = _skip_if_no_server()
@@ -91,7 +91,9 @@ class TestIssue134Backpressure(unittest.TestCase):
         uri = f"s3://{BUCKET}/issue134/basic-write.bin"
         size = 32 << 20  # 32 MiB — two parts at part_size=16 MiB
         data = bytes([0xAA]) * size
-        w = s3dlio.MultipartUploadWriter.from_uri(uri, part_size=16 << 20, max_in_flight=4)
+        w = s3dlio.MultipartUploadWriter.from_uri(
+            uri, part_size=16 << 20, max_in_flight=4
+        )
         w.write(data)
         info = w.close()
         self.assertEqual(info["total_bytes"], size, "total_bytes mismatch")
@@ -108,8 +110,8 @@ class TestIssue134Backpressure(unittest.TestCase):
         """256 MiB upload with tight max_in_flight=4 completes without OOM."""
         self._skip()
         uri = f"s3://{BUCKET}/issue134/large-no-oom.bin"
-        part_size = 8 << 20   # 8 MiB
-        max_in_flight = 4     # max 4 × 8 MiB = 32 MiB Rust heap at once
+        part_size = 8 << 20  # 8 MiB
+        max_in_flight = 4  # max 4 × 8 MiB = 32 MiB Rust heap at once
         total_size = 256 << 20  # 256 MiB total (32 parts)
 
         # Write in 8 MiB chunks — same pattern as DLIO benchmark's write loop
@@ -138,14 +140,16 @@ class TestIssue134Backpressure(unittest.TestCase):
     def test_max_in_flight_1_is_slower_than_16(self):
         """max_in_flight=1 (fully serialised) is measurably slower than max_in_flight=16."""
         self._skip()
-        size = 64 << 20   # 64 MiB
+        size = 64 << 20  # 64 MiB
         part_size = 8 << 20  # 8 → 8 parts
         data = bytes([0xCC]) * part_size
 
         # max_in_flight=1: fully serialised — each write() blocks until the
         # previous UploadPart completes.
         uri1 = f"s3://{BUCKET}/issue134/backpressure-t1.bin"
-        w1 = s3dlio.MultipartUploadWriter.from_uri(uri1, part_size=part_size, max_in_flight=1)
+        w1 = s3dlio.MultipartUploadWriter.from_uri(
+            uri1, part_size=part_size, max_in_flight=1
+        )
         t0 = time.perf_counter()
         for _ in range(size // part_size):
             w1.write(data)
@@ -154,7 +158,9 @@ class TestIssue134Backpressure(unittest.TestCase):
 
         # max_in_flight=16: all parts pipeline concurrently
         uri16 = f"s3://{BUCKET}/issue134/backpressure-t16.bin"
-        w16 = s3dlio.MultipartUploadWriter.from_uri(uri16, part_size=part_size, max_in_flight=16)
+        w16 = s3dlio.MultipartUploadWriter.from_uri(
+            uri16, part_size=part_size, max_in_flight=16
+        )
         t0 = time.perf_counter()
         for _ in range(size // part_size):
             w16.write(data)
@@ -167,9 +173,10 @@ class TestIssue134Backpressure(unittest.TestCase):
         )
         # max_in_flight=1 MUST be slower — proves backpressure is active and effective
         self.assertGreater(
-            t1_elapsed, t16_elapsed,
+            t1_elapsed,
+            t16_elapsed,
             f"Expected max_in_flight=1 ({t1_elapsed:.2f}s) to be slower than "
-            f"max_in_flight=16 ({t16_elapsed:.2f}s) — backpressure may not be working"
+            f"max_in_flight=16 ({t16_elapsed:.2f}s) — backpressure may not be working",
         )
         print("  Backpressure confirmed: serialised writes slower than pipelined  ✓")
 
@@ -187,7 +194,9 @@ class TestIssue134Backpressure(unittest.TestCase):
         total_size = len(pattern_a) + len(pattern_b) + len(pattern_c)
 
         uri = f"s3://{BUCKET}/issue134/integrity.bin"
-        w = s3dlio.MultipartUploadWriter.from_uri(uri, part_size=part_size, max_in_flight=4)
+        w = s3dlio.MultipartUploadWriter.from_uri(
+            uri, part_size=part_size, max_in_flight=4
+        )
         w.write(pattern_a)
         w.write(pattern_b)
         w.write(pattern_c)
@@ -197,15 +206,17 @@ class TestIssue134Backpressure(unittest.TestCase):
         # Read back and verify each section
         try:
             head = bytes(s3dlio.get_range(uri, 0, 16))
-            mid  = bytes(s3dlio.get_range(uri, part_size, 16))
+            mid = bytes(s3dlio.get_range(uri, part_size, 16))
             tail = bytes(s3dlio.get_range(uri, 2 * part_size, 16))
             self.assertEqual(head, bytes([0x11]) * 16, "head mismatch")
-            self.assertEqual(mid,  bytes([0x22]) * 16, "middle mismatch")
+            self.assertEqual(mid, bytes([0x22]) * 16, "middle mismatch")
             self.assertEqual(tail, bytes([0x33]) * 16, "tail mismatch")
             print("  content_integrity: head/mid/tail byte patterns correct  ✓")
         except AttributeError:
             # get_range not available in this build — skip read-back check
-            print("  content_integrity: write OK (get_range unavailable, skipping read-back)")
+            print(
+                "  content_integrity: write OK (get_range unavailable, skipping read-back)"
+            )
 
     # ------------------------------------------------------------------
     # 5. Throughput — prove we're not in the broken 0.16 GB/s regime
@@ -215,7 +226,7 @@ class TestIssue134Backpressure(unittest.TestCase):
     def test_throughput_acceptable(self):
         """Single-writer throughput against loopback s3-ultra is ≥ 0.20 GB/s."""
         self._skip()
-        part_size  = 32 << 20   # 32 MiB parts
+        part_size = 32 << 20  # 32 MiB parts
         max_in_flight = 8
         total_size = 256 << 20  # 256 MiB
         chunk = bytes([0xDD]) * part_size
@@ -240,9 +251,10 @@ class TestIssue134Backpressure(unittest.TestCase):
         # Minimum bar: 0.20 GB/s on loopback. Well below what s3-ultra can do,
         # but catches catastrophic regressions (the 0.16 GB/s OOM-panic scenario).
         self.assertGreaterEqual(
-            gbps, 0.20,
+            gbps,
+            0.20,
             f"Throughput {gbps:.3f} GB/s is below the 0.20 GB/s minimum — "
-            "possible regression in multipart upload pipeline"
+            "possible regression in multipart upload pipeline",
         )
         print("  Throughput ✓")
 
@@ -254,7 +266,7 @@ class TestIssue134Backpressure(unittest.TestCase):
         self._skip()
         N = 4
         part_size = 8 << 20
-        obj_size  = 24 << 20  # 3 parts each
+        obj_size = 24 << 20  # 3 parts each
         chunk = bytes([0xEE]) * part_size
         errors = []
 
@@ -269,8 +281,9 @@ class TestIssue134Backpressure(unittest.TestCase):
                     w.write(chunk)
                     written += len(chunk)
                 info = w.close()
-                assert info["total_bytes"] == obj_size, \
+                assert info["total_bytes"] == obj_size, (
                     f"worker {idx}: total_bytes={info['total_bytes']} != {obj_size}"
+                )
             except Exception as e:
                 errors.append(f"worker {idx}: {e}")
 
@@ -302,7 +315,9 @@ class TestIssue134Backpressure(unittest.TestCase):
         N = 4  # 4 parts = 64 MiB total
 
         w = s3dlio.MultipartUploadWriter.from_uri(
-            uri, part_size=part_size, max_in_flight=2  # tight limit
+            uri,
+            part_size=part_size,
+            max_in_flight=2,  # tight limit
         )
         total = 0
         for i in range(N):
@@ -324,7 +339,9 @@ class TestIssue134Backpressure(unittest.TestCase):
 # ── entry point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"s3dlio {s3dlio.__version__}  bucket={BUCKET}  "
-          f"endpoint={os.environ.get('AWS_ENDPOINT_URL', '(none)')}")
+    print(
+        f"s3dlio {s3dlio.__version__}  bucket={BUCKET}  "
+        f"endpoint={os.environ.get('AWS_ENDPOINT_URL', '(none)')}"
+    )
     print()
     unittest.main(verbosity=2)

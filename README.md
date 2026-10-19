@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![CI](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-1478-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.128-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-1893-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.10.0-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94.1%2B-orange)](https://www.rust-lang.org)
@@ -10,10 +10,11 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-Full-backend builds support the stable Azure Blob Storage Rust SDK 1.0 API.
+Full-backend builds support the stable Azure Blob Storage Rust SDK 1.x API (1.1).
 
 ## Recent Releases
 
+- **v0.10.0** — Caller-buffer GET, typed HEAD; zero copy everywhere; official GCS only — [PR #293](https://github.com/russfellows/s3dlio/pull/293)
 - **v0.9.128** — Zero-copy writes, opt-in `.env`, Azure credentials — [PR #262](https://github.com/russfellows/s3dlio/pull/262)
 - **v0.9.126** — Exact URI selection; routing, upload fixes — [PR #237](https://github.com/russfellows/s3dlio/pull/237)
 - **v0.9.124** (not on PyPI) — Exact delete contract, op-log safety — [PR #217](https://github.com/russfellows/s3dlio/pull/217)
@@ -220,7 +221,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 ## ✨ Key Features
 
 - **High Performance**: High-throughput multi GB/s reads and writes on platforms with sufficient network and storage capabilities
-- **Zero-Copy Architecture**: `bytes::Bytes` throughout for minimal memory overhead
+- **Zero-Copy Architecture**: no payload copies except [documented exceptions](docs/PYTHON_API_GUIDE.md#remaining-copies-rule-1); Python buffers are read and filled in place
 - **Multi-Protocol**: S3, Azure Blob, GCS, file://, direct:// (O_DIRECT)
 - **HTTP/2 Support (opt-in)**: **HTTP/1.1 is the default** — HTTP/2 is almost always slower for bulk storage workloads. Opt in with `S3DLIO_HTTPS_H2=1` (TLS ALPN, `https://`), `S3DLIO_H2C=1` (cleartext h2c, `http://`), or `S3DLIO_ENABLE_HTTP2=1` (both). See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 - **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
@@ -325,7 +326,8 @@ cargo build --release --features full-backends
 - Repository: https://github.com/russfellows/google-cloud-rust
 - Integration in this repo is pinned in [Cargo.toml](Cargo.toml) (currently via release tag from that fork).
 
-**Legacy note:** `gcs-community` remains as a legacy opt-in path, but the primary supported path is the official Google crates from the patched `russfellows/google-cloud-rust` fork.
+Since v0.10.0 this is the only GCS client (`gcs-community` is removed). `GCS_ENDPOINT_URL` / `STORAGE_EMULATOR_HOST` point it at
+an emulator; see [Environment Variables](docs/Environment_Variables.md#gcs-custom-endpoint-examples).
 
 ## Quick Start
 
@@ -440,6 +442,27 @@ dataset = S3IterableDataset("gs://bucket/data/", loader_opts={})
 dataloader = DataLoader(dataset, batch_size=16)
 ```
 
+**Read into your own buffer (v0.10.0):**
+```python
+import asyncio, s3dlio
+
+async def read(uri):
+    meta = await s3dlio.head_async(uri)          # ObjectMetadata(size, etag, version_id) or None
+    if meta is None:
+        raise FileNotFoundError(uri)
+    buf = bytearray(meta.size)                   # any writable byte buffer: numpy, mmap, ctypes, ...
+    await s3dlio.get_into_async(uri, buf, expected_len=meta.size)  # written into buf as it arrives
+    return buf
+
+data = asyncio.run(read("s3://bucket/key"))
+s3dlio.object_capabilities("s3://bucket/key")  # {"provider": "s3", "get_into": True, "head": True}
+```
+Do not touch `buf` until the `await` returns; a size other than `expected_len` raises
+`LengthMismatchError`. See the [Python API guide](docs/PYTHON_API_GUIDE.md#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100).
+
+**Writes borrow your buffer (v0.10.0):** async writes read your buffer in place until the `await` finishes; pass
+`borrow=False` for a copy.
+
 **Streaming & Compression:**
 ```python
 # High-performance streaming with compression
@@ -488,7 +511,7 @@ def worker(stream, uri_template, n):
     buf = bytearray(8 * 1024 * 1024)
     for i in range(n):
         stream.fill(buf)       # reuse buffer, unique data each time
-        s3dlio.put_bytes(buf, uri_template.format(i))
+        s3dlio.put_bytes(uri_template.format(i), buf)
 
 threads = [threading.Thread(target=worker, args=(stream, "s3://bucket/obj-{}.bin", 100))
            for _ in range(32)]
@@ -513,7 +536,7 @@ store = s3dlio.create_multi_endpoint_store(
         "s3://bucket-2/data", 
         "s3://bucket-3/data",
     ],
-    strategy="least_connections"  # or "round_t robin"
+    strategy="least_connections"  # or "round_robin"
 )
 
 # Zero-copy data access (memoryview compatible)

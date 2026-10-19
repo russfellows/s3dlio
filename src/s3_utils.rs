@@ -38,7 +38,10 @@ use crate::data_gen::generate_object;
 use crate::list_pattern::ListPattern;
 
 // S3 client creation
-use crate::retry::retry_get_body;
+use crate::object_error::{attach_object_error, object_error, ObjectErrorKind};
+use crate::object_store::HeadMetadata;
+use crate::receive_progress::{ReceiveProgress, SpanMark};
+use crate::retry::{attach_s3_classification, retry_get_body, RetryClassify};
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
 
 // S3 operation logging (the public helpers in this module write the S3Ops row)
@@ -213,9 +216,22 @@ where
     // transient/definite verdict along (issue #240): `retry_get_body` needs
     // it and could not recover it from the message.
     let retryable = crate::retry::sdk_error_is_retryable(&e);
+    // The HTTP status and the service code travel with the verdict, so a typed
+    // classification (plan §4.5 A2) can be made after the flattening.
+    let status = e.raw_response().map(|r| r.status().as_u16());
+    let code = match &e {
+        SdkError::ServiceError(s) => s.err().code().map(str::to_owned),
+        _ => None,
+    };
+    // A construction failure (the request could not be built) is told apart from a
+    // timeout or dispatch failure, both of which have no response either.
+    let construction = matches!(&e, SdkError::ConstructionFailure(_));
     anyhow::Error::new(crate::retry::SdkFailure::new(
         format!("{}: {}", ctx, format_sdk_error(&e)),
         retryable,
+        status,
+        code,
+        construction,
     ))
 }
 
@@ -329,12 +345,21 @@ fn get_range_opt_enabled() -> bool {
 fn get_range_threshold_bytes() -> u64 {
     *RANGE_THRESHOLD_BYTES.get_or_init(|| {
         crate::dotenv::apply(); // latched for the process: the policy first (#243)
-        let mb = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(32);
-        mb * 1024 * 1024
+        threshold_from_mb(std::env::var("S3DLIO_RANGE_THRESHOLD_MB").ok().as_deref())
     })
+}
+
+/// The default range-split threshold, in megabytes.
+const DEFAULT_RANGE_THRESHOLD_MB: u64 = 32;
+
+/// The range-split threshold in bytes for a `S3DLIO_RANGE_THRESHOLD_MB` setting: an unset or
+/// unparseable value is the default, and a value too large for 64 bits of bytes saturates at
+/// `u64::MAX` (a threshold nothing reaches) instead of wrapping to a small one.
+fn threshold_from_mb(setting: Option<&str>) -> u64 {
+    setting
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RANGE_THRESHOLD_MB)
+        .saturating_mul(1024 * 1024)
 }
 
 /// Process-global object size cache.
@@ -477,21 +502,6 @@ pub enum S3FirstSegment<'a> {
     Server(&'a str),
 }
 
-/// True if `s` is a syntactically valid dotted-quad IPv4 address (four
-/// `0..=255` octets separated by dots). S3 bucket names are explicitly
-/// forbidden from being formatted as an IP address, so this check is
-/// unambiguous — it can never misclassify a legal bucket name.
-fn looks_like_ipv4(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-    parts.len() == 4
-        && parts.iter().all(|p| {
-            !p.is_empty()
-                && p.len() <= 3
-                && p.chars().all(|c| c.is_ascii_digit())
-                && p.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
-        })
-}
-
 /// Text of the one-time deprecation warning for the retired
 /// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable.
 const RETIRED_HINT_TLDS_WARNING: &str =
@@ -503,8 +513,8 @@ const RETIRED_HINT_TLDS_WARNING: &str =
 /// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is set: it no longer has any effect
 /// (issue #178).
 ///
-/// The environment is read exactly once, the first time
-/// [`classify_s3_first_segment`] runs; setting the variable later in the same
+/// The environment is read exactly once, the first time an s3:// parse or
+/// first-segment classification runs; setting the variable later in the same
 /// process neither warns nor changes anything. The warning goes to `tracing` AND
 /// to stderr, so it is visible in programs (and CLIs) that never install a
 /// tracing subscriber.
@@ -523,92 +533,17 @@ fn warn_if_retired_hint_tlds_env_set() {
     });
 }
 
-/// Validate the port part of `host:port` / `[ipv6]:port`.
-///
-/// Accepted: plain ASCII decimal digits, no leading zeros, value `1..=65535`.
-/// `u16::from_str` alone is too lax (it accepts a leading `+` and `0`); leading
-/// zeros are rejected because `host:09000` is ambiguous (octal habits) and would
-/// otherwise leave two spellings of one server in configs, URLs and logs.
-fn validate_s3_server_port(port: &str, segment: &str) -> Result<()> {
-    if port.is_empty() {
-        bail!(
-            "empty port in '{segment}': a server must be host:port with a port from 1 to 65535 \
-             (e.g. s3://host:9000/bucket/key)"
-        );
-    }
-    if !port.bytes().all(|b| b.is_ascii_digit()) {
-        bail!(
-            "invalid port '{port}' in '{segment}': a port is 1 to 65535 written as plain decimal \
-             digits (no sign or other characters), e.g. s3://host:9000/bucket/key"
-        );
-    }
-    if port.len() > 1 && port.starts_with('0') {
-        bail!(
-            "invalid port '{port}' in '{segment}': leading zeros are not accepted; write the \
-             port without them (e.g. :9000)"
-        );
-    }
-    match port.parse::<u16>() {
-        Ok(n) if n >= 1 => Ok(()),
-        _ => bail!(
-            "invalid port '{port}' in '{segment}': a port must be from 1 to 65535 \
-             (e.g. s3://host:9000/bucket/key)"
-        ),
-    }
-}
-
-/// Longest host the `host:port` grammar accepts (the DNS name limit).
-const S3_SERVER_HOST_MAX_LEN: usize = 253;
-
-/// The supported host grammar, quoted in every host error.
-const S3_SERVER_HOST_GRAMMAR: &str = "a host is 1 to 253 ASCII letters, digits, '-', '.' and '_', \
-     with no empty labels (no leading or trailing '.', no '..')";
-
-/// Validate the host part of `host:port` (a DNS name, IPv4 literal or
-/// container-style name such as `minio_1`).
-///
-/// Grammar: 1..=253 characters, each an ASCII letter, digit, `-`, `.` or `_`
-/// (`_` is kept for container-style names), with no empty label (no leading or
-/// trailing `.`, no `..`). Anything else - `/`, `\`, whitespace, control
-/// characters, `%`, `?`, `#`, non-ASCII, ... - is an error naming the character.
-/// Enforcing this before any endpoint URI is built means a host can never change
-/// how `s3://host:port/bucket/key` is split (`node/prefix:9000` would otherwise
-/// read back as bucket `node`, routed to the global client).
-fn validate_s3_server_host(host: &str, segment: &str) -> Result<()> {
-    if host.is_empty() {
-        bail!(
-            "missing host before ':' in '{segment}': use host:port, e.g. \
-             s3://host:9000/bucket/key"
-        );
-    }
-    if let Some(bad) = host
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')))
-    {
-        bail!(
-            "invalid character {bad:?} in host '{host}' of '{segment}': {S3_SERVER_HOST_GRAMMAR}"
-        );
-    }
-    // Every character is ASCII here, so byte length is character length.
-    if host.len() > S3_SERVER_HOST_MAX_LEN {
-        bail!(
-            "host of '{segment}' is {} characters, longer than the {S3_SERVER_HOST_MAX_LEN} \
-             allowed: {S3_SERVER_HOST_GRAMMAR}",
-            host.len()
-        );
-    }
-    if host.split('.').any(str::is_empty) {
-        bail!("empty label (a leading or trailing '.', or '..') in host '{host}' of '{segment}': {S3_SERVER_HOST_GRAMMAR}");
-    }
-    Ok(())
-}
-
 /// THE single rule that decides whether the first path segment of an `s3://`
 /// URI is a server or a bucket. The URI parser ([`parse_s3_uri_full`]), the
 /// store factory (`store_for_uri*`), `MultiEndpointStore` and the `s3-cli`
 /// bucket commands and `--endpoints` lists all call this, so those components
 /// cannot disagree (issues #178, #193, #194). Other code paths that handle
 /// `s3://` URIs do not call it yet; see the Changelog for the tracking issues.
+///
+/// The rule is implemented once, in
+/// `crate::capabilities::classify_s3_first_segment_pure`, which never reads the
+/// environment. This function is that rule plus the one-shot warning about the retired
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable, and nothing else.
 ///
 /// - `host:port` or `[ipv6]:port` (explicit port, plain decimal `1..=65535`, no
 ///   leading zeros) → [`S3FirstSegment::Server`]. The bracketed content must be a
@@ -626,105 +561,10 @@ fn validate_s3_server_host(host: &str, segment: &str) -> Result<()> {
 ///   `data.example.com` and `localhost` → [`S3FirstSegment::Bucket`]. Bucket
 ///   names are not otherwise validated here.
 pub fn classify_s3_first_segment(segment: &str) -> Result<S3FirstSegment<'_>> {
+    // The retired-variable warning is the only environment read, and it belongs to this
+    // wrapper; the rule itself is the environment-free `classify_s3_first_segment_pure`.
     warn_if_retired_hint_tlds_env_set();
-
-    if segment.is_empty() {
-        bail!(
-            "empty first segment in the S3 URI: expected a bucket name (s3://bucket/key) or a \
-             server with a port (s3://host:9000/bucket/key)"
-        );
-    }
-    if segment.contains("://") {
-        bail!(
-            "'{segment}' looks like a URL; a server is written host:port without a scheme \
-             or path (e.g. host:9000)"
-        );
-    }
-    if segment.contains('@') {
-        bail!(
-            "'{segment}' contains userinfo ('@'), which is not supported; write the server as \
-             host:port and supply credentials through the environment"
-        );
-    }
-    if segment.starts_with("arn:") && segment.matches(':').count() >= 2 {
-        bail!(
-            "'{segment}' looks like an ARN; ARNs are not supported here — use s3://bucket/key, \
-             or s3://host:port/bucket/key to name a server"
-        );
-    }
-
-    if let Some(rest) = segment.strip_prefix('[') {
-        // Bracketed IPv6: "[addr]:port"
-        let Some((addr, after)) = rest.split_once(']') else {
-            bail!("unterminated '[' in '{segment}': an IPv6 server is written [addr]:port");
-        };
-        if addr.is_empty() {
-            bail!("empty IPv6 address in '{segment}'");
-        }
-        if addr.parse::<std::net::Ipv6Addr>().is_err() {
-            if addr.parse::<std::net::Ipv4Addr>().is_ok() {
-                bail!(
-                    "'{segment}' puts an IPv4 address inside brackets; brackets are for IPv6 \
-                     only — write {addr}:port"
-                );
-            }
-            bail!("invalid IPv6 address '{addr}' in '{segment}'");
-        }
-        if after.is_empty() {
-            bail!(
-                "'{segment}' names an IPv6 address without a port; add :port, \
-                 e.g. s3://{segment}:9000/bucket/key"
-            );
-        }
-        let Some(port) = after.strip_prefix(':') else {
-            bail!(
-                "unexpected text '{after}' after ']' in '{segment}': an IPv6 server is written \
-                 [addr]:port"
-            );
-        };
-        validate_s3_server_port(port, segment)?;
-        return Ok(S3FirstSegment::Server(segment));
-    }
-    if segment.contains(['[', ']']) {
-        bail!(
-            "unexpected bracket in '{segment}': brackets are only for an IPv6 server, [addr]:port"
-        );
-    }
-
-    match segment.matches(':').count() {
-        0 => {
-            if looks_like_ipv4(segment) {
-                bail!(
-                    "'{segment}' is an IP address with no port; add :port to name a server, \
-                     e.g. s3://{segment}:9000/bucket/key (an IP address cannot be an S3 bucket name)"
-                );
-            }
-            Ok(S3FirstSegment::Bucket(segment))
-        }
-        1 => {
-            let (host, port) = segment.split_once(':').unwrap_or((segment, ""));
-            validate_s3_server_host(host, segment)?;
-            validate_s3_server_port(port, segment)?;
-            Ok(S3FirstSegment::Server(segment))
-        }
-        _ if segment.parse::<std::net::Ipv6Addr>().is_ok() => bail!(
-            "'{segment}' is an unbracketed IPv6 address; write it in brackets with a \
-             port, e.g. s3://[{segment}]:9000/bucket/key (add :port)"
-        ),
-        _ => bail!(
-            "'{segment}' contains more than one ':' and is not an IPv6 address; a server is \
-             written host:port or [ipv6]:port"
-        ),
-    }
-}
-
-/// The error for `s3://host:9000`, `s3://host:9000/` and `s3://host:9000//key`:
-/// the server is fine, the bucket after it is missing.
-fn missing_bucket_after_server(endpoint: &str, uri: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "missing bucket after server '{endpoint}' in S3 URI '{uri}': the bucket name cannot be \
-         empty; write s3://{endpoint}/bucket/key"
-    )
+    crate::capabilities::classify_s3_first_segment_pure(segment)
 }
 
 /// Parse S3 URI with optional endpoint support.
@@ -782,57 +622,10 @@ fn missing_bucket_after_server(endpoint: &str, uri: &str) -> anyhow::Error {
 /// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is now ignored (a one-time
 /// deprecation warning is logged if it is set).
 pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
-    let trimmed = uri
-        .strip_prefix("s3://")
-        .context("URI must start with s3://")?;
-
-    // Find the first slash to split host/bucket from key
-    let Some(slash_pos) = trimmed.find('/') else {
-        // `s3://host:9000` is a valid server with no bucket, not a bucket with a
-        // missing slash: say which.
-        if let Ok(S3FirstSegment::Server(endpoint)) = classify_s3_first_segment(trimmed) {
-            return Err(missing_bucket_after_server(endpoint, uri));
-        }
-        bail!("URI must contain '/' after bucket");
-    };
-    let before_slash = &trimmed[..slash_pos];
-    let after_slash = &trimmed[slash_pos + 1..];
-
-    match classify_s3_first_segment(before_slash)
-        .with_context(|| format!("invalid S3 URI '{uri}'"))?
-    {
-        S3FirstSegment::Server(endpoint) => {
-            // Format: s3://host:port/bucket/key
-            let endpoint = endpoint.to_string();
-
-            // Find next slash for bucket/key split
-            let slash_pos2 = after_slash.find('/').unwrap_or(after_slash.len());
-            let bucket = after_slash[..slash_pos2].to_string();
-            let key = if slash_pos2 < after_slash.len() {
-                after_slash[slash_pos2 + 1..].to_string()
-            } else {
-                String::new()
-            };
-
-            if bucket.is_empty() {
-                return Err(missing_bucket_after_server(&endpoint, uri));
-            }
-
-            Ok(S3UriComponents {
-                endpoint: Some(endpoint),
-                bucket,
-                key,
-            })
-        }
-        S3FirstSegment::Bucket(bucket) => {
-            // Format: s3://bucket/key (standard AWS)
-            Ok(S3UriComponents {
-                endpoint: None,
-                bucket: bucket.to_string(),
-                key: after_slash.to_string(),
-            })
-        }
-    }
+    // The retired-variable warning is the only environment read, and it belongs to this
+    // wrapper; the parsing itself is the environment-free `parse_s3_uri_pure`.
+    warn_if_retired_hint_tlds_env_set();
+    crate::capabilities::parse_s3_uri_pure(uri)
 }
 
 /// Split `s3://bucket/key` → (`bucket`, `key`).
@@ -895,7 +688,7 @@ pub fn s3_bucket_target(uri_or_bucket: &str) -> Result<S3BucketTarget> {
         Some(server) => {
             let bucket = segments.next().unwrap_or("");
             if bucket.is_empty() {
-                return Err(missing_bucket_after_server(
+                return Err(crate::capabilities::missing_bucket_after_server(
                     &server.authority,
                     uri_or_bucket,
                 ));
@@ -1319,6 +1112,84 @@ pub(crate) async fn get_object_range_async(
     get_object_range_with_client(&client, bucket, key, offset, length).await
 }
 
+/// Receive an S3 response body into ONE buffer (Rule #1, stage G R2).
+///
+/// `ByteStream::collect().into_bytes()` keeps every network chunk alive and then, when the body
+/// arrived in more than one chunk (always, for a large object), copies the whole body into a
+/// new contiguous buffer: two copies of the object in memory at the peak. This instead
+/// allocates the destination ONCE (`expected_len`, the response's `Content-Length`) and streams
+/// each chunk into it as it arrives, so each chunk is freed as soon as it is copied. The one
+/// chunk-to-destination copy is the unavoidable "network chunk into the final buffer" copy. The
+/// result is the `Vec`'s allocation handed over as `Bytes` (no further copy).
+///
+/// * `expected_len = Some(n)`: the body must be exactly `n` bytes; longer or shorter is an
+///   error (never silently truncated or padded). The allocation is fallible, so an absurd
+///   `Content-Length` is an error, not an abort.
+/// * `expected_len = None` (a chunked body of unknown size): the chunks are kept, a single
+///   chunk is returned as it is (no copy), and several are gathered ONCE into a buffer of the
+///   now-known total. That path peaks at 2x the body (documented, unavoidable without a
+///   length) and is rare: S3 sends `Content-Length` on every GET.
+pub(crate) async fn receive_body_presized(
+    mut body: aws_sdk_s3::primitives::ByteStream,
+    expected_len: Option<u64>,
+) -> Result<Bytes> {
+    let Some(expected) = expected_len else {
+        let mut chunks: Vec<Bytes> = Vec::new();
+        let mut total: usize = 0;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.context("read response body chunk")?;
+            total = total
+                .checked_add(chunk.len())
+                .context("response body length overflows usize")?;
+            chunks.push(chunk);
+        }
+        if chunks.len() <= 1 {
+            return Ok(chunks.pop().unwrap_or_default());
+        }
+        let mut whole: Vec<u8> = Vec::new();
+        whole.try_reserve_exact(total).map_err(|e| {
+            anyhow::anyhow!("cannot allocate {total} bytes for the response body: {e}")
+        })?;
+        for chunk in &chunks {
+            // Gather copy: a body of unknown length arrived in several chunks and the caller
+            // needs it contiguous; this is the one copy (see the function comment).
+            whole.extend_from_slice(chunk);
+        }
+        return Ok(Bytes::from(whole));
+    };
+
+    let expected = usize::try_from(expected)
+        .map_err(|_| anyhow::anyhow!("response Content-Length {expected} exceeds usize"))?;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(expected).map_err(|e| {
+        anyhow::anyhow!("cannot allocate {expected} bytes for the response body: {e}")
+    })?;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.context("read response body chunk")?;
+        if chunk.len() > expected - buf.len() {
+            bail!("response body longer than its Content-Length: got more than {expected} bytes");
+        }
+        // The one allowed copy: the network chunk into the final destination buffer.
+        buf.extend_from_slice(&chunk);
+    }
+    if buf.len() != expected {
+        bail!(
+            "response body shorter than its Content-Length: got {} of {expected} bytes",
+            buf.len()
+        );
+    }
+    Ok(Bytes::from(buf))
+}
+
+/// [`receive_body_presized`] for a `GetObject` response: sized from the response's own
+/// `Content-Length` (an absent or negative header means "unknown").
+pub(crate) async fn receive_get_output_body(
+    output: aws_sdk_s3::operation::get_object::GetObjectOutput,
+) -> Result<Bytes> {
+    let expected = output.content_length().and_then(|n| u64::try_from(n).ok());
+    receive_body_presized(output.body, expected).await
+}
+
 /// [`get_object_range_async`] on a caller-chosen client (issue #208): a
 /// per-endpoint store passes ITS client, so the read goes to the store's own
 /// server, never to the process-wide one.  `get_object_range_async` is this
@@ -1368,9 +1239,10 @@ pub(crate) async fn get_object_range_with_client(
             .send()
             .await
             .sdk_context(format!("GET range for s3://{}/{} failed", bucket, key))?;
-        let body = resp.body.collect().await.context("collect range body")?;
-        // Zero-copy: return Bytes directly
-        Ok::<Bytes, anyhow::Error>(body.into_bytes())
+        // Zero-copy (Rule #1): one pre-sized buffer, each chunk copied into it once.
+        receive_get_output_body(resp)
+            .await
+            .context("collect range body")
     })
     .await?;
 
@@ -1428,10 +1300,12 @@ pub async fn get_object_range_uri_timed_async(
             bucket, key
         ))?;
     let ttfb = t0.elapsed();
-    let body = resp.body.collect().await.context("collect range body")?;
+    // Zero-copy (Rule #1): one pre-sized buffer, each chunk copied into it once.
+    let bytes = receive_get_output_body(resp)
+        .await
+        .context("collect range body")?;
     let total = t0.elapsed();
     let transfer = total.saturating_sub(ttfb);
-    let bytes = body.into_bytes();
     Ok((bytes, ttfb, transfer))
 }
 
@@ -1575,30 +1449,35 @@ pub(crate) async fn get_object_concurrent_range_with_client(
     // which then tripped the `start_offset >= object_size` guard below
     // and returned an empty Bytes with Ok status for an object that
     // actually has data. Surface the anomaly instead.
-    let object_size = head_resp.content_length().ok_or_else(|| {
-        anyhow::anyhow!(
-            "HEAD for s3://{}/{} succeeded but returned no Content-Length header \
-             — cannot determine object size for a range GET",
-            bucket,
-            key
-        )
-    })? as u64;
+    let object_size =
+        checked_content_length(head_resp.content_length(), bucket, key)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "HEAD for s3://{}/{} succeeded but returned no Content-Length header \
+                 — cannot determine object size for a range GET",
+                bucket,
+                key
+            )
+        })?;
 
-    // Calculate actual range
+    // Calculate actual range.  `saturating_add` and `saturating_sub` keep an offset or a
+    // length near `u64::MAX` from overflowing, and a range that starts at or past the end of
+    // the object has `total_bytes == 0`.
     let start_offset = offset;
     let end_offset = match length {
-        Some(len) => std::cmp::min(start_offset + len, object_size),
+        Some(len) => std::cmp::min(start_offset.saturating_add(len), object_size),
         None => object_size,
     };
+    let total_bytes = end_offset.saturating_sub(start_offset);
+
+    // Both limits are resolved and validated BEFORE any shortcut (the empty success at or past
+    // the end of the object, and the small-object single request), so an invalid setting is
+    // rejected whatever the object's size or the offset (issue #235).
+    let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
+    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
 
     if start_offset >= object_size {
         return Ok(Bytes::new());
     }
-
-    let total_bytes = end_offset - start_offset;
-
-    // Determine optimal strategy based on size
-    let effective_chunk_size = chunk_size.unwrap_or_else(|| get_optimal_chunk_size(total_bytes));
 
     // Use single request for small objects
     if total_bytes <= effective_chunk_size as u64 {
@@ -1611,9 +1490,6 @@ pub(crate) async fn get_object_concurrent_range_with_client(
     }
 
     // Use concurrent ranges for large objects
-    let effective_concurrency =
-        max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
-
     debug!(
         "Using concurrent range GET: {} bytes, chunk_size={}, concurrency={}",
         total_bytes, effective_chunk_size, effective_concurrency
@@ -1673,6 +1549,11 @@ async fn concurrent_range_get_impl(
     chunk_size: usize,
     max_concurrency: usize,
 ) -> Result<Bytes> {
+    // Last line of defence (issue #235): every route resolves its limits through
+    // `resolve_range_*` first, but a zero here would build ranges forever or a semaphore with
+    // no permits, so the engine refuses it before allocating or awaiting anything.
+    require_effective_chunk_size("chunk_size", chunk_size)?;
+    require_effective_concurrency("max_concurrency", max_concurrency)?;
     let total_bytes = (end_offset - start_offset) as usize;
 
     // Build (range_start, range_end) tuples in ascending offset order.
@@ -1715,63 +1596,9 @@ async fn concurrent_range_get_impl(
                 .await
                 .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
-            let range_header = format!("bytes={}-{}", range_start, range_end - 1);
-
-            // Bounded retry over send() + body-stream (issue #148
-            // Phase 4b). Once the reqwest connector streams response
-            // bodies, smithy's own retry stops covering body-transfer
-            // failures — we retry the whole send()+stream pair here.
-            //
-            // Inline (not `crate::retry::retry_get_body`) because that
-            // helper's `FnMut() -> Fut` signature can't share `&mut seg`
-            // across attempts without Arc<Mutex> or unsafe. Semantics
-            // match: max_retry_attempts() budget + linear 100ms*attempt
-            // backoff, and (issue #240) no retry of a definite client error.
-            //
-            // Silent-data-corruption gate (audit §2.4): `written`
-            // MUST be declared inside `attempt_range_chunk_fill` so
-            // each retry attempt starts writing at position 0. If it
-            // leaked across attempts, a partial failed stream's bytes
-            // would remain at [0..old_written] mixed with successful
-            // retry bytes, length would still be seg_len but content
-            // would be a mix of two attempts — no error raised.
-            // Locked in by tests/test_phase4_retry_fault_injection.rs.
-            let attempts = crate::constants::max_retry_attempts().max(1);
-            let mut last_err: Option<anyhow::Error> = None;
-            let mut succeeded = false;
-            for attempt in 1..=attempts {
-                match attempt_range_chunk_fill(
-                    &client,
-                    &bucket,
-                    &key,
-                    &range_header,
-                    range_start,
-                    range_end,
-                    &mut seg,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        succeeded = true;
-                        break;
-                    }
-                    Err(e) => {
-                        // Issue #240: same rule as `retry_get_body` -- a
-                        // definite answer (404, 403, 412, ...) ends the loop.
-                        let definite = !crate::retry::RetryClassify::is_retryable(&e);
-                        last_err = Some(e);
-                        if definite {
-                            break;
-                        }
-                        if attempt < attempts {
-                            tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                        }
-                    }
-                }
-            }
-            if !succeeded {
-                return Err(last_err.expect("attempts >= 1"));
-            }
+            // Bounded retry over send() + body-stream; see `fill_range_segment_with_retry`.
+            fill_range_segment_with_retry(&client, &bucket, &key, range_start, range_end, &mut seg)
+                .await?;
 
             Ok::<(usize, BytesMut), anyhow::Error>((idx, seg))
         });
@@ -1805,6 +1632,86 @@ async fn concurrent_range_get_impl(
     );
 
     Ok(output.freeze())
+}
+
+/// One range GET of `[range_start, range_end)` received straight into `seg` (whose length is
+/// the range length), with the bounded retry that covers the send() + body-stream pair.
+///
+/// Bounded retry over send() + body-stream (issue #148 Phase 4b). Once the reqwest connector
+/// streams response bodies, smithy's own retry stops covering body-transfer failures - we retry
+/// the whole send()+stream pair here.
+///
+/// Inline (not `crate::retry::retry_get_body`) because that helper's `FnMut() -> Fut`
+/// signature can't share `&mut seg` across attempts without Arc<Mutex> or unsafe. Semantics
+/// match: max_retry_attempts() budget + linear 100ms*attempt backoff, and (issue #240) no retry
+/// of a definite client error.
+///
+/// Silent-data-corruption gate (audit §2.4): `written` MUST be declared inside
+/// `attempt_range_chunk_fill` so each retry attempt starts writing at position 0. If it leaked
+/// across attempts, a partial failed stream's bytes would remain at [0..old_written] mixed with
+/// successful retry bytes, length would still be seg_len but content would be a mix of two
+/// attempts - no error raised. Locked in by tests/test_phase4_retry_fault_injection.rs.
+async fn fill_range_segment_with_retry(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    range_start: u64,
+    range_end: u64,
+    seg: &mut BytesMut,
+) -> Result<()> {
+    let range_header = format!("bytes={}-{}", range_start, range_end - 1);
+    let attempts = crate::constants::max_retry_attempts().max(1);
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts {
+        match attempt_range_chunk_fill(
+            client,
+            bucket,
+            key,
+            &range_header,
+            range_start,
+            range_end,
+            seg,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Issue #240: same rule as `retry_get_body` -- a definite answer (404, 403,
+                // 412, ...) ends the loop.
+                let definite = !crate::retry::RetryClassify::is_retryable(&e);
+                last_err = Some(e);
+                if definite {
+                    break;
+                }
+                if attempt < attempts {
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("range GET made no attempt")))
+}
+
+/// Range GET of `[start, start + seg.len())` of `bucket`/`key` on the process-wide client,
+/// received STRAIGHT into the caller's `seg` (the chunk-to-destination copy is the only copy),
+/// with the same bounded retry as the range engine. A short or long body is an error. Returns
+/// the filled segment so a caller that pre-split one master buffer can `unsplit` it back with
+/// no copy (stage G R4: the dataset range mode).
+pub(crate) async fn get_object_range_into_segment_async(
+    bucket: &str,
+    key: &str,
+    start: u64,
+    mut seg: BytesMut,
+) -> Result<BytesMut> {
+    if seg.is_empty() {
+        return Ok(seg);
+    }
+    let end = start
+        .checked_add(seg.len() as u64)
+        .context("range end overflows u64")?;
+    let client = aws_s3_client_async().await?;
+    fill_range_segment_with_retry(&client, bucket, key, start, end, &mut seg).await?;
+    Ok(seg)
 }
 
 /// One attempt at streaming a range GET's body into a pre-allocated
@@ -1871,48 +1778,115 @@ async fn attempt_range_chunk_fill(
     Ok(())
 }
 
-/// Get optimal chunk size based on total transfer size
-fn get_optimal_chunk_size(total_bytes: u64) -> usize {
-    // The `.env` policy first (#243, review R9): `S3DLIO_CHUNK_SIZE` may come from the file.
-    crate::dotenv::apply();
-    std::env::var("S3DLIO_CHUNK_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or({
-            // Intelligent defaults based on object size
-            if total_bytes < 16 * 1024 * 1024 {
-                // < 16MB: Use 1MB chunks
-                1024 * 1024
-            } else if total_bytes < 256 * 1024 * 1024 {
-                // 16MB - 256MB: Use 4MB chunks
-                4 * 1024 * 1024
-            } else {
-                // > 256MB: Use 8MB chunks for optimal throughput
-                8 * 1024 * 1024
-            }
-        })
+/// The environment variable that sets the range chunk size.
+const ENV_RANGE_CHUNK_SIZE: &str = "S3DLIO_CHUNK_SIZE";
+/// The environment variable that sets the range concurrency.
+const ENV_RANGE_CONCURRENCY: &str = "S3DLIO_RANGE_CONCURRENCY";
+
+/// Issue #235: a range chunk size of 0 can never cover a range.  `name` is the setting as the
+/// user spells it (the environment variable, or the parameter).
+fn require_effective_chunk_size(name: &str, value: usize) -> Result<usize> {
+    if value == 0 {
+        bail!(
+            "{name} must be an integer >= 1 (valid range: 1 or more), got 0: \
+             a chunk of 0 bytes can never cover the requested range"
+        );
+    }
+    Ok(value)
 }
 
-/// Get optimal concurrency based on total transfer size
-fn get_optimal_concurrency(total_bytes: u64) -> usize {
-    // The `.env` policy first (#243, review R9): `S3DLIO_RANGE_CONCURRENCY` may come from the file.
+/// Issue #235: a range concurrency of 0 builds a semaphore with no permits, and one above
+/// [`Semaphore::MAX_PERMITS`] makes `Semaphore::new` panic.  Both are errors naming `name`.
+fn require_effective_concurrency(name: &str, value: usize) -> Result<usize> {
+    crate::concurrency::require_concurrency_at_least_one(name, value)?;
+    if value > Semaphore::MAX_PERMITS {
+        bail!(
+            "{name} must be an integer >= 1 and <= {} (the most permits a semaphore holds), got {value}",
+            Semaphore::MAX_PERMITS
+        );
+    }
+    Ok(value)
+}
+
+/// The chunk size a range GET will really use, after the caller's argument and the
+/// environment have been resolved (issue #235).
+///
+/// An explicit argument wins; otherwise `S3DLIO_CHUNK_SIZE`, otherwise the size-based
+/// default.  The EFFECTIVE value must be at least 1: a zero is an error naming the variable
+/// (or the parameter, when the caller passed it), returned before any range is allocated.
+/// The range receive path reuses this one check.
+pub(crate) fn resolve_range_chunk_size(
+    chunk_size: Option<usize>,
+    total_bytes: u64,
+) -> Result<usize> {
+    match chunk_size {
+        Some(n) => require_effective_chunk_size("chunk_size", n),
+        None => get_optimal_chunk_size(total_bytes),
+    }
+}
+
+/// The concurrency a range GET will really use (issue #235): an explicit argument,
+/// otherwise `S3DLIO_RANGE_CONCURRENCY`, otherwise the size-based default.  The EFFECTIVE
+/// value must be at least 1: a zero is an error naming the variable (or the parameter),
+/// returned before any semaphore is built.  The range receive path reuses this check.
+pub(crate) fn resolve_range_concurrency(
+    max_concurrency: Option<usize>,
+    total_bytes: u64,
+) -> Result<usize> {
+    match max_concurrency {
+        Some(n) => require_effective_concurrency("max_concurrency", n),
+        None => get_optimal_concurrency(total_bytes),
+    }
+}
+
+/// Get optimal chunk size based on total transfer size.
+///
+/// A zero from `S3DLIO_CHUNK_SIZE` is an error naming the variable (issue #235).
+fn get_optimal_chunk_size(total_bytes: u64) -> Result<usize> {
+    // The `.env` policy first (#243, review R9): `S3DLIO_CHUNK_SIZE` may come from the file.
     crate::dotenv::apply();
-    std::env::var("S3DLIO_RANGE_CONCURRENCY")
+    if let Some(n) = std::env::var(ENV_RANGE_CHUNK_SIZE)
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            let cores = num_cpus::get();
-            if total_bytes < 32 * 1024 * 1024 {
-                // < 32MB: Limited concurrency
-                std::cmp::max(2, cores / 2)
-            } else if total_bytes < 512 * 1024 * 1024 {
-                // 32MB - 512MB: Moderate concurrency
-                std::cmp::max(4, cores)
-            } else {
-                // > 512MB: High concurrency for large transfers
-                std::cmp::max(8, cores * 2)
-            }
-        })
+    {
+        return require_effective_chunk_size(ENV_RANGE_CHUNK_SIZE, n);
+    }
+    // Intelligent defaults based on object size
+    Ok(if total_bytes < 16 * 1024 * 1024 {
+        // < 16MB: Use 1MB chunks
+        1024 * 1024
+    } else if total_bytes < 256 * 1024 * 1024 {
+        // 16MB - 256MB: Use 4MB chunks
+        4 * 1024 * 1024
+    } else {
+        // > 256MB: Use 8MB chunks for optimal throughput
+        8 * 1024 * 1024
+    })
+}
+
+/// Get optimal concurrency based on total transfer size.
+///
+/// A zero from `S3DLIO_RANGE_CONCURRENCY` is an error naming the variable (issue #235).
+fn get_optimal_concurrency(total_bytes: u64) -> Result<usize> {
+    // The `.env` policy first (#243, review R9): `S3DLIO_RANGE_CONCURRENCY` may come from the file.
+    crate::dotenv::apply();
+    if let Some(n) = std::env::var(ENV_RANGE_CONCURRENCY)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        return require_effective_concurrency(ENV_RANGE_CONCURRENCY, n);
+    }
+    let cores = num_cpus::get();
+    Ok(if total_bytes < 32 * 1024 * 1024 {
+        // < 32MB: Limited concurrency
+        std::cmp::max(2, cores / 2)
+    } else if total_bytes < 512 * 1024 * 1024 {
+        // 32MB - 512MB: Moderate concurrency
+        std::cmp::max(4, cores)
+    } else {
+        // > 512MB: High concurrency for large transfers
+        std::cmp::max(8, cores * 2)
+    })
 }
 
 /// Synchronous wrapper for concurrent range GET
@@ -2535,15 +2509,20 @@ async fn get_object_with_known_size_async(
     require_chunk_size_at_least_one(chunk_size)?;
     let start_offset = offset;
     let end_offset = match length {
-        Some(len) => std::cmp::min(start_offset + len, object_size),
+        Some(len) => std::cmp::min(start_offset.saturating_add(len), object_size),
         None => object_size,
     };
+    // 0 when the range starts at or past the end of the object (no subtraction underflow).
+    let total_bytes = end_offset.saturating_sub(start_offset);
+    // Both limits are resolved and validated BEFORE any shortcut (the empty success at or past
+    // the end of the object, and the small-object single request), so an invalid setting is
+    // rejected whatever the object's size or the offset (issue #235).
+    let effective_chunk_size = resolve_range_chunk_size(chunk_size, total_bytes)?;
+    let effective_concurrency = resolve_range_concurrency(max_concurrency, total_bytes)?;
+
     if start_offset >= object_size {
         return Ok(Bytes::new());
     }
-
-    let total_bytes = end_offset - start_offset;
-    let effective_chunk_size = chunk_size.unwrap_or_else(|| get_optimal_chunk_size(total_bytes));
 
     // If total fits in one chunk, use a single range request (no concurrency overhead).
     if total_bytes <= effective_chunk_size as u64 {
@@ -2553,8 +2532,6 @@ async fn get_object_with_known_size_async(
         return get_object_range_async(bucket, key, start_offset, Some(total_bytes)).await;
     }
 
-    let effective_concurrency =
-        max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
     let client = aws_s3_client_async().await?;
     concurrent_range_get_impl(
         &client,
@@ -2581,6 +2558,719 @@ pub(crate) async fn get_object_uri_rows(uri: &str, rows: Rows) -> Result<Bytes> 
         bail!("Cannot GET: no key specified");
     }
     get_object_rows(&bucket, &key, rows).await
+}
+
+// -----------------------------------------------------------------------------
+// Caller-buffer GET and typed HEAD (plan docs/implementation-plans/
+// v0.10.0-caller-buffer-get-plan.md, §4.3 "S3" and §4.5 A1, A2, A7, A8)
+// -----------------------------------------------------------------------------
+//
+// `dst.len()` is the expected length.  `Ok(())` means exactly `dst.len()` bytes were
+// written and the whole-object size equals it.  Every write into `dst` happens inside the
+// future of the entry point: range parts are `FuturesUnordered` futures in the SAME task,
+// never `tokio::spawn`ed, so dropping the future stops every writer.
+//
+// Two routes, chosen from the expected length alone (no size cache, no extra request):
+//
+// * one unranged GET, streamed straight into `dst` (zero length, below the range
+//   threshold, range optimisation off, or HEAD skipped by `S3DLIO_SKIP_HEAD`);
+// * a ranged fan-out: a FRESH HEAD gives the size and the ETag, then every range is sent
+//   with `If-Match: <that ETag>`, on every attempt, so a version change fails the read
+//   (HTTP 412, `VersionChanged`) instead of mixing two versions.  A HEAD that fails, or
+//   supplies no size or no usable ETag, falls back to the single GET.
+//
+// The single GET pins itself: the ETag of its first response is sent as `If-Match` on every
+// retry.  A response with no usable ETag cannot be pinned, so a partially received request
+// then fails instead of being retried (pieces of unknown versions are never combined); it is
+// retried only before any byte was written.  On a pinned read (every range, every retry) a
+// response with NO ETag fails too: it cannot confirm the version.  A protocol violation (a
+// missing or wrong Content-Range, a bad Content-Length, a long body) is final, never retried.
+
+/// A typed error that did not come from an SDK failure.  The detail goes in the retained
+/// source, the `ObjectError` message stays empty (it never carries a key or a URL).
+fn typed_s3_error(kind: ObjectErrorKind, detail: String) -> anyhow::Error {
+    attach_object_error(anyhow::anyhow!(detail), kind, "s3", "")
+}
+
+/// The whole-object size does not equal the destination length.
+fn length_mismatch_error(
+    bucket: &str,
+    key: &str,
+    expected: u64,
+    actual: Option<u64>,
+) -> anyhow::Error {
+    let detail = match actual {
+        Some(actual) => format!(
+            "S3 object s3://{bucket}/{key} is {actual} bytes but the destination holds {expected}"
+        ),
+        None => format!(
+            "S3 object s3://{bucket}/{key} reported no usable size but the destination holds \
+             {expected}"
+        ),
+    };
+    typed_s3_error(ObjectErrorKind::LengthMismatch { expected, actual }, detail)
+}
+
+/// A body longer than the destination, detected while streaming.  The stream is not read to
+/// its end, so `at_least` is a LOWER BOUND on the object's size (`actual` of the
+/// `LengthMismatch` carries it, and the message says so).
+fn length_exceeded_error(bucket: &str, key: &str, expected: u64, at_least: usize) -> anyhow::Error {
+    let at_least = u64::try_from(at_least).unwrap_or(u64::MAX);
+    typed_s3_error(
+        ObjectErrorKind::LengthMismatch {
+            expected,
+            actual: Some(at_least),
+        },
+        format!(
+            "S3 object s3://{bucket}/{key} is longer than the destination: at least {at_least} \
+             bytes against {expected}"
+        ),
+    )
+}
+
+/// The pinned version is no longer the one the service returns.
+fn version_changed_error(bucket: &str, key: &str, why: &str) -> anyhow::Error {
+    typed_s3_error(
+        ObjectErrorKind::VersionChanged,
+        format!("S3 object s3://{bucket}/{key} {why}"),
+    )
+}
+
+/// A response that breaks the protocol (wrong range, missing header, wrong body length).
+fn protocol_error(bucket: &str, key: &str, why: &str) -> anyhow::Error {
+    typed_s3_error(
+        ObjectErrorKind::Other,
+        format!("S3 GET for s3://{bucket}/{key}: {why}"),
+    )
+}
+
+/// `usize` to `u64`, checked.
+fn len_to_u64(n: usize) -> Result<u64> {
+    u64::try_from(n).map_err(|_| {
+        typed_s3_error(
+            ObjectErrorKind::Other,
+            format!("a length of {n} does not fit in 64 bits"),
+        )
+    })
+}
+
+/// The ETag a read can pin: non-empty, and not weak (`If-Match` compares strongly, so a weak
+/// tag could never match).  Otherwise opaque, passed to the service exactly as received.
+fn usable_etag(etag: Option<&str>) -> Option<String> {
+    etag.filter(|e| !e.trim().is_empty() && !e.starts_with("W/"))
+        .map(str::to_owned)
+}
+
+/// A response `Content-Length` (of a GET or a HEAD), checked: a negative value is a protocol
+/// error (`Other`, not retried).
+fn checked_content_length(raw: Option<i64>, bucket: &str, key: &str) -> Result<Option<u64>> {
+    match raw {
+        None => Ok(None),
+        Some(v) => u64::try_from(v).map(Some).map_err(|_| {
+            typed_s3_error(
+                ObjectErrorKind::Other,
+                format!("S3 response for s3://{bucket}/{key}: negative Content-Length"),
+            )
+        }),
+    }
+}
+
+/// A short range body: the stream ended cleanly before the requested bytes all arrived.  It
+/// is a failure of delivery, not a malformed answer, so it is `Transport` and stays retryable
+/// (the retry is pinned to the same version by `If-Match`).
+fn short_range_body_error(bucket: &str, key: &str) -> anyhow::Error {
+    typed_s3_error(
+        ObjectErrorKind::Transport,
+        format!("S3 GET for s3://{bucket}/{key}: range body shorter than requested"),
+    )
+}
+
+/// Is a failed attempt worth repeating?  The typed verdict ([`RetryClassify`]), except that a
+/// protocol violation is final: a typed `Other` that carries no SDK failure is an answer that
+/// broke the protocol (a missing or wrong `Content-Range`, a bad `Content-Length`, a body
+/// longer than asked, a response that cannot confirm the pinned version).  A server that
+/// answers that way will answer that way again, and each repeat is a full ranged attempt.
+/// An `Other` that does come from the SDK keeps the SDK verdict.
+fn attempt_is_retryable(e: &anyhow::Error) -> bool {
+    let protocol_violation = e.downcast_ref::<crate::retry::SdkFailure>().is_none()
+        && object_error(e).is_some_and(|o| o.kind == ObjectErrorKind::Other);
+    !protocol_violation && RetryClassify::is_retryable(e)
+}
+
+/// A range-setting error (a zero or oversized limit) as a typed `Other`, so the receive path
+/// reports only typed errors.  The message that names the setting stays in the chain.
+fn range_setting_error(e: anyhow::Error) -> anyhow::Error {
+    attach_object_error(e, ObjectErrorKind::Other, "s3", "invalid range setting")
+}
+
+/// Parse `bytes <first>-<last>/<total>`.  An unknown total (`*`) is not accepted.
+fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
+    let rest = header.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (first, last) = range.split_once('-')?;
+    Some((
+        first.trim().parse().ok()?,
+        last.trim().parse().ok()?,
+        total.trim().parse().ok()?,
+    ))
+}
+
+/// Check a `Content-Range` against what was asked: the whole-object `total` must equal the
+/// destination length (else `LengthMismatch`), and, when `bounds` is given, the returned
+/// first and last byte must be exactly the requested ones.
+fn validate_content_range(
+    header: Option<&str>,
+    bounds: Option<(u64, u64)>,
+    total: u64,
+    bucket: &str,
+    key: &str,
+) -> Result<()> {
+    let Some(header) = header else {
+        return Err(protocol_error(
+            bucket,
+            key,
+            "the response carries no Content-Range",
+        ));
+    };
+    let Some((first, last, actual_total)) = parse_content_range(header) else {
+        return Err(protocol_error(bucket, key, "malformed Content-Range"));
+    };
+    if actual_total != total {
+        return Err(length_mismatch_error(
+            bucket,
+            key,
+            total,
+            Some(actual_total),
+        ));
+    }
+    if let Some((want_first, want_last)) = bounds {
+        if first != want_first || last != want_last {
+            return Err(protocol_error(
+                bucket,
+                key,
+                "Content-Range does not match the requested range",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A response to a read pinned to `pinned` must carry that ETag.  A different ETag is another
+/// version (`VersionChanged`), whatever the service did with `If-Match`.  An absent or empty
+/// ETag cannot confirm the version, so it fails closed (`Other`, not retried): a service that
+/// ignores `If-Match` and sends no ETag would otherwise slip another version into the buffer.
+fn check_response_etag(
+    response: Option<&str>,
+    pinned: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<()> {
+    match response {
+        Some(e) if e == pinned => Ok(()),
+        Some(e) if !e.is_empty() => Err(version_changed_error(
+            bucket,
+            key,
+            "no longer has the ETag the read pinned",
+        )),
+        _ => Err(typed_s3_error(
+            ObjectErrorKind::Other,
+            format!(
+                "S3 GET for s3://{bucket}/{key}: the response carries no ETag, so it cannot \
+                 confirm the pinned version"
+            ),
+        )),
+    }
+}
+
+/// An error from reading a response body: no HTTP response of its own, so `Transport`.
+fn body_stream_error(
+    e: impl std::error::Error + Send + Sync + 'static,
+    pinned: bool,
+) -> anyhow::Error {
+    attach_s3_classification(
+        anyhow::Error::new(e).context("S3 GET body stream failed"),
+        pinned,
+    )
+}
+
+/// Linear backoff between attempts, as `retry_get_body` does.
+fn attempt_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(100u64.saturating_mul(u64::from(attempt)))
+}
+
+/// One attempt of the single, unranged GET into `dst`.
+///
+/// `pin` is the ETag of the first response that had a usable one; once set it is sent as
+/// `If-Match` and every later response is checked against it.  `wrote` is set as soon as a
+/// byte has been written.  The cursor starts at the span start on every attempt.
+async fn get_into_single_attempt(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    span: &mut SpanMark<'_>,
+    pin: &mut Option<String>,
+    wrote: &mut bool,
+) -> Result<()> {
+    let expected = len_to_u64(dst.len())?;
+    let mut request = client.get_object().bucket(bucket).key(key);
+    if let Some(etag) = pin.as_deref() {
+        request = request.if_match(etag);
+    }
+    let mut resp = request
+        .send()
+        .await
+        .sdk_context(format!("S3 GET for s3://{bucket}/{key} failed"))
+        .map_err(|e| attach_s3_classification(e, pin.is_some()))?;
+
+    match pin.as_deref() {
+        Some(pinned) => check_response_etag(resp.e_tag(), pinned, bucket, key)?,
+        None => *pin = usable_etag(resp.e_tag()),
+    }
+
+    let length = checked_content_length(resp.content_length(), bucket, key)?;
+    if let Some(range) = resp.content_range() {
+        // An unranged GET should not be partial; if the service says so, the total must still
+        // be the destination length, and a non-empty read must cover all of it.
+        let bounds = (expected > 0).then(|| (0, expected - 1));
+        validate_content_range(Some(range), bounds, expected, bucket, key)?;
+    }
+    match length {
+        Some(length) if length != expected => {
+            // Dropped unread: the body is never touched.
+            return Err(length_mismatch_error(bucket, key, expected, Some(length)));
+        }
+        None if expected == 0 => {
+            // An empty destination can only be verified from the size header.
+            return Err(length_mismatch_error(bucket, key, expected, None));
+        }
+        _ => {}
+    }
+    if expected == 0 {
+        // The size header is 0: nothing to read, and the body is dropped unread.
+        return Ok(());
+    }
+
+    let mut written: usize = 0;
+    while let Some(chunk) = resp.body.next().await {
+        let chunk = chunk.map_err(|e| body_stream_error(e, pin.is_some()))?;
+        let Some(end) = written
+            .checked_add(chunk.len())
+            .filter(|end| *end <= dst.len())
+        else {
+            // More bytes than the destination holds: nothing is written past its end.  The
+            // true length is unknown (the stream is not read further), so `actual` is the
+            // count received so far including this chunk: a lower bound, saturating.
+            return Err(length_exceeded_error(
+                bucket,
+                key,
+                expected,
+                written.saturating_add(chunk.len()),
+            ));
+        };
+        let Some(slot) = dst.get_mut(written..end) else {
+            return Err(protocol_error(bucket, key, "destination bounds"));
+        };
+        slot.copy_from_slice(&chunk);
+        if !chunk.is_empty() {
+            *wrote = true;
+        }
+        span.record_copy(len_to_u64(written)?, len_to_u64(chunk.len())?)
+            .map_err(|e| attach_object_error(e, ObjectErrorKind::Other, "s3", "progress"))?;
+        written = end;
+    }
+    if written != dst.len() {
+        return Err(length_mismatch_error(
+            bucket,
+            key,
+            expected,
+            Some(len_to_u64(written)?),
+        ));
+    }
+    Ok(())
+}
+
+/// The single GET with its retries.  The retry budget is `S3DLIO_MAX_RETRY_ATTEMPTS`, with
+/// linear backoff, as `retry_get_body`; the verdict is the typed one
+/// ([`RetryClassify`]).  One [`SpanMark`] covers the whole object across every retry.
+async fn get_into_single(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    progress: &ReceiveProgress,
+) -> Result<()> {
+    let attempts = crate::constants::max_retry_attempts().max(1);
+    let mut span = SpanMark::new(progress);
+    let mut pin: Option<String> = None;
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts {
+        let mut wrote = false;
+        match get_into_single_attempt(client, bucket, key, dst, &mut span, &mut pin, &mut wrote)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if wrote && pin.is_none() {
+                    // Bytes arrived but the version cannot be pinned: never repaired.
+                    return Err(e.context(
+                        "a partially received response with no usable ETag is not retried",
+                    ));
+                }
+                if !attempt_is_retryable(&e) {
+                    return Err(e);
+                }
+                last = Some(e);
+                if attempt < attempts {
+                    tokio::time::sleep(attempt_backoff(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        typed_s3_error(
+            ObjectErrorKind::Other,
+            "no GET attempt was made".to_string(),
+        )
+    }))
+}
+
+/// One fixed, disjoint part of the destination: `offset` is its position in the object.
+pub(crate) struct RangePart<'a> {
+    pub(crate) offset: u64,
+    pub(crate) buf: &'a mut [u8],
+}
+
+/// The object version a ranged read is pinned to: the ETag and whole-object size of the fresh
+/// HEAD, on the client whose server the read goes to.
+pub(crate) struct PinnedRead<'a> {
+    pub(crate) client: &'a aws_sdk_s3::Client,
+    pub(crate) bucket: &'a str,
+    pub(crate) key: &'a str,
+    /// Sent as `If-Match` on every range and retry.
+    pub(crate) etag: &'a str,
+    /// The whole-object size every `Content-Range` must report.
+    pub(crate) total: u64,
+}
+
+/// Split `dst` into parts of `chunk_size` bytes (the last one may be shorter), lazily, so a
+/// small chunk size never builds a vector with one entry per part.
+fn range_parts(dst: &mut [u8], chunk_size: usize) -> Result<impl Iterator<Item = RangePart<'_>>> {
+    let chunk_size =
+        require_effective_chunk_size("chunk_size", chunk_size).map_err(range_setting_error)?;
+    Ok(dst.chunks_mut(chunk_size).scan(0u64, |offset, buf| {
+        let part = RangePart {
+            offset: *offset,
+            buf,
+        };
+        // The offsets sum to at most `dst.len()`, so this cannot saturate.
+        *offset = offset.saturating_add(u64::try_from(part.buf.len()).unwrap_or(u64::MAX));
+        Some(part)
+    }))
+}
+
+/// One attempt at one range part: a ranged GET with `If-Match`, streamed into `part`.
+///
+/// The cursor is local to the call, so every retry starts at the part start; `span` is the
+/// part's high-water mark and is kept across retries.  The response must carry the exact
+/// `Content-Range` that was asked for and a total equal to `total`.  Every failure is typed;
+/// as the read is pinned, a 404 is `VersionChanged`, never absence.
+pub(crate) async fn attempt_range_part_into(
+    read: &PinnedRead<'_>,
+    part: &mut RangePart<'_>,
+    span: &mut SpanMark<'_>,
+) -> Result<()> {
+    let PinnedRead {
+        client,
+        bucket,
+        key,
+        etag: if_match,
+        total,
+    } = *read;
+    let len = len_to_u64(part.buf.len())?;
+    let Some(last) = len.checked_sub(1).and_then(|l| part.offset.checked_add(l)) else {
+        // An empty part has no valid range (`bytes=a--1` is never sent) and nothing to read.
+        return Ok(());
+    };
+    let range = format!("bytes={}-{}", part.offset, last);
+    let mut resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(&range)
+        .if_match(if_match)
+        .send()
+        .await
+        .sdk_context(format!(
+            "S3 range GET for s3://{bucket}/{key} {range} failed"
+        ))
+        .map_err(|e| attach_s3_classification(e, true))?;
+
+    check_response_etag(resp.e_tag(), if_match, bucket, key)?;
+    validate_content_range(
+        resp.content_range(),
+        Some((part.offset, last)),
+        total,
+        bucket,
+        key,
+    )?;
+    if let Some(length) = checked_content_length(resp.content_length(), bucket, key)? {
+        if length != len {
+            return Err(protocol_error(
+                bucket,
+                key,
+                "Content-Length does not match the requested range",
+            ));
+        }
+    }
+
+    let mut written: usize = 0;
+    while let Some(chunk) = resp.body.next().await {
+        let chunk = chunk.map_err(|e| body_stream_error(e, true))?;
+        let Some(end) = written
+            .checked_add(chunk.len())
+            .filter(|end| *end <= part.buf.len())
+        else {
+            return Err(protocol_error(
+                bucket,
+                key,
+                "range body longer than requested",
+            ));
+        };
+        let Some(slot) = part.buf.get_mut(written..end) else {
+            return Err(protocol_error(bucket, key, "destination bounds"));
+        };
+        slot.copy_from_slice(&chunk);
+        span.record_copy(len_to_u64(written)?, len_to_u64(chunk.len())?)
+            .map_err(|e| attach_object_error(e, ObjectErrorKind::Other, "s3", "progress"))?;
+        written = end;
+    }
+    if written != part.buf.len() {
+        return Err(short_range_body_error(bucket, key));
+    }
+    Ok(())
+}
+
+/// One part with its retries: the same budget and backoff as the single GET, and the typed
+/// verdict.  Every attempt carries `If-Match`, so a retry can never read another version.
+async fn range_part_with_retries(
+    read: &PinnedRead<'_>,
+    mut part: RangePart<'_>,
+    progress: &ReceiveProgress,
+) -> Result<()> {
+    let attempts = crate::constants::max_retry_attempts().max(1);
+    let mut span = SpanMark::new(progress);
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts {
+        match attempt_range_part_into(read, &mut part, &mut span).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !attempt_is_retryable(&e) {
+                    return Err(e);
+                }
+                last = Some(e);
+                if attempt < attempts {
+                    tokio::time::sleep(attempt_backoff(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        typed_s3_error(
+            ObjectErrorKind::Other,
+            "no range attempt was made".to_string(),
+        )
+    }))
+}
+
+/// Read all `parts` of one object version, at most `max_concurrency` at a time.
+///
+/// `read` names the version every range is pinned to (the ETag and total of the fresh HEAD).  The parts are futures of THIS task (a sliding window over
+/// `FuturesUnordered`); on the first error the others are dropped, which stops their
+/// writers before this function returns.
+pub(crate) async fn concurrent_range_get_into<'a, I>(
+    read: &PinnedRead<'_>,
+    parts: I,
+    max_concurrency: usize,
+    progress: &ReceiveProgress,
+) -> Result<()>
+where
+    I: IntoIterator<Item = RangePart<'a>>,
+{
+    let max_concurrency = require_effective_concurrency("max_concurrency", max_concurrency)
+        .map_err(range_setting_error)?;
+    let mut pending = parts.into_iter();
+    let mut in_flight = FuturesUnordered::new();
+    loop {
+        while in_flight.len() < max_concurrency {
+            let Some(part) = pending.next() else { break };
+            in_flight.push(range_part_with_retries(read, part, progress));
+        }
+        match in_flight.next().await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(e),
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Is the ranged fan-out used for a read of `expected` bytes?  The same switches as the
+/// allocating path: range optimisation on, HEAD not skipped, and at or above the threshold.
+fn get_into_uses_fanout(expected: u64) -> bool {
+    expected > 0
+        && get_range_opt_enabled()
+        && !get_skip_head()
+        && expected >= get_range_threshold_bytes()
+}
+
+/// The ranged fan-out: a fresh HEAD (the size cache is never consulted) for the size and the
+/// ETag, then pinned ranges.  Falls back to the single GET when the HEAD fails or supplies no
+/// usable size or ETag.
+async fn get_into_fanout(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    progress: &ReceiveProgress,
+) -> Result<()> {
+    let expected = len_to_u64(dst.len())?;
+    // Both limits are validated before any request (#235), exactly as the allocating path.
+    let chunk_size = resolve_range_chunk_size(None, expected).map_err(range_setting_error)?;
+    let concurrency = resolve_range_concurrency(None, expected).map_err(range_setting_error)?;
+
+    let head = client.head_object().bucket(bucket).key(key).send().await;
+    let (size, etag) = match &head {
+        Ok(h) => (
+            h.content_length().and_then(|l| u64::try_from(l).ok()),
+            usable_etag(h.e_tag()),
+        ),
+        Err(_) => (None, None),
+    };
+    if head.is_err() {
+        debug!("get_into: HEAD failed for s3://{bucket}/{key}; using one pinned GET");
+    }
+    if let Some(size) = size {
+        if size != expected {
+            return Err(length_mismatch_error(bucket, key, expected, Some(size)));
+        }
+    }
+    match (size, etag) {
+        (Some(total), Some(etag)) => {
+            let parts = range_parts(dst, chunk_size)?;
+            let read = PinnedRead {
+                client,
+                bucket,
+                key,
+                etag: &etag,
+                total,
+            };
+            concurrent_range_get_into(&read, parts, concurrency, progress).await
+        }
+        _ => get_into_single(client, bucket, key, dst, progress).await,
+    }
+}
+
+/// Read `s3://bucket/key` into `dst` on `client` (the process-wide client or a per-endpoint
+/// one: the request goes to THIS client's server and to no other).  See the section comment
+/// for the contract and the two routes.  Writes no op-log row; [`S3Ops::get_into`] does when
+/// it has a logger.
+///
+/// [`S3Ops::get_into`]: crate::s3_ops::S3Ops::get_into
+pub(crate) async fn get_into_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    progress: &ReceiveProgress,
+) -> Result<()> {
+    if key.is_empty() {
+        return Err(typed_s3_error(
+            ObjectErrorKind::Other,
+            "Cannot GET: no key specified".to_string(),
+        ));
+    }
+    if get_into_uses_fanout(len_to_u64(dst.len())?) {
+        get_into_fanout(client, bucket, key, dst, progress).await
+    } else {
+        get_into_single(client, bucket, key, dst, progress).await
+    }
+}
+
+/// [`get_into_with_client`] on the process-wide client.  `rows` says whether the call writes
+/// the S3 helper row (one `GET` row, written by [`S3Ops::get_into`]); internal ranges,
+/// retries and the fan-out HEAD never write one.
+///
+/// [`S3Ops::get_into`]: crate::s3_ops::S3Ops::get_into
+pub(crate) async fn get_into_global(
+    bucket: &str,
+    key: &str,
+    dst: &mut [u8],
+    progress: &ReceiveProgress,
+    rows: Rows,
+) -> Result<()> {
+    build_ops_for(rows)
+        .await?
+        .get_into(bucket, key, dst, progress)
+        .await
+}
+
+/// Typed HEAD on `client`: `Ok(None)` only for typed absence (`NotFound`); a refusal,
+/// throttling or a transport failure is an error.  A HEAD 404 has no body, so a missing
+/// BUCKET (`NoSuchBucket`) cannot be told from a missing key: both are `Ok(None)` (a GET,
+/// whose 404 carries the XML error code, does tell them apart).  A response with no usable
+/// `Content-Length` is an error (a size is never assumed to be 0).  The ETag is opaque.
+pub(crate) async fn head_typed_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<HeadMetadata>> {
+    if key.is_empty() {
+        return Err(typed_s3_error(
+            ObjectErrorKind::Other,
+            "Cannot HEAD: no key specified".to_string(),
+        ));
+    }
+    match client.head_object().bucket(bucket).key(key).send().await {
+        Ok(resp) => {
+            let size = match checked_content_length(resp.content_length(), bucket, key)? {
+                Some(size) => size,
+                None => {
+                    return Err(typed_s3_error(
+                        ObjectErrorKind::Other,
+                        format!("S3 HEAD for s3://{bucket}/{key} reported no Content-Length"),
+                    ))
+                }
+            };
+            Ok(Some(HeadMetadata {
+                size,
+                etag: resp.e_tag().filter(|e| !e.is_empty()).map(str::to_owned),
+                version_id: resp.version_id().map(str::to_owned),
+            }))
+        }
+        Err(e) => {
+            let err = attach_s3_classification(
+                sdk_anyhow(format!("S3 HEAD for s3://{bucket}/{key} failed"), e),
+                false,
+            );
+            if object_error(&err).is_some_and(|o| o.kind == ObjectErrorKind::NotFound) {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// [`head_typed_with_client`] on the process-wide client; `rows` as for [`get_into_global`]
+/// (one `HEAD` row, written by [`S3Ops::head_typed`]).
+///
+/// [`S3Ops::head_typed`]: crate::s3_ops::S3Ops::head_typed
+pub(crate) async fn head_typed(
+    bucket: &str,
+    key: &str,
+    rows: Rows,
+) -> Result<Option<HeadMetadata>> {
+    build_ops_for(rows).await?.head_typed(bucket, key).await
 }
 
 // -----------------------------------------------------------------------------
@@ -2728,7 +3418,8 @@ async fn put_object_multipart_on(
             Some(client) => MultipartUploadSink::new_with_client(client, &bucket, &key, cfg)?,
             None => MultipartUploadSink::new(&bucket, &key, cfg)?,
         };
-        sink.write_blocking(&data)?;
+        // Owned `Bytes` goes in as `Bytes`: sliced into parts, never copied (Rule #1).
+        sink.write_bytes_blocking(data)?;
         sink.finish_blocking()?;
         Ok::<(), anyhow::Error>(())
     })
@@ -3554,5 +4245,391 @@ mod tests {
     fn concurrent_range_limits_accept_none_and_positive() {
         assert!(require_concurrent_range_limits(None, None).is_ok());
         assert!(require_concurrent_range_limits(Some(1), Some(1)).is_ok());
+    }
+}
+
+/// Issue #235: the effective range limits are validated after the environment is resolved.
+#[cfg(test)]
+mod range_limit_resolution_tests {
+    use super::*;
+
+    const VARS: &[&str] = &[ENV_RANGE_CHUNK_SIZE, ENV_RANGE_CONCURRENCY];
+
+    #[test]
+    fn zero_from_the_environment_is_rejected_naming_the_variable() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "0");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "0");
+        let chunk = resolve_range_chunk_size(None, 64).expect_err("zero chunk size");
+        assert!(
+            format!("{chunk:#}").contains("S3DLIO_CHUNK_SIZE"),
+            "{chunk:#}"
+        );
+        assert!(format!("{chunk:#}").contains(">= 1"), "{chunk:#}");
+        let conc = resolve_range_concurrency(None, 64).expect_err("zero concurrency");
+        assert!(
+            format!("{conc:#}").contains("S3DLIO_RANGE_CONCURRENCY"),
+            "{conc:#}"
+        );
+        assert!(format!("{conc:#}").contains(">= 1"), "{conc:#}");
+    }
+
+    #[test]
+    fn an_explicit_argument_wins_over_the_environment_and_zero_names_the_parameter() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "0");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "0");
+        assert_eq!(
+            resolve_range_chunk_size(Some(4096), 64).expect("explicit"),
+            4096
+        );
+        assert_eq!(resolve_range_concurrency(Some(3), 64).expect("explicit"), 3);
+        let chunk = resolve_range_chunk_size(Some(0), 64).expect_err("zero argument");
+        assert!(format!("{chunk:#}").contains("chunk_size"), "{chunk:#}");
+        let conc = resolve_range_concurrency(Some(0), 64).expect_err("zero argument");
+        assert!(format!("{conc:#}").contains("max_concurrency"), "{conc:#}");
+    }
+
+    /// A concurrency above `Semaphore::MAX_PERMITS` would panic in `Semaphore::new`: it is
+    /// rejected by name, from the environment and as an argument.  The limit itself is valid.
+    #[test]
+    fn concurrency_above_the_semaphore_limit_is_rejected_by_name() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        let limit = Semaphore::MAX_PERMITS;
+        std::env::set_var(ENV_RANGE_CONCURRENCY, (limit + 1).to_string());
+        let env_err = resolve_range_concurrency(None, 64).expect_err("above the limit");
+        let text = format!("{env_err:#}");
+        assert!(text.contains("S3DLIO_RANGE_CONCURRENCY"), "{text}");
+        assert!(text.contains(&limit.to_string()), "{text}");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, usize::MAX.to_string());
+        assert!(resolve_range_concurrency(None, 64).is_err());
+        std::env::remove_var(ENV_RANGE_CONCURRENCY);
+        let arg_err = resolve_range_concurrency(Some(limit + 1), 64).expect_err("above the limit");
+        assert!(
+            format!("{arg_err:#}").contains("max_concurrency"),
+            "{arg_err:#}"
+        );
+        assert_eq!(
+            resolve_range_concurrency(Some(limit), 64).expect("at the limit"),
+            limit
+        );
+        // What the guard protects: the limit builds a semaphore, one more would panic.
+        assert_eq!(Semaphore::new(limit).available_permits(), limit);
+    }
+
+    #[test]
+    fn valid_and_unparseable_settings_are_unchanged() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "8192");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "5");
+        assert_eq!(resolve_range_chunk_size(None, 64).expect("env"), 8192);
+        assert_eq!(resolve_range_concurrency(None, 64).expect("env"), 5);
+        // An unparseable value still falls back to the size-based default, as before.
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "not-a-number");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "-1");
+        assert_eq!(
+            resolve_range_chunk_size(None, 64).expect("default"),
+            1024 * 1024
+        );
+        assert!(resolve_range_concurrency(None, 64).expect("default") >= 2);
+        std::env::remove_var(ENV_RANGE_CHUNK_SIZE);
+        std::env::remove_var(ENV_RANGE_CONCURRENCY);
+        assert_eq!(
+            resolve_range_chunk_size(None, 300 * 1024 * 1024).expect("default"),
+            8 * 1024 * 1024
+        );
+    }
+
+    /// Stage B follow-up F1: the known-size path returns an empty success at or past the end of
+    /// the object.  That shortcut used to run BEFORE the environment-derived limits were
+    /// resolved, so a zero escaped the validation for an empty object and for offsets at and
+    /// beyond the end.  The path is reached by `get_object_uri_optimized_async` with offset 0
+    /// only, so the offsets can only be driven here, on the private function.  No request is
+    /// made on any of these calls (a rejected setting returns before a client is built, and an
+    /// empty success never builds one).
+    #[tokio::test]
+    async fn known_size_path_validates_the_environment_at_and_past_the_end() {
+        let _guard = crate::test_env::lock_async().await;
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        // (object size, offset, length): an empty object; exactly at the end; beyond the end;
+        // an offset and length whose sum overflows a u64.
+        let shapes: [(u64, u64, Option<u64>); 5] = [
+            (0, 0, None),
+            (16, 16, None),
+            (16, 1000, None),
+            (16, 16, Some(8)),
+            (16, u64::MAX, Some(u64::MAX)),
+        ];
+        for variable in VARS {
+            for (size, offset, length) in shapes {
+                std::env::remove_var(ENV_RANGE_CHUNK_SIZE);
+                std::env::remove_var(ENV_RANGE_CONCURRENCY);
+                std::env::set_var(variable, "0");
+                let err = get_object_with_known_size_async(
+                    "bucket", "key", size, offset, length, None, None,
+                )
+                .await
+                .expect_err(&format!(
+                    "{variable}=0 must be rejected (size {size}, offset {offset}, length {length:?})"
+                ));
+                let text = format!("{err:#}");
+                assert!(text.contains(variable), "must name {variable}: {text}");
+                assert!(text.contains(">= 1"), "must give the valid range: {text}");
+
+                // The control: valid settings keep the empty success for the same call.
+                std::env::set_var(ENV_RANGE_CHUNK_SIZE, "4");
+                std::env::set_var(ENV_RANGE_CONCURRENCY, "2");
+                let body = get_object_with_known_size_async(
+                    "bucket", "key", size, offset, length, None, None,
+                )
+                .await
+                .expect("valid settings give an empty success");
+                assert!(body.is_empty());
+            }
+        }
+    }
+
+    /// An explicit argument still wins over the environment on the same shortcut: a zero in the
+    /// environment is not consulted when the caller passed the setting (and the argument is
+    /// itself validated).
+    #[tokio::test]
+    async fn known_size_path_explicit_arguments_keep_precedence_at_the_end() {
+        let _guard = crate::test_env::lock_async().await;
+        let _env = crate::test_env::EnvRestore::capture(VARS);
+        std::env::set_var(ENV_RANGE_CHUNK_SIZE, "0");
+        std::env::set_var(ENV_RANGE_CONCURRENCY, "0");
+        let body = get_object_with_known_size_async("b", "k", 16, 16, None, Some(4), Some(2))
+            .await
+            .expect("explicit valid arguments override the zero environment");
+        assert!(body.is_empty());
+        let err = get_object_with_known_size_async("b", "k", 16, 16, None, Some(4), Some(0))
+            .await
+            .expect_err("an explicit zero concurrency is rejected by name");
+        assert!(format!("{err:#}").contains("max_concurrency"), "{err:#}");
+    }
+}
+
+/// Pure helpers of the caller-buffer receive path (plan §4.5 A2, A8).
+#[cfg(test)]
+mod receive_path_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_range_threshold_defaults_parses_and_saturates() {
+        assert_eq!(threshold_from_mb(None), 32 * MIB, "unset is the default");
+        assert_eq!(threshold_from_mb(Some("not-a-number")), 32 * MIB);
+        assert_eq!(
+            threshold_from_mb(Some("-1")),
+            32 * MIB,
+            "negative is unparseable"
+        );
+        assert_eq!(threshold_from_mb(Some("0")), 0, "zero forces the fan-out");
+        assert_eq!(threshold_from_mb(Some("1")), MIB);
+        // The largest value whose byte count fits is exact; one more saturates, never wraps
+        // to a small threshold (which would send every read down the fan-out).
+        let largest = u64::MAX / MIB;
+        assert_eq!(threshold_from_mb(Some(&largest.to_string())), largest * MIB);
+        assert_eq!(
+            threshold_from_mb(Some(&(largest + 1).to_string())),
+            u64::MAX
+        );
+        assert_eq!(threshold_from_mb(Some(&u64::MAX.to_string())), u64::MAX);
+    }
+
+    #[test]
+    fn a_negative_content_length_is_a_typed_non_retried_protocol_error() {
+        assert_eq!(checked_content_length(None, "b", "k").expect("none"), None);
+        assert_eq!(
+            checked_content_length(Some(0), "b", "k").expect("zero"),
+            Some(0)
+        );
+        assert_eq!(
+            checked_content_length(Some(i64::MAX), "b", "k").expect("max"),
+            u64::try_from(i64::MAX).ok()
+        );
+        let err = checked_content_length(Some(-1), "b", "k").expect_err("negative");
+        assert_eq!(
+            object_error(&err).map(|o| o.kind),
+            Some(ObjectErrorKind::Other)
+        );
+        assert!(!attempt_is_retryable(&err), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("negative Content-Length"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn the_response_etag_must_equal_the_pin_and_an_absent_one_fails_closed() {
+        check_response_etag(Some("\"a\""), "\"a\"", "b", "k").expect("equal");
+        let other = check_response_etag(Some("\"b\""), "\"a\"", "b", "k").expect_err("differs");
+        assert_eq!(
+            object_error(&other).map(|o| o.kind),
+            Some(ObjectErrorKind::VersionChanged)
+        );
+        for (what, response) in [("absent", None), ("empty", Some(""))] {
+            let err = check_response_etag(response, "\"a\"", "b", "k").expect_err(what);
+            assert_eq!(
+                object_error(&err).map(|o| o.kind),
+                Some(ObjectErrorKind::Other),
+                "{what}"
+            );
+            assert!(
+                format!("{err:#}").contains("cannot confirm"),
+                "{what}: {err:#}"
+            );
+            assert!(!attempt_is_retryable(&err), "{what}: not retried");
+        }
+    }
+
+    /// Protocol violations are final; delivery failures and SDK verdicts are not touched.
+    #[test]
+    fn only_protocol_violations_are_final_for_the_attempt_loops() {
+        assert!(!attempt_is_retryable(&protocol_error("b", "k", "bad")));
+        assert!(!attempt_is_retryable(&typed_s3_error(
+            ObjectErrorKind::Other,
+            "x".to_string()
+        )));
+        assert!(
+            attempt_is_retryable(&short_range_body_error("b", "k")),
+            "a short body is a delivery failure"
+        );
+        assert!(attempt_is_retryable(&typed_s3_error(
+            ObjectErrorKind::Transport,
+            "x".to_string()
+        )));
+        // The existing verdicts for the definite kinds are unchanged.
+        assert!(!attempt_is_retryable(&version_changed_error("b", "k", "x")));
+        assert!(!attempt_is_retryable(&length_mismatch_error(
+            "b",
+            "k",
+            1,
+            Some(2)
+        )));
+    }
+
+    #[test]
+    fn a_body_past_the_end_reports_a_lower_bound_not_a_wrong_size() {
+        let err = length_exceeded_error("b", "k", 16, 20);
+        assert_eq!(
+            object_error(&err).map(|o| o.kind),
+            Some(ObjectErrorKind::LengthMismatch {
+                expected: 16,
+                actual: Some(20)
+            })
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains("at least 20"), "{text}");
+        assert!(text.contains("16"), "{text}");
+    }
+
+    #[test]
+    fn range_setting_errors_are_typed_and_keep_the_setting_name() {
+        let err = range_setting_error(
+            require_effective_chunk_size("S3DLIO_CHUNK_SIZE", 0).expect_err("zero"),
+        );
+        assert_eq!(
+            object_error(&err).map(|o| o.kind),
+            Some(ObjectErrorKind::Other)
+        );
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("S3DLIO_CHUNK_SIZE") && text.contains(">= 1"),
+            "{text}"
+        );
+        assert!(!attempt_is_retryable(&err));
+    }
+}
+
+/// `receive_body_presized` (stage G R2): one pre-sized buffer, length-checked, no re-copy.
+#[cfg(test)]
+mod receive_body_presized_tests {
+    use super::*;
+    use aws_sdk_s3::primitives::{ByteStream, SdkBody};
+    use http_body_util::StreamBody;
+
+    fn stream_of(chunks: Vec<Vec<u8>>) -> ByteStream {
+        let frames = chunks
+            .into_iter()
+            .map(|c| Ok::<_, std::io::Error>(http_body::Frame::data(Bytes::from(c))));
+        ByteStream::new(SdkBody::from_body_1_x(StreamBody::new(
+            futures::stream::iter(frames),
+        )))
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    #[test]
+    fn a_multi_chunk_body_is_assembled_exactly_in_one_buffer() {
+        let chunks = vec![
+            vec![1u8; 700],
+            vec![2u8; 1],
+            vec![3u8; 4000],
+            vec![4u8; 299],
+        ];
+        let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+        let got = rt()
+            .block_on(receive_body_presized(
+                stream_of(chunks),
+                Some(expected.len() as u64),
+            ))
+            .expect("body");
+        assert_eq!(&got[..], &expected[..]);
+    }
+
+    #[test]
+    fn a_body_longer_or_shorter_than_its_length_is_an_error() {
+        let chunks = vec![vec![9u8; 600], vec![9u8; 600]];
+        let long = rt().block_on(receive_body_presized(stream_of(chunks.clone()), Some(1000)));
+        assert!(format!("{:#}", long.expect_err("long")).contains("longer"));
+        let short = rt().block_on(receive_body_presized(stream_of(chunks), Some(2000)));
+        assert!(format!("{:#}", short.expect_err("short")).contains("shorter"));
+    }
+
+    #[test]
+    fn an_absurd_content_length_is_an_error_not_an_abort() {
+        let got = rt().block_on(receive_body_presized(
+            stream_of(vec![vec![1u8; 4]]),
+            Some(u64::MAX / 2),
+        ));
+        assert!(got.is_err());
+    }
+
+    #[test]
+    fn an_unknown_length_body_is_gathered_once_and_a_single_chunk_is_not_copied() {
+        let got = rt()
+            .block_on(receive_body_presized(
+                stream_of(vec![vec![5u8; 10], vec![6u8; 20]]),
+                None,
+            ))
+            .expect("body");
+        assert_eq!(got.len(), 30);
+        assert_eq!(&got[..10], &[5u8; 10]);
+        assert_eq!(&got[10..], &[6u8; 20]);
+
+        let one = vec![7u8; 64];
+        let ptr = one.as_ptr();
+        let got = rt()
+            .block_on(receive_body_presized(stream_of(vec![one]), None))
+            .expect("body");
+        assert_eq!(got.as_ptr(), ptr, "a single chunk is returned as it is");
+    }
+
+    #[test]
+    fn an_empty_body_is_empty() {
+        let got = rt()
+            .block_on(receive_body_presized(stream_of(vec![]), Some(0)))
+            .expect("body");
+        assert!(got.is_empty());
     }
 }

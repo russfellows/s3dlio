@@ -207,7 +207,14 @@ DOWNLOAD_CHILD = """
     uri, dest, recursive = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
     try:
         s3dlio.download(uri, dest, recursive=recursive)
-        out = {"files": sorted(os.listdir(dest))}
+        # issue #284: each object keeps its key path relative to the listing base
+        out = {
+            "files": sorted(
+                os.path.relpath(os.path.join(root, name), dest).replace(os.sep, "/")
+                for root, _dirs, names in os.walk(dest)
+                for name in names
+            )
+        }
     except BaseException as e:
         out = {"exc": type(e).__name__, "msg": str(e)}
     print("RESULT " + json.dumps(out))
@@ -244,7 +251,7 @@ def test_download_of_a_wildcard_takes_the_glob_matches(mock, tmp_path):
 
 def test_download_of_a_directory_name_does_not_cross_into_dl2(mock, tmp_path):
     out = call_download(mock, "s3://bkt/dl", tmp_path / "d")
-    assert out == {"files": ["a.npz", "b.txt", "c.npz"]}, out
+    assert out == {"files": ["a.npz", "b.txt", "sub/c.npz"]}, out
 
 
 # ---- get (an exact single object: untouched, never lists) -------------------------------

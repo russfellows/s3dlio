@@ -12,9 +12,6 @@ from pathlib import Path
 
 import pytest
 
-# Add the project root to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 
 def test_basic_functionality():
     """Test basic s3dlio functionality."""
@@ -218,30 +215,40 @@ async def test_async_functionality():
 
 
 def test_s3_functionality():
-    """Test S3 functionality if configured."""
+    """Test S3 functionality against a bucket the developer explicitly opted into."""
     print("\n=== S3 Functionality Tests ===")
 
-    s3_bucket = os.environ.get("S3_TEST_BUCKET")
+    # Explicit opt-in: no default bucket, so a plain run never reaches a live endpoint.
+    s3_bucket = os.environ.get("S3DLIO_TEST_BUCKET", "").strip()
     if not s3_bucket:
-        pytest.skip(reason="S3_TEST_BUCKET not set, requires live S3 credentials")
+        pytest.skip(
+            reason="live S3 test: set S3DLIO_TEST_BUCKET to a writable bucket to run"
+        )
+
+    import uuid
 
     import s3dlio
 
-    # Test basic S3 URI
-    s3_uri = f"s3://{s3_bucket}/test-prefix/"
-
+    s3_prefix = f"s3://{s3_bucket}/s3dlio-pytest-enhanced-{uuid.uuid4().hex[:12]}/"
+    payload = b"enhanced api s3 test"
+    obj_uri = f"{s3_prefix}obj.bin"
     try:
-        dataset = s3dlio.create_dataset(s3_uri)
+        s3dlio.put_bytes(obj_uri, payload)
+        assert s3dlio.stat(obj_uri)["size"] == len(payload)
+        assert obj_uri in s3dlio.list(s3_prefix, recursive=True)
+
+        dataset = s3dlio.create_dataset(s3_prefix)
+        assert dataset is not None
         print(f"✓ S3 dataset creation successful: {type(dataset)}")
-    except Exception as e:
-        print(f"⚠ S3 dataset creation failed (may be expected): {e}")
-        return  # Don't fail the test suite for S3 config issues
 
-    try:
-        loader = s3dlio.create_async_loader(s3_uri)
+        loader = s3dlio.create_async_loader(s3_prefix)
+        assert loader is not None
         print(f"✓ S3 async loader creation successful: {type(loader)}")
-    except Exception as e:
-        print(f"⚠ S3 async loader creation failed (may be expected): {e}")
+    finally:
+        try:
+            s3dlio.delete(obj_uri)
+        except Exception as exc:
+            print(f"cleanup warning for {obj_uri}: {exc}")
 
 
 async def main():

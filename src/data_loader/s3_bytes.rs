@@ -8,14 +8,13 @@ use crate::data_loader::parallel_fetch::DropCancel;
 use crate::data_loader::{Dataset, DatasetError};
 use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::s3_utils::{
-    get_object_range_uri_async, // NEW: implemented in s3_utils.rs next
-    get_object_uri_async,
-    list_objects as list_objects_rs,
+    get_object_range_into_segment_async, get_object_uri_async, list_objects as list_objects_rs,
     stat_object_uri_async,
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesOrdered, StreamExt};
+use std::collections::VecDeque;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -124,60 +123,72 @@ impl Dataset for S3BytesDataset {
                 // assembly) across worker threads. Prior `.buffered(N)`
                 // polled every in-flight fetch inside a single task.
                 //
-                // Uses the same shape as 3.1f (range_engine_generic):
-                // FuturesOrdered preserves in-order assembly (running
-                // write_offset + short-read semantics), and a bounded
+                // FuturesOrdered preserves in-order assembly (a short or long
+                // range is an error, never silently stitched), and a bounded
                 // spawn pool (prime + refill-on-consume) keeps at most
-                // `max_inflight` fetches alive at once so peak memory
-                // stays ~size instead of blowing up to size * n_parts.
+                // `max_inflight` fetches in flight at once.
                 // DropCancel guard cancels in-flight fetches if the
                 // caller drops this future mid-download.
                 let cancel = CancellationToken::new();
                 let _drop_cancel = DropCancel(cancel.clone());
 
-                let spawn_part = |i: usize| {
+                // Zero-copy (Rule #1, stage G R4): ONE output buffer, pre-split into one
+                // segment per part. Each range GET streams its response straight into its own
+                // segment (the network-chunk-to-destination copy is the only copy), and the
+                // segments are `unsplit` back, in order, into the original allocation (O(1),
+                // no copy). The parts used to be received into their own `Bytes` and copied
+                // again into the output.
+                let total = usize::try_from(size).map_err(|_| {
+                    DatasetError::from(format!("object size {size} does not fit in memory"))
+                })?;
+                let mut master = BytesMut::zeroed(total);
+                let mut segments: VecDeque<BytesMut> = VecDeque::with_capacity(n_parts);
+                for i in 0..n_parts {
                     let start = (i as u64) * part;
-                    let len = (size - start).min(part);
-                    let uri = uri.clone();
+                    let len = (size - start).min(part) as usize;
+                    segments.push_back(master.split_to(len));
+                }
+
+                let spawn_part = |i: usize, seg: BytesMut| {
+                    let start = (i as u64) * part;
+                    let bucket = self.bucket.clone();
+                    let key = key.clone();
                     let token = cancel.clone();
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = token.cancelled() => Err(anyhow::anyhow!(
                                 "range GET cancelled: part {}", i
                             )),
-                            r = get_object_range_uri_async(&uri, start, Some(len)) => r,
+                            r = get_object_range_into_segment_async(&bucket, &key, start, seg) => r,
                         }
                     })
                 };
 
-                let mut pending: FuturesOrdered<JoinHandle<anyhow::Result<Bytes>>> =
+                let mut pending: FuturesOrdered<JoinHandle<anyhow::Result<BytesMut>>> =
                     FuturesOrdered::new();
                 let mut next_part = 0usize;
                 while next_part < n_parts && pending.len() < max_inflight {
-                    pending.push_back(spawn_part(next_part));
+                    match segments.pop_front() {
+                        Some(seg) => pending.push_back(spawn_part(next_part, seg)),
+                        None => break,
+                    }
                     next_part += 1;
                 }
 
-                let mut out = BytesMut::zeroed(size as usize);
-                let mut write_offset: usize = 0;
+                let mut assembled: Option<BytesMut> = None;
                 let mut first_err: Option<DatasetError> = None;
 
                 while let Some(join_res) = pending.next().await {
                     match join_res {
-                        Ok(Ok(bytes)) => {
+                        Ok(Ok(seg)) => {
                             if first_err.is_none() {
-                                let len = bytes.len();
-                                let end = write_offset + len;
-                                if end > out.len() {
-                                    return Err(DatasetError::from(format!(
-                                        "range assembly overflow: writing {}..{} but buffer is {} bytes",
-                                        write_offset, end, out.len()
-                                    )));
+                                // Parts arrive in order (FuturesOrdered) and were split
+                                // from one allocation in that order: `unsplit` is O(1).
+                                match assembled.as_mut() {
+                                    Some(acc) => acc.unsplit(seg),
+                                    None => assembled = Some(seg),
                                 }
-                                out[write_offset..end].copy_from_slice(&bytes);
-                                write_offset = end;
                             }
-                            drop(bytes);
                         }
                         Ok(Err(e)) => {
                             if first_err.is_none() {
@@ -198,8 +209,10 @@ impl Dataset for S3BytesDataset {
                     }
 
                     if first_err.is_none() && next_part < n_parts {
-                        pending.push_back(spawn_part(next_part));
-                        next_part += 1;
+                        if let Some(seg) = segments.pop_front() {
+                            pending.push_back(spawn_part(next_part, seg));
+                            next_part += 1;
+                        }
                     }
                 }
 
@@ -207,8 +220,13 @@ impl Dataset for S3BytesDataset {
                     return Err(e);
                 }
 
-                if write_offset < out.len() {
-                    out.truncate(write_offset);
+                let out = assembled.unwrap_or_default();
+                if out.len() != total {
+                    return Err(DatasetError::from(format!(
+                        "range assembly length mismatch: assembled {} of {} bytes",
+                        out.len(),
+                        total
+                    )));
                 }
                 Ok(out.freeze())
             }

@@ -27,6 +27,8 @@ import io
 import os
 import struct
 import tempfile
+import uuid
+
 import pytest
 
 # ── Dependency guards ─────────────────────────────────────────────────────────
@@ -38,10 +40,14 @@ pq = pytest.importorskip("pyarrow.parquet", reason="pyarrow.parquet not installe
 # ── Fixtures / helpers ────────────────────────────────────────────────────────
 
 MINIO_ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "")
-MINIO_AVAILABLE = bool(MINIO_ENDPOINT and os.environ.get("AWS_ACCESS_KEY_ID"))
+# Explicit opt-in: the live tests run only when the developer names a writable bucket in
+# S3DLIO_TEST_BUCKET (no default bucket) and configures the endpoint and credentials.
+TEST_BUCKET = os.environ.get("S3DLIO_TEST_BUCKET", "").strip()
+MINIO_AVAILABLE = bool(
+    TEST_BUCKET and MINIO_ENDPOINT and os.environ.get("AWS_ACCESS_KEY_ID")
+)
 
-TEST_BUCKET = "mlp-flux"
-TEST_PREFIX = "s3dlio/__parquet_tests__"
+TEST_PREFIX = f"s3dlio/__parquet_tests__/{uuid.uuid4().hex[:12]}"
 TEST_URI_PREFIX = f"s3://{TEST_BUCKET}/{TEST_PREFIX}/"
 
 
@@ -49,7 +55,10 @@ def skip_without_minio(func):
     """Decorator: skip the test if MinIO is not reachable."""
     return pytest.mark.skipif(
         not MINIO_AVAILABLE,
-        reason="AWS_ENDPOINT_URL / AWS_ACCESS_KEY_ID not set — MinIO unavailable",
+        reason=(
+            "live S3 test: set S3DLIO_TEST_BUCKET, AWS_ENDPOINT_URL and "
+            "AWS_ACCESS_KEY_ID to run"
+        ),
     )(func)
 
 
@@ -59,7 +68,9 @@ def make_parquet_bytes(num_rgs: int = 2, rows_per_rg: int = 3) -> bytes:
     table = pa.table(
         {
             "id": pa.array(list(range(total_rows)), type=pa.int64()),
-            "value": pa.array([float(i) * 1.1 for i in range(total_rows)], type=pa.float32()),
+            "value": pa.array(
+                [float(i) * 1.1 for i in range(total_rows)], type=pa.float32()
+            ),
         }
     )
     buf = io.BytesIO()
@@ -78,7 +89,9 @@ def configure_s3():
     if not MINIO_AVAILABLE:
         return
     ca_bundle = os.environ.get("AWS_CA_BUNDLE", "")
-    region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    region = os.environ.get(
+        "AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    )
     s3dlio.configure_s3(
         endpoint_url=MINIO_ENDPOINT,
         region=region,
@@ -90,7 +103,9 @@ def configure_s3():
 def uploaded_parquet_uris():
     """Upload two test Parquet files; yield their URIs; delete on teardown."""
     if not MINIO_AVAILABLE:
-        pytest.skip("MinIO not available")
+        pytest.skip(
+            "live S3 test: set S3DLIO_TEST_BUCKET, AWS_ENDPOINT_URL and AWS_ACCESS_KEY_ID"
+        )
 
     data = make_parquet_bytes(num_rgs=2, rows_per_rg=3)
     keys = [
@@ -309,10 +324,10 @@ class TestParquetArrowIpc:
 # Dimensions exercised by the generation tests.
 # Each tuple is (num_cols, rows_per_rg, num_row_groups).
 GEN_DIMS = [
-    (1, 1, 1),        # minimal: single column, single row, single RG
-    (4, 16, 2),       # small multi-col, multi-RG
-    (10, 64, 4),      # moderate
-    (200, 8192, 3),   # DLRM-like schema, 3 RGs
+    (1, 1, 1),  # minimal: single column, single row, single RG
+    (4, 16, 2),  # small multi-col, multi-RG
+    (10, 64, 4),  # moderate
+    (200, 8192, 3),  # DLRM-like schema, 3 RGs
 ]
 
 
@@ -413,13 +428,17 @@ class TestLocalGenerateAndWriteParquet:
         paths = []
         for num_cols, rows_per_rg, num_rgs in specs:
             p = tmp_path / f"{num_cols}_{rows_per_rg}_{num_rgs}.parquet"
-            s3dlio.generate_and_write_parquet(f"file://{p}", num_cols, rows_per_rg, num_rgs)
+            s3dlio.generate_and_write_parquet(
+                f"file://{p}", num_cols, rows_per_rg, num_rgs
+            )
             paths.append((p, num_cols, rows_per_rg, num_rgs))
 
         for path, num_cols, rows_per_rg, num_rgs in paths:
             table = pq.read_table(str(path))
             assert table.num_columns == num_cols, f"{path.name}: wrong num_cols"
-            assert table.num_rows == rows_per_rg * num_rgs, f"{path.name}: wrong num_rows"
+            assert table.num_rows == rows_per_rg * num_rgs, (
+                f"{path.name}: wrong num_rows"
+            )
 
 
 class TestLocalParquetGetRg:

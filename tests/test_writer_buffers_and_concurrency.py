@@ -4,10 +4,12 @@
   the bytes the view shows. It used to build a slice from the buffer pointer and the byte
   length, which writes the wrong bytes for a stride and reads adjacent heap memory for a
   negative stride.
-* ``write_chunk`` releases the GIL only for an exact ``bytes`` object (immutable). A mutable
-  exporter (bytearray, writable memoryview, ...) keeps the GIL for the write, so another
-  thread cannot change it mid-read: the file receives exactly what the buffer held when the
-  call started.
+* ``write_chunk`` BORROWS the buffer (zero copy) and releases the GIL for the whole write
+  (since 0.9.128), for a mutable exporter too: other Python threads keep running, the buffer is
+  exported (``BufferError`` on a resize from another thread) and the caller must not modify it
+  until the call returns. ``write_owned_bytes(copy=True)`` is the opt-in snapshot: one copy
+  taken with the GIL held, so a thread that overwrites the buffer afterwards cannot tear the
+  write.
 * While a write is in flight, the read-only accessors (``bytes_written``, ``checksum``,
   ``compressed_bytes``) keep working and a second write waits for the first instead of
   raising "Already mutably borrowed".
@@ -110,8 +112,61 @@ def test_write_chunk_of_strided_views_writes_what_the_view_shows(tmp_path):
     }
 
 
-def test_write_chunk_keeps_the_gil_for_a_mutable_buffer(slow_fifo):
-    """A thread that overwrites the bytearray cannot tear the write: the GIL is kept."""
+def test_write_chunk_releases_the_gil_and_locks_a_mutable_buffer(slow_fifo):
+    """The documented behaviour since 0.9.128: a blocked ``write_chunk`` of a bytearray does not
+    hold the GIL (another thread runs meanwhile), the bytearray is exported (a resize from that
+    thread raises BufferError) and nothing is copied: the file receives the buffer's bytes."""
+    fifo, drained, reader = slow_fifo
+    result = run_scenario(
+        """
+        size = 16 * 1024 * 1024
+        data = bytearray(b"A" * size)
+        writer = s3dlio.create_filesystem_writer("file://" + sys.argv[1], s3dlio.PyWriterOptions())
+        go = threading.Event()
+        box = {}
+
+        def other():
+            go.wait()
+            time.sleep(0.3)  # write_chunk is now blocked on the FIFO (it drains after DELAY)
+            try:
+                data.extend(b"x")
+                box["locked"] = False
+            except BufferError:
+                box["locked"] = True
+            box["ran_at"] = time.monotonic()
+
+        thread = threading.Thread(target=other)
+        thread.start()
+        go.set()
+        t0 = time.monotonic()
+        writer.write_chunk(data)
+        elapsed = time.monotonic() - t0
+        thread.join()
+        print(json.dumps({
+            "elapsed": elapsed,
+            "locked": box["locked"],
+            "other_thread_ran_during_the_write": box["ran_at"] - t0 < elapsed,
+        }))
+        """,
+        str(fifo),
+    )
+    assert result["elapsed"] >= 0.8 * DELAY, (
+        f"the write never waited for the reader: {result}"
+    )
+    assert result["other_thread_ran_during_the_write"], (
+        f"write_chunk held the GIL for a mutable buffer: {result}"
+    )
+    assert result["locked"], (
+        f"the bytearray was not exported during the write: {result}"
+    )
+    reader.wait(timeout=60)
+    content = drained.read_bytes()
+    assert len(content) >= 8 * 1024 * 1024, f"only {len(content)} bytes were drained"
+    assert content == b"A" * len(content), "the file did not receive the buffer's bytes"
+
+
+def test_write_owned_bytes_copy_true_cannot_be_torn_by_a_concurrent_writer(slow_fifo):
+    """The opt-in snapshot: a thread that overwrites the bytearray cannot tear the write."""
     fifo, drained, reader = slow_fifo
     result = run_scenario(
         """
@@ -128,7 +183,7 @@ def test_write_chunk_keeps_the_gil_for_a_mutable_buffer(slow_fifo):
         thread.start()
         go.set()
         t0 = time.monotonic()
-        writer.write_chunk(data)
+        writer.write_owned_bytes(data, copy=True)
         elapsed = time.monotonic() - t0
         thread.join()
         print(json.dumps({"elapsed": elapsed}))

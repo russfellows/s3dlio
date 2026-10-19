@@ -25,14 +25,14 @@
 // no network call, matching B2's precedent. For `length=Some(len>0)`, the
 // inclusive end is computed via the shared, overflow-checked
 // `range_engine_generic::range_end_inclusive` helper instead of bare
-// arithmetic. The same helper is used by the Azure and community-GCS
-// `get_range()` implementations (object_store.rs, gcs_client.rs) — see
+// arithmetic. The same helper is used by the Azure
+// `get_range()` implementation (object_store.rs) — see
 // that helper's own unit tests in src/range_engine_generic.rs for direct
-// coverage of the underflow/overflow arithmetic itself. Azure and GCS
-// aren't covered by a live-network integration test here (no credentials
-// or emulators available in this environment); their correctness rests on
+// coverage of the underflow/overflow arithmetic itself. Azure
+// isn't covered by a live-network integration test here (no credentials
+// or emulators available in this environment); its correctness rests on
 // sharing this same audited helper, verified to compile via
-// `cargo check --features backend-azure,gcs-community`.
+// `cargo check --features backend-azure`.
 
 #[allow(dead_code)]
 mod common;

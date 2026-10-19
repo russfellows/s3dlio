@@ -152,7 +152,8 @@ def test_caller_supplied_checksum_is_written_and_enforced():
         store = s3dlio.PyCheckpointStore(f"file://{root}")
         writer = store.writer(world_size=1, rank=0)
         meta = writer.save_distributed_shard(STEP, EPOCH, "test", KNOWN_PAYLOAD)
-        assert meta.get("checksum") is None  # one-shot save computes none
+        # a one-shot save records the CRC-32C of the bytes it wrote (#287)
+        assert meta.get("checksum") == KNOWN_CRC32C
 
         meta["checksum"] = "crc32c:00000000"  # wrong on purpose
         manifest_key = _finalize(store, [meta])

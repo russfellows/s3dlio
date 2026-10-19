@@ -67,7 +67,8 @@ class S3PyTorchConnectorStorage(S3Storage):
 
     GCS (gs://):
         GOOGLE_APPLICATION_CREDENTIALS (path to service account JSON)
-        GCS_ENDPOINT_URL (optional)
+        GCS_ENDPOINT_URL (optional custom endpoint URL, anonymous credentials)
+        STORAGE_EMULATOR_HOST (optional emulator host:port, anonymous credentials)
 
     File/Direct (file://, direct://):
         No credentials needed - uses local filesystem
@@ -262,17 +263,26 @@ class S3PyTorchConnectorStorage(S3Storage):
             offset: Not supported (full object write only)
             length: Not supported (full object write only)
         """
-        # Handle BytesIO objects (from numpy.save, etc.)
-        if hasattr(data, "getvalue"):
+        # Handle BytesIO objects (from numpy.save, etc.). Zero copy (Rule #1): getbuffer() is a
+        # memoryview over the BytesIO's own memory, which put_bytes / the multipart writer
+        # read in place; getvalue() would copy the whole payload into a new bytes object.
+        held = None
+        if hasattr(data, "getbuffer"):
+            held = data.getbuffer()
+            content = held
+        elif hasattr(data, "getvalue"):
             content = data.getvalue()
         elif hasattr(data, "read"):
             # Seek to beginning if possible
             if hasattr(data, "seek"):
                 data.seek(0)
+            # A generic stream can only hand its bytes over by reading them: this read() is
+            # the one unavoidable copy (stream -> memory) on this path.
             content = data.read()
         else:
             content = data
 
+        view = None  # derived memoryview of `content`; released in `finally`
         try:
             size = len(content)
             threshold = _multipart_config.multipart_threshold_bytes()
@@ -289,16 +299,39 @@ class S3PyTorchConnectorStorage(S3Storage):
                     max_in_flight=_multipart_config.multipart_max_in_flight(),
                     abort_on_drop=True,
                 )
-                offset_pos = 0
-                while offset_pos < size:
-                    n = min(part_size, size - offset_pos)
-                    writer.write(content[offset_pos : offset_pos + n])
-                    offset_pos += n
-                writer.close()
+                try:
+                    # Slices of a memoryview are views, not copies (slicing bytes copies).
+                    view = memoryview(content)
+                    if view.ndim != 1 or view.format != "B":
+                        view = view.cast("B")  # a view too: still no copy
+                    total = view.nbytes
+                    offset_pos = 0
+                    while offset_pos < total:
+                        n = min(part_size, total - offset_pos)
+                        writer.write(view[offset_pos : offset_pos + n])
+                        offset_pos += n
+                    writer.close()
+                except Exception:
+                    # Abort now, deterministically: the writer holds the buffers it was given
+                    # until the upload is aborted or finished, and a traceback would keep it
+                    # (and them) alive.
+                    writer.abort()
+                    raise
             return None
         except Exception as e:
             print(f"Error writing to {id}: {e}")
             raise
+        finally:
+            # A failed write leaves this frame alive in the traceback, and with it the derived
+            # `view` (and the buffer export it shares with `held`): the caller's `with
+            # io.BytesIO(...)` would then fail in close() with BufferError and mask the real
+            # upload error. Release both explicitly.
+            for export in (view, held):
+                if export is not None:
+                    try:
+                        export.release()
+                    except BufferError:
+                        pass  # still referenced elsewhere: freed when its last user lets go
 
     @dlp.log
     def get_data(self, id, data=None, offset=None, length=None):

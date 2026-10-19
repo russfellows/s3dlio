@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Fair comparison: dgen-py vs s3dlio using Generator streaming API"""
+
 import dgen_py
 import s3dlio
 import time
@@ -44,7 +45,7 @@ gen2 = s3dlio.Generator(size=total_size, dedup=1, compress=1)
 gen2.fill_chunk(buf)
 gen2.reset()
 
-# Timed test  
+# Timed test
 start = time.perf_counter()
 while not gen2.is_complete():
     nbytes = gen2.fill_chunk(buf)
@@ -63,7 +64,7 @@ ratio = throughput_dgen / throughput_s3dlio
 if ratio > 1.1:
     print(f"❌ dgen-py {ratio:.1f}x FASTER than s3dlio")
 elif ratio < 0.9:
-    print(f"✅ s3dlio {1/ratio:.1f}x FASTER than dgen-py")
+    print(f"✅ s3dlio {1 / ratio:.1f}x FASTER than dgen-py")
 else:
-    print(f"✅ Performance parity: {abs(ratio-1)*100:.1f}% difference")
+    print(f"✅ Performance parity: {abs(ratio - 1) * 100:.1f}% difference")
 print("=" * 60)

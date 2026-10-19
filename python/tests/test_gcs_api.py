@@ -12,19 +12,38 @@ Tests:
 - Cleanup via delete()
 
 Prerequisites:
-- GCS authentication (gcloud auth login)
-- Test bucket: gs://signal65-russ-b1
+- GCS authentication (gcloud auth login or GOOGLE_APPLICATION_CREDENTIALS)
+- S3DLIO_TEST_GCS_BUCKET set to a bucket you own and may write to. The test
+  is SKIPPED when it is unset, so a plain `pytest` run never touches a live
+  GCS endpoint, even on a machine with ambient credentials.
 - s3dlio installed in current Python environment
 """
 
+import contextlib
+import os
 import sys
 import time
+import uuid
 
 import pytest
 
+# Explicit opt-in: no default bucket, so nothing live is contacted unless the
+# developer names a bucket.
+GCS_BUCKET = os.environ.get("S3DLIO_TEST_GCS_BUCKET", "").strip()
 
-def test_gcs_python_api():
+pytestmark = pytest.mark.skipif(
+    not GCS_BUCKET,
+    reason="live GCS test: set S3DLIO_TEST_GCS_BUCKET to a writable bucket to run",
+)
+
+
+def test_gcs_python_api(request):
     """Test GCS backend via Python API"""
+    _run_gcs_python_api(request.addfinalizer)
+
+
+def _run_gcs_python_api(register_cleanup):
+    """Body of the test; `register_cleanup(fn)` schedules fn after the run."""
 
     # Import s3dlio; treat a missing extension module as an optional-dependency skip
     try:
@@ -37,8 +56,8 @@ def test_gcs_python_api():
     print("🔍 Debug logging enabled")
 
     # Test configuration
-    bucket = "signal65-russ-b1"
-    test_prefix = "s3dlio-python-test"
+    bucket = GCS_BUCKET
+    test_prefix = f"s3dlio-python-test-{uuid.uuid4().hex[:12]}"
 
     print("=" * 60)
     print("GCS Python API Validation Test")
@@ -54,6 +73,23 @@ def test_gcs_python_api():
     object_size = 2 * 1024 * 1024  # 2MB each
 
     test_uri = f"{prefix}/object-0"
+    large_prefix = f"gs://{bucket}/{test_prefix}-large"
+    actual_large_uri = f"{large_prefix}/object-0.bin"
+
+    def _cleanup():
+        # Best-effort removal of everything this run created, pass or fail.
+        for uri in (
+            test_uri,
+            f"{prefix}/object-1",
+            f"{prefix}/object-2",
+            actual_large_uri,
+        ):
+            try:
+                s3dlio.delete(uri)
+            except Exception as exc:
+                print(f"cleanup warning for {uri}: {exc}")
+
+    register_cleanup(_cleanup)
 
     print(
         f"📤 Generating and uploading {num_objects} objects of {object_size // (1024 * 1024)}MB each..."
@@ -61,19 +97,15 @@ def test_gcs_python_api():
     start = time.time()
     # put(prefix, num, template=None, ...) - template is now optional
     # Use random data (default) which is non-compressible and non-deduplicatable
-    try:
-        s3dlio.put(
-            prefix,
-            num_objects,
-            size=object_size,
-            object_type="random",
-            dedup_factor=1,
-            compress_factor=1,
-        )
-    except Exception as e:
-        pytest.skip(
-            f"GCS backend unavailable (requires live credentials/bucket access to gs://{bucket}): {e}"
-        )
+    # The bucket was named explicitly, so failures here are real failures.
+    s3dlio.put(
+        prefix,
+        num_objects,
+        size=object_size,
+        object_type="random",
+        dedup_factor=1,
+        compress_factor=1,
+    )
 
     upload_time = time.time() - start
     total_mb = (num_objects * object_size) / (1024 * 1024)
@@ -134,9 +166,6 @@ def test_gcs_python_api():
     large_size = (
         128 * 1024 * 1024
     )  # 128MB (will create 2x 64MB ranges for true concurrency)
-    large_prefix = f"gs://{bucket}/{test_prefix}-large"
-    actual_large_uri = f"{large_prefix}/object-0.bin"
-
     print("📤 Generating and uploading 128MB file...")
     start = time.time()
     # Use put() with bulk generation API - generate 1 object of 128MB
@@ -190,24 +219,20 @@ def test_gcs_python_api():
         s3dlio.get(nonexistent_uri)
     print("   ✅ Correctly raised error for non-existent file")
 
-    # Cleanup
-    print("\n=== Cleanup ===")
-    try:
-        print("🗑️  Deleting test files...")
-        s3dlio.delete(test_uri)
-        s3dlio.delete(actual_large_uri)
-        print("   ✅ Cleanup complete")
-    except Exception as e:
-        print(f"   ⚠️  Cleanup warning: {e}")
-
     print("\n" + "=" * 60)
     print("✅ All GCS Python API tests PASSED!")
     print("=" * 60)
 
 
 if __name__ == "__main__":
+    if not GCS_BUCKET:
+        print(
+            "S3DLIO_TEST_GCS_BUCKET is not set; refusing to contact a live GCS bucket."
+        )
+        sys.exit(2)
     try:
-        test_gcs_python_api()
+        with contextlib.ExitStack() as stack:
+            _run_gcs_python_api(stack.callback)
         sys.exit(0)
     except AssertionError as e:
         print(f"❌ Test failed: {e}")

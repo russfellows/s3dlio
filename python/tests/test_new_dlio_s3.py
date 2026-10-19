@@ -1,11 +1,18 @@
-# Python test script to show python binding capabilities
-import time
+# Manual script (NOT a pytest test) showing python binding capabilities against a live
+# S3 bucket. Set S3DLIO_TEST_BUCKET to a bucket you own; there is no default, and the
+# script exits before any network call when it is unset.
+#   READ_PREFIX  : S3DLIO_TEST_READ_PREFIX (optional key prefix to LIST, default "")
 import asyncio
+import os
+import sys
+import time
+import uuid
+
 import s3dlio as s3
 
-# Adjust these to your S3 URIs:
-READ_PREFIX = "s3://my-bucket2/my-data2/"
-TEST_PREFIX = "s3://my-bucket2/test_rust_api/"
+BUCKET = os.environ.get("S3DLIO_TEST_BUCKET", "").strip()
+READ_PREFIX = f"s3://{BUCKET}/{os.environ.get('S3DLIO_TEST_READ_PREFIX', '')}"
+TEST_PREFIX = f"s3://{BUCKET}/test_rust_api_{uuid.uuid4().hex[:12]}/"
 NUM_OBJECTS = 500
 TEMPLATE = "object_{}_of_{}.dat"
 NUM_JOBS = 32
@@ -20,18 +27,21 @@ def sync_tests():
     dt = time.time() - start
     print(f"Found {len(objs)} objects under {READ_PREFIX} in {dt:.2f}s")
 
-
     print("\n=== Sync PUT ===")
     start = time.time()
     s3.put(TEST_PREFIX, NUM_OBJECTS, TEMPLATE, NUM_JOBS)
     dt = time.time() - start
     total_bytes = NUM_OBJECTS * SIZE
     mib = total_bytes / (1024**2)
-    print(f"Uploaded {NUM_OBJECTS} objects ({mib:.2f} MiB) in {dt:.2f}s -> {NUM_OBJECTS/dt:.2f} ops/s, {mib/dt:.2f} MiB/s")
- 
+    print(
+        f"Uploaded {NUM_OBJECTS} objects ({mib:.2f} MiB) in {dt:.2f}s -> {NUM_OBJECTS / dt:.2f} ops/s, {mib / dt:.2f} MiB/s"
+    )
+
     print("\n=== Sync STAT ===")
     # re-build the same list of URIs we want to stat
-    uris = [f"{TEST_PREFIX}" + TEMPLATE.format(i, NUM_OBJECTS) for i in range(NUM_OBJECTS)]
+    uris = [
+        f"{TEST_PREFIX}" + TEMPLATE.format(i, NUM_OBJECTS) for i in range(NUM_OBJECTS)
+    ]
     stat_uri = uris[0]
     obj_meta = s3.stat(stat_uri)
     print(f"Stat for {stat_uri}:")
@@ -39,20 +49,26 @@ def sync_tests():
         print(f"  {k}: {v}")
 
     print("\n=== Sync GET Many ===")
-    uris = [f"{TEST_PREFIX}" + TEMPLATE.format(i, NUM_OBJECTS) for i in range(NUM_OBJECTS)]
+    uris = [
+        f"{TEST_PREFIX}" + TEMPLATE.format(i, NUM_OBJECTS) for i in range(NUM_OBJECTS)
+    ]
     start = time.time()
     pairs = s3.get_many(uris, NUM_JOBS)
     dt = time.time() - start
     total_bytes = sum(len(b) for (_, b) in pairs)
     mib = total_bytes / (1024**2)
-    print(f"Fetched {len(pairs)} objects ({mib:.2f} MiB) in {dt:.2f}s -> {len(pairs)/dt:.2f} ops/s, {mib/dt:.2f} MiB/s")
+    print(
+        f"Fetched {len(pairs)} objects ({mib:.2f} MiB) in {dt:.2f}s -> {len(pairs) / dt:.2f} ops/s, {mib / dt:.2f} MiB/s"
+    )
 
     print("\n=== Sync GET Many Stats ===")
     start = time.time()
     n, tot = s3.get_many_stats(uris, NUM_JOBS)
     dt = time.time() - start
     mib = tot / (1024**2)
-    print(f"Stats: {n} objects, {tot} bytes ({mib:.2f} MiB) in {dt:.2f}s -> {n/dt:.2f} ops/s, {mib/dt:.2f} MiB/s")
+    print(
+        f"Stats: {n} objects, {tot} bytes ({mib:.2f} MiB) in {dt:.2f}s -> {n / dt:.2f} ops/s, {mib / dt:.2f} MiB/s"
+    )
 
     print("\n=== Sync DELETE ===")
     start = time.time()
@@ -63,7 +79,7 @@ def sync_tests():
 
 async def async_tests():
     # turn on info‑level logs (shows the AWS_CA_BUNDLE message)
-    #s3.init_logging("info")
+    # s3.init_logging("info")
 
     print("=== Async LIST ===")
     start = time.time()
@@ -76,23 +92,31 @@ async def async_tests():
     await s3.put_async(TEST_PREFIX, NUM_OBJECTS, TEMPLATE, NUM_JOBS)
     dt = time.time() - start
     mib = (NUM_OBJECTS * SIZE) / (1024**2)
-    print(f"Uploaded {NUM_OBJECTS} objects ({mib:.2f} MiB) in {dt:.2f}s -> {NUM_OBJECTS/dt:.2f} ops/s, {mib/dt:.2f} MiB/s")
+    print(
+        f"Uploaded {NUM_OBJECTS} objects ({mib:.2f} MiB) in {dt:.2f}s -> {NUM_OBJECTS / dt:.2f} ops/s, {mib / dt:.2f} MiB/s"
+    )
 
     print("\n=== Async GET Many ===")
-    uris = [f"{TEST_PREFIX}" + TEMPLATE.format(i, NUM_OBJECTS) for i in range(NUM_OBJECTS)]
+    uris = [
+        f"{TEST_PREFIX}" + TEMPLATE.format(i, NUM_OBJECTS) for i in range(NUM_OBJECTS)
+    ]
     start = time.time()
     pairs = await s3.get_many_async(uris, NUM_JOBS)
     dt = time.time() - start
     total_bytes = sum(len(b) for (_, b) in pairs)
     mib = total_bytes / (1024**2)
-    print(f"Fetched {len(pairs)} objects ({mib:.2f} MiB) in {dt:.2f}s -> {len(pairs)/dt:.2f} ops/s, {mib/dt:.2f} MiB/s")
+    print(
+        f"Fetched {len(pairs)} objects ({mib:.2f} MiB) in {dt:.2f}s -> {len(pairs) / dt:.2f} ops/s, {mib / dt:.2f} MiB/s"
+    )
 
     print("\n=== Async GET Many Stats ===")
     start = time.time()
     n, tot = await s3.get_many_stats_async(uris, NUM_JOBS)
     dt = time.time() - start
     mib = tot / (1024**2)
-    print(f"Stats: {n} objects, {tot} bytes ({mib:.2f} MiB) in {dt:.2f}s -> {n/dt:.2f} ops/s, {mib/dt:.2f} MiB/s")
+    print(
+        f"Stats: {n} objects, {tot} bytes ({mib:.2f} MiB) in {dt:.2f}s -> {n / dt:.2f} ops/s, {mib / dt:.2f} MiB/s"
+    )
 
     print("\n=== Async DELETE ===")
     start = time.time()
@@ -102,24 +126,26 @@ async def async_tests():
 
 
 def main():
+    if not BUCKET:
+        sys.exit(
+            "S3DLIO_TEST_BUCKET is not set; set it to a bucket you own to run this script."
+        )
 
     # turn on info‑level logs (shows the AWS S3 info messages, including AWS_CA_BUNDLE loading)
-    #s3.init_logging("info")
+    # s3.init_logging("info")
     # turn on debug‑level logs (shows AWS S3 SDK info + debug messages)
-    #s3.init_logging("debug")
+    # s3.init_logging("debug")
 
     # Start op logging (warp-replay compatible TSV.ZST)
-    #s3.init_op_log("/tmp/python_s3_ops_test.tsv.zst")
+    # s3.init_op_log("/tmp/python_s3_ops_test.tsv.zst")
 
     sync_tests()
     print()
     asyncio.run(async_tests())
 
     # Flush and close (safe to call multiple times)
-    #s3.finalize_op_log()
-
+    # s3.finalize_op_log()
 
 
 if __name__ == "__main__":
     main()
-

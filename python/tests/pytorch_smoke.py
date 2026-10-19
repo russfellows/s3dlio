@@ -1,20 +1,26 @@
 # pytorch_smoke.py
-from s3dlio.torch import S3IterableDataset
-from s3dlio import list as list_uri, stat
-from torch.utils.data import DataLoader
-import s3dlio as s3
-from s3dlio import list_uris, stat
-
-
-#s3.init_logging("info")
-
+# s3.init_logging("info")
 import inspect
+import os
+import sys
+
+from s3dlio import list as list_uri
+from s3dlio import list_full_uris, stat
 from s3dlio.torch import S3IterableDataset
+from torch.utils.data import DataLoader
+
 print(inspect.signature(S3IterableDataset.from_prefix))
 
-URI = "s3://russ-b3/health/"
+# Manual smoke script (not a pytest test): reads from a live bucket you name explicitly.
+# S3DLIO_TEST_BUCKET must contain a "health/" prefix with some objects; no default bucket.
+BUCKET = os.environ.get("S3DLIO_TEST_BUCKET", "").strip()
+if not BUCKET:
+    sys.exit(
+        "S3DLIO_TEST_BUCKET is not set; set it to a bucket you own to run this smoke script."
+    )
+URI = f"s3://{BUCKET}/health/"
 
-uris = list_uris(URI)
+uris = list_full_uris(URI)
 keys = list_uri(URI)
 print("object count:", len(keys))
 print("first 3 keys:", keys[:3])
@@ -31,4 +37,3 @@ for i, batch in enumerate(loader):
     assert sizes == s3_sizes
     if i == 1:
         break
-

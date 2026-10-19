@@ -14,7 +14,7 @@ pub use latest::Latest;
 pub use manifest::{Manifest, ShardMeta};
 pub use paths::{KeyLayout, Strategy};
 pub use reader::Reader;
-pub use writer::Writer;
+pub use writer::{IntoShardBytes, Writer};
 
 /// Configuration for checkpoint operations
 #[derive(Debug, Clone)]
@@ -163,13 +163,14 @@ impl CheckpointStore {
         Reader::new(&*self.store, self.uri.clone())
     }
 
-    /// Convenience method to save a single-rank checkpoint
-    pub async fn save(
+    /// Convenience method to save a single-rank checkpoint. Zero copy for a `Bytes` payload
+    /// (see [`IntoShardBytes`]); a borrowed `&[u8]` is copied once.
+    pub async fn save<D: IntoShardBytes>(
         &self,
         step: u64,
         epoch: u64,
         framework: &str,
-        data: &[u8],
+        data: D,
         user_meta: Option<serde_json::Value>,
     ) -> Result<String> {
         let writer = self.writer(1, 0);

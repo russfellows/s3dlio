@@ -70,7 +70,7 @@ use crate::data_loader::parallel_fetch::DropCancel;
 /// style range request, given a start `offset` and a nonzero byte `length`.
 ///
 /// audit #152 findings 2.5/2.6/2.7 (bug B4): the S3, Azure, and
-/// community-GCS `get_range()` implementations each computed this as a bare
+/// (since-removed community) GCS `get_range()` implementations each computed this as a bare
 /// `offset + length - 1`, which underflows — wrapping to a huge value in
 /// release builds, panicking in debug builds — whenever `length == 0`.
 ///
@@ -256,6 +256,7 @@ impl RangeEngine {
             "max_concurrent_ranges",
             self.config.max_concurrent_ranges,
         )?;
+        self.require_chunk_size()?;
 
         // audit #152 bug 2.8 (D9): a zero-byte object is a legitimate,
         // existing object (an empty file) -- not an error. Previously
@@ -345,7 +346,13 @@ impl RangeEngine {
         Ok((bytes, stats))
     }
 
-    /// Download using concurrent range requests (stream-based for large objects)
+    /// Download using concurrent range requests whose results are `Bytes` (the compatibility
+    /// path of [`RangeEngine::download`]).
+    ///
+    /// Each range arrives as a `Bytes` the provider allocated, and is copied into its segment of
+    /// the master buffer. That copy is the one a `Bytes`-returning `get_range` forces: the
+    /// provider owns the allocation it hands back. A provider that can receive into a caller
+    /// buffer uses [`RangeEngine::download_into_master`] instead and has no such copy.
     async fn download_with_ranges<F, Fut>(
         &self,
         object_size: u64,
@@ -356,6 +363,149 @@ impl RangeEngine {
     where
         F: Fn(u64, u64) -> Fut + Send + Sync + Clone + 'static,
         Fut: std::future::Future<Output = Result<Bytes>> + Send,
+    {
+        let fill = move |offset: u64, mut segment: BytesMut| {
+            let get_range = get_range.clone();
+            async move {
+                let length = segment.len();
+                let bytes = get_range(offset, length as u64).await?;
+                if bytes.len() == length {
+                    // Documented copy: the provider's `Bytes` -> this range's segment of the
+                    // master buffer (see the doc comment above). A wrong length is copied
+                    // nowhere; the engine turns it into the short/over-read error.
+                    segment.copy_from_slice(&bytes);
+                }
+                Ok::<(BytesMut, usize), anyhow::Error>((segment, bytes.len()))
+            }
+        };
+        self.run_ranges(object_size, 0, fill, cancel, start_time)
+            .await
+    }
+
+    /// Download an object by receiving every range straight into its own disjoint segment of
+    /// ONE master buffer: no per-range allocation and no per-range copy (stage G, R3).
+    ///
+    /// `fill_range(offset, segment)` must fill `segment` (an owned, exclusive window of the
+    /// master buffer, `segment.len()` bytes long) with the object's bytes starting at `offset`,
+    /// and return the segment together with the number of bytes it wrote. The segment it
+    /// returns must be the one it was given (the engine checks the address and length). The
+    /// count must equal the range length: a short or over read is an error, as in
+    /// [`RangeEngine::download`].
+    ///
+    /// `tail_probe`: the caller planned from a size that may be stale and wants a blob that
+    /// grew to be detected. The master buffer gets ONE extra byte, the last segment is one byte
+    /// longer than the range, and the count the last `fill_range` returns must still equal the
+    /// planned length: a blob of exactly the planned size answers that many bytes (the service
+    /// clamps the range to its end), a blob that grew fills the extra byte too, and a blob that
+    /// shrank answers fewer. The extra byte is never part of the result.
+    ///
+    /// The segments are `BytesMut::split_to` windows of the master buffer, put back together
+    /// in order with `unsplit`, which joins adjacent windows of one allocation in O(1) without
+    /// copying. A zero `object_size` returns an empty object without calling `fill_range`.
+    pub async fn download_into_master<F, Fut>(
+        &self,
+        object_size: u64,
+        tail_probe: bool,
+        fill_range: F,
+        cancel: Option<CancellationToken>,
+    ) -> Result<(Bytes, RangeDownloadStats)>
+    where
+        F: Fn(u64, BytesMut) -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = Result<(BytesMut, usize)>> + Send,
+    {
+        crate::concurrency::require_concurrency_at_least_one(
+            "max_concurrent_ranges",
+            self.config.max_concurrent_ranges,
+        )?;
+        self.require_chunk_size()?;
+        if object_size == 0 {
+            return Ok((
+                Bytes::new(),
+                RangeDownloadStats {
+                    bytes_downloaded: 0,
+                    ranges_processed: 0,
+                    elapsed_time: Duration::ZERO,
+                    throughput_bps: 0,
+                },
+            ));
+        }
+        let start_time = Instant::now();
+        let probe = usize::from(tail_probe);
+        if object_size < self.config.min_split_size {
+            return self
+                .download_single_into(object_size, probe, fill_range, start_time)
+                .await;
+        }
+        self.run_ranges(object_size, probe, fill_range, cancel, start_time)
+            .await
+    }
+
+    /// One request into a master buffer of the object's size (the small-object path of
+    /// [`RangeEngine::download_into_master`]).
+    async fn download_single_into<F, Fut>(
+        &self,
+        object_size: u64,
+        probe: usize,
+        fill_range: F,
+        start_time: Instant,
+    ) -> Result<(Bytes, RangeDownloadStats)>
+    where
+        F: Fn(u64, BytesMut) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<(BytesMut, usize)>> + Send,
+    {
+        let size = usize::try_from(object_size)
+            .map_err(|_| anyhow::anyhow!("object size {object_size} does not fit in memory"))?;
+        let total = size
+            .checked_add(probe)
+            .ok_or_else(|| anyhow::anyhow!("object size {object_size} is too large"))?;
+        let master = BytesMut::zeroed(total);
+        let want_ptr = master.as_ptr() as usize;
+        let (mut master, written) =
+            tokio::time::timeout(self.config.range_timeout, fill_range(0, master))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Single request timeout after {:?}",
+                        self.config.range_timeout
+                    )
+                })?
+                .map_err(|e| anyhow::anyhow!("Single request failed: {}", e))?;
+        if written != size {
+            return Err(anyhow::anyhow!(
+                "Single request short/over read: expected {} bytes, got {} bytes",
+                object_size,
+                written
+            ));
+        }
+        if master.as_ptr() as usize != want_ptr || master.len() != total {
+            bail!("Single request: the fill function returned a different buffer");
+        }
+        master.truncate(size);
+        let elapsed = start_time.elapsed();
+        let stats = RangeDownloadStats {
+            bytes_downloaded: object_size,
+            ranges_processed: 1,
+            elapsed_time: elapsed,
+            throughput_bps: Self::calculate_throughput(object_size, elapsed),
+        };
+        Ok((master.freeze(), stats))
+    }
+
+    /// The concurrent range machinery behind [`RangeEngine::download`] and
+    /// [`RangeEngine::download_into_master`]: `fill(offset, segment)` fills one range's segment
+    /// and returns it with the count of bytes written. See `download_into_master` for the
+    /// contract and `probe` (the extra byte after the last range).
+    async fn run_ranges<F, Fut>(
+        &self,
+        object_size: u64,
+        probe: usize,
+        fill: F,
+        cancel: Option<CancellationToken>,
+        start_time: Instant,
+    ) -> Result<(Bytes, RangeDownloadStats)>
+    where
+        F: Fn(u64, BytesMut) -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = Result<(BytesMut, usize)>> + Send,
     {
         // Calculate optimal range splits
         let ranges = self.calculate_ranges(object_size);
@@ -385,18 +535,14 @@ impl RangeEngine {
         //
         // Bounded spawn pool: we prime the pool with `max_concurrent`
         // spawns, then produce a new spawn each time we consume a result.
-        // Without this cap all N spawns would be alive simultaneously,
-        // each holding a chunk-sized Bytes in its JoinHandle after
-        // completion — driving peak memory to ~2× total_size (observed
-        // failure of `range_engine_download_peak_memory_bounded`).
         //
         // DropCancel guards mid-flight drop; external cancel is honored
         // via a second select! arm.
         let internal_cancel = CancellationToken::new();
         let _drop_cancel = DropCancel(internal_cancel.clone());
 
-        let spawn_fetch = |idx: usize, offset: u64, length: u64| {
-            let get_range = get_range.clone();
+        let spawn_fetch = |idx: usize, offset: u64, length: u64, segment: BytesMut| {
+            let fill = fill.clone();
             let semaphore = Arc::clone(&semaphore);
             let external_cancel = cancel.clone();
             let internal_token = internal_cancel.clone();
@@ -407,7 +553,9 @@ impl RangeEngine {
                     .map_err(|e| anyhow::anyhow!("Semaphore acquisition failed: {}", e))?;
 
                 let fetch = async {
-                    let bytes = tokio::time::timeout(timeout, get_range(offset, length))
+                    let want_ptr = segment.as_ptr() as usize;
+                    let want_len = segment.len();
+                    let (segment, written) = tokio::time::timeout(timeout, fill(offset, segment))
                         .await
                         .map_err(|_| {
                             anyhow::anyhow!(
@@ -430,26 +578,33 @@ impl RangeEngine {
                     // Locked contract (issue #152 / audit finding f39,
                     // docs/implementation-plans/v0.9.109-audit-fix-plan.md
                     // §3 bug A1): any short OR over read is a hard error.
-                    // Assembly below writes each chunk at a running
-                    // cursor rather than its declared range offset, so a
-                    // length mismatch on any non-final chunk — even one
+                    // A length mismatch on any non-final range — even one
                     // that's later "compensated" by a mismatch elsewhere
-                    // and sums to the right total — silently shifts every
-                    // subsequent chunk to the wrong position. There is no
-                    // safe way to tolerate a mismatch here; it must abort
-                    // the whole download.
-                    if bytes.len() != length as usize {
+                    // and sums to the right total — would leave the wrong
+                    // bytes at every later position. There is no safe way
+                    // to tolerate a mismatch here; it must abort the whole
+                    // download.
+                    if written as u64 != length {
                         return Err(anyhow::anyhow!(
                             "Range {} short/over read: expected {} bytes at offset {}, got {} \
                              bytes (last_range={})",
                             idx,
                             length,
                             offset,
-                            bytes.len(),
+                            written,
                             idx == n_ranges - 1
                         ));
                     }
-                    Ok::<(usize, Bytes), anyhow::Error>((idx, bytes))
+                    // The segment must be the window it was handed: joining windows that are
+                    // not adjacent in one allocation would silently fall back to copying.
+                    if segment.as_ptr() as usize != want_ptr || segment.len() != want_len {
+                        return Err(anyhow::anyhow!(
+                            "Range {} fill returned a different buffer than the segment it was \
+                             given",
+                            idx
+                        ));
+                    }
+                    Ok::<(usize, BytesMut), anyhow::Error>((idx, segment))
                 };
 
                 let external_wait = async {
@@ -471,47 +626,63 @@ impl RangeEngine {
             })
         };
 
+        // The master buffer (issue #148, audit §3.3a / Patch 3), allocated once. Each range
+        // gets its own window of it, split off in range order as the range is started. Peak
+        // live memory is the master buffer plus the transport's own in-flight chunks.
+        let size = usize::try_from(object_size)
+            .map_err(|_| anyhow::anyhow!("object size {object_size} does not fit in memory"))?;
+        let total = size
+            .checked_add(probe)
+            .ok_or_else(|| anyhow::anyhow!("object size {object_size} is too large"))?;
+        let mut unassigned = BytesMut::zeroed(total);
+        let master_ptr = unassigned.as_ptr() as usize;
+
+        // The window for range `idx`: its length, plus the probe byte on the last range.
+        let mut take_segment = |idx: usize, length: u64| -> Result<BytesMut> {
+            let mut len = usize::try_from(length)
+                .map_err(|_| anyhow::anyhow!("range {idx} length {length} does not fit"))?;
+            if idx + 1 == n_ranges {
+                len += probe;
+            }
+            if len > unassigned.len() {
+                bail!(
+                    "range {} needs {} bytes but only {} remain in the master buffer",
+                    idx,
+                    len,
+                    unassigned.len()
+                );
+            }
+            Ok(unassigned.split_to(len))
+        };
+
         let pool_cap = self.config.max_concurrent_ranges;
-        let mut pending: FuturesOrdered<JoinHandle<Result<(usize, Bytes)>>> = FuturesOrdered::new();
+        let mut pending: FuturesOrdered<JoinHandle<Result<(usize, BytesMut)>>> =
+            FuturesOrdered::new();
         let mut next_range = 0usize;
         while next_range < n_ranges && pending.len() < pool_cap {
             let (offset, length) = ranges[next_range];
-            pending.push_back(spawn_fetch(next_range, offset, length));
+            let segment = take_segment(next_range, length)?;
+            pending.push_back(spawn_fetch(next_range, offset, length, segment));
             next_range += 1;
         }
 
-        // Pre-allocate the master output buffer (issue #148, audit
-        // §3.3a / Patch 3). Peak live memory is bounded by
-        // `pool_cap * chunk_size` (in-flight/queued) + `master`.
-        let mut master = BytesMut::zeroed(object_size as usize);
-        let mut write_offset: usize = 0;
+        let mut assembled: Option<BytesMut> = None;
         let mut ranges_seen: usize = 0;
         let mut first_err: Option<anyhow::Error> = None;
 
         while let Some(join_res) = pending.next().await {
             match join_res {
-                Ok(Ok((idx, bytes))) => {
+                Ok(Ok((idx, segment))) => {
                     if first_err.is_none() {
-                        let len = bytes.len();
-                        tracing::trace!("Assembling range {} ({} bytes)", idx, len);
-
-                        let end = write_offset
-                            .checked_add(len)
-                            .ok_or_else(|| anyhow::anyhow!("range assembly offset overflow"))?;
-                        if end > master.len() {
-                            bail!(
-                                "range {} would write {}..{} but master buffer is only {} bytes",
-                                idx,
-                                write_offset,
-                                end,
-                                master.len()
-                            );
+                        tracing::trace!("Assembling range {} ({} bytes)", idx, segment.len());
+                        // Results arrive in range order, so each window is adjacent to the
+                        // one before it in the same allocation: `unsplit` joins them in O(1).
+                        match assembled.as_mut() {
+                            None => assembled = Some(segment),
+                            Some(done) => done.unsplit(segment),
                         }
-                        master[write_offset..end].copy_from_slice(&bytes);
-                        write_offset = end;
                         ranges_seen += 1;
                     }
-                    drop(bytes);
                 }
                 Ok(Err(e)) => {
                     if first_err.is_none() {
@@ -535,7 +706,8 @@ impl RangeEngine {
             // Refill the spawn pool as slots free up.
             if first_err.is_none() && next_range < n_ranges {
                 let (offset, length) = ranges[next_range];
-                pending.push_back(spawn_fetch(next_range, offset, length));
+                let segment = take_segment(next_range, length)?;
+                pending.push_back(spawn_fetch(next_range, offset, length, segment));
                 next_range += 1;
             }
         }
@@ -543,25 +715,31 @@ impl RangeEngine {
         if let Some(e) = first_err {
             return Err(e);
         }
-        let _ = ranges_seen;
 
-        // Defense in depth: every chunk that reached this point matched
-        // its declared range length exactly (enforced above), and
-        // `calculate_ranges` partitions `object_size` exactly, so
-        // `write_offset` must equal `master.len()` here. This should be
-        // unreachable — if it ever fires, something upstream violated
-        // the per-chunk length invariant without going through the
-        // error path above, which is itself a bug worth surfacing
-        // loudly rather than silently truncating (the old behavior,
-        // which is the root cause this fix closes out).
-        if write_offset != master.len() {
+        // Defense in depth: every range that reached this point matched its declared length
+        // exactly (enforced above) and `calculate_ranges` partitions `object_size` exactly, so
+        // every window was handed out, returned and joined. If this ever fires, something
+        // upstream violated the per-range length invariant without going through the error
+        // path above, which is itself a bug worth surfacing loudly rather than silently
+        // truncating.
+        let mut master = assembled.unwrap_or_default();
+        if ranges_seen != n_ranges || master.len() != total || !unassigned.is_empty() {
             bail!(
-                "range assembly invariant violated: wrote {} bytes but master buffer is {} \
-                 bytes (object_size drifted from the sum of range lengths)",
-                write_offset,
-                master.len()
+                "range assembly invariant violated: joined {} of {} ranges into {} bytes \
+                 (expected {}), {} bytes never assigned",
+                ranges_seen,
+                n_ranges,
+                master.len(),
+                total,
+                unassigned.len()
             );
         }
+        if master.as_ptr() as usize != master_ptr {
+            // `unsplit` could not join two windows and copied: still correct, no longer zero
+            // copy. Unreachable while the windows are adjacent; surfaced instead of hidden.
+            tracing::warn!("range assembly copied: the master buffer moved while joining ranges");
+        }
+        master.truncate(size);
 
         let bytes_downloaded = master.len() as u64;
         let elapsed = start_time.elapsed();
@@ -584,6 +762,15 @@ impl RangeEngine {
         Ok((master.freeze(), stats))
     }
 
+    /// A zero chunk size would make `calculate_ranges` plan empty ranges for ever (a loop that
+    /// grows a vector until memory runs out): an error before any range is planned.
+    fn require_chunk_size(&self) -> Result<()> {
+        if self.config.chunk_size == 0 {
+            bail!("RangeEngineConfig::chunk_size must be at least 1 byte (got 0)");
+        }
+        Ok(())
+    }
+
     /// Calculate optimal range splits for an object
     ///
     /// Splits the object into chunks of approximately chunk_size,
@@ -596,6 +783,10 @@ impl RangeEngine {
         while offset < object_size {
             let remaining = object_size - offset;
             let length = remaining.min(chunk_size);
+            if length == 0 {
+                // Unreachable after `require_chunk_size`; never loop without progress.
+                break;
+            }
             ranges.push((offset, length));
             offset += length;
         }

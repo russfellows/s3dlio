@@ -14,8 +14,9 @@ use crate::gcs_constants::{
     DEFAULT_WINDOW_MIB, ENV_GCS_GRPC_CHANNELS, ENV_GRPC_INITIAL_WINDOW_MIB,
     GCS_MAX_CONCURRENT_DELETES, GCS_MIN_CHANNELS,
 };
+use crate::object_error::ObjectErrorKind;
 use crate::read_buffer::ReadBuffer;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::Stream;
 use google_cloud_gax::paginator::ItemPaginator;
@@ -35,6 +36,154 @@ static GCS_CONTROL: OnceCell<Arc<StorageControl>> = OnceCell::const_new();
 static EFFECTIVE_GCS_RAPID_MODE: std::sync::OnceLock<RapidMode> = std::sync::OnceLock::new();
 const GCS_FULL_READ_REPAIR_MAX_ATTEMPTS: usize = 4;
 const GCS_FULL_READ_RETRY_MAX_ATTEMPTS: usize = 3;
+
+// ============================================================================
+// Custom endpoint / emulator support (GCS_ENDPOINT_URL, STORAGE_EMULATOR_HOST)
+// ============================================================================
+
+/// Which environment variable named the custom endpoint.  Either way the endpoint is "not Google's
+/// production endpoint" (an emulator, a test server, a proxy): the client is built with anonymous
+/// credentials, as the legacy community client did for any custom endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcsEndpointSource {
+    /// `GCS_ENDPOINT_URL`: the URL is used as given.
+    EndpointUrl,
+    /// `STORAGE_EMULATOR_HOST`: the emulator convention (`host:port`, `http://` added).
+    EmulatorHost,
+}
+
+/// A custom GCS endpoint resolved from the environment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GcsEndpoint {
+    /// The endpoint URL handed to the SDK (`with_endpoint`).  A `STORAGE_EMULATOR_HOST` value
+    /// without a scheme has `http://` prepended.
+    pub url: String,
+    /// The variable it came from.
+    pub source: GcsEndpointSource,
+}
+
+/// `Debug` shows the URL with any embedded credentials masked (see `redact_endpoint_url`), because an
+/// endpoint ends up in logs and assertion messages.  The `url` field itself is the real value.
+impl std::fmt::Debug for GcsEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcsEndpoint")
+            .field("url", &redact_endpoint_url(&self.url))
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// Environment-free resolution of the custom endpoint: `lookup` reads one variable by name.
+///
+/// - `GCS_ENDPOINT_URL` wins; its value is used as given (trimmed).
+/// - else `STORAGE_EMULATOR_HOST` (`host:port`), with `http://` prepended when the value has no
+///   `http://` or `https://` scheme.
+/// - an empty or blank value counts as unset (so an empty `GCS_ENDPOINT_URL` falls through to
+///   `STORAGE_EMULATOR_HOST` instead of selecting an empty endpoint).
+/// - neither set: `None`, and the client is built exactly as it is without this feature.
+pub fn resolve_gcs_endpoint_with(lookup: impl Fn(&str) -> Option<String>) -> Option<GcsEndpoint> {
+    let get = |name: &str| {
+        lookup(name)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(url) = get(crate::constants::ENV_GCS_ENDPOINT_URL) {
+        return Some(GcsEndpoint {
+            url,
+            source: GcsEndpointSource::EndpointUrl,
+        });
+    }
+    get(crate::constants::ENV_STORAGE_EMULATOR_HOST).map(|host| GcsEndpoint {
+        url: if host.starts_with("http://") || host.starts_with("https://") {
+            host
+        } else {
+            format!("http://{host}")
+        },
+        source: GcsEndpointSource::EmulatorHost,
+    })
+}
+
+/// Resolves the custom GCS endpoint from the process environment.
+///
+/// Applies the `.env` policy first (#243): this is a public setting reader, so a `.env` opted
+/// into with `S3DLIO_LOAD_DOTENV` is visible to the very first call.  See
+/// [`resolve_gcs_endpoint_with`] for the rules.  `None` means the default GCS endpoint.
+pub fn resolve_gcs_endpoint() -> Option<GcsEndpoint> {
+    crate::dotenv::apply();
+    resolve_gcs_endpoint_with(|name| std::env::var(name).ok())
+}
+
+/// The endpoint made safe to log.
+///
+/// The authority ends at the first `/`, `?` or `#`.  A `user:password@` in it (up to the LAST `@`)
+/// is replaced by `***@`.  When the authority has no `@` but an `@` follows it, the text after the
+/// authority could carry credentials, so it is masked (`/***`) if the authority is a plain
+/// `host[:port]`, and the whole remainder is masked (`***`) if it is not (for example `u:pa` from
+/// `u:pa/ss@host`, where a password holds a `/`).  A URL with no `@` is returned unchanged.
+fn redact_endpoint_url(url: &str) -> String {
+    let (scheme, rest) = match url.find("://") {
+        Some(i) => url.split_at(i + 3),
+        None => ("", url),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some(at) = authority.rfind('@') {
+        return format!("{scheme}***@{}", &rest[at + 1..]);
+    }
+    if !rest[authority_end..].contains('@') {
+        return url.to_string();
+    }
+    if is_host_and_port(authority) {
+        format!("{scheme}{authority}/***")
+    } else {
+        format!("{scheme}***")
+    }
+}
+
+/// True for `host`, `host:port`, `[v6]` and `[v6]:port` (a port is digits only).
+fn is_host_and_port(authority: &str) -> bool {
+    let all_digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if authority.starts_with('[') {
+        return match authority.find(']') {
+            Some(i) => {
+                let tail = &authority[i + 1..];
+                tail.is_empty() || tail.strip_prefix(':').is_some_and(all_digits)
+            }
+            None => false,
+        };
+    }
+    match authority.rsplit_once(':') {
+        None => true,
+        Some((host, port)) => !host.contains(':') && all_digits(port),
+    }
+}
+
+/// The `Storage` builder: the SDK defaults, plus, for a custom endpoint, the endpoint and
+/// anonymous credentials.  With no endpoint this is `Storage::builder()` unchanged.
+fn storage_builder(
+    endpoint: Option<&GcsEndpoint>,
+) -> google_cloud_storage::builder::storage::ClientBuilder {
+    let builder = Storage::builder();
+    match endpoint {
+        None => builder,
+        Some(e) => builder
+            .with_endpoint(e.url.clone())
+            .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build()),
+    }
+}
+
+/// The `StorageControl` builder, configured exactly like [`storage_builder`].
+fn control_builder(
+    endpoint: Option<&GcsEndpoint>,
+) -> google_cloud_storage::builder::storage_control::ClientBuilder {
+    let builder = StorageControl::builder();
+    match endpoint {
+        None => builder,
+        Some(e) => builder
+            .with_endpoint(e.url.clone())
+            .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build()),
+    }
+}
 
 /// Exponential backoff delay for GCS full-read retry attempts.
 ///
@@ -192,6 +341,20 @@ pub struct GcsObjectMetadata {
     pub key: String,
 }
 
+/// A GCS object time as an RFC 3339 string (#263).
+///
+/// GCS reports object times as Google's `Timestamp`, whose `Debug` form is a struct dump
+/// (`Timestamp { seconds: .., nanos: .. }`), not a time.  The provider-neutral
+/// `ObjectMetadata::last_modified` and the GCS listing consumers expect RFC 3339, which
+/// Google's `String::from(Timestamp)` produces (UTC, with the fraction kept when there is one).
+/// An absent time stays absent.
+fn object_time_rfc3339<T>(time: Option<T>) -> Option<String>
+where
+    T: Into<String>,
+{
+    time.map(Into::into)
+}
+
 /// RAPID mode configuration.
 ///
 /// Controls whether gRPC BidiReadObject/BidiWriteObject (with appendable=true)
@@ -256,6 +419,8 @@ impl GcsClient {
     /// - gcloud CLI credentials
     pub async fn new() -> Result<Self> {
         crate::dotenv::apply();
+        // Custom endpoint / emulator (None: the SDK defaults, byte for byte as before).
+        let endpoint = resolve_gcs_endpoint();
         let storage = GCS_STORAGE
             .get_or_try_init(|| async {
                 debug!("Initializing GCS Storage client (first time only)");
@@ -315,7 +480,18 @@ impl GcsClient {
                      initial_window={window_mib} MiB"
                 );
 
-                let client = Storage::builder()
+                if let Some(e) = endpoint.as_ref() {
+                    info!(
+                        "GCS custom endpoint: {} (from {}; anonymous credentials)",
+                        redact_endpoint_url(&e.url),
+                        match e.source {
+                            GcsEndpointSource::EndpointUrl => crate::constants::ENV_GCS_ENDPOINT_URL,
+                            GcsEndpointSource::EmulatorHost => crate::constants::ENV_STORAGE_EMULATOR_HOST,
+                        }
+                    );
+                }
+
+                let client = storage_builder(endpoint.as_ref())
                     .with_grpc_subchannel_count(subchannel_count)
                     .build()
                     .await
@@ -330,9 +506,12 @@ impl GcsClient {
             .get_or_try_init(|| async {
                 debug!("Initializing GCS StorageControl client (first time only)");
 
-                let client = StorageControl::builder().build().await.map_err(|e| {
-                    anyhow!("Failed to initialize GCS StorageControl client: {}", e)
-                })?;
+                let client = control_builder(endpoint.as_ref())
+                    .build()
+                    .await
+                    .map_err(|e| {
+                        anyhow!("Failed to initialize GCS StorageControl client: {}", e)
+                    })?;
 
                 info!("GCS StorageControl client initialized successfully");
                 Ok::<Arc<StorageControl>, anyhow::Error>(Arc::new(client))
@@ -715,7 +894,9 @@ impl GcsClient {
         range: Option<ReadRange>,
         window: Option<(u64, Option<u64>)>,
     ) -> Result<Bytes> {
-        let mut builder = self.storage.read_object(bucket_name, object);
+        // The fork's URL encoder leaves a literal `%` alone (issue #270); see the helper.
+        let wire_name = http_media_object_name(object);
+        let mut builder = self.storage.read_object(bucket_name, wire_name.as_ref());
         if let Some(r) = range {
             builder = builder.set_read_range(r);
         }
@@ -906,11 +1087,7 @@ impl GcsClient {
         let metadata = GcsObjectMetadata {
             size: obj.size as u64,
             etag: Some(obj.etag.clone()),
-            updated: obj.update_time.map(|t| {
-                // Timestamp is google_cloud_wkt::timestamp::Timestamp
-                // Convert to RFC3339 format
-                format!("{:?}", t) // Use debug formatting as fallback
-            }),
+            updated: object_time_rfc3339(obj.update_time),
             key: object.to_string(),
         };
 
@@ -964,7 +1141,7 @@ impl GcsClient {
         let metadata = GcsObjectMetadata {
             size: obj.size as u64,
             etag: Some(obj.etag.clone()),
-            updated: obj.update_time.map(|t| format!("{:?}", t)),
+            updated: object_time_rfc3339(obj.update_time),
             key: object.to_string(),
         };
 
@@ -1477,6 +1654,138 @@ fn is_retryable_gcs_read_error(message: &str) -> bool {
         || normalized.contains("resource_exhausted")
 }
 
+/// Classify a GCS failure from the typed `google_cloud_gax` error (plan §4.5 A2).
+///
+/// Only typed accessors are used; message text is never inspected.
+///
+/// * HTTP 404 or gRPC `NotFound` is `NotFound`.  GCS gives the same status for a missing
+///   bucket, so absence of the bucket is not told apart from absence of the object;
+/// * 412 or `FailedPrecondition` is `VersionChanged`;
+/// * 403 or `PermissionDenied` is `Forbidden`;
+/// * `Unavailable` or `ResourceExhausted`, or HTTP 503 or 429, is `Throttled`;
+/// * gRPC `DeadlineExceeded` is `Transport`: the deadline expired before a usable answer, like
+///   a timeout;
+/// * HTTP 408 (parity with S3), gRPC `Internal` and gRPC `Aborted` are `Server`: the service
+///   asks for the request to be repeated;
+/// * a typed transport failure (timeout, connect, I/O, or a transport error without an
+///   HTTP status) is `Transport`;
+/// * any other HTTP 5xx is `Server`;
+/// * everything else is `Other`, in particular HTTP 401 and gRPC `Unauthenticated` (a
+///   credential problem, not retried), and gRPC `Unknown` and `Cancelled` (no evidence the
+///   service failed, not retried).
+pub(crate) fn classify_gcs_failure(e: &google_cloud_gax::error::Error) -> ObjectErrorKind {
+    use google_cloud_gax::error::rpc::Code;
+    let http = e.http_status_code();
+    let code = e.status().map(|s| s.code);
+    if http == Some(404) || code == Some(Code::NotFound) {
+        ObjectErrorKind::NotFound
+    } else if http == Some(412) || code == Some(Code::FailedPrecondition) {
+        ObjectErrorKind::VersionChanged
+    } else if http == Some(403) || code == Some(Code::PermissionDenied) {
+        ObjectErrorKind::Forbidden
+    } else if matches!(code, Some(Code::Unavailable | Code::ResourceExhausted))
+        || matches!(http, Some(503 | 429))
+    {
+        ObjectErrorKind::Throttled
+    } else if code == Some(Code::DeadlineExceeded) {
+        ObjectErrorKind::Transport
+    } else if matches!(code, Some(Code::Internal | Code::Aborted)) || http == Some(408) {
+        ObjectErrorKind::Server
+    } else if http.is_none() && (e.is_timeout() || e.is_connect() || e.is_transport()) {
+        ObjectErrorKind::Transport
+    } else if matches!(http, Some(500..=599)) {
+        ObjectErrorKind::Server
+    } else {
+        ObjectErrorKind::Other
+    }
+}
+
+/// Attach the GCS classification of `err` as an
+/// [`ObjectError`](crate::object_error::ObjectError) context.
+///
+/// `err` must carry a `google_cloud_gax` error (found through any context layers).  An error
+/// that does not is returned unchanged: an unclassified error stays unclassified, and the
+/// typed-only retry rule ([`gcs_typed_retry_verdict`]) then never retries it.
+///
+/// An error that already carries an `ObjectError` is returned unchanged, with one exception:
+/// on a `pinned` read whose outer kind is `NotFound`, a `VersionChanged` is attached over it
+/// (the outer classification wins), because a pinned read never reports absence.
+///
+/// The attached `ObjectError`'s own message is built only from the HTTP status and the gRPC
+/// code name, never from server-supplied text.  The retained source error, reachable through
+/// `{:#}`, `{:?}` or the chain, is the `google_cloud_gax` error itself and is NOT redacted by
+/// this module.
+pub(crate) fn attach_gcs_classification(err: anyhow::Error, pinned: bool) -> anyhow::Error {
+    if let Some(existing) = crate::object_error::object_error(&err) {
+        if pinned && existing.kind == ObjectErrorKind::NotFound {
+            return crate::object_error::attach_object_error(
+                err,
+                ObjectErrorKind::VersionChanged,
+                "gs",
+                "pinned version no longer found",
+            );
+        }
+        return err;
+    }
+    let Some(g) = err.downcast_ref::<google_cloud_gax::error::Error>() else {
+        return err;
+    };
+    let kind = classify_gcs_failure(g);
+    let message = match (g.http_status_code(), g.status()) {
+        (Some(h), Some(s)) => format!("status {h}, code {:?}", s.code),
+        (Some(h), None) => format!("status {h}"),
+        (None, Some(s)) => format!("code {:?}", s.code),
+        (None, None) => "no status".to_string(),
+    };
+    if pinned {
+        crate::object_error::attach_pinned_read_error(err, kind, "gs", message)
+    } else {
+        crate::object_error::attach_object_error(err, kind, "gs", message)
+    }
+}
+
+/// The retry predicate for the new GCS receive and repair loop: **typed only**.
+///
+/// Only an outer `Throttled`, `Transport` or `Server` classification is retryable.  An
+/// unclassified error (no `ObjectError`), `Other`, `Forbidden`, `NotFound`, `VersionChanged`,
+/// a length error, and any message text that merely contains a status number are not.  This
+/// is not [`is_retryable_gcs_read_error`] (message text) and not the generic conservative
+/// fallback of `RetryClassify`; it never authorizes combining unpinned responses either.
+pub(crate) fn gcs_typed_retry_verdict(err: &anyhow::Error) -> bool {
+    matches!(
+        crate::object_error::object_error(err).map(|o| o.kind),
+        Some(ObjectErrorKind::Throttled | ObjectErrorKind::Transport | ObjectErrorKind::Server)
+    )
+}
+
+/// The object name as the pinned fork's HTTP `read_object` must be given it, so that the
+/// URL names exactly the literal object.
+///
+/// `read_object` builds `/storage/v1/b/{bucket}/o/{enc(object)}?alt=media`, and its `enc`
+/// (`storage/client.rs`) encodes the characters GCS requires (`/`, `@`, `=`, space, ...) but
+/// deliberately PRESERVES `%` (its own test maps `preserve%percent%21` to itself).  A literal
+/// `%2F` in an object name would therefore reach GCS as an escape and be decoded to `/`, which
+/// names a different object.  Sending every literal `%` as `%25` makes the fork's encoder
+/// produce the right URL for any name.
+///
+/// The same mechanism covers `\`: `enc` leaves it alone, and the URL parser then reads it as a
+/// `/` in an http path (measured: `a\b` reached the server as `a/b`), so it is sent as `%5C`.
+/// The `%` replacement runs first, so the `%` of a `%5C` is never doubled.
+///
+/// Every HTTP read goes through this (issue #270): `get_object_via_http` (whole and ranged
+/// reads) and the caller-buffer `HttpOpener`.  The gRPC/Rapid routes carry the name in a
+/// protobuf field, not a URL, and must receive it unchanged.
+///
+/// The names `.` and `..` cannot be addressed over the HTTP path (URL parsing collapses dot
+/// segments); GCS forbids them as object names anyway, and this helper does not change that.
+fn http_media_object_name(object: &str) -> std::borrow::Cow<'_, str> {
+    if object.contains(['%', '\\']) {
+        std::borrow::Cow::Owned(object.replace('%', "%25").replace('\\', "%5C"))
+    } else {
+        std::borrow::Cow::Borrowed(object)
+    }
+}
+
 /// How many bytes an HTTP read will return, for sizing its destination buffer once (#252).
 ///
 /// `object_size` is the object's size from the response; `window` is the requested
@@ -1571,27 +1880,8 @@ fn gcs_scaled_timeout_secs(expected_size_bytes: u64) -> u64 {
 /// - gs://bucket/ → ("bucket", "")
 /// - gs://bucket  → ("bucket", "") - requires trailing slash for proper parsing
 pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
-    // Strip gs:// or gcs:// prefix
-    let path = uri
-        .strip_prefix("gs://")
-        .or_else(|| uri.strip_prefix("gcs://"))
-        .ok_or_else(|| anyhow!("Invalid GCS URI (expected gs:// or gcs:// prefix): {}", uri))?;
-
-    // Split into bucket and object path
-    let mut parts = path.splitn(2, '/');
-    let bucket = parts
-        .next()
-        .ok_or_else(|| anyhow!("Invalid GCS URI (missing bucket): {}", uri))?
-        .to_string();
-
-    // Object path is optional (empty for bucket-only URIs like gs://bucket/ for listings)
-    let object_path = parts.next().unwrap_or("").to_string();
-
-    if bucket.is_empty() {
-        bail!("Invalid GCS URI (empty bucket name): {}", uri);
-    }
-
-    Ok((bucket, object_path))
+    // The structure of a gs:// URI is parsed in one place, by the environment-free parser.
+    crate::capabilities::parse_gs_uri_pure(uri)
 }
 
 /// Query whether a GCS bucket or `gs://` URI refers to a RAPID (Hyperdisk ML / zonal) bucket.
@@ -1628,6 +1918,971 @@ pub async fn query_gcs_rapid_bucket(bucket_or_uri: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Caller-buffer GET and typed HEAD (plan §4.3, §4.5 A1, A2, A7, A8; #264)
+// ---------------------------------------------------------------------------
+//
+// The receive loop is written against a small `ReadOpener` interface ("open at an offset,
+// pinned to a generation, and give me a stream of chunks or a typed error") so that its core
+// is driven by a deterministic fake in the tests.  The two real openers are the HTTP
+// `read_object` route and the Rapid `open_object` route; neither ever sees the destination.
+//
+// Every write into `dst` happens in the task that awaits `receive_into`; nothing is spawned.
+// Dropping the future therefore stops every writer.
+mod caller_buffer {
+    use super::*;
+    use crate::object_error::{attach_object_error, object_error};
+    use crate::object_store::HeadMetadata;
+    use crate::range_version::{Leader, ObjectVersion, Role};
+    use crate::receive_progress::{ReceiveProgress, SpanMark};
+    use async_trait::async_trait;
+    use google_cloud_gax::error::rpc::Code;
+    use google_cloud_gax::error::Error as GaxError;
+    use google_cloud_storage::model::Object;
+    use google_cloud_storage::object_descriptor::ObjectDescriptor;
+    use google_cloud_storage::read_object::ReadObjectResponse;
+    use google_cloud_storage::read_resume_policy::NeverResume;
+
+    /// What an opened read says about the object it is reading.
+    pub(super) struct ObjectFacts {
+        /// The whole object's size, signed as the service reports it (validated before use).
+        pub size: i64,
+        /// The object's generation; `<= 0` means the response gave no usable identity.
+        pub generation: i64,
+    }
+
+    /// One read request: `limit == None` reads to the end of the object.
+    pub(super) struct OpenRequest {
+        pub start: u64,
+        pub limit: Option<u64>,
+        /// `Some` pins the read to this generation (`set_generation` on the real openers).
+        pub generation: Option<i64>,
+    }
+
+    /// An opened read: the object facts and the stream of data chunks.
+    pub(super) struct Opened {
+        pub facts: ObjectFacts,
+        pub stream: Box<dyn ChunkStream>,
+    }
+
+    /// A stream of data chunks.  Errors are the typed `google_cloud_gax` error.
+    #[async_trait]
+    pub(super) trait ChunkStream: Send {
+        async fn next_chunk(&mut self) -> Option<Result<Bytes, GaxError>>;
+    }
+
+    /// Opens reads of one object.
+    #[async_trait]
+    pub(super) trait ReadOpener: Send + Sync {
+        /// Open a read.  An open that fails reports the typed error.
+        async fn open(&self, request: &OpenRequest) -> Result<Opened, GaxError>;
+
+        /// The authoritative metadata of the object, with no data range requested.
+        async fn describe(&self, generation: Option<i64>) -> Result<Object, GaxError>;
+    }
+
+    /// Most repairs one caller-buffer read may use in TOTAL, whatever progress they make.  It is
+    /// four times the no-progress limit (`GCS_FULL_READ_REPAIR_MAX_ATTEMPTS`), so a read that
+    /// keeps advancing may survive several interruptions, yet the number of outer repairs is
+    /// finite and independent of the object size. Without it, one byte followed by a failure
+    /// could cost one repair per object byte. With the backoff capped at 2 s the outer repairs
+    /// add about 25 s of backoff at most; SDK retries, redirects and I/O time are additional.
+    const GCS_FULL_READ_TOTAL_REPAIR_MAX_ATTEMPTS: usize = 4 * GCS_FULL_READ_REPAIR_MAX_ATTEMPTS;
+
+    /// Retry and repair limits, and the one behavioural switch (`rapid`).
+    pub(super) struct ReceiveConfig {
+        /// A Rapid bucket: a zero-length destination reads the descriptor, and an
+        /// OUT_OF_RANGE on the first full read is checked against the descriptor.
+        pub rapid: bool,
+        /// Longest wait for the next chunk; `None` waits indefinitely.
+        pub chunk_timeout: Option<Duration>,
+        /// Delay before retry or repair number `n` (1-based).
+        pub retry_delay: fn(usize) -> Duration,
+        /// Attempts allowed while nothing has been written yet.
+        pub max_open_attempts: usize,
+        /// Consecutive repairs allowed after some bytes were written (pinned reads only) without
+        /// the cursor advancing past the previous repair point.  A repair that advances the
+        /// cursor starts THIS count again; it does not extend `max_total_repairs`.
+        pub max_repairs: usize,
+        /// Repairs allowed in TOTAL for the whole logical read (pinned reads only).  Progress
+        /// never refills it, and the backoff delay is taken from it, so it never restarts either.
+        /// Together with the no-progress bound above it makes the repair work finite for any
+        /// object size. The real HTTP and Rapid openers disable ordinary SDK body resumption
+        /// (`NeverResume`). There are at most `max_open_attempts + max_total_repairs` outer
+        /// opener calls, not wire requests: each call retains the SDK's ordinary request retry
+        /// policy (the pinned default has a 300 s retry time limit, not an attempt-count cap).
+        /// The pinned fork's `ResumeRedirect`
+        /// (`bidi/resume_redirect.rs`) and `RetryRedirect` (`retry_redirect.rs`) continue server
+        /// redirects regardless of `NeverResume`, so redirect re-connects are bounded only by the
+        /// server, the per-attempt timeout and, in the stream phase, `chunk_timeout`.
+        pub max_total_repairs: usize,
+    }
+
+    impl ReceiveConfig {
+        pub(super) fn new(rapid: bool, chunk_timeout: Option<Duration>) -> Self {
+            Self {
+                rapid,
+                chunk_timeout,
+                retry_delay: gcs_retry_backoff_delay,
+                max_open_attempts: GCS_FULL_READ_RETRY_MAX_ATTEMPTS,
+                max_repairs: GCS_FULL_READ_REPAIR_MAX_ATTEMPTS,
+                max_total_repairs: GCS_FULL_READ_TOTAL_REPAIR_MAX_ATTEMPTS,
+            }
+        }
+    }
+
+    /// The limits for one caller-buffer read of `len` bytes.  The chunk timeout is the same on
+    /// both routes (HTTP and Rapid), sized to the bytes expected: a stalled body is a typed
+    /// timeout, classified Transport, and the pinned read is repaired.
+    pub(super) fn read_config(rapid: bool, len: usize) -> Result<ReceiveConfig> {
+        Ok(ReceiveConfig::new(
+            rapid,
+            gcs_read_chunk_timeout(to_u64(len)?),
+        ))
+    }
+
+    fn to_u64(v: usize) -> Result<u64> {
+        u64::try_from(v).map_err(|_| anyhow!("length {v} does not fit in u64"))
+    }
+
+    /// A reported size, validated before conversion: a negative size is an error, never zero.
+    fn size_to_u64(size: i64, what: &str) -> Result<u64> {
+        u64::try_from(size).map_err(|_| {
+            attach_object_error(
+                anyhow!("GCS reported a negative size ({size}) for {what}"),
+                ObjectErrorKind::Other,
+                "gs",
+                "negative size",
+            )
+        })
+    }
+
+    /// Attach the typed classification to a gax failure.  `context` says which operation
+    /// failed, in the caller's words (the phase differs: opening a read, a stream, a HEAD).
+    /// `pinned` upgrades a 404 to `VersionChanged`: once a generation is pinned, absence is
+    /// never reported.
+    fn gax_failure(e: GaxError, context: String, pinned: bool) -> anyhow::Error {
+        attach_gcs_classification(anyhow::Error::new(e).context(context), pinned)
+    }
+
+    /// What may be logged about a failure: its classification (provider, kind, HTTP status
+    /// and gRPC code) and nothing else.  The source chain behind `{:#}` can carry text the
+    /// server supplied, such as an error body, so it is never logged.
+    pub(super) fn loggable(err: &anyhow::Error) -> String {
+        object_error(err).map_or_else(|| "unclassified failure".to_string(), ToString::to_string)
+    }
+
+    fn length_mismatch(what: &str, expected: u64, actual: Option<u64>) -> anyhow::Error {
+        attach_object_error(
+            anyhow!("GCS caller-buffer GET length mismatch for {what}"),
+            ObjectErrorKind::LengthMismatch { expected, actual },
+            "gs",
+            "",
+        )
+    }
+
+    fn version_changed(what: &str, detail: &str) -> anyhow::Error {
+        attach_object_error(
+            anyhow!("GCS caller-buffer GET of {what}: the object changed after its generation was pinned"),
+            ObjectErrorKind::VersionChanged,
+            "gs",
+            detail,
+        )
+    }
+
+    /// OUT_OF_RANGE by its typed status code (never by message text).
+    fn is_out_of_range(e: &GaxError) -> bool {
+        e.status().map(|s| s.code) == Some(Code::OutOfRange)
+    }
+
+    /// The stream of a read that has nothing to deliver (a zero-length Rapid read).
+    struct EmptyStream;
+
+    #[async_trait]
+    impl ChunkStream for EmptyStream {
+        async fn next_chunk(&mut self) -> Option<Result<Bytes, GaxError>> {
+            None
+        }
+    }
+
+    /// How many retries and repairs have been used.
+    #[derive(Default)]
+    struct Budget {
+        failures_before_data: usize,
+        /// Repairs used in total for this read.  Progress never refills it.
+        repairs: usize,
+        /// Repairs used since the cursor last advanced past the previous repair point.
+        stalled: usize,
+        /// Where the cursor stood at the most recent repair.
+        last_repair_at: Option<usize>,
+    }
+
+    impl Budget {
+        /// The delay before the retry or repair that `err` allows, or `None` when it allows
+        /// none.  `cursor` is how many bytes the span already holds and `len` its size.
+        ///
+        /// The verdict is `gcs_typed_retry_verdict` and nothing else.  With bytes already
+        /// written, only a pinned read is repaired (unpinned responses are never combined), and
+        /// a span that is complete has no suffix left to resume.
+        fn next_delay(
+            &mut self,
+            cfg: &ReceiveConfig,
+            err: &anyhow::Error,
+            cursor: usize,
+            len: usize,
+            pinned: bool,
+        ) -> Option<Duration> {
+            if !gcs_typed_retry_verdict(err) {
+                return None;
+            }
+            if cursor == 0 {
+                self.failures_before_data += 1;
+                if self.failures_before_data >= cfg.max_open_attempts {
+                    return None;
+                }
+                Some((cfg.retry_delay)(self.failures_before_data))
+            } else {
+                if !pinned || cursor >= len {
+                    return None;
+                }
+                self.take_repair(cfg, cursor)
+            }
+        }
+
+        /// Use one repair at `cursor`, returning its delay, or `None` when none are left.
+        ///
+        /// Two bounds apply and either one ends the repairs:
+        ///
+        /// * a TOTAL (`max_total_repairs`) for the whole logical read, which progress never
+        ///   refills.  A read that advances one byte per request is therefore failed after a
+        ///   fixed number of repairs, not one reconnection per object byte, and the caller's
+        ///   allocation is not held for a time that grows with the object size;
+        /// * a NO-PROGRESS limit (`max_repairs`): when `cursor` is past where the previous repair
+        ///   began, the repair did advance the read and only this count starts again.
+        ///
+        /// The backoff delay is taken from the total count, so progress does not reset it.
+        fn take_repair(&mut self, cfg: &ReceiveConfig, cursor: usize) -> Option<Duration> {
+            if self
+                .last_repair_at
+                .is_some_and(|previous| cursor > previous)
+            {
+                self.stalled = 0;
+            }
+            if self.repairs >= cfg.max_total_repairs || self.stalled >= cfg.max_repairs {
+                return None;
+            }
+            self.repairs = self.repairs.saturating_add(1);
+            self.stalled = self.stalled.saturating_add(1);
+            self.last_repair_at = Some(cursor);
+            Some((cfg.retry_delay)(self.repairs))
+        }
+    }
+
+    async fn back_off(delay: Duration) {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Receive the whole object into `dst` (`dst.len()` is the expected size).
+    ///
+    /// * The first response's generation is retained; every retry and repair is pinned to it.
+    ///   A response with a different generation, or a 404 on a pinned request, is
+    ///   `VersionChanged`.  Without a usable generation a single response is accepted, and a
+    ///   partially received request fails (unpinned responses are never combined).
+    /// * Repair writes the suffix of the same span, resuming at the cursor, under one
+    ///   [`SpanMark`] that survives every retry and repair, so each position is counted once.
+    /// * The object's size must equal `dst.len()` before any byte is copied, and the received
+    ///   count must equal it exactly.  A chunk that would pass the end of `dst` is refused
+    ///   whole; nothing is ever written beyond `dst`.
+    /// * Retries use only [`gcs_typed_retry_verdict`].
+    /// * Repair work is finite whatever the object size: at most `cfg.max_total_repairs` repairs in
+    ///   all (progress never refills them), and at most `cfg.max_repairs` in a row without the
+    ///   cursor advancing. The openers disable ordinary SDK body resumption; ordinary SDK
+    ///   request retries and Rapid server redirects remain separate layers, so this is not a
+    ///   wire-request or elapsed-time bound (see `ReceiveConfig::max_total_repairs`). On
+    ///   exhaustion the typed failure is returned and `progress` keeps what was received.
+    pub(super) async fn receive_into<O: ReadOpener + ?Sized>(
+        opener: &O,
+        what: &str,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        cfg: &ReceiveConfig,
+    ) -> Result<()> {
+        receive_span(opener, what, SpanOf::Whole, dst, progress, cfg)
+            .await
+            .map(|_| ())
+    }
+
+    /// Which part of the object one receive covers, and how it is tied to one version of it.
+    pub(super) enum SpanOf<'a> {
+        /// The whole object, exactly as [`receive_into`].
+        Whole,
+        /// The bytes `base..base + dst.len()`, one range of a read of several (or the only one):
+        /// every range of the same logical GET shares `version`.
+        Window {
+            base: u64,
+            version: &'a ObjectVersion<i64>,
+        },
+    }
+
+    /// What [`receive_planned`] is told about its span.
+    struct Plan<'a> {
+        base: u64,
+        ranged: bool,
+        /// The generation every request must name from the first one on; `None` for a request
+        /// that learns it from its own first response.
+        pinned: Option<i64>,
+        /// Set when this receive is the leader of a read of several ranges: the generation of
+        /// its first response is reported through it (as soon as the response arrives).
+        leader: Option<&'a Leader<'a, i64>>,
+    }
+
+    /// [`receive_into`] for a span of the object.
+    ///
+    /// * [`SpanOf::Whole`]: the whole object (`base == 0`), exactly as [`receive_into`]: the
+    ///   object's size must equal `dst.len()` and exactly that many bytes are written.
+    /// * [`SpanOf::Window`] (the range engine, stage G R3): every request names its window
+    ///   (`start`, `limit`), the object must be at least `base` bytes long, and the bytes that
+    ///   exist in the window are written (`min(dst.len(), size - base)`; the service clamps a
+    ///   range to the end of the object). The count written is returned and the caller decides
+    ///   whether a short answer is an error. Retries and repairs are pinned to the first
+    ///   response's generation and size exactly as for the whole object.
+    ///
+    /// All the windows of one logical GET share one [`ObjectVersion`] (stage G review, G-F2):
+    /// the first window to start is sent unpinned and reports its response's generation as soon
+    /// as the response arrives; every other window waits for that, and every one of its requests
+    /// names that generation, so an object replaced between two windows (by another of the same
+    /// size included) is a `VersionChanged` error and never a body of two versions. A first
+    /// response with no usable generation fails the other windows at once (the caller then reads
+    /// the object as one response, see [`ObjectVersion::is_unavailable`]); a first window that
+    /// fails releases them with its reason.
+    pub(super) async fn receive_span<O: ReadOpener + ?Sized>(
+        opener: &O,
+        what: &str,
+        span: SpanOf<'_>,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        cfg: &ReceiveConfig,
+    ) -> Result<usize> {
+        match span {
+            SpanOf::Whole => {
+                let plan = Plan {
+                    base: 0,
+                    ranged: false,
+                    pinned: None,
+                    leader: None,
+                };
+                receive_planned(opener, what, plan, dst, progress, cfg).await
+            }
+            SpanOf::Window { base, version } => {
+                // A window with nothing in it makes no request and takes no part in the version.
+                if dst.is_empty() {
+                    return Ok(0);
+                }
+                match version.join().await? {
+                    Role::Follower(generation) => {
+                        let plan = Plan {
+                            base,
+                            ranged: true,
+                            pinned: Some(generation),
+                            leader: None,
+                        };
+                        receive_planned(opener, what, plan, dst, progress, cfg).await
+                    }
+                    Role::Leader(leader) => {
+                        let plan = Plan {
+                            base,
+                            ranged: true,
+                            pinned: None,
+                            leader: Some(&leader),
+                        };
+                        let result = receive_planned(opener, what, plan, dst, progress, cfg).await;
+                        if let Err(e) = &result {
+                            // Releases the other windows with the reason (a no-op once the
+                            // generation was reported). Only the classification is passed on.
+                            leader.fail(loggable(e));
+                        }
+                        result
+                    }
+                }
+            }
+        }
+    }
+
+    /// The receive loop of [`receive_span`], for a span whose version handling is settled.
+    async fn receive_planned<O: ReadOpener + ?Sized>(
+        opener: &O,
+        what: &str,
+        plan: Plan<'_>,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        cfg: &ReceiveConfig,
+    ) -> Result<usize> {
+        let Plan {
+            base,
+            ranged,
+            pinned: initial_pin,
+            leader,
+        } = plan;
+        let len = dst.len();
+        let expected = to_u64(len)?;
+        if ranged && len == 0 {
+            return Ok(0);
+        }
+        let mut span = SpanMark::new(progress);
+        let mut cursor = 0usize;
+        let mut pinned: Option<i64> = initial_pin;
+        let mut first_size: Option<u64> = None;
+        let mut budget = Budget::default();
+        // A Rapid zero-length read is answered by the descriptor alone: no data range is
+        // requested, so an empty object cannot fail with OUT_OF_RANGE and no HTTP size header
+        // or stale control-plane zero is trusted.
+        let descriptor_only = len == 0 && cfg.rapid;
+
+        'attempt: loop {
+            let cursor64 = to_u64(cursor)?;
+            let remaining = expected
+                .checked_sub(cursor64)
+                .ok_or_else(|| anyhow!("cursor {cursor} is past the end of the span"))?;
+            // The first whole-object request reads to the end; a repair, and every ranged
+            // request, asks for exactly the missing part of its window.
+            let request = OpenRequest {
+                start: base
+                    .checked_add(cursor64)
+                    .ok_or_else(|| anyhow!("range start {base} + {cursor64} overflows"))?,
+                limit: (cursor > 0 || ranged).then_some(remaining),
+                generation: pinned,
+            };
+            let was_pinned = pinned.is_some();
+
+            let acquired = if descriptor_only {
+                opener.describe(None).await.map(|object| Opened {
+                    facts: ObjectFacts {
+                        size: object.size,
+                        generation: object.generation,
+                    },
+                    stream: Box::new(EmptyStream),
+                })
+            } else {
+                opener.open(&request).await
+            };
+            let opened = match acquired {
+                Ok(opened) => opened,
+                Err(e) => {
+                    // OUT_OF_RANGE on the first full Rapid read may be an empty object.  Ask the
+                    // authoritative descriptor; never turn it into absence.
+                    if cfg.rapid && len > 0 && cursor == 0 && !was_pinned && is_out_of_range(&e) {
+                        if let Ok(object) = opener.describe(None).await {
+                            if object.size == 0 {
+                                return Err(length_mismatch(what, expected, Some(0)));
+                            }
+                        }
+                    }
+                    let err = gax_failure(
+                        e,
+                        format!("GCS caller-buffer GET could not open {what}"),
+                        was_pinned,
+                    );
+                    match budget.next_delay(cfg, &err, cursor, len, was_pinned) {
+                        Some(delay) => {
+                            debug!(
+                                "GCS caller-buffer GET of {what}: retrying the open: {}",
+                                loggable(&err)
+                            );
+                            back_off(delay).await;
+                            continue 'attempt;
+                        }
+                        None => return Err(err),
+                    }
+                }
+            };
+
+            match pinned {
+                Some(generation) if opened.facts.generation != generation => {
+                    return Err(version_changed(what, "response generation differs"));
+                }
+                Some(_) => {}
+                None if opened.facts.generation > 0 => {
+                    pinned = Some(opened.facts.generation);
+                    if let Some(leader) = leader {
+                        leader.publish(opened.facts.generation);
+                    }
+                }
+                None => {
+                    if let Some(leader) = leader {
+                        leader.unavailable();
+                    }
+                }
+            }
+
+            let size = size_to_u64(opened.facts.size, what)?;
+            // How many bytes this span can deliver.
+            let target: usize = if ranged {
+                match first_size {
+                    Some(known) if known != size => {
+                        return Err(version_changed(
+                            what,
+                            "size differs on a pinned retry or repair",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => first_size = Some(size),
+                }
+                // The window may run past the end of the object (the service clamps it); one
+                // that starts at or past the end holds nothing and is a length mismatch.
+                let available = match size.checked_sub(base) {
+                    Some(available) if available > 0 => available,
+                    _ => return Err(length_mismatch(what, expected, Some(size))),
+                };
+                usize::try_from(available.min(expected))
+                    .map_err(|_| anyhow!("span length does not fit in memory"))?
+            } else {
+                if size != expected {
+                    // The body is dropped unread.
+                    return Err(if was_pinned {
+                        version_changed(what, "size differs on a pinned retry or repair")
+                    } else {
+                        length_mismatch(what, expected, Some(size))
+                    });
+                }
+                len
+            };
+
+            let before = cursor;
+            let mut stream = opened.stream;
+            loop {
+                let next = match cfg.chunk_timeout {
+                    Some(limit) => match tokio::time::timeout(limit, stream.next_chunk()).await {
+                        Ok(next) => next,
+                        Err(_) => Some(Err(GaxError::timeout(format!(
+                            "no data for {limit:?} while reading"
+                        )))),
+                    },
+                    None => stream.next_chunk().await,
+                };
+                match next {
+                    None => break,
+                    Some(Ok(chunk)) => {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        let Some(end) =
+                            cursor.checked_add(chunk.len()).filter(|end| *end <= target)
+                        else {
+                            return Err(length_mismatch(what, expected, None));
+                        };
+                        let Some(window) = dst.get_mut(cursor..end) else {
+                            return Err(length_mismatch(what, expected, None));
+                        };
+                        window.copy_from_slice(&chunk);
+                        span.record_copy(to_u64(cursor)?, to_u64(chunk.len())?)?;
+                        cursor = end;
+                    }
+                    Some(Err(e)) => {
+                        let err = gax_failure(
+                            e,
+                            format!("GCS caller-buffer GET stream failed for {what}"),
+                            pinned.is_some(),
+                        );
+                        match budget.next_delay(cfg, &err, cursor, len, pinned.is_some()) {
+                            Some(delay) => {
+                                debug!(
+                                    "GCS caller-buffer GET of {what}: repairing at offset {cursor}: {}",
+                                    loggable(&err)
+                                );
+                                back_off(delay).await;
+                                continue 'attempt;
+                            }
+                            None => return Err(err),
+                        }
+                    }
+                }
+            }
+
+            if cursor == target {
+                return Ok(cursor);
+            }
+            // A clean end that is short.  A pinned read that made progress repairs the suffix;
+            // anything else is a length mismatch.
+            if pinned.is_some() && cursor > before {
+                if let Some(delay) = budget.take_repair(cfg, cursor) {
+                    debug!(
+                        "GCS caller-buffer GET of {what}: short end at {cursor} of {len}, repairing the suffix"
+                    );
+                    back_off(delay).await;
+                    continue 'attempt;
+                }
+            }
+            return Err(length_mismatch(what, expected, Some(to_u64(cursor)?)));
+        }
+    }
+
+    // -- typed HEAD (pure decision logic) ----------------------------------
+
+    /// `(GcsObjectMetadata, generation)` from a metadata `Object`.  The size is validated
+    /// before conversion (a negative size is an error, never 0); an empty ETag is absent.
+    /// The public `GcsObjectMetadata` has no generation, so it travels beside it.
+    pub(super) fn metadata_with_generation(
+        obj: &Object,
+        key: &str,
+    ) -> Result<(GcsObjectMetadata, i64)> {
+        let size = size_to_u64(obj.size, key)?;
+        Ok((
+            GcsObjectMetadata {
+                size,
+                etag: (!obj.etag.is_empty()).then(|| obj.etag.clone()),
+                updated: object_time_rfc3339(obj.update_time),
+                key: key.to_string(),
+            },
+            obj.generation,
+        ))
+    }
+
+    /// The outcome of a metadata request: present with its generation, absent only for a typed
+    /// NotFound, or the classified failure.  OUT_OF_RANGE, 403, throttling and every other
+    /// failure stay failures.
+    pub(super) fn head_outcome(
+        result: Result<Object, GaxError>,
+        what: &str,
+        key: &str,
+    ) -> Result<Option<(GcsObjectMetadata, i64)>> {
+        match result {
+            Ok(obj) => metadata_with_generation(&obj, key).map(Some),
+            Err(e) => {
+                let err = gax_failure(e, format!("GCS HEAD failed for {what}"), false);
+                match object_error(&err).map(|o| o.kind) {
+                    Some(ObjectErrorKind::NotFound) => Ok(None),
+                    _ => Err(err),
+                }
+            }
+        }
+    }
+
+    /// The provider-neutral HEAD answer: size, the ETag if any, and the generation as
+    /// `version_id` when the service gave one.
+    pub(super) fn head_metadata(meta: GcsObjectMetadata, generation: i64) -> HeadMetadata {
+        HeadMetadata {
+            size: meta.size,
+            etag: meta.etag,
+            version_id: (generation > 0).then(|| generation.to_string()),
+        }
+    }
+
+    // -- the real openers --------------------------------------------------
+
+    /// Standard buckets: the HTTP `read_object` route.
+    ///
+    /// The fields are `pub(super)` so the tests can drive this real opener against a local server.
+    pub(super) struct HttpOpener<'a> {
+        pub(super) storage: &'a Storage,
+        pub(super) bucket_name: &'a str,
+        pub(super) object: &'a str,
+    }
+
+    struct HttpStream(ReadObjectResponse);
+
+    #[async_trait]
+    impl ChunkStream for HttpStream {
+        async fn next_chunk(&mut self) -> Option<Result<Bytes, GaxError>> {
+            self.0.next().await
+        }
+    }
+
+    #[async_trait]
+    impl ReadOpener for HttpOpener<'_> {
+        /// Opens `GET ...?alt=media`: `set_generation` becomes the `generation` query parameter
+        /// and the range becomes the `Range` header (`bytes=a-b`, or `bytes=a-` to the end).
+        ///
+        /// The object's size is `x-goog-stored-content-length`.  On the live JSON media API that
+        /// header carries the FULL stored size on ranged (206) responses as well as on unranged
+        /// ones (measured 2026-10: `Range: bytes=4-15` on a 16-byte object gives
+        /// `content-range: bytes 4-15/16`, `x-goog-stored-content-length: 16`, `content-length:
+        /// 12`).  The size check of a repair against `dst.len()` therefore compares the whole
+        /// object, as it does for the first request.  The generation is `x-goog-generation`.
+        async fn open(&self, request: &OpenRequest) -> Result<Opened, GaxError> {
+            let object = http_media_object_name(self.object);
+            // The SDK's own read-resume layer is switched off on this path.  Its default
+            // (`Recommended`, fork `storage/common_options.rs:34`) has no attempt limit
+            // (`read_resume_policy.rs:134-140` ignores the resume count), so it could reconnect
+            // once per byte of a slowly advancing body, outside every bound of the receive loop.
+            // With `NeverResume` a broken body surfaces here as its typed error and the bounded
+            // repair loop in `receive_into` owns ordinary body repairs, each pinned to the
+            // generation. Every open still keeps the client's request retry policy; Rapid
+            // server redirects are a separate documented exception to the body-resume policy.
+            let mut builder = self
+                .storage
+                .read_object(self.bucket_name, object.as_ref())
+                .with_read_resume_policy(NeverResume);
+            if let Some(generation) = request.generation {
+                builder = builder.set_generation(generation);
+            }
+            match (request.start, request.limit) {
+                (0, None) => {}
+                (start, Some(limit)) => {
+                    builder = builder.set_read_range(ReadRange::segment(start, limit))
+                }
+                (start, None) => builder = builder.set_read_range(ReadRange::offset(start)),
+            }
+            let response = builder.send().await?;
+            let highlights = response.object();
+            Ok(Opened {
+                facts: ObjectFacts {
+                    size: highlights.size,
+                    generation: highlights.generation,
+                },
+                stream: Box::new(HttpStream(response)),
+            })
+        }
+
+        /// Not available on the HTTP route.  The descriptor is a Rapid concept: `receive_into`
+        /// asks for one only when `ReceiveConfig::rapid` is set, which this route never sets.  The
+        /// answer is a typed, non-retryable error, not a data GET whose body would be thrown away.
+        async fn describe(&self, generation: Option<i64>) -> Result<Object, GaxError> {
+            Err(GaxError::binding(format!(
+                "the HTTP route has no object descriptor (Rapid buckets only); generation {generation:?} was requested"
+            )))
+        }
+    }
+
+    /// Rapid buckets: the existing `open_object` (BidiReadObject) route.
+    ///
+    /// No local test drives this opener: the pinned fork has no local bidi-streaming server to
+    /// point it at, so its `set_generation`, range mapping and descriptor facts are covered by the
+    /// live Rapid gate of plan section 8 (the "Existing GCS Rapid route" row), not by a unit
+    /// test.  The receive loop above it is tested with the fake opener in `rapid` mode.
+    struct RapidOpener<'a> {
+        storage: &'a Storage,
+        bucket_name: &'a str,
+        object: &'a str,
+        attempt_timeout: Duration,
+    }
+
+    /// A Rapid read.  The descriptor stays open for as long as the reader is used.
+    struct RapidStream {
+        descriptor: ObjectDescriptor,
+        reader: ReadObjectResponse,
+    }
+
+    #[async_trait]
+    impl ChunkStream for RapidStream {
+        async fn next_chunk(&mut self) -> Option<Result<Bytes, GaxError>> {
+            let next = self.reader.next().await;
+            if matches!(next, Some(Err(_))) {
+                trace!(
+                    "GCS Rapid read failed; upload id {:?}",
+                    self.descriptor.headers().get("x-guploader-uploadid")
+                );
+            }
+            next
+        }
+    }
+
+    #[async_trait]
+    impl ReadOpener for RapidOpener<'_> {
+        async fn open(&self, request: &OpenRequest) -> Result<Opened, GaxError> {
+            let mut builder = self
+                .storage
+                .open_object(self.bucket_name, self.object)
+                .with_attempt_timeout(self.attempt_timeout)
+                // No SDK-level reconnection of a broken read (fork `bidi/connector.rs`
+                // `reconnect`, which consults this policy, `Recommended` by default and without
+                // an attempt limit): the bounded repair loop in `receive_into` owns it.
+                .with_read_resume_policy(NeverResume);
+            if let Some(generation) = request.generation {
+                builder = builder.set_generation(generation);
+            }
+            let range = match (request.start, request.limit) {
+                (0, None) => ReadRange::all(),
+                (start, Some(limit)) => ReadRange::segment(start, limit),
+                (start, None) => ReadRange::offset(start),
+            };
+            let (descriptor, reader) = builder.send_and_read(range).await?;
+            let object = descriptor.object();
+            Ok(Opened {
+                facts: ObjectFacts {
+                    size: object.size,
+                    generation: object.generation,
+                },
+                stream: Box::new(RapidStream { descriptor, reader }),
+            })
+        }
+
+        async fn describe(&self, generation: Option<i64>) -> Result<Object, GaxError> {
+            let mut builder = self
+                .storage
+                .open_object(self.bucket_name, self.object)
+                .with_attempt_timeout(self.attempt_timeout);
+            if let Some(generation) = generation {
+                builder = builder.set_generation(generation);
+            }
+            Ok(builder.send().await?.object())
+        }
+    }
+
+    impl GcsClient {
+        /// Read the whole object into `dst` (caller-buffer GET, plan §4.3 and §4.5).
+        ///
+        /// `dst.len()` is the expected size: `Ok(())` means exactly `dst.len()` bytes were
+        /// written and the object's size equals it.  Rapid buckets use the existing Rapid
+        /// route (`open_object`); other buckets use HTTP.  The first response's generation is
+        /// pinned on every retry and repair; see [`receive_into`] for the full contract.
+        /// `progress` counts the distinct positions of `dst` filled, also when the read fails.
+        pub async fn get_object_into(
+            &self,
+            bucket: &str,
+            object: &str,
+            dst: &mut [u8],
+            progress: &ReceiveProgress,
+        ) -> Result<()> {
+            let what = format!("gs://{bucket}/{object}");
+            let bucket_name = format_bucket_name(bucket);
+            let rapid = self.is_rapid_bucket(bucket).await;
+            let cfg = read_config(rapid, dst.len())?;
+            if rapid {
+                debug!("GCS GET INTO (gRPC): {what}, {} bytes", dst.len());
+                let opener = RapidOpener {
+                    storage: &self.storage,
+                    bucket_name: &bucket_name,
+                    object,
+                    attempt_timeout: gcs_bidi_attempt_timeout(),
+                };
+                receive_into(&opener, &what, dst, progress, &cfg).await
+            } else {
+                debug!("GCS GET INTO (HTTP): {what}, {} bytes", dst.len());
+                let opener = HttpOpener {
+                    storage: &self.storage,
+                    bucket_name: &bucket_name,
+                    object,
+                };
+                receive_into(&opener, &what, dst, progress, &cfg).await
+            }
+        }
+
+        /// Read the bytes `offset..offset + dst.len()` of an object straight into `dst` and
+        /// return how many were written (stage G, R3: the range engine's per-range receive).
+        ///
+        /// The count is `dst.len()` unless the range runs past the end of the object (the
+        /// service clamps it): the caller decides whether a short answer is an error. A range
+        /// that starts at or past the end is a `LengthMismatch`. Rapid buckets use the Rapid route,
+        /// others HTTP; retries and repairs are pinned to the first response's generation (see
+        /// [`receive_span`]). `progress` counts the positions written.
+        ///
+        /// This is one range standing alone (its own version). The ranges of ONE logical GET go
+        /// through [`Self::get_object_range_into_versioned`] so that they share a version.
+        pub async fn get_object_range_into(
+            &self,
+            bucket: &str,
+            object: &str,
+            offset: u64,
+            dst: &mut [u8],
+            progress: &ReceiveProgress,
+        ) -> Result<usize> {
+            self.get_object_range_into_versioned(
+                bucket,
+                object,
+                offset,
+                dst,
+                progress,
+                &ObjectVersion::new(),
+            )
+            .await
+        }
+
+        /// [`Self::get_object_range_into`] for one range of a read of SEVERAL ranges of the same
+        /// object (the range engine, stage G review G-F2): all of them share `version`, the
+        /// generation of the first response to arrive. The first range to start is sent
+        /// unpinned; every other range names that generation in every request it makes, so an
+        /// object replaced between two ranges is a `VersionChanged` error, never a body of two
+        /// versions. See [`receive_span`] for the rest.
+        pub(crate) async fn get_object_range_into_versioned(
+            &self,
+            bucket: &str,
+            object: &str,
+            offset: u64,
+            dst: &mut [u8],
+            progress: &ReceiveProgress,
+            version: &ObjectVersion<i64>,
+        ) -> Result<usize> {
+            let what = format!("gs://{bucket}/{object}");
+            let bucket_name = format_bucket_name(bucket);
+            let rapid = self.is_rapid_bucket(bucket).await;
+            let cfg = read_config(rapid, dst.len())?;
+            let span = SpanOf::Window {
+                base: offset,
+                version,
+            };
+            if rapid {
+                debug!(
+                    "GCS GET RANGE INTO (gRPC): {what}, offset={offset}, {} bytes",
+                    dst.len()
+                );
+                let opener = RapidOpener {
+                    storage: &self.storage,
+                    bucket_name: &bucket_name,
+                    object,
+                    attempt_timeout: gcs_bidi_attempt_timeout(),
+                };
+                receive_span(&opener, &what, span, dst, progress, &cfg).await
+            } else {
+                debug!(
+                    "GCS GET RANGE INTO (HTTP): {what}, offset={offset}, {} bytes",
+                    dst.len()
+                );
+                let opener = HttpOpener {
+                    storage: &self.storage,
+                    bucket_name: &bucket_name,
+                    object,
+                };
+                receive_span(&opener, &what, span, dst, progress, &cfg).await
+            }
+        }
+
+        /// Typed HEAD (plan §4.3, §4.5 A8): size, ETag if any, and the generation as
+        /// `version_id`.  `Ok(None)` only for a typed NotFound.  GCS answers a missing bucket and a
+        /// missing object with the same NotFound, so `None` can mean either: the two are not told
+        /// apart, and no extra probe is made to manufacture the distinction.  403 and every other
+        /// failure are errors.
+        pub async fn head_typed(&self, bucket: &str, object: &str) -> Result<Option<HeadMetadata>> {
+            Ok(self
+                .stat_object_with_generation(bucket, object)
+                .await?
+                .map(|(meta, generation)| head_metadata(meta, generation)))
+        }
+
+        /// Object metadata with its generation, `None` for a typed NotFound.
+        ///
+        /// On a Rapid bucket the size comes from the `open_object(..).send()` descriptor, which
+        /// requests no data range: an empty object reports 0 instead of failing a one-byte
+        /// read with OUT_OF_RANGE, and the control plane's possibly stale zero is not used.
+        pub(crate) async fn stat_object_with_generation(
+            &self,
+            bucket: &str,
+            object: &str,
+        ) -> Result<Option<(GcsObjectMetadata, i64)>> {
+            let what = format!("gs://{bucket}/{object}");
+            let bucket_name = format_bucket_name(bucket);
+            let described: Result<Object, GaxError> = if self.is_rapid_bucket(bucket).await {
+                let opener = RapidOpener {
+                    storage: &self.storage,
+                    bucket_name: &bucket_name,
+                    object,
+                    attempt_timeout: gcs_bidi_attempt_timeout(),
+                };
+                opener.describe(None).await
+            } else {
+                self.control
+                    .get_object()
+                    .set_bucket(bucket_name.clone())
+                    .set_object(object.to_string())
+                    .send()
+                    .await
+            };
+            head_outcome(described, &what, object)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1640,7 +2895,7 @@ mod tests {
     /// Serialize all tests that mutate environment variables.  Without this
     /// guard two tests running in parallel could observe each other's
     /// `set_var` / `remove_var` calls and produce non-deterministic results.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    pub(super) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     // ------------------------------------------------------------------
     // parse_gcs_uri
@@ -2711,3 +3966,236 @@ mod zero_copy_tests {
         );
     }
 }
+
+/// Typed classification and the typed-only retry rule of the new GCS receive loop (plan §4.5
+/// A2). Every error here is built from the gax error's typed constructors; no test relies on
+/// message text.
+#[cfg(test)]
+mod object_error_tests {
+    use super::*;
+    use crate::object_error::object_error;
+    use anyhow::Context;
+    use google_cloud_gax::error::rpc::{Code, Status};
+    use google_cloud_gax::error::Error as Gax;
+
+    fn http(code: u16) -> Gax {
+        Gax::http(code, http::HeaderMap::new(), Bytes::from_static(b"body"))
+    }
+
+    fn grpc(code: Code) -> Gax {
+        Gax::service(Status::default().set_code(code).set_message("injected"))
+    }
+
+    /// Classify as the loop's attachment site does: keep the typed gax error as the source and
+    /// wrap it in string contexts.
+    fn classified(e: Gax, pinned: bool) -> anyhow::Error {
+        let wrapped = Err::<(), _>(anyhow::Error::new(e))
+            .context("GCS ranged read")
+            .unwrap_err();
+        attach_gcs_classification(wrapped, pinned)
+    }
+
+    fn kind_of(err: &anyhow::Error) -> ObjectErrorKind {
+        object_error(err).expect("classified").kind
+    }
+
+    #[test]
+    fn classification_follows_the_typed_status() {
+        use ObjectErrorKind::*;
+        assert_eq!(classify_gcs_failure(&http(404)), NotFound);
+        assert_eq!(classify_gcs_failure(&grpc(Code::NotFound)), NotFound);
+        assert_eq!(classify_gcs_failure(&http(412)), VersionChanged);
+        assert_eq!(
+            classify_gcs_failure(&grpc(Code::FailedPrecondition)),
+            VersionChanged
+        );
+        assert_eq!(classify_gcs_failure(&http(403)), Forbidden);
+        assert_eq!(
+            classify_gcs_failure(&grpc(Code::PermissionDenied)),
+            Forbidden
+        );
+        assert_eq!(classify_gcs_failure(&http(503)), Throttled);
+        assert_eq!(classify_gcs_failure(&http(429)), Throttled);
+        assert_eq!(classify_gcs_failure(&grpc(Code::Unavailable)), Throttled);
+        assert_eq!(
+            classify_gcs_failure(&grpc(Code::ResourceExhausted)),
+            Throttled
+        );
+        assert_eq!(classify_gcs_failure(&http(500)), Server);
+        assert_eq!(classify_gcs_failure(&http(502)), Server);
+        assert_eq!(classify_gcs_failure(&Gax::io("reset")), Transport);
+        assert_eq!(classify_gcs_failure(&Gax::timeout("deadline")), Transport);
+        assert_eq!(classify_gcs_failure(&Gax::connect("refused")), Transport);
+        assert_eq!(classify_gcs_failure(&http(400)), Other);
+        assert_eq!(classify_gcs_failure(&grpc(Code::InvalidArgument)), Other);
+        assert_eq!(classify_gcs_failure(&Gax::deser("bad body")), Other);
+    }
+
+    /// The mapping choices of the typed classifier that are not obvious from the status alone.
+    #[test]
+    fn deadline_internal_aborted_and_408_are_transient_and_the_rest_are_other() {
+        use ObjectErrorKind::*;
+        // 408 is the S3 parity choice: Server.
+        assert_eq!(classify_gcs_failure(&http(408)), Server);
+        // The deadline expired before an answer: like a timeout.
+        assert_eq!(
+            classify_gcs_failure(&grpc(Code::DeadlineExceeded)),
+            Transport
+        );
+        // The service asked for the request to be repeated.
+        assert_eq!(classify_gcs_failure(&grpc(Code::Internal)), Server);
+        assert_eq!(classify_gcs_failure(&grpc(Code::Aborted)), Server);
+        // No evidence of a service failure, or a credential problem: Other.
+        assert_eq!(classify_gcs_failure(&grpc(Code::Unknown)), Other);
+        assert_eq!(classify_gcs_failure(&grpc(Code::Cancelled)), Other);
+        assert_eq!(classify_gcs_failure(&grpc(Code::Unauthenticated)), Other);
+        assert_eq!(classify_gcs_failure(&http(401)), Other);
+    }
+
+    /// The typed-only predicate retries typed transient and transport errors, including 503.
+    #[test]
+    fn typed_transient_and_transport_errors_are_retried() {
+        for e in [
+            http(503),
+            http(429),
+            http(500),
+            http(408),
+            grpc(Code::Unavailable),
+            grpc(Code::ResourceExhausted),
+            grpc(Code::DeadlineExceeded),
+            grpc(Code::Internal),
+            grpc(Code::Aborted),
+            Gax::io("connection reset"),
+            Gax::timeout("deadline"),
+            Gax::connect("refused"),
+        ] {
+            let err = classified(e, false);
+            assert!(
+                gcs_typed_retry_verdict(&err),
+                "{:?} must be retried",
+                kind_of(&err)
+            );
+        }
+    }
+
+    /// Nothing else retries: not an unclassified error whose message merely contains "503",
+    /// not an `Other`, not HTTP 403, not gRPC PermissionDenied, not absence or a version change.
+    #[test]
+    fn unclassified_other_forbidden_and_definite_errors_are_not_retried() {
+        let text_503 = anyhow::anyhow!("upstream answered 503 Service Unavailable, try later");
+        assert!(object_error(&text_503).is_none());
+        assert!(!gcs_typed_retry_verdict(&text_503));
+        // Attaching to an error with no gax source leaves it unclassified.
+        let still = attach_gcs_classification(text_503, false);
+        assert!(object_error(&still).is_none());
+        assert!(!gcs_typed_retry_verdict(&still));
+
+        // An `Other` whose message contains a retry-looking number.
+        let other = Gax::http(
+            400,
+            http::HeaderMap::new(),
+            Bytes::from_static(b"503 timeout"),
+        );
+        let other = classified(other, false);
+        assert_eq!(kind_of(&other), ObjectErrorKind::Other);
+        assert!(!gcs_typed_retry_verdict(&other));
+
+        for e in [
+            http(403),
+            grpc(Code::PermissionDenied),
+            http(404),
+            grpc(Code::NotFound),
+            http(412),
+            grpc(Code::FailedPrecondition),
+            http(401),
+            grpc(Code::Unauthenticated),
+            grpc(Code::Unknown),
+            grpc(Code::Cancelled),
+        ] {
+            let err = classified(e, false);
+            assert!(!gcs_typed_retry_verdict(&err), "{:?}", kind_of(&err));
+        }
+        // The old message-text helper would have retried this text; the typed rule does not.
+        assert!(is_retryable_gcs_read_error("UNAVAILABLE: upstream reset"));
+        let text_only = anyhow::anyhow!("UNAVAILABLE: upstream reset");
+        assert!(!gcs_typed_retry_verdict(&text_only));
+    }
+
+    /// A pinned read never reports absence: a 404 or NOT_FOUND on a retry or repair is a
+    /// version change, which is not retried and is not "not found".
+    #[test]
+    fn pinned_404_is_a_version_change() {
+        for e in [http(404), grpc(Code::NotFound)] {
+            let err = classified(e, true);
+            assert_eq!(kind_of(&err), ObjectErrorKind::VersionChanged);
+            assert!(!gcs_typed_retry_verdict(&err));
+            assert!(!crate::delete_contract::is_not_found(&err));
+        }
+        // Unpinned (first request): absence.
+        let first = classified(http(404), false);
+        assert_eq!(kind_of(&first), ObjectErrorKind::NotFound);
+        assert!(crate::delete_contract::is_not_found(&first));
+    }
+
+    /// An error that already carries an outer `NotFound` is upgraded to `VersionChanged` on a
+    /// pinned read, and left alone otherwise.
+    #[test]
+    fn pinned_attach_upgrades_an_existing_not_found() {
+        let first = classified(http(404), false);
+        assert_eq!(kind_of(&first), ObjectErrorKind::NotFound);
+        let upgraded = attach_gcs_classification(first, true);
+        assert_eq!(kind_of(&upgraded), ObjectErrorKind::VersionChanged);
+        assert!(!gcs_typed_retry_verdict(&upgraded));
+        assert!(!crate::delete_contract::is_not_found(&upgraded));
+        // Not pinned: unchanged.
+        let first = classified(http(404), false);
+        let same = attach_gcs_classification(first, false);
+        assert_eq!(kind_of(&same), ObjectErrorKind::NotFound);
+        // Pinned, but another kind: unchanged.
+        let forbidden = classified(http(403), false);
+        let same = attach_gcs_classification(forbidden, true);
+        assert_eq!(kind_of(&same), ObjectErrorKind::Forbidden);
+    }
+
+    /// The attached message names status and code only.
+    #[test]
+    fn attached_message_has_status_and_code_but_not_the_payload() {
+        let err = classified(
+            Gax::http(
+                503,
+                http::HeaderMap::new(),
+                Bytes::from_static(b"SECRET-PAYLOAD"),
+            ),
+            false,
+        );
+        let o = object_error(&err).expect("typed");
+        let text = o.to_string();
+        assert!(text.contains("status 503"), "{text}");
+        assert!(!text.contains("SECRET-PAYLOAD"), "{text}");
+    }
+}
+
+// Tests for the typed HEAD decision logic and the #263 object-time conversion.
+#[cfg(test)]
+#[path = "gcs_head_typed_tests.rs"]
+mod head_typed_tests;
+
+// Tests of the caller-buffer receive loop, driven by a deterministic fake source.
+#[cfg(test)]
+#[path = "gcs_get_into_tests.rs"]
+mod get_into_tests;
+
+// Tests of the ranged receive (the range engine's per-range receive), driven by a small fake.
+#[cfg(test)]
+#[path = "gcs_range_into_tests.rs"]
+mod range_into_tests;
+
+// Tests of the real HTTP opener against a local HTTP server (generation, range, size facts).
+#[cfg(test)]
+#[path = "gcs_http_opener_tests.rs"]
+mod http_opener_tests;
+
+// Tests of the custom-endpoint / emulator resolution (GCS_ENDPOINT_URL, STORAGE_EMULATOR_HOST).
+#[cfg(test)]
+#[path = "gcs_endpoint_tests.rs"]
+mod endpoint_tests;

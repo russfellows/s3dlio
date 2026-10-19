@@ -19,7 +19,6 @@ import sys
 import textwrap
 
 import pytest
-
 from test_oplog_lifecycle import run_scenario
 
 pytestmark = pytest.mark.skipif(
@@ -88,8 +87,6 @@ CHILD = """
 
 def need_thread_gap():
     """Skip when the host cannot tell RT_WORKERS from the default worker count."""
-    if any(v in os.environ for v in _MPI_VARS):
-        pytest.skip("an MPI world-size variable changes the per-process thread budget")
     if CPUS < RT_WORKERS + BLOCKING_ALLOWANCE + 3:
         pytest.skip(
             f"{CPUS} CPUs leave no gap between {RT_WORKERS} workers "
@@ -102,7 +99,39 @@ def is_configured_count(runtime_threads):
     return RT_WORKERS <= runtime_threads <= RT_WORKERS + BLOCKING_ALLOWANCE
 
 
+# Variables whose value in the CALLER's environment would change what a child measures.
+# run_scenario() copies os.environ into the child, so removing them from os.environ (per
+# test, restored afterwards) is what makes the child's environment explicit: each scenario
+# then sets exactly the ones it wants (S3DLIO_LOAD_DOTENV above all) and nothing leaks in.
+_CALLER_ENV_VARS = (
+    "S3DLIO_LOAD_DOTENV",
+    "S3DLIO_RT_THREADS",
+    "S3DLIO_RT_THREADS_UNSAFE",
+    *_MPI_VARS,  # change the per-process thread budget the worker-count checks rely on
+    "S3DLIO_243_MARKER",
+    "S3DLIO_243_PRESET",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_S3",
+    "AWS_PROFILE",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_caller_environment(monkeypatch):
+    """No test depends on what the person running the tests exported (issue #279)."""
+    for var in _CALLER_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
 def run(tmp_path, switch=None):
+    """Run CHILD in a fresh interpreter in `tmp_path` (which holds a `.env`).
+
+    `switch` is the child's S3DLIO_LOAD_DOTENV; None means "not set at all"."""
     (tmp_path / ".env").write_text(DOTENV)
     env = {
         "S3DLIO_243_PRESET": "real-env",
@@ -110,16 +139,6 @@ def run(tmp_path, switch=None):
     }
     if switch is not None:
         env["S3DLIO_LOAD_DOTENV"] = switch
-    for var in (
-        "S3DLIO_RT_THREADS",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_ENDPOINT_URL",
-        "AWS_ENDPOINT_URL_S3",
-        "S3DLIO_LOAD_DOTENV",
-    ):
-        if var in os.environ and var not in env:
-            pytest.skip(f"{var} is set in the caller's environment")
     proc = run_scenario(textwrap.dedent(CHILD), cwd=tmp_path, env=env)
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, (
@@ -145,9 +164,7 @@ def test_a_setting_latched_at_the_first_call_sees_the_file(tmp_path):
 def test_without_the_switch_the_file_is_ignored_and_the_error_says_so(tmp_path):
     out = run(tmp_path)
     assert out["marker"] is None, out
-    if CPUS >= RT_WORKERS + BLOCKING_ALLOWANCE + 3 and not any(
-        v in os.environ for v in _MPI_VARS
-    ):
+    if CPUS >= RT_WORKERS + BLOCKING_ALLOWANCE + 3:
         # Without the file the runtime keeps its default size, not RT_WORKERS.
         assert not is_configured_count(out["rt_workers"]), (out, RT_WORKERS, CPUS)
     assert "Missing AWS_ACCESS_KEY_ID" in out["error"], out

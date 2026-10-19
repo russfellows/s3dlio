@@ -12,13 +12,14 @@
 //! for every C-contiguous buffer, whatever its item type (`uint8`, `float32`, `bool`,
 //! `array('b')`, ctypes `'<B'`, a multi-dimensional C-contiguous array, ...).
 //!
-//! | `data`                                              | `put_bytes`              | `put_bytes_async`, default | `put_bytes_async(borrow=True)` |
+//! | `data`                                              | `put_bytes`, `put_many`  | `put_bytes_async` / `put_many_async` / `MultiEndpointStore` puts, default (`borrow=True`) | same with `borrow=False` (the opt-in snapshot) |
 //! |-----------------------------------------------------|--------------------------|----------------------------|--------------------------------|
 //! | `s3dlio.BytesView`                                  | 0 copies                 | 0 copies                   | 0 copies                       |
 //! | exact `bytes`                                       | 0 copies                 | 0 copies                   | 0 copies                       |
-//! | any other C-contiguous buffer (bytearray, memoryview, numpy, `array.array`, ctypes, mmap, ...) | 0 copies | 1 snapshot copy (GIL released above 256 KiB) | 0 copies |
+//! | an immutable source behind a buffer export (`memoryview(bytes)`, a `bytes` subclass) | 0 copies | 0 copies | 0 copies (kept alive by a reference, read in place) |
+//! | any other C-contiguous buffer (bytearray, memoryview, numpy, `array.array`, ctypes, mmap, ...) | 0 copies | 0 copies | 1 snapshot copy (GIL released above 256 KiB for `put_bytes_async`, held for the batch/endpoint puts) |
 //! | non-contiguous (strided, reversed, transposed) view | 1 gather copy, GIL held  | same                       | same                           |
-//! | not a buffer, only `__bytes__()` / `bytes(obj)`     | 1 copy, made by Python   | same                       | same                           |
+//! | not a buffer, only `__bytes__()`                    | 1 copy, made by Python   | same                       | same                           |
 //!
 //! "0 copies" means the native code reads the caller's own memory. For a buffer export
 //! the `Py_buffer` is held as the owner of the `Bytes` ([`Bytes::from_owner`]) and read with
@@ -29,8 +30,10 @@
 //!
 //! # Contract with the caller
 //!
-//! While the export is held (for `put_bytes`: the whole call; for `put_bytes_async`: until
-//! the awaitable completes with `borrow=True`, or only during the snapshot copy otherwise):
+//! While the export is held (for `put_bytes` and `put_many`: the whole call; for
+//! `put_bytes_async`, `put_many_async` and the `MultiEndpointStore` puts: until the awaitable
+//! completes, which is the DEFAULT (`borrow=True`); only during the snapshot copy with
+//! `borrow=False`):
 //!
 //! * the exporter cannot be resized or freed: `bytearray.extend()/clear()` from another
 //!   thread raises `BufferError`;
@@ -135,9 +138,10 @@
 //! extension, a device) is a DATA RACE with the copy: the snapshot is then undefined and the
 //! behaviour is undefined in the Rust sense; multi-threaded callers that mutate shared buffers
 //! must serialise the call with their writers. An allocation failure is a `MemoryError`.
-//! The streaming writers (`write_chunk`, `write_owned_bytes`, `MultipartUploadWriter.write`)
-//! use the same conversion but are STRICT: only buffer-protocol objects and objects with
-//! `__bytes__()` are accepted (`put_bytes` keeps its `bytes(obj)` fallback).
+//! Every writer (`put_bytes`, `put_bytes_async`, `write_chunk`, `write_owned_bytes`,
+//! `MultipartUploadWriter.write`) uses the same STRICT conversion (issue #261): only
+//! buffer-protocol objects and objects with `__bytes__()` are accepted. An int or a bool (which
+//! `bytes(5)` would turn into five zero bytes) and an arbitrary iterable are a `TypeError`.
 //! They BORROW the buffer for the one call (no thread may modify it until the call returns; the
 //! export is released before it returns). `write_owned_bytes(copy=True)` and
 //! `MultipartUploadWriter.write(copy=True)` instead take one snapshot with the GIL held
@@ -163,11 +167,13 @@ use crate::constants::{
 pub(crate) enum PayloadUse {
     /// The call blocks until the store is done (`put_bytes`): read the caller's memory in place.
     Blocking,
-    /// `put_bytes_async` default: the store keeps reading after the call returns, so mutable
-    /// memory is copied once, now (a snapshot).
+    /// `put_bytes_async(borrow=False)`, the opt-in snapshot: the store keeps reading after the
+    /// call returns, so MUTABLE memory is copied once, now. An immutable source (exact `bytes`,
+    /// `BytesView`, `memoryview(bytes)`, a `bytes` subclass) is never copied.
     Snapshot,
-    /// `put_bytes_async(borrow=True)`: the caller promised not to modify or free the buffer
-    /// until the awaitable completes, so it is read in place like `Blocking`.
+    /// `put_bytes_async` (DEFAULT, `borrow=True`), `put_many_async`, the `MultiEndpointStore`
+    /// puts: the caller promised not to modify or free the buffer until the awaitable completes,
+    /// so it is read in place like `Blocking`.
     Borrowed,
     /// The streaming writers' `copy=True`: a mutable exporter is copied once, with the GIL held
     /// for the whole copy (no pure-Python thread can interleave; a writer that RELEASES the GIL -
@@ -204,10 +210,44 @@ pub(crate) struct Latch {
     redrain_slice_used: AtomicBool,
 }
 
-#[derive(Default)]
 struct LatchState {
     dropped: bool,
     released: bool,
+    /// Owners that have not yet been dropped / exports not yet released. A single-export latch
+    /// ([`Latch::new`]) starts at 1 each; a batch latch ([`Latch::new_batch`]) counts up as
+    /// exports are added and reports `dropped`/`released` only once the batch is sealed and every
+    /// counted export has been dropped/released.
+    drops_left: usize,
+    releases_left: usize,
+    /// A batch latch that is still being filled (see [`Latch::batch_seal`]).
+    batch_open: bool,
+    /// Exports counted on a batch latch so far.
+    added: usize,
+}
+
+impl LatchState {
+    fn single() -> Self {
+        Self {
+            dropped: false,
+            released: false,
+            drops_left: 1,
+            releases_left: 1,
+            batch_open: false,
+            added: 0,
+        }
+    }
+
+    /// Set the flags whose counts have reached zero (once the batch, if any, is sealed).
+    fn settle(&mut self) {
+        if !self.batch_open {
+            if self.drops_left == 0 {
+                self.dropped = true;
+            }
+            if self.releases_left == 0 {
+                self.released = true;
+            }
+        }
+    }
 }
 
 /// Times a wait for native readers hit its deadline (a backend kept a clone past the timeout).
@@ -243,7 +283,7 @@ pub(crate) fn deadline_warning_text(n: u64) -> String {
 impl Latch {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(LatchState::default()),
+            state: Mutex::new(LatchState::single()),
             cv: Condvar::new(),
             notify: tokio::sync::Notify::new(),
             notify_released: tokio::sync::Notify::new(),
@@ -251,21 +291,81 @@ impl Latch {
         })
     }
 
+    /// A latch for ONE batch of exports (`put_many`, `put_many_async`, ...): the completion barrier
+    /// of every export added with [`batch_add`](Self::batch_add) at once. It reads as dropped /
+    /// released only after [`batch_seal`](Self::batch_seal) and when EVERY counted export has been
+    /// dropped / released (an empty batch is ready as soon as it is sealed).
+    pub(crate) fn new_batch() -> Arc<Self> {
+        let latch = Self::new();
+        {
+            let mut state = latch.lock();
+            state.drops_left = 0;
+            state.releases_left = 0;
+            state.batch_open = true;
+        }
+        latch
+    }
+
+    /// Count one more export of a batch latch. Call BEFORE the export's owner exists.
+    pub(crate) fn batch_add(&self) {
+        let mut state = self.lock();
+        state.drops_left += 1;
+        state.releases_left += 1;
+        state.added += 1;
+    }
+
+    /// How many exports were counted on this batch latch (0: the batch holds none, so no
+    /// barrier is needed).
+    pub(crate) fn batch_len(&self) -> usize {
+        self.lock().added
+    }
+
+    /// No more exports will be added: the latch may now report completion.
+    pub(crate) fn batch_seal(&self) {
+        let (dropped, released) = {
+            let mut state = self.lock();
+            state.batch_open = false;
+            state.settle();
+            (state.dropped, state.released)
+        };
+        self.cv.notify_all();
+        if dropped {
+            self.notify.notify_one();
+        }
+        if released {
+            self.notify_released.notify_one();
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, LatchState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn mark_dropped(&self) {
-        self.lock().dropped = true;
+        let dropped = {
+            let mut state = self.lock();
+            state.drops_left = state.drops_left.saturating_sub(1);
+            state.settle();
+            state.dropped
+        };
         self.cv.notify_all();
-        self.notify.notify_one();
+        if dropped {
+            self.notify.notify_one();
+        }
     }
 
     /// `PyBuffer_Release` has run: wake every blocking and async waiter.
     pub(crate) fn mark_released(&self) {
-        self.lock().released = true;
+        let released = {
+            let mut state = self.lock();
+            state.releases_left = state.releases_left.saturating_sub(1);
+            state.settle();
+            state.released
+        };
         self.cv.notify_all();
-        self.notify_released.notify_one();
+        if released {
+            self.notify_released.notify_one();
+        }
     }
 
     pub(crate) fn is_dropped(&self) -> bool {
@@ -478,10 +578,13 @@ pub(crate) fn retained_for_test() -> usize {
         .len()
 }
 
-/// Drop every retained clone, in order. Never touches Python (an `ExportOwner` drop only queues),
-/// so it is safe to call with the GIL held - which also keeps every drainer out until all of
-/// them are queued. Returns how many were dropped.
+/// Drop every retained clone, in order, and disarm a pending [`arm_retain_for_test`] (so a test
+/// that armed the hook and failed before any put consumed it cannot make the NEXT test's put
+/// retain a clone forever). Never touches Python (an `ExportOwner` drop only queues), so it is
+/// safe to call with the GIL held - which also keeps every drainer out until all of them are
+/// queued. Returns how many were dropped.
 pub(crate) fn release_retained_for_test() -> usize {
+    TEST_RETAIN_NEXT.store(false, Ordering::SeqCst);
     let retained =
         std::mem::take(&mut *TEST_RETAINED.lock().unwrap_or_else(PoisonError::into_inner));
     let n = retained.len();
@@ -511,29 +614,64 @@ struct RawExport {
     latch: Option<Arc<Latch>>,
 }
 
-// SAFETY: the struct is only read from other threads (its `buf`/`len` are fixed for the life
-// of the export) and released by value under the GIL.
+// SAFETY: `Send`: the `Py_buffer` is a plain description of memory that the export pins for as
+// long as it is held; it is released by value, and only while holding the GIL (a `py` token, or
+// the queue drained by a GIL holder), so which thread owns the struct does not matter.
+// `Sync`: through `&RawExport` the fields (`buf`, `len`, `format`, ...) are only ever READ - they
+// are fixed for the life of the export - and the read-only payload path hands out only shared
+// `&[u8]` views of the memory. The writable path (`WritableExport`) reads the `buf` POINTER VALUE
+// through a shared `&self.inner.export` in `as_mut_slice` - never the bytes behind it - and builds
+// the `&mut [u8]` only inside `&mut WritableExport`, which is exclusive, and only while the caller
+// honours the documented exclusive-use contract (nothing else reads or writes the destination
+// until the call is terminal).
 unsafe impl Send for RawExport {}
 unsafe impl Sync for RawExport {}
 
-/// Whether a `struct`-module format string describes Python objects or pointers (`O`, `P`),
-/// which must never be uploaded as bytes. `:name:` field names are skipped.
+/// Whether a PEP 3118 / `struct`-module format string describes Python objects or pointers, which
+/// must never be uploaded as bytes (the bytes are memory addresses). The pointer-bearing codes are
+/// `O` (object), `P` (`void *`), `&` (pointer to the following type: `ctypes.POINTER(T)` is
+/// `&<T>`), `z` (`char *`), `Z` (`wchar_t *`) and `X` (function pointer, `X{}`), wherever they
+/// appear: after byte-order prefixes and counts, and inside `T{...}`. `:name:` field names are
+/// skipped. `Zf` / `Zd` / `Zg` are complex numbers (NumPy), not pointers. A lowercase `p` is a
+/// Pascal string (a length byte plus characters), not a pointer, and is accepted.
+///
+/// Known limits (the format string alone cannot tell, so these buffers are NOT refused):
+/// * A `:` inside a ctypes structure FIELD NAME hides what follows it. The PEP 3118 name syntax
+///   (`:name:`) has no escape for a colon, so the scan cannot tell where such a name ends and a
+///   pointer field after it can be missed.
+/// * A ctypes `Union` reports the format `B` (plain bytes) whatever it contains, so a pointer
+///   inside a union cannot be detected from the format.
 fn format_has_pointers(fmt: &str) -> bool {
     let mut in_name = false;
-    for c in fmt.chars() {
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             ':' => in_name = !in_name,
-            'O' | 'P' if !in_name => return true,
+            _ if in_name => {}
+            'Z' if matches!(chars.peek(), Some('f' | 'd' | 'g')) => {
+                chars.next(); // the complex-number code, not a wide-string pointer
+            }
+            'O' | 'P' | '&' | 'z' | 'Z' | 'X' => return true,
             _ => {}
         }
     }
     false
 }
 
+/// The PUT refusal of a buffer of Python objects or pointers.
 fn pointer_format_error(fmt: &str) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
         "cannot upload a buffer of Python objects or pointers (buffer format {fmt:?}): \
          its bytes are memory addresses, not data"
+    ))
+}
+
+/// The same refusal for a READ destination (`get_into_async`): nothing is uploaded there, so the
+/// wording is about the destination (issue #277).
+fn pointer_destination_error(fmt: &str) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+        "a buffer of Python objects or pointers (buffer format {fmt:?}) cannot be used as a \
+         read destination: object data would overwrite its memory addresses"
     ))
 }
 
@@ -939,6 +1077,229 @@ impl Drop for ExportOwner {
     }
 }
 
+/// Owner of a WRITABLE buffer export (the destination of `get_into_async`).
+///
+/// It wraps an [`ExportOwner`] rather than duplicating it, so the release and drop behaviour is
+/// the very code the PUT path uses: `Drop` queues the export for a GIL holder to release and then
+/// marks the latch dropped (nothing is queued, and the export is forgotten, on a finalized
+/// interpreter); [`ExportOwnerMut::release`] releases directly with a `py` token, no queue.
+/// `len` is the number of bytes the writer may use (`expected_len`, never more than the
+/// exporter's length).
+struct ExportOwnerMut {
+    inner: ExportOwner,
+    len: usize,
+}
+
+impl ExportOwnerMut {
+    /// Take ownership of `export` (attaching `latch` to it) and validate it with
+    /// [`check_writable_view`] for `len` bytes, so no `ExportOwnerMut` can exist for a view that
+    /// fails those checks (writable, itemsize 1, plain byte format, no suboffsets, C-contiguous,
+    /// `len <= export.len()`, a non-null `buf` when `len > 0`), which is what
+    /// [`as_mut_slice`](Self::as_mut_slice) relies on.
+    ///
+    /// On a refused check the export is released here, with the `py` token (latch marked released,
+    /// then dropped), and the error is returned: nothing stays held.
+    fn new(py: Python<'_>, export: RawExport, latch: Arc<Latch>, len: usize) -> PyResult<Self> {
+        let inner = ExportOwner::new(export, latch);
+        let checked = match &inner.export {
+            Some(e) => check_writable_view(&e.view, len),
+            // `ExportOwner::new` always holds the export it was given.
+            None => Err(pyo3::exceptions::PyBufferError::new_err(
+                "internal error: the destination export is missing",
+            )),
+        };
+        match checked {
+            Ok(()) => Ok(Self { inner, len }),
+            Err(e) => {
+                inner.release(py);
+                Err(e)
+            }
+        }
+    }
+
+    /// Exactly `len` bytes of the exporter's memory; `&mut []` when `len == 0`, so no slice is
+    /// ever built from a pointer that may be null.
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            return &mut [];
+        }
+        match &self.inner.export {
+            // SAFETY: the export is live (released only by `release`/the queue, both of which
+            // consume or drop `self`), so `buf` points at the exporter's memory, which the export
+            // pins. `new` ran `check_writable_view` (no `ExportOwnerMut` exists otherwise), which
+            // gives a non-null `buf`, `len <= view.len` and a contiguous view, so `len` bytes are
+            // in bounds. `&mut self` makes this the
+            // only reference to those bytes derived from this owner; the documented caller
+            // obligation (nothing else reads, writes, resizes or reuses the destination until the
+            // call is terminal) covers the Python side.
+            Some(e) => unsafe { std::slice::from_raw_parts_mut(e.view.buf.cast::<u8>(), self.len) },
+            None => &mut [],
+        }
+    }
+
+    /// Release now; the `py` token proves the GIL is held. Marks the latch released, then dropped.
+    fn release(self, py: Python<'_>) {
+        self.inner.release(py);
+    }
+}
+
+/// A writable, C-contiguous byte destination held for one `get_into` call. Native code writes
+/// the object into [`as_mut_slice`](Self::as_mut_slice); the export is released either directly
+/// ([`release`](Self::release), with a GIL token, for failures before ownership transfers) or by
+/// dropping it (the path once native code owns it: queued, then released by a GIL holder).
+///
+/// The destination is under an exclusive-use contract (plan §4.2 item 4): from acquisition until
+/// the call is terminal, nothing else reads, writes, resizes or reuses that memory. In
+/// particular, two concurrent receives into the same or overlapping memory are forbidden, since
+/// each would hold a `&mut [u8]` over bytes the other also writes (aliasing mutable references).
+pub(crate) struct WritableExport {
+    owner: ExportOwnerMut,
+}
+
+// Note (no unsafe code here): `WritableExport` moves into a Tokio task and is used on whatever
+// worker runs it. Its only non-`Send` content would be the raw `Py_buffer` pointers inside
+// `RawExport`, which are `Send` (see the safety comment there): the export is merely a pin on the
+// exporter's memory. The bytes behind `as_mut_slice` are written from that worker WITHOUT the
+// GIL, which is sound under the exclusive-use contract (no Python thread reads or writes the
+// destination until the call is terminal), and `as_mut_slice` needs `&mut self`, so two Rust
+// threads cannot obtain the slice at once. Dropping the value on any thread never touches Python
+// (it queues the export). The auto trait impls already hold; this is a compile-time assertion
+// that they keep holding.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<WritableExport>();
+};
+
+impl WritableExport {
+    /// Exactly `expected_len` bytes (never the exporter's full length); empty when 0.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.owner.as_mut_slice()
+    }
+
+    /// Release the export directly (no queue); the `py` token proves the GIL is held. Marks the
+    /// call's latch released and dropped.
+    pub(crate) fn release(self, py: Python<'_>) {
+        self.owner.release(py);
+    }
+}
+
+/// The checks of A4 on a freshly acquired writable `Py_buffer`, as pure functions of the view so
+/// every refusal is one place: not read-only, one-byte items in a plain byte format (none of the
+/// pointer-bearing formats; one optional byte-order prefix), `expected_len` within the exporter's
+/// length (checked conversion), a non-null pointer when there is data, and (defense behind the
+/// `PyBUF_C_CONTIGUOUS` request) no suboffsets and a really C-contiguous layout.
+fn check_writable_view(view: &ffi::Py_buffer, expected_len: usize) -> PyResult<()> {
+    use pyo3::exceptions::{PyBufferError, PyTypeError, PyValueError};
+    if view.readonly != 0 {
+        return Err(PyBufferError::new_err(
+            "the destination buffer is read-only; get_into needs a writable buffer",
+        ));
+    }
+    // The pointer-bearing formats are named before the item size is checked: an array of
+    // pointers (`ctypes.c_void_p * n`) has 8-byte items, and "pointers" is the useful reason.
+    if !view.format.is_null() {
+        // SAFETY: a non-null `format` is a NUL-terminated string owned by the exporter, valid
+        // while the export is held (the caller holds it).
+        let fmt = unsafe { std::ffi::CStr::from_ptr(view.format) }.to_string_lossy();
+        if format_has_pointers(&fmt) {
+            return Err(pointer_destination_error(&fmt));
+        }
+    }
+    if view.itemsize != 1 {
+        return Err(PyTypeError::new_err(format!(
+            "the destination buffer must have 1-byte items, got itemsize {}",
+            view.itemsize
+        )));
+    }
+    if !view.format.is_null() {
+        // SAFETY: as above.
+        let fmt = unsafe { std::ffi::CStr::from_ptr(view.format) }.to_string_lossy();
+        // At most ONE leading byte-order/alignment character (`@ = < > !`), then exactly one byte
+        // code: what a ctypes byte array reports (`<B`), and what the borrowed PUT path accepts.
+        let code = fmt
+            .strip_prefix(['@', '=', '<', '>', '!'])
+            .unwrap_or(fmt.as_ref());
+        if !matches!(code, "B" | "b" | "c") {
+            return Err(PyTypeError::new_err(format!(
+                "the destination buffer must be a plain byte buffer (format 'B', 'b' or 'c', \
+                 optionally with one byte-order prefix), got format {fmt:?}"
+            )));
+        }
+    }
+    let len = usize::try_from(view.len).map_err(|_| {
+        PyValueError::new_err(format!(
+            "the destination buffer reports length {}",
+            view.len
+        ))
+    })?;
+    if expected_len > len {
+        return Err(PyValueError::new_err(format!(
+            "the destination buffer holds {len} bytes but {expected_len} are expected"
+        )));
+    }
+    if len > 0 && view.buf.is_null() {
+        return Err(PyBufferError::new_err(
+            "the destination buffer has no memory address",
+        ));
+    }
+    // Defense in depth behind the `PyBUF_C_CONTIGUOUS` request: an exporter that returned a
+    // view anyway must really be one flat run of `len` bytes, or the slice built from `buf`
+    // would cover memory the view does not describe.
+    if !view.suboffsets.is_null() {
+        return Err(PyBufferError::new_err(
+            "the destination buffer uses suboffsets (indirect addressing); \
+             get_into needs a flat C-contiguous buffer",
+        ));
+    }
+    if view.ndim > 1 || !view.strides.is_null() {
+        // SAFETY: `view` is a valid, fully initialised `Py_buffer` (a shared reference); when
+        // `ndim > 1` or `strides` is set, `shape`/`strides` are the exporter's arrays of `ndim`
+        // entries (the buffer-protocol contract), which `PyBuffer_IsContiguous` only reads. It
+        // does not touch Python state and needs no particular thread state beyond the caller's.
+        let contiguous = unsafe { ffi::PyBuffer_IsContiguous(view, b'C' as std::ffi::c_char) };
+        if contiguous == 0 {
+            return Err(PyBufferError::new_err(
+                "the destination buffer is not C-contiguous; get_into needs a flat buffer",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Hold `dst` as the writable destination of one `get_into` call (A4), on the CALLER'S `latch`
+/// (the one the completion guard waits on).
+///
+/// The export is requested with `PyBUF_WRITABLE | PyBUF_FORMAT | PyBUF_C_CONTIGUOUS`, with no
+/// read-only fallback. Any refusal leaves nothing held: a held export is released first (with
+/// `py`), and the latch is marked released and dropped, because no native writer will ever exist
+/// for it. Then the error is raised.
+///
+/// The `latch` is SINGLE-USE per call: every path here ends with it marked released and dropped
+/// (success: when the returned export is released or dropped). That includes the
+/// `PyObject_GetBuffer` failure path, which marks both at once because nothing is held and no
+/// owner will ever do it. Pass a fresh latch for every call; a latch must not be reused.
+pub(crate) fn acquire_writable(
+    py: Python<'_>,
+    dst: &Bound<'_, PyAny>,
+    expected_len: usize,
+    latch: &Arc<Latch>,
+) -> PyResult<WritableExport> {
+    let flags = ffi::PyBUF_WRITABLE | ffi::PyBUF_FORMAT | ffi::PyBUF_C_CONTIGUOUS;
+    let export = match RawExport::get(dst, flags) {
+        Ok(export) => export,
+        Err(e) => {
+            // Nothing was exported: there is nothing for the latch to wait for.
+            latch.mark_released();
+            latch.mark_dropped();
+            return Err(e);
+        }
+    };
+    // From here the latch is attached to the export, so releasing it marks `released`. `new`
+    // runs the view checks and, on a refusal, releases the export (released, then dropped).
+    let owner = ExportOwnerMut::new(py, export, latch.clone(), expected_len)?;
+    Ok(WritableExport { owner })
+}
+
 /// Exact `bytes` (or the `bytes` Python made for a gather / `__bytes__`) as the owner of a `Bytes`.
 struct PyBytesOwner {
     _keep: Py<PyBytes>,
@@ -980,12 +1341,16 @@ fn snapshot_copy(py: Python<'_>, src: &[u8], may_detach: bool) -> PyResult<Bytes
     } else {
         py.detach(|| try_snapshot(src, src.len()))
     };
-    result.map_err(|_| {
-        PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
-            "cannot allocate {} bytes for the put_bytes_async snapshot",
-            src.len()
-        ))
-    })
+    result.map_err(|_| snapshot_allocation_error(src.len()))
+}
+
+/// The `MemoryError` of a failed snapshot allocation. Every caller that snapshots a payload
+/// (`put_bytes_async`, `put_many`, `MultiEndpointStore`, the streaming writers) shares it, so the
+/// wording names no single API.
+fn snapshot_allocation_error(len: usize) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
+        "cannot allocate {len} bytes for the payload snapshot"
+    ))
 }
 
 /// Copy `src` into a fresh buffer reserved fallibly (`reserve` is `src.len()`; a parameter so
@@ -1025,10 +1390,6 @@ impl Held {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.as_slice().len()
-    }
-
     /// Release the hold; the `py` token proves the GIL is held.
     pub(crate) fn release(self, py: Python<'_>) {
         if let Parts::Export(owner, _) = self.0 {
@@ -1041,14 +1402,14 @@ impl Held {
 /// only buffer-protocol objects and objects with `__bytes__()` are accepted - NOT an int (which
 /// `bytes(5)` would turn into five zero bytes) or an arbitrary iterable.
 pub(crate) fn hold_for_call(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Held> {
-    payload_parts(py, data, PayloadUse::Blocking, true).map(Held)
+    payload_parts(py, data, PayloadUse::Blocking).map(Held)
 }
 
 /// The streaming writers' `copy=True`: `data` as `Bytes` that nothing else can modify. A mutable
 /// exporter is copied once with the GIL held; exact `bytes` and `BytesView` are returned as they
 /// are (immutable, zero copies). Strict like [`hold_for_call`].
 pub(crate) fn snapshot_for_call(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Bytes> {
-    match payload_parts(py, data, PayloadUse::SnapshotUnderGil, true)? {
+    match payload_parts(py, data, PayloadUse::SnapshotUnderGil)? {
         Parts::Plain(bytes) => Ok(bytes),
         // Not produced for SnapshotUnderGil; copy defensively rather than assume.
         Parts::Export(owner, _) => {
@@ -1070,14 +1431,30 @@ pub(crate) fn put_payload_from_py(
     put_payload(py, data, usage).map(|p| p.bytes)
 }
 
+/// One item of a batch (`put_many`, `put_many_async`): like [`put_payload`], but a held export
+/// is counted on the shared `batch` latch ([`Latch::new_batch`]) instead of getting its own, so
+/// ONE barrier covers the whole batch. A snapshot (`PayloadUse::Snapshot*`) or an immutable
+/// source yields plain `Bytes` and adds nothing to the latch. Strict, like [`put_payload`].
+pub(crate) fn put_payload_in_batch(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    usage: PayloadUse,
+    batch: &Arc<Latch>,
+) -> PyResult<Bytes> {
+    Ok(match payload_parts_in(py, data, usage, Some(batch))? {
+        Parts::Plain(bytes) => bytes,
+        Parts::Export(owner, _) => Bytes::from_owner(owner),
+    })
+}
+
 /// Like [`put_payload_from_py`] but also returns the completion barrier of a held export.
-/// (`put_bytes` keeps accepting anything `bytes(obj)` accepts, as before.)
+/// Strict (issue #261): an int, a bool or an arbitrary iterable is a `TypeError`.
 pub(crate) fn put_payload(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
     usage: PayloadUse,
 ) -> PyResult<Payload> {
-    Ok(match payload_parts(py, data, usage, false)? {
+    Ok(match payload_parts(py, data, usage)? {
         Parts::Plain(bytes) => Payload { bytes, latch: None },
         Parts::Export(owner, latch) => {
             let bytes = Bytes::from_owner(owner);
@@ -1098,11 +1475,68 @@ pub(crate) fn put_payload(
     })
 }
 
-fn payload_parts(
+/// The immutable `bytes` object (or `bytes` subclass instance) behind `data`, looking through
+/// `memoryview` wrappers (`memoryview(b)`, `memoryview(memoryview(b))`, slices of them), or `None`
+/// when `data` is anything else. A buffer's own `readonly` flag is NOT enough: a read-only
+/// `memoryview(bytearray).toreadonly()`, a read-only mmap or a non-writeable NumPy view can still
+/// change through another handle, so only a `bytes` base proves the memory can never change.
+fn immutable_bytes_base<'py>(data: &Bound<'py, PyAny>) -> Option<Bound<'py, PyBytes>> {
+    use pyo3::types::PyMemoryView;
+    let mut current = data.clone();
+    // Bounded: a memoryview of a memoryview of ... is a short chain.
+    for _ in 0..16 {
+        if let Ok(b) = current.cast::<PyBytes>() {
+            return Some(b.clone());
+        }
+        if current.is_instance_of::<PyMemoryView>() {
+            let next = current.getattr("obj").ok()?;
+            if next.is_none() {
+                return None; // a released memoryview
+            }
+            current = next;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// `Bytes` over an export of an IMMUTABLE source, with no copy and no held export: the
+/// `bytes` object behind the export is kept alive by a reference instead (see
+/// [`immutable_bytes_base`]). `None` unless the export is read-only, its source is a `bytes`
+/// object and the exported memory lies inside that object's data; the caller then falls back to
+/// the snapshot copy of a mutable source.
+fn immutable_export_bytes(data: &Bound<'_, PyAny>, export: &RawExport) -> Option<Bytes> {
+    if export.view.readonly == 0 || export.view.buf.is_null() {
+        return None;
+    }
+    let base = immutable_bytes_base(data)?;
+    let base_data = base.as_bytes();
+    let start = base_data.as_ptr() as usize;
+    let end = start.checked_add(base_data.len())?;
+    let ptr = export.view.buf as usize;
+    let len = export.len();
+    if ptr < start || ptr.checked_add(len)? > end {
+        return None;
+    }
+    Some(Bytes::from_owner(PyBytesOwner {
+        ptr: ptr as *const u8,
+        len,
+        _keep: base.unbind(),
+    }))
+}
+
+fn payload_parts(py: Python<'_>, data: &Bound<'_, PyAny>, usage: PayloadUse) -> PyResult<Parts> {
+    payload_parts_in(py, data, usage, None)
+}
+
+/// [`payload_parts`], with the export (if any) counted on the shared `batch` latch instead of
+/// getting a latch of its own.
+fn payload_parts_in(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
     usage: PayloadUse,
-    strict: bool,
+    batch: Option<&Arc<Latch>>,
 ) -> PyResult<Parts> {
     let plain = Parts::Plain;
     // 1. s3dlio's own BytesView: refcount clone. MUST come first: BytesView also implements
@@ -1123,7 +1557,28 @@ fn payload_parts(
             export.release(py);
             return Ok(plain(Bytes::new()));
         }
-        let latch = Latch::new();
+        let snapshotting = matches!(usage, PayloadUse::Snapshot | PayloadUse::SnapshotUnderGil);
+        // A BORROWED export of an immutable source (the streaming writers, `borrow=True`) needs
+        // no hold either: the `bytes` is kept alive by a reference, so there is no export to
+        // guard or wait for, and the same view may be passed again while a part is in flight.
+        if snapshotting || usage == PayloadUse::Borrowed {
+            // Rule #1: an IMMUTABLE source (a `bytes` subclass, `memoryview(bytes)`, ...) cannot
+            // change after this call, so a snapshot of it would be a pointless copy: the source
+            // is kept alive by a reference and read in place, whatever the usage. Only a source
+            // that can change (bytearray, NumPy, mmap, a read-only view of a mutable object, ...)
+            // is copied; that copy is the documented opt-in of `borrow=False` / `copy=True`.
+            if let Some(bytes) = immutable_export_bytes(data, &export) {
+                export.release(py);
+                return Ok(plain(bytes));
+            }
+        }
+        let latch = match batch {
+            Some(shared) if !snapshotting => {
+                shared.batch_add();
+                Arc::clone(shared)
+            }
+            _ => Latch::new(),
+        };
         let owner = ExportOwner::new(export, latch.clone());
         return match usage {
             PayloadUse::Blocking | PayloadUse::Borrowed => Ok(Parts::Export(owner, latch)),
@@ -1158,17 +1613,10 @@ fn payload_parts(
         }
     }
 
-    // 5. Last resort: `__bytes__()`, and (unless `strict`) `bytes(obj)`; Python's fresh `bytes`
-    //    is wrapped (one copy). `bytes(obj)` would turn an int into that many zero bytes and
-    //    accept any iterable of ints, which the streaming writers must refuse.
-    let bytes_result = data.call_method0("__bytes__").or_else(|e| {
-        if strict {
-            Err(e)
-        } else {
-            py.get_type::<PyBytes>().call1((data,))
-        }
-    });
-    match bytes_result {
+    // 5. Last resort: `__bytes__()` only; Python's fresh `bytes` is wrapped (one copy). There is
+    //    NO `bytes(obj)` fallback (issue #261): it would turn an int or a bool into that many
+    //    zero bytes and accept any iterable of ints, which every writer must refuse.
+    match data.call_method0("__bytes__") {
         Ok(bytes_obj) => match bytes_obj.cast_exact::<PyBytes>() {
             Ok(b) => Ok(plain(bytes_from_pybytes(b))),
             Err(_) => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
@@ -1414,6 +1862,143 @@ mod tests {
             ba.call_method1("__setitem__", (0, 6)).unwrap();
             assert_eq!(got.len(), 4096);
             assert!(got.iter().all(|&b| b == 5));
+        });
+    }
+
+    /// Stage G (W9, Rule #1): a snapshot never copies an IMMUTABLE source. `memoryview(bytes)`
+    /// (also nested, also a slice of it) and a `bytes` subclass yield `Bytes` over the very same
+    /// memory in both snapshot modes, with no export held (the bytes object is kept alive by a
+    /// reference instead), and the bytes stay valid after the Python names are dropped.
+    #[test]
+    fn snapshot_does_not_copy_an_immutable_source() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!(
+                    "class Sub(bytes):\n    pass\n\
+                     base = bytes(range(256)) * 16\n\
+                     sub = Sub(base)\n\
+                     mv = memoryview(base)\n\
+                     mv2 = memoryview(mv)\n\
+                     piece = memoryview(base)[100:3000]\n\
+                     mv_sub = memoryview(sub)"
+                ),
+            );
+            for name in ["sub", "mv", "mv2", "piece", "mv_sub"] {
+                let obj = l.get_item(name).unwrap().unwrap();
+                let src = exported_ptr(&obj);
+                for mode in [PayloadUse::Snapshot, PayloadUse::SnapshotUnderGil] {
+                    let got = put_payload_from_py(py, &obj, mode).unwrap();
+                    assert_eq!(got.as_ptr(), src, "{name} was copied ({mode:?})");
+                    let full = (name == "sub" || name == "mv" || name == "mv2" || name == "mv_sub")
+                        .then_some(4096);
+                    assert_eq!(got.len(), full.unwrap_or(2900), "{name} length");
+                    py.detach(move || drop(got)); // dropped off the GIL: never blocks
+                }
+            }
+            // The Bytes outlive every Python name for the source.
+            let got = put_payload_from_py(
+                py,
+                &l.get_item("mv").unwrap().unwrap(),
+                PayloadUse::Snapshot,
+            )
+            .unwrap();
+            py.run(c_str!("mv.release(); mv2.release()"), None, Some(&l))
+                .unwrap();
+            l.del_item("mv").unwrap();
+            l.del_item("mv2").unwrap();
+            l.del_item("base").unwrap();
+            l.del_item("sub").unwrap();
+            l.del_item("mv_sub").unwrap();
+            l.del_item("piece").unwrap();
+            assert_eq!(got.len(), 4096);
+            assert!(got.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8));
+        });
+    }
+
+    /// The `readonly` flag alone does not make a source immutable: a read-only VIEW of a
+    /// bytearray (or of anything else that can change) keeps the documented snapshot copy.
+    #[test]
+    fn snapshot_still_copies_a_readonly_view_of_a_mutable_source() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!(
+                    "ba = bytearray(4096)\n\
+                     ro = memoryview(ba).toreadonly()"
+                ),
+            );
+            let ro = l.get_item("ro").unwrap().unwrap();
+            let src = exported_ptr(&ro);
+            let ba = l.get_item("ba").unwrap().unwrap();
+            for mode in [PayloadUse::Snapshot, PayloadUse::SnapshotUnderGil] {
+                let got = put_payload_from_py(py, &ro, mode).unwrap();
+                assert_ne!(got.as_ptr(), src, "a mutable source must be snapshotted");
+                ba.call_method1("__setitem__", (0, 7)).unwrap();
+                assert_eq!(got[0], 0, "the snapshot must not see later changes");
+                ba.call_method1("__setitem__", (0, 0)).unwrap();
+            }
+        });
+    }
+
+    /// Stage G (W8): ONE batch latch is the barrier of every export of a `put_many` batch. It
+    /// reads as dropped/released only when the batch is sealed and EVERY export is dropped /
+    /// released; an item that is snapshotted or immutable adds nothing; the exports of a failed
+    /// batch are all released.
+    #[test]
+    fn batch_latch_covers_every_export_of_the_batch() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!(
+                    "a = bytearray(b'a' * 4096)\n\
+                     b = bytearray(b'b' * 4096)\n\
+                     frozen = b'immutable'"
+                ),
+            );
+            let a = l.get_item("a").unwrap().unwrap();
+            let b = l.get_item("b").unwrap().unwrap();
+            let frozen = l.get_item("frozen").unwrap().unwrap();
+            let batch = Latch::new_batch();
+            let pa = put_payload_in_batch(py, &a, PayloadUse::Blocking, &batch).unwrap();
+            let pb = put_payload_in_batch(py, &b, PayloadUse::Blocking, &batch).unwrap();
+            let pf = put_payload_in_batch(py, &frozen, PayloadUse::Blocking, &batch).unwrap();
+            assert_eq!(pa.as_ptr(), exported_ptr(&a), "item a was copied");
+            assert_eq!(pb.as_ptr(), exported_ptr(&b), "item b was copied");
+            assert_eq!(batch.batch_len(), 2, "bytes adds no export to the batch");
+            // Not sealed yet: nothing is complete, whatever has been dropped.
+            assert_eq!(latch_state(&batch), (false, false));
+            batch.batch_seal();
+            assert_eq!(latch_state(&batch), (false, false), "both exports are held");
+            assert!(!resizable(&a) && !resizable(&b), "both buffers are locked");
+            drop(pa);
+            assert!(!latch_ready(py, &batch), "one export is still held");
+            assert!(!resizable(&b));
+            drop(pb);
+            assert!(latch_ready(py, &batch), "all exports dropped and released");
+            assert_eq!(latch_state(&batch), (true, true));
+            assert!(resizable(&a) && resizable(&b), "both released");
+            drop(pf);
+        });
+    }
+
+    /// A sealed batch with no export is ready at once; a snapshot item adds nothing.
+    #[test]
+    fn empty_batch_latch_is_ready_when_sealed() {
+        init();
+        Python::attach(|py| {
+            let batch = Latch::new_batch();
+            assert!(!latch_ready(py, &batch), "an open batch is never ready");
+            let ba = PyByteArray::new(py, &[1u8; 64]);
+            let got = put_payload_in_batch(py, ba.as_any(), PayloadUse::SnapshotUnderGil, &batch)
+                .unwrap();
+            assert_ne!(got.as_ptr(), exported_ptr(ba.as_any()));
+            batch.batch_seal();
+            assert_eq!(batch.batch_len(), 0);
+            assert!(latch_ready(py, &batch));
         });
     }
 
@@ -1711,11 +2296,249 @@ mod tests {
             .is_ok()
     }
 
+    /// #282: EVERY pointer-bearing format code is refused, not only `O` and `P`. The formats are
+    /// the ones CPython reports for real ctypes arrays: `POINTER(T)` is `&<T>`, `c_char_p` is
+    /// `z`, `c_wchar_p` is `Z`, a function pointer is `X{}`; a structure with a pointer field is
+    /// `T{...}`. Every put conversion refuses them in every mode, and nothing stays exported;
+    /// a read destination refuses them with the destination wording.
+    #[test]
+    fn every_pointer_bearing_ctypes_buffer_is_refused() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!(
+                    "import ctypes\n\
+                     S = lambda base, name, *fields: type(name, (base,), {'_fields_': list(fields)})\n\
+                     WithPointer = S(ctypes.Structure, 'WithPointer', ('n', ctypes.c_int), ('p', ctypes.POINTER(ctypes.c_int)))\n\
+                     WithText = S(ctypes.Structure, 'WithText', ('n', ctypes.c_int), ('s', ctypes.c_char_p))\n\
+                     Plain = S(ctypes.Structure, 'Plain', ('n', ctypes.c_int), ('x', ctypes.c_double))\n\
+                     bad = {\n\
+                       'POINTER': (ctypes.POINTER(ctypes.c_int) * 4)(),\n\
+                       'c_char_p': (ctypes.c_char_p * 4)(),\n\
+                       'c_wchar_p': (ctypes.c_wchar_p * 4)(),\n\
+                       'py_object': (ctypes.py_object * 2)(),\n\
+                       'c_void_p': (ctypes.c_void_p * 4)(),\n\
+                       'function_pointer': (ctypes.CFUNCTYPE(None) * 2)(),\n\
+                       'struct_with_pointer': (WithPointer * 2)(),\n\
+                       'struct_with_char_p': (WithText * 2)(),\n\
+                     }\n\
+                     good = {\n\
+                       'c_ubyte': (ctypes.c_ubyte * 8)(),\n\
+                       'c_byte': (ctypes.c_byte * 8)(),\n\
+                       'c_char': (ctypes.c_char * 8)(),\n\
+                       'c_short': (ctypes.c_short * 8)(),\n\
+                       'c_uint': (ctypes.c_uint * 8)(),\n\
+                       'c_float': (ctypes.c_float * 8)(),\n\
+                       'c_double': (ctypes.c_double * 8)(),\n\
+                       'c_bool': (ctypes.c_bool * 8)(),\n\
+                       'c_wchar': (ctypes.c_wchar * 8)(),\n\
+                       'plain_struct': (Plain * 2)(),\n\
+                     }"
+                ),
+            );
+            let bad = l.get_item("bad").unwrap().unwrap();
+            let bad = bad.cast::<PyDict>().unwrap();
+            for (name, obj) in bad.iter() {
+                let name: String = name.extract().unwrap();
+                for mode in BOTH {
+                    let err = put_payload_from_py(py, &obj, mode)
+                        .err()
+                        .unwrap_or_else(|| panic!("{name} ({mode:?}) was accepted for upload"));
+                    assert!(
+                        err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                        "{name} ({mode:?}): {err}"
+                    );
+                    assert!(
+                        err.to_string().contains("cannot upload a buffer"),
+                        "{name} ({mode:?}): {err}"
+                    );
+                }
+                assert!(
+                    snapshot_for_call(py, &obj).is_err(),
+                    "{name}: snapshot_for_call accepted it"
+                );
+                assert!(
+                    hold_for_call(py, &obj).is_err(),
+                    "{name}: hold_for_call accepted it"
+                );
+                assert!(resizable_len_check(&obj), "{name}: export leaked");
+
+                let latch = Latch::new();
+                let err = acquire_writable(py, &obj, 4, &latch)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name}: accepted as a read destination"));
+                assert!(
+                    err.to_string().contains("read destination"),
+                    "{name}: {err}"
+                );
+            }
+            let good = l.get_item("good").unwrap().unwrap();
+            let good = good.cast::<PyDict>().unwrap();
+            for (name, obj) in good.iter() {
+                for mode in BOTH {
+                    put_payload_from_py(py, &obj, mode)
+                        .unwrap_or_else(|e| panic!("{name} ({mode:?}) was refused: {e}"));
+                }
+                drain_pending_exports(py);
+            }
+        });
+    }
+
+    /// #282: the format scan, on format strings: pointer codes anywhere (also after byte-order
+    /// prefixes and inside `T{...}`), field names skipped, complex `Zf`/`Zd`/`Zg` and plain
+    /// codes untouched.
+    #[test]
+    fn format_scan_names_every_pointer_code_and_nothing_else() {
+        for fmt in [
+            "O",
+            "<O",
+            "P",
+            "<P",
+            "&<i",
+            "&i",
+            "<z",
+            "z",
+            "<Z",
+            "Z",
+            "X{}",
+            "T{<i:a:4x<P:p:}",
+            "T{<i:a:4x&<i:p:}",
+            "T{<i:a:<z:s:}",
+            "T{<i:a:<Z:s:}",
+            "T{<i:a:X{}:f:}",
+            "3<P",
+            "T{<Zd:c:<P:p:}",
+            "4P",
+            "3<P",
+            "(2,3)P",
+            "T{T{<i:a:<P:p:}:b:}",
+        ] {
+            assert!(format_has_pointers(fmt), "{fmt:?} must be refused");
+        }
+        for fmt in [
+            "B",
+            "b",
+            "c",
+            "<B",
+            "<H",
+            "<I",
+            "<q",
+            "<f",
+            "<d",
+            "<?",
+            "<u",
+            "<e",
+            "<Zf",
+            "Zd",
+            "<Zg",
+            "10s",
+            "T{<i:a:4x<d:x:}",
+            "T{<i:Pos:<B:Obj:}",
+            "T{<i:zed:<Zd:Zeta:}",
+            "2x",
+            "T{<i:X:}",
+            // lowercase `p` is a Pascal string (length byte + characters), not a pointer
+            "p",
+            "<p",
+            "10p",
+            "T{<i:a:8p:s:}",
+        ] {
+            assert!(!format_has_pointers(fmt), "{fmt:?} must stay valid");
+        }
+    }
+
+    /// #277: a pointer-format buffer is refused as a READ destination with wording about a
+    /// destination, not an upload; the PUT wording is unchanged. Both are `TypeError`s and nothing
+    /// stays exported.
+    #[test]
+    fn pointer_format_refusal_wording_depends_on_the_direction() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!("import ctypes\nptrs = (ctypes.c_void_p * 4)()\nobjs = (ctypes.py_object * 2)()"),
+            );
+            for name in ["ptrs", "objs"] {
+                let obj = l.get_item(name).unwrap().unwrap();
+
+                let latch = Latch::new();
+                let err = acquire_writable(py, &obj, 4, &latch)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name}: a pointer destination must be refused"));
+                assert!(
+                    err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                    "{name}: {err}"
+                );
+                let text = err.to_string();
+                assert!(
+                    !text.contains("upload"),
+                    "{name}: a read destination refusal talks about uploading: {text}"
+                );
+                assert!(
+                    text.contains("read destination"),
+                    "{name}: the refusal does not say it is a read destination: {text}"
+                );
+                assert!(resizable_len_check(&obj), "{name}: export leaked");
+
+                let err = put_payload_from_py(py, &obj, PayloadUse::Blocking)
+                    .expect_err("a pointer buffer must not be uploaded");
+                assert!(
+                    err.to_string().contains("cannot upload a buffer"),
+                    "{name}: the PUT wording changed: {err}"
+                );
+            }
+        });
+    }
+
+    /// #278: `release_retained_for_test` also disarms a pending `arm_retain_for_test`, so a test
+    /// that armed the hook and failed before any put consumed it cannot make the NEXT test's put
+    /// retain a clone forever.
+    #[test]
+    fn release_retained_disarms_a_pending_arming() {
+        init();
+        Python::attach(|py| {
+            let l = ns(py, c_str!("buf = bytearray(b'abcdefgh')"));
+            let buf = l.get_item("buf").unwrap().unwrap();
+
+            arm_retain_for_test();
+            release_retained_for_test();
+            let payload = put_payload(py, &buf, PayloadUse::Blocking).expect("payload");
+            let retained = retained_for_test();
+
+            // Leave nothing behind whatever the outcome: drop any clone, then the payload.
+            release_retained_for_test();
+            drop(payload);
+            drain_pending_exports(py);
+
+            assert_eq!(
+                retained, 0,
+                "a pending arming survived release_retained_for_test: the next put retained a clone"
+            );
+            assert!(resizable(&buf), "export leaked");
+        });
+    }
+
     /// Item 7: a failed snapshot allocation is a MemoryError, not an abort.
     #[test]
     fn snapshot_allocation_failure_is_a_memory_error() {
         assert!(try_snapshot(&[1, 2, 3], usize::MAX).is_err());
         assert_eq!(try_snapshot(&[1, 2, 3], 3).unwrap().as_ref(), &[1, 2, 3]);
+    }
+
+    /// The snapshot `MemoryError` is shared by `put_many` / `MultiEndpointStore` / the writers, so
+    /// its wording must not name `put_bytes_async`.
+    #[test]
+    fn snapshot_memory_error_wording_is_generic() {
+        init();
+        Python::attach(|py| {
+            let e = snapshot_allocation_error(12345);
+            assert!(e.is_instance_of::<pyo3::exceptions::PyMemoryError>(py));
+            let text = e.value(py).str().unwrap().to_string();
+            assert!(text.contains("12345 bytes"), "{text}");
+            assert!(text.contains("payload snapshot"), "{text}");
+            assert!(!text.contains("put_bytes_async"), "{text}");
+        });
     }
 
     /// Item 5: a small snapshot is copied with the GIL held (no detach); big ones detach.
@@ -1932,17 +2755,16 @@ mod tests {
                 resizable(ba.as_any()),
                 "released directly with the py token"
             );
-            // put_bytes keeps its liberal bytes(obj) fallback (unchanged behaviour)
-            assert_eq!(
-                put_payload_from_py(
-                    py,
-                    &objs.get_item("list").unwrap().unwrap(),
-                    PayloadUse::Blocking
-                )
-                .unwrap()
-                .as_ref(),
-                &[1u8, 2, 3]
-            );
+            // put_bytes uses the same strict conversion (issue #261): no bytes(obj) fallback
+            for (name, obj) in objs.iter() {
+                let e = put_payload_from_py(py, &obj, PayloadUse::Blocking)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name} accepted by put_bytes"));
+                assert!(
+                    e.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                    "{name}"
+                );
+            }
         });
     }
 
@@ -2134,6 +2956,504 @@ mod tests {
 
             // strict: an int is refused, nothing is written
             assert!(snapshot_for_call(py, &5i32.into_pyobject(py).unwrap().into_any()).is_err());
+        });
+    }
+
+    // ---- writable export (A4, #264) -------------------------------------------------------
+
+    fn latch_state(latch: &Latch) -> (bool, bool) {
+        (latch.is_dropped(), latch.is_released())
+    }
+
+    /// Objects that must be accepted as a writable destination: name, object, its length in bytes.
+    fn writable_objects<'py>(py: Python<'py>) -> Vec<(&'static str, Bound<'py, PyAny>, usize)> {
+        let l = ns(
+            py,
+            c_str!(
+                "import array, ctypes, mmap\n\
+                 objs = [\n\
+                   ('bytearray', bytearray(range(64)), 64),\n\
+                   ('memoryview', memoryview(bytearray(64)), 64),\n\
+                   ('array_B', array.array('B', range(32)), 32),\n\
+                   ('array_b', array.array('b', [1, -2] * 16), 32),\n\
+                   ('mv_c', memoryview(bytearray(b'x' * 48)).cast('c'), 48),\n\
+                   ('mv_3d', memoryview(bytearray(24)).cast('B', (2, 3, 4)), 24),\n\
+                   ('mmap', mmap.mmap(-1, 4096), 4096),\n\
+                   ('ctypes_ubyte', (ctypes.c_ubyte * 16)(), 16),\n\
+                   ('ctypes_byte', (ctypes.c_byte * 16)(), 16),\n\
+                   ('ctypes_char', (ctypes.c_char * 16)(), 16),\n\
+                 ]"
+            ),
+        );
+        let objs = l.get_item("objs").unwrap().unwrap();
+        objs.try_iter()
+            .unwrap()
+            .map(|t| {
+                let t = t.unwrap();
+                let name: String = t.get_item(0).unwrap().extract().unwrap();
+                let name: &'static str = Box::leak(name.into_boxed_str());
+                (
+                    name,
+                    t.get_item(1).unwrap(),
+                    t.get_item(2).unwrap().extract().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Accepted: the slice IS the exporter's memory (pointer identity), exactly `expected_len`
+    /// long; writes through it are visible in the Python object after `release`; the caller's
+    /// latch is the one that is marked.
+    #[test]
+    fn writable_export_accepts_writable_byte_buffers_and_writes_in_place() {
+        init();
+        Python::attach(|py| {
+            let count = writable_objects(py).len();
+            for idx in 0..count {
+                // A fresh object for every length, so an earlier fill cannot mask a later one.
+                for pick in [|n: usize| n, |n: usize| n - 1, |n: usize| n / 2] {
+                    let (name, obj, nbytes) = writable_objects(py).swap_remove(idx);
+                    let expected = pick(nbytes);
+                    let before = bytes_of(py, &obj);
+                    let src = exported_ptr(&obj);
+                    let latch = Latch::new();
+                    let mut ex = acquire_writable(py, &obj, expected, &latch)
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                    assert_eq!(latch_state(&latch), (false, false), "{name}: held");
+                    let slice = ex.as_mut_slice();
+                    assert_eq!(slice.as_ptr(), src, "{name}: not the exporter's memory");
+                    assert_eq!(slice.len(), expected, "{name}: length");
+                    slice.fill(0xA5);
+                    ex.release(py);
+                    assert_eq!(latch_state(&latch), (true, true), "{name}: after release");
+                    let after = bytes_of(py, &obj);
+                    assert!(
+                        after[..expected].iter().all(|&b| b == 0xA5),
+                        "{name}: the write is not visible in the Python object"
+                    );
+                    assert_eq!(
+                        after[expected..],
+                        before[expected..],
+                        "{name}: bytes beyond expected_len changed"
+                    );
+                }
+            }
+        });
+    }
+
+    fn bytes_of(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<u8> {
+        py.import("builtins")
+            .unwrap()
+            .call_method1("bytes", (obj,))
+            .unwrap()
+            .extract()
+            .unwrap()
+    }
+
+    /// `expected_len` beyond the exporter's length is refused (ValueError), nothing stays held.
+    #[test]
+    fn writable_export_refuses_expected_len_beyond_the_buffer() {
+        init();
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[0u8; 16]);
+            let latch = Latch::new();
+            let err = acquire_writable(py, ba.as_any(), 17, &latch)
+                .err()
+                .expect("17 > 16 must be refused");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert_eq!(latch_state(&latch), (true, true), "export not released");
+            assert!(resizable(ba.as_any()), "export leaked");
+            // exact length is fine
+            let latch = Latch::new();
+            let ex = acquire_writable(py, ba.as_any(), 16, &latch).unwrap();
+            ex.release(py);
+        });
+    }
+
+    /// Read-only, non-contiguous, wrong-itemsize/format and pointer-bearing exporters are all
+    /// refused with the right exception class, and nothing stays exported.
+    #[test]
+    fn writable_export_refuses_unsuitable_exporters_and_releases() {
+        init();
+        Python::attach(|py| {
+            use pyo3::exceptions::{PyBufferError, PyTypeError};
+            // Third element of every case: a probe that raises (BufferError) if a hold on the
+            // exporter is still outstanding - releasing a memoryview, or resizing an array, fails
+            // while an export of it exists. The probes bind their target as a default argument
+            // because `ns` runs the source with separate locals (no closure over them).
+            let l = ns(
+                py,
+                c_str!(
+                    "import array, ctypes\n\
+                     base = bytearray(range(32))\n\
+                     mv_ro = memoryview(b'abcdefgh')\n\
+                     mv_rob = memoryview(base).toreadonly()\n\
+                     mv_str = memoryview(base)[::2]\n\
+                     mv_rev = memoryview(base)[::-1]\n\
+                     a_i = array.array('i', range(8))\n\
+                     a_H = array.array('H', range(8))\n\
+                     a_d = array.array('d', [0.0] * 4)\n\
+                     mv_bool = memoryview(bytearray(8)).cast('?')\n\
+                     nop = lambda: None\n\
+                     cases = {\n\
+                       'bytes': (b'abcdefgh', 'buffer', nop),\n\
+                       'ro_memoryview': (mv_ro, 'buffer', lambda o=mv_ro: o.release()),\n\
+                       'ro_view_of_bytearray': (mv_rob, 'buffer', lambda o=mv_rob: o.release()),\n\
+                       'strided': (mv_str, 'buffer', lambda o=mv_str: o.release()),\n\
+                       'reversed': (mv_rev, 'buffer', lambda o=mv_rev: o.release()),\n\
+                       'array_i': (a_i, 'type', lambda o=a_i: o.append(1)),\n\
+                       'array_H': (a_H, 'type', lambda o=a_H: o.append(1)),\n\
+                       'array_d': (a_d, 'type', lambda o=a_d: o.append(1.0)),\n\
+                       'bool_bytes': (mv_bool, 'type', lambda o=mv_bool: o.release()),\n\
+                       'c_void_p': ((ctypes.c_void_p * 4)(), 'type', nop),\n\
+                       'py_object': ((ctypes.py_object * 2)(), 'type', nop),\n\
+                       'not_a_buffer': (object(), 'type', nop),\n\
+                       'int': (5, 'type', nop),\n\
+                     }"
+                ),
+            );
+            let cases = l.get_item("cases").unwrap().unwrap();
+            let cases = cases.cast::<PyDict>().unwrap();
+            let getrefcount = py.import("sys").unwrap().getattr("getrefcount").unwrap();
+            let refcount = |obj: &Bound<'_, PyAny>| -> usize {
+                getrefcount.call1((obj,)).unwrap().extract().unwrap()
+            };
+            for (name, entry) in cases.iter() {
+                let name: String = name.extract().unwrap();
+                let obj = entry.get_item(0).unwrap();
+                let kind: String = entry.get_item(1).unwrap().extract().unwrap();
+                let probe = entry.get_item(2).unwrap();
+                let refs_before = refcount(&obj);
+                let latch = Latch::new();
+                let err = acquire_writable(py, &obj, 4, &latch)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name} must be refused"));
+                // The exporter's own refusal of a writable / contiguous request is a
+                // BufferError; our own format/itemsize refusals are TypeErrors.
+                let ok = if kind == "buffer" {
+                    err.is_instance_of::<PyBufferError>(py)
+                } else {
+                    err.is_instance_of::<PyTypeError>(py)
+                };
+                assert!(ok, "{name}: wrong exception class: {err}");
+                assert_eq!(latch_state(&latch), (true, true), "{name}: latch");
+                // Nothing leaked, for EVERY refused exporter: the reference a held `Py_buffer`
+                // keeps on its exporter is gone, and the exporter is still releasable/resizable.
+                assert_eq!(
+                    refcount(&obj),
+                    refs_before,
+                    "{name}: a refused export kept a reference to the exporter"
+                );
+                probe
+                    .call0()
+                    .unwrap_or_else(|e| panic!("{name}: a refused export leaked a hold: {e}"));
+            }
+            // The bytearray behind several of the memoryviews is resizable again as well.
+            let base = l.get_item("base").unwrap().unwrap();
+            assert!(
+                resizable(&base),
+                "a refused export leaked a hold on the bytearray"
+            );
+        });
+    }
+
+    /// A refusal after a successful `PyObject_GetBuffer` (wrong format) releases the export that
+    /// was taken: the plain `bytearray` behind it is resizable again at once.
+    #[test]
+    fn writable_export_refusal_after_acquisition_releases_the_export() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!("ba = bytearray(8)\nmv = memoryview(ba).cast('?')"),
+            );
+            let ba = l.get_item("ba").unwrap().unwrap();
+            let mv = l.get_item("mv").unwrap().unwrap();
+            let latch = Latch::new();
+            // The memoryview holds one export of `ba` itself; ours must add and drop another.
+            assert!(acquire_writable(py, &mv, 4, &latch).is_err());
+            assert_eq!(latch_state(&latch), (true, true));
+            mv.call_method0("release").unwrap();
+            assert!(resizable(&ba), "the refused export was not released");
+        });
+    }
+
+    /// Zero length: accepted, an empty slice, released cleanly. The slice is not built from the
+    /// exporter's pointer (which may be null) when the length is 0.
+    #[test]
+    fn writable_export_zero_length_gives_an_empty_slice() {
+        init();
+        Python::attach(|py| {
+            // an empty exporter
+            let empty = PyByteArray::new(py, &[]);
+            let latch = Latch::new();
+            let mut ex = acquire_writable(py, empty.as_any(), 0, &latch).unwrap();
+            assert!(ex.as_mut_slice().is_empty());
+            assert!(!resizable(empty.as_any()), "an empty export is still held");
+            ex.release(py);
+            assert_eq!(latch_state(&latch), (true, true));
+            assert!(resizable(empty.as_any()));
+
+            // expected_len 0 on a non-empty exporter: still empty, memory untouched
+            let ba = PyByteArray::new(py, &[7u8; 16]);
+            let latch = Latch::new();
+            let mut ex = acquire_writable(py, ba.as_any(), 0, &latch).unwrap();
+            assert_eq!(ex.as_mut_slice().len(), 0);
+            ex.release(py);
+            let seen: Vec<u8> = ba.to_vec();
+            assert_eq!(seen, vec![7u8; 16]);
+
+            // A view whose address is NULL with length 0 (what some exporters report): the
+            // checks accept it and no slice is built from the null pointer.
+            // SAFETY: an all-zero Py_buffer is a valid empty value; `obj` is NULL, which
+            // `PyBuffer_Release` treats as nothing to release.
+            let mut view: Box<ffi::Py_buffer> = Box::new(unsafe { std::mem::zeroed() });
+            view.itemsize = 1;
+            assert!(view.buf.is_null() && view.len == 0);
+            check_writable_view(&view, 0).expect("null buf with len 0 is valid");
+            let latch = Latch::new();
+            let raw = RawExport { view, latch: None };
+            let mut owner = ExportOwnerMut::new(py, raw, latch.clone(), 0)
+                .expect("the constructor accepts a null buf with len 0");
+            assert!(owner.as_mut_slice().is_empty());
+            owner.release(py);
+            assert_eq!(latch_state(&latch), (true, true));
+        });
+    }
+
+    /// Data with a null address is refused by the checks; a negative reported length too.
+    #[test]
+    fn writable_view_checks_refuse_null_data_and_bad_lengths() {
+        init();
+        // SAFETY: an all-zero Py_buffer is a valid empty value.
+        let mut view: Box<ffi::Py_buffer> = Box::new(unsafe { std::mem::zeroed() });
+        view.itemsize = 1;
+        view.len = 8;
+        assert!(check_writable_view(&view, 4).is_err(), "null buf, len 8");
+        view.len = -1;
+        assert!(check_writable_view(&view, 0).is_err(), "negative len");
+        view.len = 0;
+        view.readonly = 1;
+        assert!(check_writable_view(&view, 0).is_err(), "read-only");
+    }
+
+    /// Refusals AFTER a view was handed over, driven through hand-built `Py_buffer`s (so the
+    /// exporter cannot pre-empt them): read-only, suboffsets, and non-contiguous shapes are all
+    /// refused with a BufferError, a flat view and a C-contiguous multi-dimensional one are
+    /// accepted (so the contiguity defense does not over-refuse), and the constructor refuses the
+    /// same views itself, releasing the export (latch released, then dropped): no
+    /// `ExportOwnerMut` exists for a view that fails the checks.
+    #[test]
+    fn writable_view_checks_refuse_readonly_suboffsets_and_non_contiguous_views() {
+        use pyo3::exceptions::PyBufferError;
+        init();
+        let mut mem = [0u8; 4];
+        let mut shape1: [ffi::Py_ssize_t; 1] = [4];
+        let mut stride_gap: [ffi::Py_ssize_t; 1] = [2];
+        let mut shape2: [ffi::Py_ssize_t; 2] = [2, 2];
+        let mut strides_c: [ffi::Py_ssize_t; 2] = [2, 1];
+        let mut strides_f: [ffi::Py_ssize_t; 2] = [1, 2];
+        let mut suboffsets: [ffi::Py_ssize_t; 1] = [0];
+        // A valid flat 4-byte view of `mem`; the tests below change one property each. The arrays
+        // above outlive every view built here.
+        let mut flat = |mem: &mut [u8; 4]| -> Box<ffi::Py_buffer> {
+            // SAFETY: an all-zero Py_buffer is a valid empty value; `obj` stays NULL, which
+            // `PyBuffer_Release` treats as nothing to release.
+            let mut view: Box<ffi::Py_buffer> = Box::new(unsafe { std::mem::zeroed() });
+            view.buf = mem.as_mut_ptr().cast();
+            view.len = 4;
+            view.itemsize = 1;
+            view.ndim = 1;
+            view.shape = shape1.as_mut_ptr();
+            view
+        };
+        let refused = |view: &ffi::Py_buffer, what: &str| {
+            Python::attach(|py| {
+                let err = check_writable_view(view, 4)
+                    .err()
+                    .unwrap_or_else(|| panic!("{what} must be refused"));
+                assert!(err.is_instance_of::<PyBufferError>(py), "{what}: {err}");
+            });
+        };
+
+        let ok = flat(&mut mem);
+        check_writable_view(&ok, 4).expect("a flat writable view is valid");
+
+        let mut ro = flat(&mut mem);
+        ro.readonly = 1;
+        refused(&ro, "read-only with data");
+
+        let mut sub = flat(&mut mem);
+        sub.suboffsets = suboffsets.as_mut_ptr();
+        refused(&sub, "suboffsets");
+
+        let mut gap = flat(&mut mem);
+        gap.strides = stride_gap.as_mut_ptr();
+        refused(&gap, "stride 2 over 1-byte items");
+
+        let mut fortran = flat(&mut mem);
+        fortran.ndim = 2;
+        fortran.shape = shape2.as_mut_ptr();
+        fortran.strides = strides_f.as_mut_ptr();
+        refused(&fortran, "Fortran-ordered 2-D");
+
+        let mut c2 = flat(&mut mem);
+        c2.ndim = 2;
+        c2.shape = shape2.as_mut_ptr();
+        c2.strides = strides_c.as_mut_ptr();
+        check_writable_view(&c2, 4).expect("a C-contiguous 2-D view is valid");
+
+        // The constructor runs the same checks and releases what it was given on a refusal.
+        for (what, view) in [("read-only", ro), ("suboffsets", sub), ("Fortran", fortran)] {
+            Python::attach(|py| {
+                let latch = Latch::new();
+                let raw = RawExport { view, latch: None };
+                let err = ExportOwnerMut::new(py, raw, latch.clone(), 4)
+                    .err()
+                    .unwrap_or_else(|| panic!("{what}: the constructor must refuse"));
+                assert!(err.is_instance_of::<PyBufferError>(py), "{what}: {err}");
+                assert_eq!(latch_state(&latch), (true, true), "{what}: latch");
+            });
+        }
+        let latch = Latch::new();
+        Python::attach(|py| {
+            let raw = RawExport {
+                view: c2,
+                latch: None,
+            };
+            let mut owner = ExportOwnerMut::new(py, raw, latch.clone(), 4)
+                .expect("the constructor accepts a C-contiguous 2-D view");
+            assert_eq!(owner.as_mut_slice().len(), 4);
+            assert_eq!(latch_state(&latch), (false, false), "held");
+            owner.release(py);
+        });
+        assert_eq!(latch_state(&latch), (true, true));
+    }
+
+    /// The format rule of A4 through hand-built `Py_buffer`s: `B`, `b` and `c`, each with at most
+    /// ONE leading byte-order/alignment character (`@ = < > !`), are accepted (what a ctypes byte
+    /// array reports, matching the borrowed PUT path); a bare prefix, two prefixes, and every other
+    /// format are refused with a TypeError.
+    #[test]
+    fn writable_view_checks_format_accepts_one_byte_order_prefix_with_byte_codes() {
+        use pyo3::exceptions::PyTypeError;
+        init();
+        let mut mem = [0u8; 4];
+        let mut shape1: [ffi::Py_ssize_t; 1] = [4];
+        let mut view_with = |format: &'static std::ffi::CStr| -> Box<ffi::Py_buffer> {
+            // SAFETY: an all-zero Py_buffer is a valid empty value; `obj` stays NULL.
+            let mut view: Box<ffi::Py_buffer> = Box::new(unsafe { std::mem::zeroed() });
+            view.buf = mem.as_mut_ptr().cast();
+            view.len = 4;
+            view.itemsize = 1;
+            view.ndim = 1;
+            view.shape = shape1.as_mut_ptr();
+            view.format = format.as_ptr().cast_mut();
+            view
+        };
+        for fmt in [
+            c"B", c"b", c"c", c"@B", c"@b", c"@c", c"=B", c"=b", c"=c", c"<B", c"<b", c"<c", c">B",
+            c">b", c">c", c"!B", c"!b", c"!c",
+        ] {
+            let view = view_with(fmt);
+            check_writable_view(&view, 4)
+                .unwrap_or_else(|e| panic!("format {fmt:?} must be accepted: {e}"));
+        }
+        for fmt in [
+            c"?", c"<?", c"x", c"e", c"i", c"H", c"<<B", c"@<B", c"BB", c"<BB", c"<", c"@", c"!",
+            c"", c"B<", c"<H", c"s", c"<s", c"2B",
+        ] {
+            let view = view_with(fmt);
+            Python::attach(|py| {
+                let err = check_writable_view(&view, 4)
+                    .err()
+                    .unwrap_or_else(|| panic!("format {fmt:?} must be refused"));
+                assert!(err.is_instance_of::<PyTypeError>(py), "{fmt:?}: {err}");
+            });
+        }
+        // A pointer-bearing format keeps its own refusal (also a TypeError), with or without a prefix.
+        for fmt in [c"O", c"<P"] {
+            let view = view_with(fmt);
+            assert!(check_writable_view(&view, 4).is_err(), "{fmt:?}");
+        }
+    }
+
+    /// `release(py)` is direct: latch released and dropped at once, no queue, and the exporter is
+    /// resizable immediately (a live export would make `extend` raise BufferError).
+    #[test]
+    fn writable_export_release_is_direct_and_immediate() {
+        init();
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[1u8; 4096]);
+            let latch = Latch::new();
+            let ex = acquire_writable(py, ba.as_any(), 4096, &latch).unwrap();
+            let err = ba
+                .call_method1("extend", (b"x".as_slice(),))
+                .expect_err("resize must fail while the destination is exported");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyBufferError>(py));
+            ex.release(py);
+            assert_eq!(latch_state(&latch), (true, true));
+            assert!(resizable(ba.as_any()), "release(py) left the export held");
+        });
+    }
+
+    /// The Drop path (no GIL token): dropping only marks the latch dropped and queues the
+    /// export; the export stays held until a GIL holder drains, which releases it and marks the
+    /// latch released.
+    #[test]
+    fn writable_export_drop_queues_then_drain_releases() {
+        init();
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[1u8; 4096]);
+            let latch = Latch::new();
+            let ex = acquire_writable(py, ba.as_any(), 4096, &latch).unwrap();
+            drop(ex); // this thread holds the GIL throughout, so no drainer can run
+            assert_eq!(
+                latch_state(&latch),
+                (true, false),
+                "drop must mark dropped, not released"
+            );
+            assert!(
+                !resizable(ba.as_any()),
+                "dropped export was released without a drain"
+            );
+            assert!(latch_ready(py, &latch), "drain must release it");
+            assert_eq!(latch_state(&latch), (true, true));
+            assert!(resizable(ba.as_any()));
+        });
+    }
+
+    /// Dropped on a thread without the GIL (as a Tokio worker would): never blocks, and the
+    /// releaser thread (or any drainer) releases it afterwards.
+    #[test]
+    fn writable_export_dropped_without_the_gil_is_released_by_the_releaser() {
+        init();
+        let (ba, latch) = Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[1u8; 4096]);
+            let latch = Latch::new();
+            let mut ex = acquire_writable(py, ba.as_any(), 4096, &latch).unwrap();
+            let (tx, rx) = mpsc::channel();
+            let t = std::thread::spawn(move || {
+                ex.as_mut_slice().fill(9); // writing without the GIL
+                drop(ex);
+                tx.send(()).ok();
+            });
+            // The GIL is held here while the other thread drops the export.
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("dropping the writable export blocked on the GIL");
+            t.join().unwrap();
+            assert!(latch.is_dropped());
+            (ba.unbind(), latch)
+        });
+        assert!(
+            latch.wait_released_blocking(Duration::from_secs(10)),
+            "nobody released the dropped export"
+        );
+        Python::attach(|py| {
+            let ba = ba.bind(py);
+            let v = ba.to_vec(); // before `resizable`, which appends a byte
+            assert!(v.iter().all(|&b| b == 9), "writes lost");
+            assert!(resizable(ba.as_any()));
         });
     }
 }

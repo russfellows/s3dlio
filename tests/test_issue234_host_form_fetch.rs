@@ -72,11 +72,23 @@ fn fresh_dir(tag: &str) -> PathBuf {
     p
 }
 
+/// Every file below `dir`, as `/`-joined paths relative to `dir`: a download keeps each
+/// object's key path relative to the listing base (#284).
 fn files_in(dir: &Path) -> BTreeSet<String> {
-    std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"))
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect()
+    fn walk(dir: &Path, prefix: &str, out: &mut BTreeSet<String>) {
+        for e in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}")) {
+            let e = e.unwrap();
+            let name = format!("{prefix}{}", e.file_name().to_string_lossy());
+            if e.file_type().unwrap().is_dir() {
+                walk(&e.path(), &format!("{name}/"), out);
+            } else {
+                out.insert(name);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(dir, "", &mut out);
+    out
 }
 
 fn set(names: &[&str]) -> BTreeSet<String> {
@@ -147,15 +159,15 @@ async fn library_download_fetches_from_the_server_that_listed() {
     );
     assert_eq!(
         files_in(&dest),
-        set(&["a.npz", "b.txt", "c.npz"]),
-        "flat destination"
+        set(&["a.npz", "b.txt", "sub/c.npz"]),
+        "nested keys keep their path relative to the listing base"
     );
     assert_b_bytes(
         &dest,
         &[
             ("a.npz", "dl/a.npz"),
             ("b.txt", "dl/b.txt"),
-            ("c.npz", "dl/sub/c.npz"),
+            ("sub/c.npz", "dl/sub/c.npz"),
         ],
     );
     assert!(
@@ -186,8 +198,11 @@ async fn library_download_matching_fetches_from_the_server_that_listed() {
         (summary.attempted, summary.succeeded, summary.failed),
         (2, 2, 0)
     );
-    assert_eq!(files_in(&dest), set(&["a.npz", "c.npz"]));
-    assert_b_bytes(&dest, &[("a.npz", "dl/a.npz"), ("c.npz", "dl/sub/c.npz")]);
+    assert_eq!(files_in(&dest), set(&["a.npz", "sub/c.npz"]));
+    assert_b_bytes(
+        &dest,
+        &[("a.npz", "dl/a.npz"), ("sub/c.npz", "dl/sub/c.npz")],
+    );
     assert!(
         a.requests_for(&bucket).is_empty(),
         "the process-wide server must see no request: {:?}",
@@ -211,7 +226,7 @@ fn cli_download_fetches_from_the_server_that_listed() {
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(
         files_in(&dest),
-        set(&["a.npz", "b.txt", "c.npz"]),
+        set(&["a.npz", "b.txt", "sub/c.npz"]),
         "{}",
         text(&out)
     );
@@ -220,7 +235,7 @@ fn cli_download_fetches_from_the_server_that_listed() {
         &[
             ("a.npz", "dl/a.npz"),
             ("b.txt", "dl/b.txt"),
-            ("c.npz", "dl/sub/c.npz"),
+            ("sub/c.npz", "dl/sub/c.npz"),
         ],
     );
     assert!(
@@ -251,8 +266,16 @@ fn cli_download_with_pattern_fetches_from_the_server_that_listed() {
     );
 
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(files_in(&dest), set(&["a.npz", "c.npz"]), "{}", text(&out));
-    assert_b_bytes(&dest, &[("a.npz", "dl/a.npz"), ("c.npz", "dl/sub/c.npz")]);
+    assert_eq!(
+        files_in(&dest),
+        set(&["a.npz", "sub/c.npz"]),
+        "{}",
+        text(&out)
+    );
+    assert_b_bytes(
+        &dest,
+        &[("a.npz", "dl/a.npz"), ("sub/c.npz", "dl/sub/c.npz")],
+    );
     assert!(
         a.requests_for(&bucket).is_empty(),
         "{:?}",

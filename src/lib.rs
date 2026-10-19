@@ -9,9 +9,6 @@ compile_error!("Enable only one of: native-backends or arrow-backend");
 #[cfg(not(any(feature = "native-backends", feature = "arrow-backend")))]
 compile_error!("Must enable either 'native-backends' or 'arrow-backend' feature");
 
-// The 'gcs-community' feature is a legacy opt-in alternative (JSON API, no RAPID)
-// selected under the shared `backend-gcs` backend gate.
-
 // ===== Core Public API =====
 // This is the main stable API that external users should use
 pub mod api;
@@ -25,6 +22,7 @@ pub use api::*;
 // ===== Internal Modules (Implementation) =====
 // These are public for internal use but may change without notice
 
+pub mod capabilities; // pure, environment-free object capabilities (plan §4.5 A3, #264)
 pub mod checksum; // CRC-32C: the checksum every writer reports (#256)
 pub mod config;
 pub mod constants;
@@ -37,10 +35,17 @@ pub mod progress;
 // NOTE: sharded_client.rs and range_engine.rs (the S3-specific variant) were
 // removed in v0.9.90.  They were never-completed stubs with no callers.  The
 // production range engine is range_engine_generic.rs — see that file for context.
+pub mod download_layout; // (#284): where a downloaded object is written
 pub mod list_pattern; // (#213): the explicit client-side regex filter for listings
 pub mod mp;
 pub mod multi_endpoint;
 pub mod range_engine_generic; // Universal stream-based range engine (v0.9.2+)
+#[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
+pub(crate) mod range_version; // one object version per logical RangeEngine GET (stage G, G-F2)
+pub(crate) mod redact; // credential redaction of URIs shown in messages (one implementation)
+                       // The one entry the `s3-cli` binary needs: an error from a store call, made safe to print.
+#[doc(hidden)]
+pub use redact::sanitized_error;
 pub mod s3_selection; // (#213): which objects an s3:// URI selects
 pub mod uri_utils; // v0.9.14: Multi-endpoint URI expansion utilities // v0.9.14: Multi-endpoint load balancing with thread/process control
 
@@ -59,9 +64,11 @@ use pyo3::prelude::*;
 // Internal modules - these may change in future versions
 pub(crate) mod delete_batch_plan; // pure URI-grouping helpers for delete_batch (#179)
 pub mod delete_contract; // delete contract A shared by s3-cli and the Python API (#210, #167, #212)
+pub mod object_error; // typed object errors for the caller-buffer GET and typed HEAD (plan §4.5 A2)
 pub mod object_store;
 #[cfg(any(feature = "backend-azure", feature = "backend-gcs", test))]
 pub(crate) mod read_buffer; // streamed-GET destination buffer, sized once (#252)
+pub mod receive_progress; // distinct-position progress of one receive (plan §4.5 A1, A7)
 pub(crate) mod redirect_client; // HTTP 307 redirect following (for AIStore compatibility)
 pub mod retry; // v0.9.108+ Phase 4: shared retry helper for body-transfer failures
 pub mod s3_client;
@@ -94,10 +101,7 @@ pub mod tfrecord_index;
 #[cfg(feature = "numa")]
 pub mod numa;
 
-// Google Cloud Storage client - feature-gated backend selection
-#[cfg(feature = "gcs-community")]
-pub mod gcs_client; // Community-maintained gcloud-storage implementation
-
+// Google Cloud Storage client (official google-cloud-storage SDK)
 #[cfg(feature = "backend-gcs")]
 pub mod gcs_constants; // Single source of truth for all GCS/gRPC tuning constants
 #[cfg(feature = "backend-gcs")]

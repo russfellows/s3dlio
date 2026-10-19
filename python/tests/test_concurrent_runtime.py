@@ -16,26 +16,44 @@ Usage:
 """
 
 import argparse
-import os
-import sys
-import time
-import tempfile
 import shutil
-import traceback
+import sys
+import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+
+import pytest
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Concurrent s3dlio runtime test")
-    p.add_argument("--threads", type=int, default=16,
-                   help="Number of ThreadPoolExecutor workers (default: 16)")
-    p.add_argument("--objects", type=int, default=200,
-                   help="Number of objects to create/read (default: 200)")
-    p.add_argument("--size", type=int, default=65536,
-                   help="Object size in bytes (default: 65536)")
-    p.add_argument("--rounds", type=int, default=3,
-                   help="Number of put/get/verify rounds (default: 3)")
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=16,
+        help="Number of ThreadPoolExecutor workers (default: 16)",
+    )
+    p.add_argument(
+        "--objects",
+        type=int,
+        default=200,
+        help="Number of objects to create/read (default: 200)",
+    )
+    p.add_argument(
+        "--size", type=int, default=65536, help="Object size in bytes (default: 65536)"
+    )
+    p.add_argument(
+        "--rounds",
+        type=int,
+        default=3,
+        help="Number of put/get/verify rounds (default: 3)",
+    )
     return p.parse_args()
+
+
+def payload_for(i, size):
+    """Deterministic per-object payload, so a mixed-up or truncated object is detected."""
+    return (i.to_bytes(8, "big") * (size // 8 + 1))[:size]
 
 
 def banner(msg):
@@ -44,15 +62,14 @@ def banner(msg):
     print(f"{'=' * 60}")
 
 
-def test_concurrent_put_bytes(s3dlio, base_uri, num_threads, num_objects, obj_size):
+def run_concurrent_put_bytes(s3dlio, base_uri, num_threads, num_objects, obj_size):
     """Put objects concurrently from multiple threads — triggers the old bugs."""
     banner(f"PUT {num_objects} objects × {obj_size}B  ({num_threads} threads)")
-    data = os.urandom(obj_size)
     errors = []
 
     def put_one(i):
         uri = f"{base_uri}/obj_{i:06d}.bin"
-        s3dlio.put_bytes(uri, data)
+        s3dlio.put_bytes(uri, payload_for(i, obj_size))
         return i
 
     t0 = time.monotonic()
@@ -68,7 +85,9 @@ def test_concurrent_put_bytes(s3dlio, base_uri, num_threads, num_objects, obj_si
     rate = num_objects / elapsed
     total_mb = (num_objects * obj_size) / (1024 * 1024)
 
-    print(f"  Completed {num_objects - len(errors)}/{num_objects} puts in {elapsed:.2f}s")
+    print(
+        f"  Completed {num_objects - len(errors)}/{num_objects} puts in {elapsed:.2f}s"
+    )
     print(f"  {rate:.0f} ops/s  |  {total_mb / elapsed:.1f} MB/s")
 
     if errors:
@@ -78,7 +97,7 @@ def test_concurrent_put_bytes(s3dlio, base_uri, num_threads, num_objects, obj_si
     return errors
 
 
-def test_concurrent_get(s3dlio, base_uri, num_threads, num_objects, obj_size):
+def run_concurrent_get(s3dlio, base_uri, num_threads, num_objects, obj_size):
     """Get objects concurrently from multiple threads."""
     banner(f"GET {num_objects} objects  ({num_threads} threads)")
     errors = []
@@ -88,6 +107,8 @@ def test_concurrent_get(s3dlio, base_uri, num_threads, num_objects, obj_size):
         data = s3dlio.get(uri)
         if len(data) != obj_size:
             raise ValueError(f"Expected {obj_size} bytes, got {len(data)}")
+        if bytes(data.memoryview()) != payload_for(i, obj_size):
+            raise ValueError(f"Content mismatch for {uri}")
         return i
 
     t0 = time.monotonic()
@@ -103,7 +124,9 @@ def test_concurrent_get(s3dlio, base_uri, num_threads, num_objects, obj_size):
     rate = num_objects / elapsed
     total_mb = (num_objects * obj_size) / (1024 * 1024)
 
-    print(f"  Completed {num_objects - len(errors)}/{num_objects} gets in {elapsed:.2f}s")
+    print(
+        f"  Completed {num_objects - len(errors)}/{num_objects} gets in {elapsed:.2f}s"
+    )
     print(f"  {rate:.0f} ops/s  |  {total_mb / elapsed:.1f} MB/s")
 
     if errors:
@@ -113,7 +136,7 @@ def test_concurrent_get(s3dlio, base_uri, num_threads, num_objects, obj_size):
     return errors
 
 
-def test_concurrent_stat(s3dlio, base_uri, num_threads, num_objects):
+def run_concurrent_stat(s3dlio, base_uri, num_threads, num_objects, obj_size):
     """Stat objects concurrently from multiple threads."""
     banner(f"STAT {num_objects} objects  ({num_threads} threads)")
     errors = []
@@ -121,6 +144,8 @@ def test_concurrent_stat(s3dlio, base_uri, num_threads, num_objects):
     def stat_one(i):
         uri = f"{base_uri}/obj_{i:06d}.bin"
         info = s3dlio.stat(uri)
+        if info["size"] != obj_size:
+            raise ValueError(f"stat size {info['size']} != {obj_size} for {uri}")
         return i
 
     t0 = time.monotonic()
@@ -133,7 +158,9 @@ def test_concurrent_stat(s3dlio, base_uri, num_threads, num_objects):
                 errors.append((futs[f], exc))
 
     elapsed = time.monotonic() - t0
-    print(f"  Completed {num_objects - len(errors)}/{num_objects} stats in {elapsed:.2f}s")
+    print(
+        f"  Completed {num_objects - len(errors)}/{num_objects} stats in {elapsed:.2f}s"
+    )
     print(f"  {num_objects / elapsed:.0f} ops/s")
 
     if errors:
@@ -143,7 +170,7 @@ def test_concurrent_stat(s3dlio, base_uri, num_threads, num_objects):
     return errors
 
 
-def test_concurrent_exists(s3dlio, base_uri, num_threads, num_objects):
+def run_concurrent_exists(s3dlio, base_uri, num_threads, num_objects):
     """Exists check concurrently from multiple threads."""
     banner(f"EXISTS {num_objects} objects  ({num_threads} threads)")
     errors = []
@@ -165,7 +192,9 @@ def test_concurrent_exists(s3dlio, base_uri, num_threads, num_objects):
                 errors.append((futs[f], exc))
 
     elapsed = time.monotonic() - t0
-    print(f"  Completed {num_objects - len(errors)}/{num_objects} exists in {elapsed:.2f}s")
+    print(
+        f"  Completed {num_objects - len(errors)}/{num_objects} exists in {elapsed:.2f}s"
+    )
     print(f"  {num_objects / elapsed:.0f} ops/s")
 
     if errors:
@@ -175,7 +204,7 @@ def test_concurrent_exists(s3dlio, base_uri, num_threads, num_objects):
     return errors
 
 
-def test_concurrent_delete(s3dlio, base_uri, num_threads, num_objects):
+def run_concurrent_delete(s3dlio, base_uri, num_threads, num_objects):
     """Delete objects concurrently from multiple threads."""
     banner(f"DELETE {num_objects} objects  ({num_threads} threads)")
     errors = []
@@ -195,7 +224,9 @@ def test_concurrent_delete(s3dlio, base_uri, num_threads, num_objects):
                 errors.append((futs[f], exc))
 
     elapsed = time.monotonic() - t0
-    print(f"  Completed {num_objects - len(errors)}/{num_objects} deletes in {elapsed:.2f}s")
+    print(
+        f"  Completed {num_objects - len(errors)}/{num_objects} deletes in {elapsed:.2f}s"
+    )
     print(f"  {num_objects / elapsed:.0f} ops/s")
 
     if errors:
@@ -205,11 +236,11 @@ def test_concurrent_delete(s3dlio, base_uri, num_threads, num_objects):
     return errors
 
 
-def test_put_many_batch(s3dlio, base_uri, num_objects, obj_size):
+def run_put_many_batch(s3dlio, base_uri, num_objects, obj_size):
     """Test the new put_many() batch function."""
     banner(f"PUT_MANY batch: {num_objects} objects × {obj_size}B")
     items = [
-        (f"{base_uri}/batch_{i:06d}.bin", os.urandom(obj_size))
+        (f"{base_uri}/batch_{i:06d}.bin", payload_for(i, obj_size))
         for i in range(num_objects)
     ]
 
@@ -220,27 +251,43 @@ def test_put_many_batch(s3dlio, base_uri, num_objects, obj_size):
         total_mb = (num_objects * obj_size) / (1024 * 1024)
         print(f"  Completed {num_objects} puts in {elapsed:.2f}s")
         print(f"  {num_objects / elapsed:.0f} ops/s  |  {total_mb / elapsed:.1f} MB/s")
-        return []
     except Exception as exc:
         elapsed = time.monotonic() - t0
         print(f"  *** FAILED after {elapsed:.2f}s: {exc}")
         return [(0, exc)]
 
+    # Read every object back and compare it with what was put.
+    errors = []
+    for i, (uri, data) in enumerate(items):
+        try:
+            got = s3dlio.get(uri)
+            if bytes(got.memoryview()) != data:
+                raise ValueError(f"Content mismatch for {uri}")
+        except Exception as exc:
+            errors.append((i, exc))
+    if errors:
+        print(f"  *** {len(errors)} read-back ERRORS, first: {errors[0][1]}")
+    return errors
 
-def test_mixed_concurrent(s3dlio, base_uri, num_threads, num_objects, obj_size):
+
+def run_mixed_concurrent(s3dlio, base_uri, num_threads, num_objects, obj_size):
     """Mixed PUT + GET + STAT concurrently — stress test."""
     banner(f"MIXED ops: {num_objects * 3} total  ({num_threads} threads)")
-    data = os.urandom(obj_size)
     errors = []
 
     def mixed_op(i):
         """Each task: put → get → stat on the same object."""
         uri = f"{base_uri}/mixed_{i:06d}.bin"
+        data = payload_for(i, obj_size)
         s3dlio.put_bytes(uri, data)
         got = s3dlio.get(uri)
         if len(got) != obj_size:
             raise ValueError(f"Size mismatch: expected {obj_size}, got {len(got)}")
-        s3dlio.stat(uri)
+        if bytes(got.memoryview()) != data:
+            raise ValueError(f"Content mismatch for {uri}")
+        info = s3dlio.stat(uri)
+        if info["size"] != obj_size:
+            raise ValueError(f"stat size {info['size']} != {obj_size} for {uri}")
         return i
 
     t0 = time.monotonic()
@@ -254,7 +301,9 @@ def test_mixed_concurrent(s3dlio, base_uri, num_threads, num_objects, obj_size):
 
     elapsed = time.monotonic() - t0
     total_ops = (num_objects - len(errors)) * 3
-    print(f"  Completed {num_objects - len(errors)}/{num_objects} mixed sequences in {elapsed:.2f}s")
+    print(
+        f"  Completed {num_objects - len(errors)}/{num_objects} mixed sequences in {elapsed:.2f}s"
+    )
     print(f"  {total_ops / elapsed:.0f} total ops/s")
 
     if errors:
@@ -262,6 +311,96 @@ def test_mixed_concurrent(s3dlio, base_uri, num_threads, num_objects, obj_size):
         for idx, exc in errors[:5]:
             print(f"      obj {idx}: {exc}")
     return errors
+
+
+# ---------------------------------------------------------------------------
+# pytest entry points (file:// backend, no credentials needed).  The run_* helpers above
+# are shared with the command-line main() below.
+# ---------------------------------------------------------------------------
+PYTEST_THREADS = 16
+PYTEST_OBJECTS = 200
+PYTEST_SIZE = 65536
+
+
+@pytest.fixture(scope="module")
+def s3dlio():
+    import s3dlio as module
+
+    return module
+
+
+@pytest.fixture
+def base_uri(tmp_path):
+    return f"file://{tmp_path}"
+
+
+def _assert_no_errors(errors):
+    assert not errors, f"{len(errors)} errors, first: {errors[0][0]}: {errors[0][1]!r}"
+
+
+def _populate(s3dlio, base_uri):
+    _assert_no_errors(
+        run_concurrent_put_bytes(
+            s3dlio, base_uri, PYTEST_THREADS, PYTEST_OBJECTS, PYTEST_SIZE
+        )
+    )
+
+
+def test_concurrent_put_bytes(s3dlio, base_uri):
+    _assert_no_errors(
+        run_concurrent_put_bytes(
+            s3dlio, base_uri, PYTEST_THREADS, PYTEST_OBJECTS, PYTEST_SIZE
+        )
+    )
+
+
+def test_concurrent_get(s3dlio, base_uri):
+    _populate(s3dlio, base_uri)
+    _assert_no_errors(
+        run_concurrent_get(
+            s3dlio, base_uri, PYTEST_THREADS, PYTEST_OBJECTS, PYTEST_SIZE
+        )
+    )
+
+
+def test_concurrent_stat(s3dlio, base_uri):
+    _populate(s3dlio, base_uri)
+    _assert_no_errors(
+        run_concurrent_stat(
+            s3dlio, base_uri, PYTEST_THREADS, PYTEST_OBJECTS, PYTEST_SIZE
+        )
+    )
+
+
+def test_concurrent_exists(s3dlio, base_uri):
+    _populate(s3dlio, base_uri)
+    _assert_no_errors(
+        run_concurrent_exists(s3dlio, base_uri, PYTEST_THREADS, PYTEST_OBJECTS)
+    )
+
+
+def test_concurrent_delete(s3dlio, base_uri):
+    _populate(s3dlio, base_uri)
+    _assert_no_errors(
+        run_concurrent_delete(s3dlio, base_uri, PYTEST_THREADS, PYTEST_OBJECTS)
+    )
+    # The deletes must really have removed every object.
+    for i in range(PYTEST_OBJECTS):
+        assert not s3dlio.exists(f"{base_uri}/obj_{i:06d}.bin")
+
+
+def test_put_many_batch(s3dlio, base_uri):
+    _assert_no_errors(
+        run_put_many_batch(s3dlio, base_uri, min(PYTEST_OBJECTS, 100), PYTEST_SIZE)
+    )
+
+
+def test_mixed_concurrent(s3dlio, base_uri):
+    _assert_no_errors(
+        run_mixed_concurrent(
+            s3dlio, base_uri, PYTEST_THREADS, PYTEST_OBJECTS, PYTEST_SIZE
+        )
+    )
 
 
 def main():
@@ -273,6 +412,7 @@ def main():
     print(f"  Rounds:  {args.rounds}")
 
     import s3dlio
+
     print(f"\n  s3dlio loaded from: {s3dlio.__file__}")
 
     # Create temp directory for file:// backend testing
@@ -289,28 +429,35 @@ def main():
             print(f"{'#' * 60}")
 
             # Core operations that triggered the original bugs
-            all_errors += test_concurrent_put_bytes(
-                s3dlio, round_uri, args.threads, args.objects, args.size)
-            all_errors += test_concurrent_get(
-                s3dlio, round_uri, args.threads, args.objects, args.size)
-            all_errors += test_concurrent_stat(
-                s3dlio, round_uri, args.threads, args.objects)
-            all_errors += test_concurrent_exists(
-                s3dlio, round_uri, args.threads, args.objects)
+            all_errors += run_concurrent_put_bytes(
+                s3dlio, round_uri, args.threads, args.objects, args.size
+            )
+            all_errors += run_concurrent_get(
+                s3dlio, round_uri, args.threads, args.objects, args.size
+            )
+            all_errors += run_concurrent_stat(
+                s3dlio, round_uri, args.threads, args.objects, args.size
+            )
+            all_errors += run_concurrent_exists(
+                s3dlio, round_uri, args.threads, args.objects
+            )
 
             # Batch put_many
             batch_uri = f"{base_uri}/batch_round_{round_num}"
-            all_errors += test_put_many_batch(
-                s3dlio, batch_uri, min(args.objects, 100), args.size)
+            all_errors += run_put_many_batch(
+                s3dlio, batch_uri, min(args.objects, 100), args.size
+            )
 
             # Mixed concurrent operations (put+get+stat per thread)
             mixed_uri = f"{base_uri}/mixed_round_{round_num}"
-            all_errors += test_mixed_concurrent(
-                s3dlio, mixed_uri, args.threads, args.objects, args.size)
+            all_errors += run_mixed_concurrent(
+                s3dlio, mixed_uri, args.threads, args.objects, args.size
+            )
 
             # Cleanup: delete all objects from this round
-            all_errors += test_concurrent_delete(
-                s3dlio, round_uri, args.threads, args.objects)
+            all_errors += run_concurrent_delete(
+                s3dlio, round_uri, args.threads, args.objects
+            )
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
@@ -326,7 +473,7 @@ def main():
             print(f"    obj {idx}: {type(exc).__name__}: {exc}")
         sys.exit(1)
     else:
-        print(f"  PASS: All operations completed without errors")
+        print("  PASS: All operations completed without errors")
         print(f"  Threads={args.threads}  Objects={args.objects}  Rounds={args.rounds}")
         sys.exit(0)
 

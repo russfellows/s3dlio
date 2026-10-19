@@ -228,13 +228,16 @@ enum Command {
         #[clap(short, long)]
         pattern: Option<String>,
     },
-    /// Download one or many objects concurrently.
+    /// Read one or many objects concurrently and report bytes and throughput.
+    ///
+    /// `get` only reads the objects: it fetches their bytes, reports the byte count and throughput,
+    /// and does not save them anywhere. To save objects to a local path use `download`.
     ///
     /// On s3:// the URI is a name, never a bare prefix and never a regex: `get s3://b/file.txt`
-    /// downloads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` downloads everything under
+    /// reads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` reads everything under
     /// `dl/` (never `dl2/`); `get s3://b/dl/` the contents of that directory. `*` makes an explicit
     /// glob over the full key (`*` stays in one directory level, `**` crosses `/`):
-    /// `get 's3://b/file.txt*'` downloads `file.txt`, `file.txt.bak` and `file.txt2`. To narrow the
+    /// `get 's3://b/file.txt*'` reads `file.txt`, `file.txt.bak` and `file.txt2`. To narrow the
     /// selection with a regex use `--pattern`, matched against the object name relative to the
     /// listing base (for `s3://b/dl/` and key `dl/sub/c.npz` the pattern sees `sub/c.npz`).
     /// This rule is implemented for s3:// only; file://, direct://, gs:// and az:// do not yet
@@ -260,7 +263,7 @@ enum Command {
         #[arg(long = "concurrent", value_parser = parse_jobs)]
         concurrent: Option<usize>,
 
-        /// File containing list of S3 URIs to download (one per line).
+        /// File containing list of S3 URIs to read (one per line).
         #[arg(long = "keylist")]
         keylist: Option<PathBuf>,
 
@@ -751,7 +754,21 @@ fn parse_human_size(input: &str) -> std::result::Result<usize, String> {
 /// worker threads) is built, so the runtime and everything after it see the file's
 /// values and the environment is set while the process has only its main thread
 /// (issue #243). The runtime is built right after.
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    // Every command's error ends up here, so the one place that prints it also redacts it:
+    // credentials in any `scheme://` URI of the cause chain (userinfo, signed queries) are
+    // removed and control / bidi characters are escaped. Same `Error: ...` form as the
+    // default `main` result printer, and the exit code stays non-zero.
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {:?}", s3dlio::sanitized_error(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     // s3-cli loads a `.env` file by default (variables already set are never overridden).
     // `S3DLIO_LOAD_DOTENV=0` turns that off, `=<path>` loads that file instead (issue #243).
     // No log subscriber exists yet, so a problem with the named file is printed here.
@@ -975,7 +992,11 @@ async fn async_main() -> Result<()> {
                     if dest.starts_with("s3://") {
                         if let Ok((bucket, _)) = parse_s3_uri(&dest) {
                             if let Err(e) = store.create_container(&bucket).await {
-                                warn!("Failed to create bucket {}: {}", bucket, e);
+                                warn!(
+                                    "Failed to create bucket {}: {}",
+                                    bucket,
+                                    s3dlio::sanitized_error(&e)
+                                );
                             }
                         }
                     } else if dest.starts_with("az://") || dest.starts_with("azure://") {
@@ -987,7 +1008,11 @@ async fn async_main() -> Result<()> {
                             .collect();
                         if let Some(container) = parts.first() {
                             if let Err(e) = store.create_container(container).await {
-                                warn!("Failed to create container {}: {}", container, e);
+                                warn!(
+                                    "Failed to create container {}: {}",
+                                    container,
+                                    s3dlio::sanitized_error(&e)
+                                );
                             }
                         }
                     } else if dest.starts_with("gs://") || dest.starts_with("gcs://") {
@@ -999,7 +1024,11 @@ async fn async_main() -> Result<()> {
                             .collect();
                         if let Some(bucket) = parts.first() {
                             if let Err(e) = store.create_container(bucket).await {
-                                warn!("Failed to create GCS bucket {}: {}", bucket, e);
+                                warn!(
+                                    "Failed to create GCS bucket {}: {}",
+                                    bucket,
+                                    s3dlio::sanitized_error(&e)
+                                );
                             }
                         }
                     }
@@ -1053,8 +1082,15 @@ async fn async_main() -> Result<()> {
             }
             // Use generic object store to list objects (works with all backends)
             let logger = global_logger();
-            let store = store_for_uri_with_logger(&src, logger)?;
-            let mut keys = store.list(&src, recursive).await?;
+            // The store and listing errors may quote a provider message with signed URLs or
+            // `user:password@`, and `main` prints the whole cause chain: they are sanitised
+            // here (credentials redacted from every URI, control and bidi characters escaped).
+            let store =
+                store_for_uri_with_logger(&src, logger).map_err(|e| s3dlio::sanitized_error(&e))?;
+            let mut keys = store
+                .list(&src, recursive)
+                .await
+                .map_err(|e| s3dlio::sanitized_error(&e))?;
             if let Some(filter) = &filter {
                 filter.retain(&src, &mut keys);
             }
@@ -1129,7 +1165,11 @@ async fn async_main() -> Result<()> {
                             if dest.starts_with("s3://") {
                                 if let Ok((bucket, _)) = parse_s3_uri(&dest) {
                                     if let Err(e) = store.create_container(&bucket).await {
-                                        warn!("Failed to create bucket {}: {}", bucket, e);
+                                        warn!(
+                                            "Failed to create bucket {}: {}",
+                                            bucket,
+                                            s3dlio::sanitized_error(&e)
+                                        );
                                     }
                                 }
                             } else if dest.starts_with("az://") || dest.starts_with("azure://") {
@@ -1140,7 +1180,11 @@ async fn async_main() -> Result<()> {
                                     .collect();
                                 if let Some(container) = parts.first() {
                                     if let Err(e) = store.create_container(container).await {
-                                        warn!("Failed to create container {}: {}", container, e);
+                                        warn!(
+                                            "Failed to create container {}: {}",
+                                            container,
+                                            s3dlio::sanitized_error(&e)
+                                        );
                                     }
                                 }
                             } else if dest.starts_with("gs://") || dest.starts_with("gcs://") {
@@ -1151,7 +1195,11 @@ async fn async_main() -> Result<()> {
                                     .collect();
                                 if let Some(bucket) = parts.first() {
                                     if let Err(e) = store.create_container(bucket).await {
-                                        warn!("Failed to create GCS bucket {}: {}", bucket, e);
+                                        warn!(
+                                            "Failed to create GCS bucket {}: {}",
+                                            bucket,
+                                            s3dlio::sanitized_error(&e)
+                                        );
                                     }
                                 }
                             }
@@ -1238,7 +1286,11 @@ async fn async_main() -> Result<()> {
                     let target = s3dlio::s3_utils::s3_bucket_target(&uri_prefix)?;
                     if let Err(e) = s3dlio::s3_utils::create_bucket_for_uri_async(&uri_prefix).await
                     {
-                        eprintln!("Warning: failed to create bucket {}: {}", target.bucket, e);
+                        eprintln!(
+                            "Warning: failed to create bucket {}: {}",
+                            target.bucket,
+                            s3dlio::sanitized_error(&e)
+                        );
                     }
                 }
             }
@@ -1464,8 +1516,9 @@ async fn stat_cmd(uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// Get command: downloads the objects the URI selects (on s3://: the exact name plus `name/...`, a
-/// directory `name/`, or a `*` / `**` glob), optionally narrowed by an explicit `--pattern` regex.
+/// Get command: reads the objects the URI selects and reports bytes and throughput; it does not
+/// save them (that is `download`). On s3:// it selects the exact name plus `name/...`, a directory
+/// `name/`, or a `*` / `**` glob, optionally narrowed by an explicit `--pattern` regex.
 #[allow(clippy::too_many_arguments)]
 async fn get_cmd(
     uri: Option<&str>,
@@ -1563,7 +1616,7 @@ async fn get_cmd(
 
         let t0 = Instant::now();
 
-        // Use universal ObjectStore interface for parallel downloads
+        // Use universal ObjectStore interface for parallel reads
         let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let mut futs = futures_util::stream::FuturesUnordered::new();
         let mut total_bytes = 0u64;
@@ -1599,11 +1652,11 @@ async fn get_cmd(
                 Ok(Ok((uri, byte_count))) => {
                     total_bytes += byte_count;
                     success_count += 1;
-                    info!("Downloaded {} bytes from {}", byte_count, uri);
+                    info!("Read {} bytes from {}", byte_count, uri);
                 }
                 Ok(Err(e)) => {
                     failure_count += 1;
-                    warn!("GET failed: {}", e);
+                    warn!("GET failed: {}", s3dlio::sanitized_error(&e));
                 }
                 Err(e) => {
                     failure_count += 1;
@@ -1616,7 +1669,7 @@ async fn get_cmd(
 
         // Update final progress
         progress_callback.update_total_bytes(total_bytes);
-        progress_tracker.finish("Download", total_bytes, dt);
+        progress_tracker.finish("Read", total_bytes, dt);
 
         // Report benchmark results (data is immediately discarded for benchmarking)
         let throughput_mb_s = (total_bytes as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64();
@@ -1724,7 +1777,7 @@ async fn get_cmd(
     let do_recursive = recursive || uri_str.ends_with('/');
 
     // === Shared real-time progress state ===
-    // These atomics are updated by spawned download tasks so the background
+    // These atomics are updated by spawned read tasks so the background
     // progress updater always sees current counts without any locking on the
     // hot path.
     let keys_listed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1846,7 +1899,7 @@ async fn get_cmd(
     let mut stream = store.list_stream(uri_str, do_recursive);
     let mut failure_count = 0u64;
 
-    // Phase 1: consume the listing stream, spawning one bounded download per key.
+    // Phase 1: consume the listing stream, spawning one bounded read per key.
     while let Some(result) = stream.next().await {
         let key = result.with_context(|| format!("list error for '{}'", uri_str))?;
         if key.ends_with('/') {
@@ -1893,14 +1946,14 @@ async fn get_cmd(
         bail!("No objects found for '{}' (a URI selects an exact name or a directory; use '*' to select by prefix)", uri_str);
     }
 
-    // Phase 2: drain all in-flight downloads and collect errors.
+    // Phase 2: drain all in-flight reads and collect errors.
     // Byte/object counts are already tracked via atomics; this loop only gathers failures.
     while let Some(result) = futs.next().await {
         match result {
             Ok(Ok(_)) => {} // atomics already updated inside the task
             Ok(Err(e)) => {
                 failure_count += 1;
-                warn!("GET failed: {}", e);
+                warn!("GET failed: {}", s3dlio::sanitized_error(&e));
             }
             Err(e) => {
                 failure_count += 1;
@@ -2282,7 +2335,7 @@ async fn put_many_cmd(
             }
             Ok(Err(e)) => {
                 failure_count += 1;
-                warn!("PUT failed: {}", e);
+                warn!("PUT failed: {}", s3dlio::sanitized_error(&e));
             }
             Err(e) => {
                 failure_count += 1;

@@ -8,22 +8,86 @@
 //! (404 `BlobNotFound` for a missing blob), and a flat container listing. It records every
 //! request and answers 403 after `cap` requests so a request storm fails fast.
 //!
+//! For the caller-buffer GET tests (#264) it also: enforces `If-Match` (412 `ConditionNotMet`),
+//! serves per-blob ETags and version ids (or none), can answer a missing container, can cap the
+//! length of a ranged reply, and can cut a GET body short after the headers (a mid-stream
+//! failure), optionally changing the blob afterwards. A scripted GET can also answer a status
+//! (429, 503, 507 ...), close the connection without a reply, or stall after some bytes. A flag
+//! strips `Content-Range` from ranged replies (a 206 that does not say which part it carries).
+//! `replace_before_get` swaps the blob (same size, another ETag) just before the n-th GET is
+//! answered, to test a replacement between the ranges of one logical read.
+//!
 //! Include with `#[path = "common/azure_fake.rs"] mod azure_fake;`.
 
 #![allow(dead_code)]
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 pub const MIB: usize = 1024 * 1024;
+
+/// A response body: whole, or a stream that can fail part-way.
+pub type Body = BoxBody<Bytes, std::io::Error>;
+
+fn full(bytes: Bytes) -> Body {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
+}
+
+/// `sent` and then a connection failure: the headers (with the full declared length) and the
+/// first bytes go out, then the server aborts the connection.
+fn cut_body(sent: Bytes) -> Body {
+    use futures::StreamExt;
+    let mut frames: Vec<Result<Frame<Bytes>, std::io::Error>> = Vec::new();
+    if !sent.is_empty() {
+        frames.push(Ok(Frame::data(sent)));
+    }
+    // The pause lets the server flush the headers and the bytes before the connection is cut.
+    let cut = futures::stream::once(async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "fake: connection cut",
+        ))
+    });
+    BodyExt::boxed(StreamBody::new(futures::stream::iter(frames).chain(cut)))
+}
+
+/// `sent` and then silence: the headers (with the full declared length) and the first bytes go
+/// out, then the body never yields again and the connection stays open.
+fn stalled_body(sent: Bytes) -> Body {
+    use futures::StreamExt;
+    let mut frames: Vec<Result<Frame<Bytes>, std::io::Error>> = Vec::new();
+    if !sent.is_empty() {
+        frames.push(Ok(Frame::data(sent)));
+    }
+    let pending = futures::stream::pending::<Result<Frame<Bytes>, std::io::Error>>();
+    BodyExt::boxed(StreamBody::new(
+        futures::stream::iter(frames).chain(pending),
+    ))
+}
+
+/// Marks the reply `handle` hands back when the connection must be closed without a reply.
+const DROP_MARKER: &str = "x-fake-drop-connection";
+
+/// Returned to hyper to close the connection without answering the request.
+#[derive(Debug)]
+struct ConnectionDropped;
+
+impl std::fmt::Display for ConnectionDropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("fake: connection dropped")
+    }
+}
+
+impl std::error::Error for ConnectionDropped {}
 
 #[derive(Clone, Debug)]
 pub struct Req {
@@ -32,6 +96,37 @@ pub struct Req {
     pub path: String,
     pub query: String,
     pub range: Option<String>,
+    pub if_match: Option<String>,
+}
+
+/// What happens to the blob after a faulted GET was served.
+#[derive(Clone, Debug)]
+pub enum AfterFault {
+    Nothing,
+    /// The blob is deleted.
+    Delete,
+    /// The blob is replaced by this content and ETag.
+    Replace(Vec<u8>, String),
+    /// Later replies carry no ETag.
+    OmitEtag,
+}
+
+/// One scripted GET failure, consumed first in first out by GETs of an existing blob.
+#[derive(Clone, Debug)]
+pub enum GetFault {
+    /// The reply declares the full length, sends `truncate_after` bytes of it and then the
+    /// connection is cut; afterwards `then` is applied to the blob.
+    Cut {
+        truncate_after: usize,
+        then: AfterFault,
+    },
+    /// The reply is this HTTP status with an empty body (and this `x-ms-error-code`, if any).
+    Status { status: u16, code: Option<String> },
+    /// The request is read and the connection is closed without any reply.
+    Drop,
+    /// The reply declares the full length, sends `after` bytes of it and then stalls for good:
+    /// the connection stays open and the body never yields again.
+    Stall { after: usize },
 }
 
 pub struct Fake {
@@ -45,6 +140,31 @@ pub struct Fake {
     pub forbidden_accounts: HashSet<String>,
     /// Names the listing reports although no such blob exists (it vanished after the listing).
     pub list_ghosts: Vec<String>,
+    /// ETag per `acct/ctr/key`; a blob without an entry has `"0x1"` (a quoted strong tag).
+    pub etags: HashMap<String, String>,
+    /// No ETag header at all on blob replies.
+    pub omit_etag: bool,
+    /// `x-ms-version-id` per `acct/ctr/key`.
+    pub version_ids: HashMap<String, String>,
+    /// Containers (`acct/ctr`) that do not exist: every blob request answers 404 `ContainerNotFound`.
+    pub missing_containers: HashSet<String>,
+    /// A ranged reply carries at most this many bytes (a service answering less than asked).
+    pub range_cap: Option<usize>,
+    /// Ranged GETs are answered 200 with the whole blob (a service that ignores `Range`).
+    pub ignore_range: bool,
+    /// `If-Match` is not enforced (a service or proxy that ignores the condition).
+    pub ignore_if_match: bool,
+    /// Ranged replies are 206 without a `Content-Range` header (the body is still the range).
+    pub strip_content_range: bool,
+    /// Scripted GET failures (see [`GetFault`]).
+    pub get_faults: VecDeque<GetFault>,
+    /// GET requests that reached an existing blob so far (HEAD and listings are not counted).
+    pub gets_seen: usize,
+    /// `(n, content, etag)`: the blob a GET names is replaced by `content` and `etag` just BEFORE
+    /// the `n`-th GET (counting from 1) is answered, so GET `n` and every later one see the new
+    /// version and earlier ones saw the old one (a same-size replacement between the ranges of
+    /// one logical read).
+    pub replace_before_get: Vec<(usize, Vec<u8>, String)>,
 }
 
 impl Default for Fake {
@@ -55,16 +175,27 @@ impl Default for Fake {
             cap: 300,
             forbidden_accounts: HashSet::new(),
             list_ghosts: Vec::new(),
+            etags: HashMap::new(),
+            omit_etag: false,
+            version_ids: HashMap::new(),
+            missing_containers: HashSet::new(),
+            range_cap: None,
+            ignore_range: false,
+            ignore_if_match: false,
+            strip_content_range: false,
+            get_faults: VecDeque::new(),
+            gets_seen: 0,
+            replace_before_get: Vec::new(),
         }
     }
 }
 
 pub type State = Arc<Mutex<Fake>>;
 
-fn plain(status: StatusCode) -> Response<Full<Bytes>> {
+fn plain(status: StatusCode) -> Response<Body> {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::new()))
+        .body(full(Bytes::new()))
         .unwrap()
 }
 
@@ -94,7 +225,7 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
+async fn handle(state: State, req: Request<Incoming>) -> Response<Body> {
     let method = req.method().clone();
     let full_uri = req.uri().to_string();
     let path = pct_decode(req.uri().path().trim_start_matches('/'));
@@ -103,6 +234,10 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
         .headers()
         .get("range")
         .or_else(|| req.headers().get("x-ms-range"))
+        .map(|v| v.to_str().unwrap_or("").to_string());
+    let if_match = req
+        .headers()
+        .get("if-match")
         .map(|v| v.to_str().unwrap_or("").to_string());
     let body = req
         .into_body()
@@ -117,6 +252,7 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
         path: path.clone(),
         query: query.clone(),
         range: range.clone(),
+        if_match: if_match.clone(),
     });
     if fake.requests.len() > fake.cap {
         return plain(StatusCode::FORBIDDEN);
@@ -126,7 +262,7 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
             .header("x-ms-error-code", "AuthorizationFailure")
-            .body(Full::new(Bytes::from(format!("forbidden: {full_uri}"))))
+            .body(full(Bytes::from(format!("forbidden: {full_uri}"))))
             .unwrap();
     }
 
@@ -137,6 +273,17 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
         segs.next().unwrap_or(""),
         segs.next().unwrap_or(""),
     );
+    if method != Method::PUT
+        && fake
+            .missing_containers
+            .contains(&format!("{account}/{container}"))
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("x-ms-error-code", "ContainerNotFound")
+            .body(full(Bytes::new()))
+            .unwrap();
+    }
     if method == Method::GET && key.is_empty() && query.contains("comp=list") {
         let prefix = query
             .split('&')
@@ -171,7 +318,7 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/xml")
-            .body(Full::new(Bytes::from(format!(
+            .body(full(Bytes::from(format!(
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?><EnumerationResults ContainerName=\"{container}\">\
                  <Blobs>{items}</Blobs><NextMarker /></EnumerationResults>"
             ))))
@@ -185,7 +332,7 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
                 .status(StatusCode::CREATED)
                 .header("etag", "\"0x1\"")
                 .header("last-modified", "Wed, 14 Oct 2026 10:00:00 GMT")
-                .body(Full::new(Bytes::new()))
+                .body(full(Bytes::new()))
                 .unwrap()
         }
         Method::DELETE => {
@@ -195,26 +342,90 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
                 Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .header("x-ms-error-code", "BlobNotFound")
-                    .body(Full::new(Bytes::new()))
+                    .body(full(Bytes::new()))
                     .unwrap()
             }
         }
         Method::GET | Method::HEAD => {
+            if method == Method::GET && fake.blobs.contains_key(&path) {
+                fake.gets_seen += 1;
+                let seen = fake.gets_seen;
+                let due: Vec<(Vec<u8>, String)> = fake
+                    .replace_before_get
+                    .iter()
+                    .filter(|(n, _, _)| *n == seen)
+                    .map(|(_, content, etag)| (content.clone(), etag.clone()))
+                    .collect();
+                for (content, etag) in due {
+                    fake.blobs.insert(path.clone(), content);
+                    fake.etags.insert(path.clone(), etag);
+                }
+            }
             let Some(data) = fake.blobs.get(&path).cloned() else {
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .header("x-ms-error-code", "BlobNotFound")
-                    .body(Full::new(Bytes::new()))
+                    .body(full(Bytes::new()))
                     .unwrap();
             };
             let total = data.len();
+            // A scripted status or dropped connection answers before anything else is looked at.
+            if method == Method::GET
+                && matches!(
+                    fake.get_faults.front(),
+                    Some(GetFault::Status { .. } | GetFault::Drop)
+                )
+            {
+                match fake.get_faults.pop_front() {
+                    Some(GetFault::Status { status, code }) => {
+                        let mut builder = Response::builder().status(
+                            StatusCode::from_u16(status)
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        );
+                        if let Some(code) = code {
+                            builder = builder.header("x-ms-error-code", code);
+                        }
+                        return builder.body(full(Bytes::new())).unwrap();
+                    }
+                    _ => {
+                        return Response::builder()
+                            .header(DROP_MARKER, "1")
+                            .body(full(Bytes::new()))
+                            .unwrap();
+                    }
+                }
+            }
+            let etag = fake
+                .etags
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| "\"0x1\"".to_string());
+            // `If-Match`: a list of tags, or `*`. A mismatch is 412, evaluated before the range.
+            if let Some(wanted) = if_match.as_deref().filter(|_| !fake.ignore_if_match) {
+                let matches = wanted
+                    .split(',')
+                    .map(str::trim)
+                    .any(|w| w == "*" || w == etag);
+                if !matches {
+                    return Response::builder()
+                        .status(StatusCode::PRECONDITION_FAILED)
+                        .header("x-ms-error-code", "ConditionNotMet")
+                        .body(full(Bytes::new()))
+                        .unwrap();
+                }
+            }
             let mut builder = Response::builder()
-                .header("etag", "\"0x1\"")
                 .header("last-modified", "Wed, 14 Oct 2026 10:00:00 GMT")
                 .header("x-ms-blob-type", "BlockBlob")
                 .header("accept-ranges", "bytes");
+            if !fake.omit_etag {
+                builder = builder.header("etag", etag);
+            }
+            if let Some(version) = fake.version_ids.get(&path) {
+                builder = builder.header("x-ms-version-id", version.as_str());
+            }
             let (status, chunk) = match range.as_deref() {
-                Some(r) if method == Method::GET => {
+                Some(r) if method == Method::GET && !fake.ignore_range => {
                     let (s, e) = r.trim_start_matches("bytes=").split_once('-').unwrap();
                     let start: usize = s.parse().unwrap();
                     if start >= total {
@@ -222,16 +433,21 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
                             .status(StatusCode::RANGE_NOT_SATISFIABLE)
                             .header("x-ms-error-code", "InvalidRange")
                             .header("content-range", format!("bytes */{total}"))
-                            .body(Full::new(Bytes::new()))
+                            .body(full(Bytes::new()))
                             .unwrap();
                     }
-                    let end = if e.is_empty() {
+                    let mut end = if e.is_empty() {
                         total - 1
                     } else {
                         e.parse::<usize>().unwrap().min(total - 1)
                     };
-                    builder =
-                        builder.header("content-range", format!("bytes {start}-{end}/{total}"));
+                    if let Some(cap) = fake.range_cap {
+                        end = end.min(start + cap.max(1) - 1);
+                    }
+                    if !fake.strip_content_range {
+                        builder =
+                            builder.header("content-range", format!("bytes {start}-{end}/{total}"));
+                    }
                     (StatusCode::PARTIAL_CONTENT, data[start..=end].to_vec())
                 }
                 _ => (StatusCode::OK, data),
@@ -240,12 +456,43 @@ async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
             if method == Method::HEAD {
                 builder
                     .header("content-length", total.to_string())
-                    .body(Full::new(Bytes::new()))
+                    .body(full(Bytes::new()))
                     .unwrap()
             } else {
+                // A scripted failure: declare the full length, send part of it. The headers and
+                // the first `truncate_after` bytes go out, then the connection is cut.
+                let fault = fake.get_faults.pop_front();
+                let declared = chunk.len();
+                let sent = match &fault {
+                    Some(GetFault::Cut { truncate_after, .. }) => {
+                        chunk[..(*truncate_after).min(declared)].to_vec()
+                    }
+                    Some(GetFault::Stall { after }) => chunk[..(*after).min(declared)].to_vec(),
+                    _ => chunk,
+                };
+                let body = match fault {
+                    Some(GetFault::Cut { then, .. }) => {
+                        match then {
+                            AfterFault::Nothing => {}
+                            AfterFault::Delete => {
+                                fake.blobs.remove(&path);
+                            }
+                            AfterFault::Replace(content, new_etag) => {
+                                fake.blobs.insert(path.clone(), content);
+                                fake.etags.insert(path.clone(), new_etag);
+                            }
+                            AfterFault::OmitEtag => {
+                                fake.omit_etag = true;
+                            }
+                        }
+                        cut_body(Bytes::from(sent))
+                    }
+                    Some(GetFault::Stall { .. }) => stalled_body(Bytes::from(sent)),
+                    _ => full(Bytes::from(sent)),
+                };
                 builder
-                    .header("content-length", chunk.len().to_string())
-                    .body(Full::new(Bytes::from(chunk)))
+                    .header("content-length", declared.to_string())
+                    .body(body)
                     .unwrap()
             }
         }
@@ -268,7 +515,14 @@ pub async fn start() -> (State, u16) {
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let state = Arc::clone(&state);
-                    async move { Ok::<_, Infallible>(handle(state, req).await) }
+                    async move {
+                        let reply = handle(state, req).await;
+                        if reply.headers().contains_key(DROP_MARKER) {
+                            Err(ConnectionDropped)
+                        } else {
+                            Ok(reply)
+                        }
+                    }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(tcp), service)
@@ -331,3 +585,67 @@ pub fn clear_azure_env() {
 
 /// One test at a time may change the process environment; hold this for the whole test.
 pub static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Give one blob (`key` under `acct/ctr`) an ETag; the default is `"0x1"` (quoted, strong).
+pub fn set_etag(state: &State, key: &str, etag: &str) {
+    state
+        .lock()
+        .unwrap()
+        .etags
+        .insert(format!("acct/ctr/{key}"), etag.to_string());
+}
+
+/// Give one blob (`key` under `acct/ctr`) a version id.
+pub fn set_version_id(state: &State, key: &str, version: &str) {
+    state
+        .lock()
+        .unwrap()
+        .version_ids
+        .insert(format!("acct/ctr/{key}"), version.to_string());
+}
+
+/// Replace the blob a GET names by `content` with `etag` just before the `n`-th GET of an
+/// existing blob is answered (see [`Fake::replace_before_get`]).
+pub fn replace_before_get(state: &State, n: usize, content: Vec<u8>, etag: &str) {
+    state
+        .lock()
+        .unwrap()
+        .replace_before_get
+        .push((n, content, etag.to_string()));
+}
+
+/// Queue a scripted body cut (see [`GetFault::Cut`]).
+pub fn push_get_fault(state: &State, truncate_after: usize, then: AfterFault) {
+    push_fault(
+        state,
+        GetFault::Cut {
+            truncate_after,
+            then,
+        },
+    );
+}
+
+/// Queue a scripted status reply (see [`GetFault::Status`]).
+pub fn push_get_status(state: &State, status: u16, code: Option<&str>) {
+    push_fault(
+        state,
+        GetFault::Status {
+            status,
+            code: code.map(str::to_string),
+        },
+    );
+}
+
+/// Queue a connection closed without a reply (see [`GetFault::Drop`]).
+pub fn push_get_drop(state: &State) {
+    push_fault(state, GetFault::Drop);
+}
+
+/// Queue a body that stalls after `after` bytes (see [`GetFault::Stall`]).
+pub fn push_get_stall(state: &State, after: usize) {
+    push_fault(state, GetFault::Stall { after });
+}
+
+fn push_fault(state: &State, fault: GetFault) {
+    state.lock().unwrap().get_faults.push_back(fault);
+}

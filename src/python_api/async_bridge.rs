@@ -315,7 +315,48 @@ where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: for<'py> IntoPyObject<'py> + Send + 'static,
 {
-    generic::future_into_py::<S3dlioRuntime, F, T>(py, fut)
+    // Test builds only: lets a test learn when the caller-supplied future body has fully
+    // finished (see `body_finished_hook`). Absent from the shipped extension.
+    #[cfg(test)]
+    let fut = body_finished_hook::observe(fut);
+    generic::future_into_py::<S3dlioRuntime, _, T>(py, fut)
+}
+
+/// Test-only observation of "the future body handed to [`future_into_py`] has returned".
+///
+/// The flag is registered per THREAD and consumed by the next `future_into_py` call made on
+/// that thread, so concurrently running tests cannot see each other's futures. It is set the
+/// moment the body's last statement has returned, i.e. before the result is converted and
+/// delivered. A body that still needs the GIL (an ungated `Python::attach` after its I/O,
+/// issue #233 / C-F2) cannot finish while the GIL is held elsewhere; a body that returns a
+/// Rust value can.
+#[cfg(test)]
+pub(crate) mod body_finished_hook {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    thread_local! {
+        static NEXT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    }
+
+    /// Arm the hook: the next `future_into_py` call on THIS thread sets `flag` when its body
+    /// has returned.
+    pub(crate) fn arm(flag: Arc<AtomicBool>) {
+        NEXT.with(|slot| *slot.borrow_mut() = Some(flag));
+    }
+
+    pub(super) fn observe<F: Future>(fut: F) -> impl Future<Output = F::Output> {
+        let flag = NEXT.with(|slot| slot.borrow_mut().take());
+        async move {
+            let out = fut.await;
+            if let Some(flag) = flag {
+                flag.store(true, Ordering::SeqCst);
+            }
+            out
+        }
+    }
 }
 
 /// `atexit` callback: release the GIL and wait (bounded) for in-flight result

@@ -163,7 +163,7 @@ class _AsyncBytesSource:
                 # Use the new generic create_async_loader function
                 loader = _core.create_async_loader(self._uri, self._opts)
                 try:
-                    async for batch in loader:  # batch: List[bytes]
+                    async for batch in loader:  # batch: list of BytesView
                         for b in batch:
                             self._q.put(b, block=True)
                 finally:
@@ -403,9 +403,11 @@ class ObjectStoreMapDataset(Dataset):
 
         # Return-style switch
         if self._return_type == "reader":
-            # Reader needs bytes, not BytesView
-            return _BytesReader(bytes(bytesview))
+            # _BytesReader wraps any buffer in a memoryview, so the BytesView is passed as is:
+            # no copy (its read() calls return bytes slices, as file objects do).
+            return _BytesReader(bytesview)
         if self._return_type == "bytes":
+            # return_type="bytes" is an API that explicitly returns `bytes` (documented copy).
             return bytes(bytesview)
 
         # Tensor mode - use zero-copy memoryview from BytesView

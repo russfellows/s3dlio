@@ -321,7 +321,6 @@ def test_copy_is_keyword_only(work_dir):
     [
         ("write_chunk", "PyObjectWriter"),
         ("write_owned_bytes", "PyObjectWriter"),
-        ("write", "MultipartUploadWriter"),
     ],
 )
 def test_python_visible_docs_state_the_borrow_contract(work_dir, func_name, owner):
@@ -347,3 +346,16 @@ def test_multipart_write_signature_has_keyword_only_copy():
     assert "copy" in sig.parameters, sig
     p = sig.parameters["copy"]
     assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is False, sig
+
+
+def test_multipart_writer_write_docstring_states_the_zero_copy_contract():
+    """`MultipartUploadWriter.write` (stage G W9): zero-copy by default, so the buffer is
+    borrowed until close()/abort() returns; `copy=True` is the snapshot; BytesView is shared."""
+    doc = s3dlio.MultipartUploadWriter.write.__doc__ or ""
+    low = " ".join(doc.lower().split())
+    assert "zero-copy by default" in low, doc
+    assert "must not modify the buffer until close()" in low.replace("``", ""), doc
+    assert "abort()" in low, doc
+    assert "copy=true" in low, doc
+    assert "bytesview" in low, doc
+    assert "until the call returns" not in low, "stale pre-0.10.0 contract"

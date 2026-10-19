@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+#[cfg(not(unix))]
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, info, trace, warn};
 
 use crate::constants::{
@@ -531,19 +532,66 @@ fn write_all_direct_with(
     Ok(())
 }
 
-/// A page-aligned buffer exposing its first `len` bytes (what the kernel filled) as the
+/// Buffered (non-O_DIRECT) range read for the `direct://` store: plain `std::fs` positional
+/// reads in a blocking task, straight into the destination Vec that becomes the returned `Bytes`
+/// (Rule #1: `tokio::fs::File::read*` would copy every byte through tokio's internal buffer).
+/// `Some(len)` reads `len` bytes, clamped to the end of the file (so `u64::MAX`, or any length
+/// beyond the end, means "to the end of the file", as it does on `file://`; an offset at or past
+/// the end is an empty result); `None` reads to the end of the file. The destination is
+/// allocated fallibly: an impossible size is an error, never an allocation panic.
+async fn read_range_buffered(path: &Path, offset: u64, length: Option<u64>) -> Result<Bytes> {
+    let path = path.to_owned();
+    let data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        let mut file = std::fs::File::open(&path)?;
+        match length {
+            Some(len) => {
+                let remaining = file.metadata()?.len().saturating_sub(offset);
+                let want = len.min(remaining);
+                let want = usize::try_from(want)
+                    .map_err(|_| anyhow::anyhow!("range read of {want} bytes is too large"))?;
+                let mut buffer = Vec::new();
+                buffer.try_reserve_exact(want).map_err(|_| {
+                    anyhow::anyhow!("cannot allocate {want} bytes for the range read")
+                })?;
+                buffer.resize(want, 0);
+                crate::file_store::read_exact_at_std(&file, &mut buffer, offset)?;
+                Ok(buffer)
+            }
+            None => {
+                let mut buffer = Vec::new();
+                file.seek(std::io::SeekFrom::Start(offset))?;
+                file.read_to_end(&mut buffer)?;
+                Ok(buffer)
+            }
+        }
+    })
+    .await??;
+    Ok(Bytes::from(data))
+}
+
+/// What a `direct://` aligned range read produced: the bytes, or (when the caller supplied a
+/// window) the number of bytes copied into the start of that window.
+enum RangeRead {
+    Bytes(Bytes),
+    Filled(usize),
+}
+
+/// A page-aligned buffer exposing `len` bytes from `start` (what the kernel filled) as the
 /// owner of a `Bytes`, so a `direct://` GET hands back the buffer it read into, with no
 /// copy, and the result is itself page-aligned (a later `direct://` PUT of it is one write).
 struct AlignedBytes {
     buf: AlignedBuf,
+    /// First exposed byte (0 for a whole-object GET; the in-buffer offset of a range GET).
+    start: usize,
     len: usize,
 }
 
 impl AsRef<[u8]> for AlignedBytes {
     fn as_ref(&self) -> &[u8] {
-        // SAFETY: `[0, len)` was written by the kernel's read (see `read_all_direct`);
-        // `len <= buf.len()`.
-        unsafe { std::slice::from_raw_parts(self.buf.as_ptr(), self.len) }
+        // SAFETY: `[start, start + len)` was written by the kernel's read (see
+        // `read_all_direct` and the range read); `start + len <= buf.len()`.
+        unsafe { std::slice::from_raw_parts(self.buf.as_ptr().add(self.start), self.len) }
     }
 }
 
@@ -694,6 +742,7 @@ fn read_all_direct_with(
     // pointer, never through the safe slice accessors, so `buf` need not be marked initialised.
     Ok(Bytes::from_owner(AlignedBytes {
         buf,
+        start: 0,
         len: file_size,
     }))
 }
@@ -740,8 +789,9 @@ impl Drop for CancelOnDrop {
 /// multiple of the staging size; the staged remainder is lost) and is NOT removed. Call
 /// `cancel()` to delete it.
 pub struct DirectIOWriter {
-    /// Buffered mode (`direct_io == false`).
-    file: Option<fs::File>,
+    /// Buffered mode (`direct_io == false`). A plain `std::fs::File` written straight from the
+    /// caller's bytes: `tokio::fs::File::write_all` would copy every chunk into tokio's own buffer.
+    file: Option<Arc<std::fs::File>>,
     /// O_DIRECT mode.
     direct: Option<std::fs::File>,
     /// File offset of the next O_DIRECT write.
@@ -807,7 +857,9 @@ impl DirectIOWriter {
                 );
             }
         } else {
-            file = Some(fs::File::create(&final_path).await?);
+            file = Some(Arc::new(
+                fs::File::create(&final_path).await?.into_std().await,
+            ));
         }
 
         let alignment = config.alignment.max(1);
@@ -986,12 +1038,18 @@ impl ObjectWriter for DirectIOWriter {
         if self.direct.is_some() {
             return self.stage_direct(data);
         }
-        let Some(file) = self.file.as_mut() else {
+        let Some(file) = self.file.as_ref().map(Arc::clone) else {
             bail!("Writer has been finalized or cancelled");
         };
-        file.write_all(data).await?;
+        // Straight from the caller's slice (Rule #1; see `write_borrowed_blocking`). Trade-off,
+        // documented: on a CURRENT-THREAD runtime this write runs inline and blocks that thread
+        // for its duration (a borrowed slice cannot be moved to another thread without a copy).
+        crate::file_store::write_borrowed_blocking(&file, data)?;
         if self.config.sync_writes {
-            file.sync_all().await?;
+            // Inline like the write above, NOT a detached `spawn_blocking`: this method then has
+            // no await point after the write, so a dropped caller future cannot abandon an fsync
+            // whose error nobody would see, or let it run beside the next write.
+            blocking_io(|| file.sync_all())?;
         }
         Ok(())
     }
@@ -1008,8 +1066,12 @@ impl ObjectWriter for DirectIOWriter {
             if !compressed_data.is_empty() {
                 if self.direct.is_some() {
                     self.stage_direct(&compressed_data)?;
-                } else if let Some(file) = self.file.as_mut() {
-                    file.write_all(&compressed_data).await?;
+                } else if let Some(file) = self.file.as_ref().map(Arc::clone) {
+                    // The compressed tail is an owned Vec: moved into the blocking task.
+                    tokio::task::spawn_blocking(move || {
+                        crate::file_store::write_all_std(&file, &compressed_data)
+                    })
+                    .await??;
                 }
             }
         } else {
@@ -1045,9 +1107,8 @@ impl ObjectWriter for DirectIOWriter {
                     sync_file(&buffered)
                 })?;
             }
-        } else if let Some(mut file) = self.file.take() {
-            file.flush().await?;
-            file.sync_all().await?;
+        } else if let Some(file) = self.file.take() {
+            tokio::task::spawn_blocking(move || file.sync_all()).await??;
         }
 
         self.finalized = true;
@@ -1242,14 +1303,7 @@ impl ConfigurableFileSystemObjectStore {
         let last_modified = metadata
             .modified()
             .ok()
-            .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map(|duration| {
-                // Convert to RFC 3339 format like S3 uses
-                let secs = duration.as_secs();
-                let datetime =
-                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-                format!("{:?}", datetime) // Simple formatting for now
-            });
+            .and_then(crate::file_store::modified_time_rfc3339);
 
         let file_hash = format!(
             "file-{}-{}",
@@ -1483,20 +1537,7 @@ impl ConfigurableFileSystemObjectStore {
     ) -> Result<Bytes> {
         if !self.config.direct_io {
             // Fallback to normal implementation
-            let mut file = fs::File::open(path).await?;
-            file.seek(std::io::SeekFrom::Start(offset)).await?;
-
-            let read_length = length.unwrap_or(u64::MAX);
-            let mut buffer = Vec::new();
-
-            if read_length == u64::MAX {
-                file.read_to_end(&mut buffer).await?;
-            } else {
-                buffer.resize(read_length as usize, 0);
-                file.read_exact(&mut buffer).await?;
-            }
-
-            return Ok(Bytes::from(buffer));
+            return read_range_buffered(path, offset, length).await;
         }
 
         // Try O_DIRECT first, fall back to regular I/O if it fails
@@ -1509,20 +1550,7 @@ impl ConfigurableFileSystemObjectStore {
                     e
                 );
                 // Fall back to regular I/O
-                let mut file = fs::File::open(path).await?;
-                file.seek(std::io::SeekFrom::Start(offset)).await?;
-
-                let read_length = length.unwrap_or(u64::MAX);
-                let mut buffer = Vec::new();
-
-                if read_length == u64::MAX {
-                    file.read_to_end(&mut buffer).await?;
-                } else {
-                    buffer.resize(read_length as usize, 0);
-                    file.read_exact(&mut buffer).await?;
-                }
-
-                Ok(Bytes::from(buffer))
+                read_range_buffered(path, offset, length).await
             }
         }
     }
@@ -1539,6 +1567,29 @@ impl ConfigurableFileSystemObjectStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<Bytes> {
+        let mut no_window = None;
+        match self
+            .try_read_range_direct_into(path, offset, length, &mut no_window)
+            .await?
+        {
+            RangeRead::Bytes(bytes) => Ok(bytes),
+            RangeRead::Filled(_) => bail!("internal error: a range read filled a window it had no"),
+        }
+    }
+
+    /// [`try_read_range_direct`](Self::try_read_range_direct), optionally into a caller window.
+    ///
+    /// With `*window == Some(w)` the requested bytes are copied into the START of `w` (the one
+    /// O_DIRECT bounce copy: the aligned read buffer, pooled or owned, to an unaligned
+    /// destination) and the result is `Filled(n)`; `w` is put back into `*window` whatever the
+    /// outcome, success or error, so the caller can retry. With `None` the result is `Bytes`.
+    async fn try_read_range_direct_into(
+        &self,
+        path: &Path,
+        offset: u64,
+        length: Option<u64>,
+        window: &mut Option<BytesMut>,
+    ) -> Result<RangeRead> {
         // O_DIRECT range read requires careful alignment
         let alignment = self.alignment() as u64;
         let aligned_offset = (offset / alignment) * alignment;
@@ -1619,56 +1670,98 @@ impl ConfigurableFileSystemObjectStore {
             let path = path.to_owned();
             let direct = self.config.direct_io;
             let want_len = usize::try_from(read_length).map_err(|_| too_big())?;
-            tokio::task::spawn_blocking(move || -> Result<Bytes> {
-                // The private-allocation permit outlives the buffer it admits: the buffer is
-                // dropped explicitly below, before this local (the permit) goes out of scope.
-                let _admission = private_permit;
-                #[cfg(test)]
-                range_read_hold::hold_if_armed(&path);
-                let result = (|| -> Result<Bytes> {
-                    let mut options = std::fs::OpenOptions::new();
-                    options.read(true);
-                    if direct {
-                        options.custom_flags(libc::O_DIRECT);
-                    }
-                    let file = options.open(&path)?;
-                    let ptr = match (own.as_mut(), lease.as_deref_mut()) {
-                        (Some(o), _) => o.as_mut_ptr(),
-                        (None, Some(l)) => l.as_mut_ptr(),
-                        (None, None) => bail!("internal error: no range-read buffer"),
-                    };
-                    // Loop until the aligned range is filled or EOF: one read() may return far less
-                    // than requested (O_DIRECT imposes per-call limits).
-                    let mut bytes_read = 0usize;
-                    while bytes_read < aligned_length {
-                        // SAFETY: `[bytes_read, aligned_length)` lies inside the buffer.
-                        let dst = SendPtr(unsafe { ptr.add(bytes_read) });
-                        let n = pread_raw(
-                            &file,
-                            dst,
-                            aligned_length - bytes_read,
-                            aligned_offset + bytes_read as u64,
-                        )?;
-                        if n == 0 {
-                            break; // EOF
+            // The caller's window (if any) travels into the blocking task and comes back with
+            // its result, so it survives an error and a retry can use it.
+            let mut win = window.take();
+            let (result, win) =
+                tokio::task::spawn_blocking(move || -> (Result<RangeRead>, Option<BytesMut>) {
+                    // The private-allocation permit outlives the buffer it admits: the buffer is
+                    // dropped explicitly below, before this local (the permit) goes out of scope.
+                    let _admission = private_permit;
+                    #[cfg(test)]
+                    range_read_hold::hold_if_armed(&path);
+                    let result = (|| -> Result<RangeRead> {
+                        let mut options = std::fs::OpenOptions::new();
+                        options.read(true);
+                        if direct {
+                            options.custom_flags(libc::O_DIRECT);
                         }
-                        bytes_read += n;
-                    }
-                    // Extract the requested subrange: only bytes the kernel wrote ([0, bytes_read)).
-                    let start = offset_adjustment.min(bytes_read);
-                    let end = start.saturating_add(want_len).min(bytes_read);
-                    let mut out = BytesMut::with_capacity(end - start);
-                    // SAFETY: `[start, end)` is inside `[0, bytes_read)`, which pread initialised.
-                    out.extend_from_slice(unsafe {
-                        std::slice::from_raw_parts(ptr.add(start), end - start)
-                    });
-                    Ok(out.freeze())
-                })();
-                drop(own);
-                drop(lease);
-                result
-            })
-            .await?
+                        let file = options.open(&path)?;
+                        let ptr = match (own.as_mut(), lease.as_deref_mut()) {
+                            (Some(o), _) => o.as_mut_ptr(),
+                            (None, Some(l)) => l.as_mut_ptr(),
+                            (None, None) => bail!("internal error: no range-read buffer"),
+                        };
+                        // Loop until the aligned range is filled or EOF: one read() may return far less
+                        // than requested (O_DIRECT imposes per-call limits).
+                        let mut bytes_read = 0usize;
+                        while bytes_read < aligned_length {
+                            // SAFETY: `[bytes_read, aligned_length)` lies inside the buffer.
+                            let dst = SendPtr(unsafe { ptr.add(bytes_read) });
+                            let n = pread_raw(
+                                &file,
+                                dst,
+                                aligned_length - bytes_read,
+                                aligned_offset + bytes_read as u64,
+                            )?;
+                            if n == 0 {
+                                break; // EOF
+                            }
+                            bytes_read += n;
+                        }
+                        // The requested subrange: only bytes the kernel wrote ([0, bytes_read)).
+                        let start = offset_adjustment.min(bytes_read);
+                        let end = start.saturating_add(want_len).min(bytes_read);
+                        if let Some(w) = win.as_mut() {
+                            // The caller's window (the range engine's segment of its master
+                            // buffer): the O_DIRECT bounce copy, made ONCE, straight from the
+                            // aligned read buffer (pooled or owned) into the window. An unaligned
+                            // destination cannot be read into with O_DIRECT, so this copy cannot
+                            // be avoided. (No intermediate buffer: it used to be pool -> fresh
+                            // BytesMut -> window.)
+                            let n = end - start;
+                            if n > w.len() {
+                                bail!(
+                                    "range read of {n} bytes does not fit a window of {}",
+                                    w.len()
+                                );
+                            }
+                            // SAFETY: `[start, end)` is inside `[0, bytes_read)`, which pread
+                            // initialised; the window is a separate allocation, `n <= w.len()`.
+                            w[..n].copy_from_slice(unsafe {
+                                std::slice::from_raw_parts(ptr.add(start), n)
+                            });
+                            return Ok(RangeRead::Filled(n));
+                        }
+                        if let Some(buf) = own.take() {
+                            // Rule #1 (zero copy): an owned (non-pooled) aligned buffer is not going
+                            // back to any pool, so the result IS a slice of it (`[start, end)` was
+                            // written by pread); it is freed when the last `Bytes` view drops. The
+                            // private-allocation permit is released on return as for any GET result
+                            // (the caller owns the memory from here on).
+                            return Ok(RangeRead::Bytes(Bytes::from_owner(AlignedBytes {
+                                buf,
+                                start,
+                                len: end - start,
+                            })));
+                        }
+                        // Pooled buffer: it must go back to the pool, so the subrange is copied out
+                        // (the one unavoidable copy of the bounded-pool design: the pool buffer is
+                        // reused for the next read, so handing it out would drain the pool).
+                        let mut out = BytesMut::with_capacity(end - start);
+                        // SAFETY: `[start, end)` is inside `[0, bytes_read)`, which pread initialised.
+                        out.extend_from_slice(unsafe {
+                            std::slice::from_raw_parts(ptr.add(start), end - start)
+                        });
+                        Ok(RangeRead::Bytes(out.freeze()))
+                    })();
+                    drop(own);
+                    drop(lease);
+                    (result, win)
+                })
+                .await?;
+            *window = win;
+            result
         }
 
         #[cfg(not(unix))]
@@ -1693,10 +1786,98 @@ impl ConfigurableFileSystemObjectStore {
             }
             let start = offset_adjustment.min(bytes_read);
             let end = start.saturating_add(read_length as usize).min(bytes_read);
+            if let Some(buf) = own.take() {
+                // Rule #1: an owned (non-pooled) buffer is handed out as a slice, not copied.
+                return Ok(RangeRead::Bytes(Bytes::from_owner(AlignedBytes {
+                    buf,
+                    start,
+                    len: end - start,
+                })));
+            }
+            // Pooled buffer: returns to the pool, so the subrange is copied out (see the unix
+            // path above).
+            let Some(aligned) = lease.as_deref() else {
+                bail!("internal error: no range-read buffer");
+            };
             let mut out = BytesMut::with_capacity(end - start);
             out.extend_from_slice(&aligned.as_slice()[start..end]);
-            Ok(out.freeze())
+            Ok(RangeRead::Bytes(out.freeze()))
         }
+    }
+
+    /// The `O_DIRECT` range-engine download (unix): O_DIRECT needs an aligned destination, and
+    /// the engine's master buffer is not aligned, so each range is read into an aligned buffer
+    /// (pooled or owned) and copied ONCE into its window of the master buffer: the O_DIRECT
+    /// bounce copy for unaligned memory, unavoidable and made exactly once (no intermediate
+    /// `Bytes`). A failed O_DIRECT read falls back to buffered I/O straight into the window, as
+    /// `get_range` falls back.
+    #[cfg(unix)]
+    async fn o_direct_range_download(
+        &self,
+        engine: &RangeEngine,
+        uri: &str,
+        object_size: u64,
+    ) -> Result<(Bytes, crate::range_engine_generic::RangeDownloadStats)> {
+        let store = self.clone();
+        let path = Self::uri_to_path(uri)?;
+        let fill_range = move |offset: u64, window: BytesMut| {
+            let store = store.clone();
+            let path = path.clone();
+            async move {
+                let want = window.len() as u64;
+                let mut slot = Some(window);
+                let attempt = store
+                    .try_read_range_direct_into(&path, offset, Some(want), &mut slot)
+                    .await;
+                match attempt {
+                    Ok(RangeRead::Filled(n)) => match slot.take() {
+                        Some(window) => Ok((window, n)),
+                        None => bail!("internal error: the range window was lost"),
+                    },
+                    Ok(RangeRead::Bytes(_)) => {
+                        bail!("internal error: a window read returned bytes")
+                    }
+                    Err(e) => {
+                        warn!(
+                            "O_DIRECT range read failed for {}, falling back to regular I/O: {}",
+                            path.display(),
+                            e
+                        );
+                        let Some(mut window) = slot.take() else {
+                            return Err(e);
+                        };
+                        tokio::task::spawn_blocking(move || -> Result<(BytesMut, usize)> {
+                            let file = std::fs::File::open(&path)?;
+                            let read =
+                                crate::file_store::read_full_at_std(&file, &mut window, offset)?;
+                            Ok((window, read))
+                        })
+                        .await?
+                    }
+                }
+            }
+        };
+        engine
+            .download_into_master(object_size, false, fill_range, None)
+            .await
+    }
+
+    /// Non-unix: each range through `get_range`; the engine copies it into its window.
+    #[cfg(not(unix))]
+    async fn o_direct_range_download(
+        &self,
+        engine: &RangeEngine,
+        uri: &str,
+        object_size: u64,
+    ) -> Result<(Bytes, crate::range_engine_generic::RangeDownloadStats)> {
+        let store = self.clone();
+        let uri_owned = uri.to_string();
+        let get_range_fn = move |offset: u64, length: u64| {
+            let store = store.clone();
+            let uri = uri_owned.clone();
+            async move { store.get_range(&uri, offset, Some(length)).await }
+        };
+        engine.download(object_size, get_range_fn, None).await
     }
 
     /// Get file using RangeEngine for concurrent downloads
@@ -1709,16 +1890,31 @@ impl ConfigurableFileSystemObjectStore {
         );
 
         let engine = RangeEngine::new(self.config.range_engine.clone());
-        let store = self.clone();
-        let uri_owned = uri.to_string();
 
-        let get_range_fn = move |offset: u64, length: u64| {
-            let store = store.clone();
-            let uri = uri_owned.clone();
-            async move { store.get_range(&uri, offset, Some(length)).await }
+        let (bytes, stats) = if self.config.direct_io {
+            self.o_direct_range_download(&engine, uri, object_size)
+                .await?
+        } else {
+            // Buffered mode (Rule #1): no alignment requirement, so every range is read with a
+            // positional read straight into its segment of the master buffer, with no
+            // per-range allocation and no copy.
+            let path = Self::uri_to_path(uri)?;
+            let fill_range = move |offset: u64, mut segment: BytesMut| {
+                let path = path.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || -> Result<(BytesMut, usize)> {
+                        let file = std::fs::File::open(&path)?;
+                        let read =
+                            crate::file_store::read_full_at_std(&file, &mut segment, offset)?;
+                        Ok((segment, read))
+                    })
+                    .await?
+                }
+            };
+            engine
+                .download_into_master(object_size, false, fill_range, None)
+                .await?
         };
-
-        let (bytes, stats) = engine.download(object_size, get_range_fn, None).await?;
 
         info!(
             "DirectIO RangeEngine complete: {} MB in {:.2}s ({:.2} MB/s, {} ranges)",
@@ -3276,5 +3472,38 @@ mod direct_io_chunking_tests {
                 .expect_err("range of u64::MAX bytes");
             assert!(e.to_string().contains("too large"), "{e}");
         }
+    }
+}
+
+/// G-F3 (stage G review), same defect class as the owned write in `file_store.rs`: a
+/// `write_chunk` future that can be dropped between its write and its fsync lets the fsync
+/// detach.
+#[cfg(test)]
+mod write_chunk_cancel_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    /// With `sync_writes` the write and its fsync complete inside ONE poll: there is no await
+    /// point between them at which a dropped future could abandon the fsync (and its error).
+    #[tokio::test]
+    async fn buffered_write_chunk_with_sync_writes_has_no_await_point_after_the_write() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("w.bin");
+        let cfg = FileSystemConfig {
+            sync_writes: true,
+            direct_io: false,
+            ..FileSystemConfig::default()
+        };
+        let mut writer = DirectIOWriter::new(path.clone(), cfg)
+            .await
+            .expect("writer");
+        let data = vec![0x5A_u8; 8192];
+        let outcome = writer.write_chunk(&data).now_or_never();
+        assert!(
+            matches!(outcome, Some(Ok(()))),
+            "write_chunk did not finish in one poll: {outcome:?}"
+        );
+        assert_eq!(std::fs::read(&path).expect("read file"), data);
+        Box::new(writer).finalize().await.expect("finalize");
     }
 }

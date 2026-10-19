@@ -38,7 +38,7 @@ const BOUND: Duration = Duration::from_secs(10);
 
 static N: AtomicU64 = AtomicU64::new(0);
 
-/// A bucket name used by exactly one test, so `requests_containing` returns only its traffic.
+/// A bucket name used by exactly one test, so `requests_for_bucket` returns only its traffic.
 fn unique_bucket(tag: &str) -> String {
     format!(
         "zero211-{tag}-{}-{}",
@@ -80,7 +80,7 @@ fn assert_rejected(what: &str, param: &str, res: anyhow::Result<impl std::fmt::D
 }
 
 fn assert_no_traffic(what: &str, state: &MockS3State, bucket: &str) {
-    let seen = state.requests_containing(bucket);
+    let seen = state.requests_for_bucket(bucket);
     assert!(
         seen.is_empty(),
         "{what}: the mock saw {} request(s) for {bucket}: {seen:?}",

@@ -6,14 +6,21 @@ This test suite verifies that the Python bindings for our streaming API work cor
 across all backends: Filesystem, Azure Blob Storage, and Direct I/O Filesystem.
 """
 
+import os
 import tempfile
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
 
 # Import our s3dlio module
 import s3dlio
+
+# Explicit opt-in for the live-backend tests: no default bucket, account or container.
+S3_BUCKET = os.environ.get("S3DLIO_TEST_BUCKET", "").strip()
+AZURE_ACCOUNT = os.environ.get("AZURE_BLOB_ACCOUNT", "").strip()
+AZURE_CONTAINER = os.environ.get("S3DLIO_TEST_AZURE_CONTAINER", "").strip()
 
 
 def test_writer_options():
@@ -174,18 +181,21 @@ def test_write_owned_bytes():
     print("✅ write_owned_bytes tests passed!")
 
 
+@pytest.mark.skipif(
+    not S3_BUCKET,
+    reason="live S3 test: set S3DLIO_TEST_BUCKET to a writable bucket to run",
+)
 def test_s3_streaming():
-    """Test S3 streaming writer (if credentials available)."""
+    """Test S3 streaming writer against an explicitly opted-in bucket."""
     print("🧪 Testing S3 streaming...")
 
-    # Try to create an S3 writer to see if credentials/connectivity are available
-    test_uri = "s3://my-bucket2/python-streaming-test.bin"
+    test_uri = (
+        f"s3://{S3_BUCKET}/s3dlio-pytest-{uuid.uuid4().hex[:12]}/streaming-test.bin"
+    )
     options = s3dlio.PyWriterOptions()
+    data = b"Python S3 streaming test data!" * 50
     try:
         writer = s3dlio.create_s3_writer(test_uri, options)
-
-        # Write some test data
-        data = b"Python S3 streaming test data!" * 50
         writer.write_chunk(data)
 
         bytes_written = writer.bytes_written()
@@ -194,28 +204,34 @@ def test_s3_streaming():
 
         writer.finalize()
         print("  ✅ S3 streaming finalized successfully")
-    except AssertionError:
-        raise
-    except Exception as e:
-        pytest.skip(f"S3 streaming skipped (credentials/bucket not available): {e}")
+
+        # The object must really be in the bucket, with the bytes we wrote.
+        assert s3dlio.stat(test_uri)["size"] == len(data)
+        assert bytes(s3dlio.get(test_uri)) == data
+    finally:
+        try:
+            s3dlio.delete(test_uri)
+        except Exception as exc:
+            print(f"cleanup warning for {test_uri}: {exc}")
 
     print("✅ S3 streaming tests passed!")
 
 
+@pytest.mark.skipif(
+    not (AZURE_ACCOUNT and AZURE_CONTAINER),
+    reason="live Azure test: set AZURE_BLOB_ACCOUNT and S3DLIO_TEST_AZURE_CONTAINER to run",
+)
 def test_azure_streaming():
-    """Test Azure streaming writer (if credentials available)."""
+    """Test Azure streaming writer against an explicitly opted-in container."""
     print("🧪 Testing Azure streaming...")
 
-    # Try to create an Azure writer to see if credentials are available
-    test_uri = (
-        "https://egiazurestore1.blob.core.windows.net/s3dlio/python-streaming-test.bin"
-    )
+    blob = f"s3dlio-pytest-{uuid.uuid4().hex[:12]}/streaming-test.bin"
+    test_uri = f"https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/{blob}"
+    az_uri = f"az://{AZURE_ACCOUNT}/{AZURE_CONTAINER}/{blob}"
     options = s3dlio.PyWriterOptions()
+    data = b"Python Azure streaming test data!" * 50
     try:
         writer = s3dlio.create_azure_writer(test_uri, options)
-
-        # Write some test data
-        data = b"Python Azure streaming test data!" * 50
         writer.write_chunk(data)
 
         bytes_written = writer.bytes_written()
@@ -224,10 +240,15 @@ def test_azure_streaming():
 
         writer.finalize()
         print("  ✅ Azure streaming finalized successfully")
-    except AssertionError:
-        raise
-    except Exception as e:
-        pytest.skip(f"Azure streaming skipped (credentials not available): {e}")
+
+        # The blob must really exist, with the bytes we wrote.
+        assert s3dlio.stat(az_uri)["size"] == len(data)
+        assert bytes(s3dlio.get(az_uri)) == data
+    finally:
+        try:
+            s3dlio.delete(az_uri)
+        except Exception as exc:
+            print(f"cleanup warning for {az_uri}: {exc}")
 
     print("✅ Azure streaming tests passed!")
 
@@ -305,9 +326,12 @@ def main():
         test_write_owned_bytes,
         test_writer_checksum,
         test_error_handling,
-        test_s3_streaming,
-        test_azure_streaming,
     ]
+    # Live-backend tests run only when explicitly opted in via environment.
+    if S3_BUCKET:
+        tests.append(test_s3_streaming)
+    if AZURE_ACCOUNT and AZURE_CONTAINER:
+        tests.append(test_azure_streaming)
 
     passed = 0
     total = len(tests)

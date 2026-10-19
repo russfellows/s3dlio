@@ -131,7 +131,9 @@ AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli stat s3://bucket/key
 S3DLIO_H2C=1  AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli put s3://bucket/prefix -n 100
 
 # Opt in to HTTP/2 on https:// only (restores pre-v0.9.108 default)
-S3DLIO_HTTPS_H2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli get s3://bucket/dataset/ -o /data/
+S3DLIO_HTTPS_H2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli download -r s3://bucket/dataset/ /data/
+# Note: a recursive download keeps each object's key path relative to the listing base
+# (a/x.bin and b/x.bin land in <dest>/a/ and <dest>/b/); unsafe keys are refused (#284).
 
 # Master switch — HTTP/2 on both schemes with one variable
 S3DLIO_ENABLE_HTTP2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli put s3://bucket/prefix -n 100
@@ -180,13 +182,13 @@ For all other workloads, leave adaptive ON (the default).
 
 ```bash
 # Default: adaptive BDP estimator (recommended for most workloads)
-S3DLIO_H2C=1 s3-cli get s3://bucket/large-dataset/ -o /data/
+S3DLIO_H2C=1 s3-cli download -r s3://bucket/large-dataset/ /data/
 
 # Static windows — useful for reproducible benchmarks
 S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
   S3DLIO_H2_STREAM_WINDOW_MB=16 \
   S3DLIO_H2_CONN_WINDOW_MB=64 \
-  s3-cli get s3://bucket/large-dataset/ -o /data/
+  s3-cli download -r s3://bucket/large-dataset/ /data/
 
 # High-throughput static config (many large objects, low-latency network)
 S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
@@ -211,7 +213,8 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 
 | Variable | Default | Description |
 |---|---|---|
-| `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` | `30` | How long `put_bytes` waits, after the store finished, for every native reader of the caller's buffer to let go before it gives up and raises `s3dlio.ExportStillReferencedError` (the buffer then stays pinned: do not reuse it). The awaitable of `put_bytes_async(borrow=True)` never completes while a reader remains: at every missed deadline it emits a `RuntimeWarning`, counts it (`_put_export_stats()["quiesce_timeouts"]`) and keeps waiting. Fractions allowed (minimum 0.001); unusable values select the default. The blocking wait is not interruptible by signals. |
+| `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` | `30` | How long `put_bytes` waits, after the store finished, for every native reader of the caller's buffer to let go before it gives up and raises `s3dlio.ExportStillReferencedError` (the buffer then stays pinned: do not reuse it). The awaitable of `put_bytes_async(borrow=True)` never completes while a reader remains: at every missed deadline it emits a `RuntimeWarning`, counts it (`_put_export_stats()["quiesce_timeouts"]`) and keeps waiting. Since v0.10.0 the same period applies to `get_into_async` (the caller's destination buffer) and `head_async`: their awaitables never complete while a native writer or request of the call remains, and warn and count at every missed deadline in the same way. Also, since v0.10.0 (stage G): the blocking `put_many`, the checkpoint save calls (`save_checkpoint`, `save_distributed_shard`, `PyCheckpointStore.save`, `PyCheckpointWriter.save_distributed_shard`, `PyCheckpointStream.write_chunk`) and `MultipartUploadWriter.close()` / `abort()` / `__exit__` wait this long for every native reader of your buffers to let go and then raise `s3dlio.ExportStillReferencedError` (the buffers stay pinned); the awaitables of `put_many_async` and the `MultiEndpointStore` writes never complete while a reader remains, as for `put_bytes_async`. Fractions allowed (minimum 0.001); unusable values select the default. The blocking wait is not interruptible by signals. |
+| `S3DLIO_UNSIGNED_PAYLOAD` | `false` | `1`/`true`/`yes`/`on`/`enable` = send `x-amz-content-sha256: UNSIGNED-PAYLOAD` instead of hashing every S3 PUT body with SHA-256. Removes a data-integrity check: use only against trusted, internal endpoints. It also changes `MultipartUploadWriter.write()`: the size from which a write is borrowed (not copied) is 2 KiB for an unsigned upload and the part size for a signed one, and an unsigned part that spans two writes is sent without a gather copy (v0.10.0). |
 
 ### Direct I/O (`direct://`) shared bounce-buffer pool
 
@@ -402,8 +405,8 @@ Sizes learned by HEAD/stat are cached (per process for the S3 read path, per sto
 |----------|---------|-------------|
 | `S3DLIO_ENABLE_RANGE_OPTIMIZATION` | `true` (v0.9.60+) | Parallel range downloads for large S3 objects. Set to `0` to disable (e.g., for small-object or memory-constrained workloads) |
 | `S3DLIO_RANGE_THRESHOLD_MB` | `32` (v0.9.60+) | Minimum object size (MB) to trigger range GET optimization |
-| `S3DLIO_RANGE_CONCURRENCY` | Auto-tuned | Number of concurrent range requests for large objects |
-| `S3DLIO_CHUNK_SIZE` | Auto-calculated | Chunk size for range requests (default: 1-8 MB based on object size) |
+| `S3DLIO_RANGE_CONCURRENCY` | Auto-tuned | Number of concurrent range requests for large objects. Must be at least 1: since v0.10.0 a zero (or a value above the semaphore limit) is an error naming the variable whenever an S3 range read uses it, for every object size and offset (#235) |
+| `S3DLIO_CHUNK_SIZE` | Auto-calculated | Chunk size for range requests (default: 1-8 MB based on object size). Must be at least 1: since v0.10.0 a zero is an error naming the variable whenever an S3 range read uses it, for every object size and offset (#235) |
 | `S3DLIO_CONCURRENT_THRESHOLD` | Auto-tuned | Threshold for enabling concurrent operations |
 | `S3DLIO_SKIP_HEAD` | unset (loader default: `true`) | `1`/`true`/`yes`/`on` (case-insensitive) = force-enable the process-wide HEAD-skip latch. See [HEAD-Skip Latch](#head-skip-latch-s3dlio_skip_head) below |
 
@@ -649,7 +652,7 @@ rejected with 401 or 403 and a failed token request both name the credential mod
 A bearer-token mode needs an `https` endpoint (the SDK refuses a token over `http`); use `sas` or `none` for an
 `http` endpoint. The SAS token is never logged and is removed from error messages. Not read: `AZURE_STORAGE_ACCOUNT`,
 `AZURE_STORAGE_KEY` and connection strings. Account-key (Shared Key) authentication is **not supported**: the Azure SDK in
-use (`azure_storage_blob` 1.0 / `azure_core` 1.1) can only sign requests with bearer tokens or use a SAS.
+use (`azure_storage_blob` 1.1 / `azure_core` 1.1) can only sign requests with bearer tokens or use a SAS.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -686,29 +689,58 @@ sai3-bench util ls az://myaccount/mycontainer/
 | Variable | Description |
 |----------|-------------|
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCS service account JSON key file |
-| `GCS_ENDPOINT_URL` | **Custom GCS endpoint** (e.g., `http://localhost:4443` for fake-gcs-server) |
-| `STORAGE_EMULATOR_HOST` | GCS emulator convention (`host:port`), `http://` prepended if missing |
+| `GCS_ENDPOINT_URL` | **Custom GCS endpoint** for the official client, for example `http://localhost:4443`. The value is used as given, so include the scheme (`http://` or `https://`). Wins over `STORAGE_EMULATOR_HOST` |
+| `STORAGE_EMULATOR_HOST` | GCS emulator convention: `host:port` (`http://` is prepended when the value has no `http://` or `https://` scheme) |
+
+Either variable means "not Google's production endpoint", exactly as the removed community client
+treated any custom endpoint, so the client is built with **anonymous credentials** (no Application
+Default Credentials are looked up, no `Authorization` header is sent). Because the credentials are anonymous, `GCS_ENDPOINT_URL` cannot be used to reach an
+authenticated private route; unset it and use the normal credentials for that.
+
+Both are read when the first GCS client is built, after the `.env` policy (`S3DLIO_LOAD_DOTENV`), and
+apply to the whole process. An empty or blank value counts as unset. With neither set, the client is
+built exactly as before and talks to `storage.googleapis.com`. The chosen endpoint is logged once at
+INFO (any `user:password@` part is replaced by `***@`).
+
+The endpoint is handed to **both** halves of the official client, which speak different protocols. This
+is what s3dlio's code does (read from `src/google_gcs_client.rs`); an endpoint must serve what the
+operation uses:
+
+| Operation | Protocol |
+|-----------|----------|
+| Whole-object and ranged reads (`get`, `get_range`; not the concurrent range engine, which is off by default for GCS and sizes the object first with a gRPC stat) | HTTP/JSON media download |
+| `put` (upload) | Storage gRPC API, `BidiWriteObject` (always, also for ordinary buckets) |
+| `stat` / `head`, `list`, `delete`, bucket create/delete/list | Storage gRPC API (`StorageControl`) |
+
+Limitation: an emulator that serves only the JSON API supports reads only; the operations that use the
+Storage gRPC API fail against it with a connection or protocol error. s3dlio does not choose the
+protocol per endpoint.
+
+What was verified: `tests/gcs_emulator_endpoint.rs` and `tests/gcs_endpoint_url_credentials.rs` run a
+client built from each variable against a local stand-in listener (not a real emulator). The read
+arrives there as `GET /storage/v1/b/<bucket>/o/<object>?alt=media` with no `Authorization` header, and the metadata client opens an HTTP/2 (gRPC) connection to the
+same listener. Nothing was run against a real emulator.
 
 ### GCS Custom Endpoint Examples
 
 ```bash
-# fake-gcs-server (local emulator)
-export GCS_ENDPOINT_URL=http://localhost:4443
-sai3-bench util ls gs://testbucket/
-
-# Using STORAGE_EMULATOR_HOST convention
+# Local emulator or test server (anonymous credentials)
 export STORAGE_EMULATOR_HOST=localhost:4443
+export S3DLIO_GCS_RAPID=0   # standard buckets: skip the bucket-type probe
 sai3-bench util ls gs://testbucket/
 
-# Multi-protocol proxy
-export GCS_ENDPOINT_URL=http://localhost:9002
-sai3-bench util ls gs://testbucket/
+# The same with a full URL
+export GCS_ENDPOINT_URL=http://localhost:4443
 ```
 
 ## Test and Release-Validation Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `S3DLIO_TEST_BUCKET` | (unset) | Read by the Python smoke and benchmark scripts under `python/tests` (not by the library). Names a bucket you own and may write to; with it unset those scripts exit or skip and contact nothing. Since v0.10.0 no test or script reaches a hard-coded bucket. |
+| `S3DLIO_TEST_GCS_BUCKET` | (unset) | Read by the live GCS tests and `scripts/test-gcs-*.sh`. A GCS bucket you own; unset means those tests skip with a reason. |
+| `AZURE_BLOB_ACCOUNT` and `S3DLIO_TEST_AZURE_CONTAINER` | (unset) | Read by the live Azure tests and scripts. Both must be set for a test to contact Azure; otherwise it skips. `AZURE_BLOB_ACCOUNT` is the storage account the Azure scripts used to hard-code. |
+| `S3DLIO_ZC_BENCH` | (unset) | `1` enables the benchmark case in `python/tests/test_zero_copy_multipart.py` (borrowing versus copying in `MultipartUploadWriter`); run it with `pytest -s`. `scripts/bench_zero_copy.sh` is the whole-API zero-copy benchmark. |
 | `S3DLIO_REQUIRE_FULL_BACKENDS` | (unset) | Read by `python/tests/test_full_backend_azure_gcs.py` only (not by the library). Unset or empty: the Azure tests are skipped on a wheel built without the Azure backend (and the GCS test on one without GCS). `1`, `true`, `yes` or `on` (case-insensitive): a missing backend **fails** every test, so an all-skipped run cannot pass for a release gate. `0`, `false`, `no` or `off`: skip, explicitly. Any other value is also a failure (a mistyped flag must not turn into a silent skip). Set it for any run meant to exercise a wheel with Azure (the PyPI/`./build_pyo3.sh` default wheel: the Azure tests need only Azure; the one GCS test needs `./build_pyo3.sh full` and is deselected otherwise), and check the run's pass count too. |
 
 ## Usage Examples
@@ -865,6 +897,7 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 
 ## Version History
 
+- **v0.10.0** *(no new library environment variables; changed: `GCS_ENDPOINT_URL` and `STORAGE_EMULATOR_HOST` now configure the official GCS client; behaviour change: zero range settings are errors)*: `GCS_ENDPOINT_URL` and `STORAGE_EMULATOR_HOST` were read only by the community GCS client, which is removed in this release (the `gcs-community` feature and the `gcloud-storage` dependency are gone); the official client (`backend-gcs`) previously ignored them. It now reads them when the first GCS client is built (after the `.env` policy): `GCS_ENDPOINT_URL` wins, an empty value counts as unset, either one means anonymous credentials, and the endpoint reaches both the HTTP/JSON and the gRPC halves of the client (see the GCS section). On the S3 concurrent-range read paths, a zero effective `S3DLIO_CHUNK_SIZE` or `S3DLIO_RANGE_CONCURRENCY` is an error naming the variable (#235): on the allocating range GET and known-size range read for every object size and offset, including empty objects and offsets at or past the end, and on `get_into_async` whenever its range fan-out is chosen; reads that never take a range path do not read them; a concurrency above the semaphore limit is also an error. `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` now also governs the new `get_into_async` and `head_async` awaitables, the blocking `put_many`, the checkpoint saves and `MultipartUploadWriter.close()` / `abort()` / `__exit__`, and the awaitables of `put_many_async` and the `MultiEndpointStore` writes. `S3DLIO_UNSIGNED_PAYLOAD` (unchanged, now documented) sets the size from which `MultipartUploadWriter.write()` borrows a buffer (2 KiB unsigned, the part size signed). On S3, `get_into_async` decides between one GET and the range fan-out with the same settings as the allocating GET (`S3DLIO_ENABLE_RANGE_OPTIMIZATION`, `S3DLIO_SKIP_HEAD`, `S3DLIO_RANGE_THRESHOLD_MB`) and sizes the fan-out with `S3DLIO_CHUNK_SIZE` and `S3DLIO_RANGE_CONCURRENCY`; the fan-out always makes its own HEAD for the size and ETag, whatever the size cache holds. Existing settings such as `S3DLIO_MAX_RETRY_ATTEMPTS` (S3) and `S3DLIO_GCS_READ_CHUNK_TIMEOUT_SECS` (GCS) apply to the new reads as to the existing ones. Test-only variables documented: `S3DLIO_TEST_BUCKET`, `S3DLIO_TEST_GCS_BUCKET`, `AZURE_BLOB_ACCOUNT` with `S3DLIO_TEST_AZURE_CONTAINER`, and `S3DLIO_ZC_BENCH`. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.128** *(new: `S3DLIO_LOAD_DOTENV`, `S3DLIO_AZURE_CREDENTIAL`, `S3DLIO_AZURE_SAS_TOKEN`, `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`, `S3DLIO_SIZE_CACHE_MAX_ENTRIES`, `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE`, `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY`, `S3DLIO_DIRECT_IO_GET_MODE`, `S3DLIO_REQUIRE_FULL_BACKENDS`; behaviour changes: library use no longer reads `.env`, Azure credential default `auto`, `direct://` bounce-pool default)*: `S3DLIO_LOAD_DOTENV` is the one switch for `.env` loading (`1`/`true`/`yes`/`on`, `0`/`false`/`no`/`off`, or a file path); the default is off for library use (Rust and Python) and on for `s3-cli`. `S3DLIO_AZURE_CREDENTIAL` selects the Azure credential mode (default `auto`, a fallback chain; `cli` restores the old `az`/`azd`-only behaviour), `S3DLIO_AZURE_SAS_TOKEN` supplies the token for `sas` mode, and `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS` (default 5000) bounds the managed-identity attempt in `auto`; the standard `AZURE_*` variables of each mode are listed in "Azure Blob Storage Configuration" above. `S3DLIO_SIZE_CACHE_MAX_ENTRIES` (default 1048576) bounds the object size cache (#241). `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (default 30) is how long a borrowed Python buffer put waits for its readers (#238). The four `S3DLIO_DIRECT_IO_*` variables size and tune the shared per-NUMA-node `direct://` bounce pool (new default 4 pairs x 16 MiB per node, provisional) and select the GET mode (#244). `S3DLIO_REQUIRE_FULL_BACKENDS` is read only by the Python test `test_full_backend_azure_gcs.py`, never by the library. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.126** *(no new environment variables; behaviour changes are in the changelog)*: an `s3://` URI selects the exact name, its directory or an explicit `*` glob (`--pattern` is the explicit regex); a concurrency, chunk or worker limit of 0 is an error; per-endpoint stores run every operation on their own server; object keys are used exactly as written. First published release after 0.9.112 (0.9.114 through 0.9.124 were not published to PyPI). Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.124** *(no new environment variables; behaviour changes are in the changelog)*: delete contract (exact delete is one DELETE request, `-r` uses the literal prefix, directories refused without `-r`) for `s3-cli delete` and Python `delete()`; op-log `file:x` destinations rejected; op-log rows with a TAB, LF or CR in an identity field rejected and counted; `build_pyo3.sh` requires both cp312 and cp313 wheels. Full changelog: [`docs/Changelog.md`](Changelog.md).

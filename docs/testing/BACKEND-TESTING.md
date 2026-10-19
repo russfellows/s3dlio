@@ -211,12 +211,12 @@ s3-cli put /tmp/test_100mb.bin az://myaccount/container/test_100mb.bin
 s3-cli put /tmp/test_100mb.bin gs://bucket/test_100mb.bin
 
 # Download and verify (automatic range detection)
-s3-cli get s3://bucket/test_100mb.bin /tmp/s3_download.bin
-s3-cli get az://myaccount/container/test_100mb.bin /tmp/azure_download.bin
-s3-cli get gs://bucket/test_100mb.bin /tmp/gcs_download.bin
+s3-cli download s3://bucket/test_100mb.bin /tmp/s3_download/
+s3-cli download az://myaccount/container/test_100mb.bin /tmp/azure_download/
+s3-cli download gs://bucket/test_100mb.bin /tmp/gcs_download/
 
 # Verify checksums match
-sha256sum /tmp/test_100mb.bin /tmp/*_download.bin
+sha256sum /tmp/test_100mb.bin /tmp/*_download/test_100mb.bin
 ```
 
 ---
@@ -330,16 +330,16 @@ s3-cli ls s3://bucket/concurrent/ | wc -l
 # Small files (< 4MB) - should NOT use range engine
 dd if=/dev/urandom of=/tmp/small.bin bs=1M count=2
 s3-cli put /tmp/small.bin s3://bucket/small.bin
-s3-cli get s3://bucket/small.bin /tmp/small_download.bin
+s3-cli download s3://bucket/small.bin /tmp/small_download/
 
 # Large files (> 4MB) - should use range engine
 dd if=/dev/urandom of=/tmp/large.bin bs=1M count=50
 s3-cli put /tmp/large.bin s3://bucket/large.bin
-s3-cli get s3://bucket/large.bin /tmp/large_download.bin
+s3-cli download s3://bucket/large.bin /tmp/large_download/
 
 # Verify both methods produce correct results
-sha256sum /tmp/small.bin /tmp/small_download.bin
-sha256sum /tmp/large.bin /tmp/large_download.bin
+sha256sum /tmp/small.bin /tmp/small_download/small.bin
+sha256sum /tmp/large.bin /tmp/large_download/large.bin
 ```
 
 ---
@@ -396,7 +396,7 @@ cargo test directio_ --release
 dd if=/dev/zero bs=1M count=1000 | pv | s3-cli put - s3://bucket/1gb.bin
 
 # Download throughput (target: 5 GB/s)
-s3-cli get s3://bucket/1gb.bin - | pv > /dev/null
+s3-cli get s3://bucket/1gb.bin   # reports bytes and throughput; get does not write a file
 
 # List performance (10k objects)
 time s3-cli ls s3://bucket/prefix/

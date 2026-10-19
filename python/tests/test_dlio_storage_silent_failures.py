@@ -33,14 +33,11 @@ enough of its import surface via sys.modules, matching the pattern used
 throughout this test suite (test_dlio_storage_get_data_range.py etc).
 """
 
-import os
 import sys
 import types
 from unittest import mock
 
 import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _install_fake_dlio_benchmark():

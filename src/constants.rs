@@ -1092,12 +1092,14 @@ pub const DEFAULT_GCS_READ_TIMEOUT_MAX_SECS: u64 = 300;
 /// Default INFO progress interval while chunk waits are in progress.
 pub const DEFAULT_GCS_READ_PROGRESS_INTERVAL_SECS: u64 = 5;
 
-/// Primary environment variable for custom GCS endpoint
+/// Custom GCS endpoint URL for the official client (an emulator or test server). Wins over
+/// [`ENV_STORAGE_EMULATOR_HOST`]. The client then uses anonymous credentials.
 /// Example: GCS_ENDPOINT_URL=http://localhost:4443
 pub const ENV_GCS_ENDPOINT_URL: &str = "GCS_ENDPOINT_URL";
 
-/// GCS emulator convention environment variable (STORAGE_EMULATOR_HOST=host:port)
-/// If value doesn't start with http://, "http://" is prepended automatically
+/// GCS emulator convention environment variable (STORAGE_EMULATOR_HOST=host:port).
+/// If the value has no `http://` or `https://` scheme, `http://` is prepended. The same
+/// rules apply as for [`ENV_GCS_ENDPOINT_URL`]: anonymous credentials.
 /// Example: STORAGE_EMULATOR_HOST=localhost:4443
 pub const ENV_STORAGE_EMULATOR_HOST: &str = "STORAGE_EMULATOR_HOST";
 

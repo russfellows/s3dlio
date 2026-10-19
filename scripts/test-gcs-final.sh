@@ -1,13 +1,16 @@
 #!/bin/bash
 set -e
 
+# No default bucket: name one you own and may write to, or this script refuses to run.
+: "${S3DLIO_TEST_GCS_BUCKET:?set S3DLIO_TEST_GCS_BUCKET to a GCS bucket you own (refusing to touch a live bucket by default)}"
+BUCKET="$S3DLIO_TEST_GCS_BUCKET"
+
 echo "=== Final GCS Backend Verification Test ==="
 echo ""
 
 # Use ADC authentication
 source gcs-native-env
 
-BUCKET="signal65-russ-b1"
 TEST_PREFIX="gcs-final-test"
 
 echo "1. Creating test file..."

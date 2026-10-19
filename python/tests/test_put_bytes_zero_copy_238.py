@@ -1,5 +1,5 @@
 """Zero-copy put_bytes() / put_bytes_async() for every contiguous buffer, whatever its item
-type, and put_bytes_async(borrow=True) (issue #238, round 2).
+type, and put_bytes_async (borrow=True by default since Stage G; borrow=False is the opt-in snapshot) (issue #238, round 2).
 
 Memory and GIL measurements run in a FRESH interpreter per case (peak RSS is a high-water
 mark). Thresholds are generous; the pointer-identity proof of "no copy" is in the Rust unit
@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 
 import pytest
 import s3dlio
@@ -199,10 +200,10 @@ def test_async_borrow_makes_no_copy(work_dir, kind):
 
 
 @pytest.mark.parametrize("kind", ["bytearray", "ctypes_mv"])
-def test_async_default_still_snapshots(work_dir, kind):
-    r = run_child(f"file://{work_dir}/obj.bin", kind, mode="async")
+def test_async_borrow_false_snapshots(work_dir, kind):
+    r = run_child(f"file://{work_dir}/obj.bin", kind, mode="async_snapshot")
     assert r["rss_growth_kib"] > r["payload_kib"] * MIN_RSS_GROWTH_FRACTION, (
-        "the default put_bytes_async is documented to take one snapshot copy"
+        "put_bytes_async(borrow=False) is documented to take one snapshot copy"
     )
     assert r["max_gap"] < MAX_STALL_SECONDS, (
         "the snapshot is copied with the GIL released"
@@ -219,8 +220,8 @@ def test_borrow_holds_the_export_until_the_await_completes(work_dir):
     )
 
 
-def test_default_async_does_not_hold_the_source(work_dir):
-    r = run_child(f"file://{work_dir}/obj.bin", "bytearray", mode="async")
+def test_async_borrow_false_does_not_hold_the_source(work_dir):
+    r = run_child(f"file://{work_dir}/obj.bin", "bytearray", mode="async_snapshot")
     assert r["pending_resizable"] is True, (
         "a snapshot must not block resizing the source"
     )
@@ -357,15 +358,47 @@ def test_arrays_of_pointers_or_objects_are_refused(work_dir, make):
     assert not os.path.exists(f"{work_dir}/p.bin")
 
 
-def test_small_default_async_snapshot_is_independent(work_dir):
-    # below the GIL-held copy threshold (256 KiB): still a true snapshot
+def test_small_async_snapshot_is_independent_with_borrow_false(work_dir):
+    # borrow=False is the opt-in snapshot; below the GIL-held copy threshold (256 KiB) it is
+    # still a true snapshot
     ba = bytearray(b"a" * 1000)
 
     async def go():
-        aw = s3dlio.put_bytes_async(f"file://{work_dir}/s.bin", ba)
+        aw = s3dlio.put_bytes_async(f"file://{work_dir}/s.bin", ba, borrow=False)
         ba[:] = b"b" * 1000
         ba.extend(b"more")
         await aw
 
     asyncio.run(go())
     assert _readback(f"file://{work_dir}/s.bin") == b"a" * 1000
+
+
+def test_default_async_put_borrows_the_buffer(work_dir):
+    # Stage G: the default is borrow=True. The native writer is held in open() on a FIFO, so
+    # the buffer is provably in flight: it is locked against resizing, and the bytes written
+    # are the caller's memory read in place (modified here before any reader attached).
+    fifo = os.path.join(work_dir, "pipe")
+    os.mkfifo(fifo)
+    ba = bytearray(b"a" * 1000)
+    box = {}
+
+    def read_fifo():
+        with open(fifo, "rb") as f:
+            box["data"] = f.read()
+
+    async def go():
+        aw = s3dlio.put_bytes_async(f"file://{fifo}", ba)  # no borrow argument
+        await asyncio.sleep(0.3)
+        with pytest.raises(BufferError):
+            ba.extend(b"more")
+        ba[:4] = b"ZZZZ"
+        t = threading.Thread(target=read_fifo, daemon=True)
+        t.start()
+        await aw
+        t.join(30)
+
+    asyncio.run(go())
+    assert box["data"] == b"ZZZZ" + b"a" * 996, (
+        "the default must read the caller's memory"
+    )
+    ba.extend(b"more")  # released once the awaitable completed
