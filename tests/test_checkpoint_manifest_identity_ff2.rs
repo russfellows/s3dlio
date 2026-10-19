@@ -1361,6 +1361,108 @@ async fn delete_checkpoint_removes_one_manifest_of_a_step_per_call() -> Result<(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Review finding P2: delete_checkpoint selects the manifest by its FILE NAME, so the manifest
+// body must record the same step. A file named for step 3 whose body says step 4 deletes nothing.
+// ---------------------------------------------------------------------------------------------
+
+/// Put `manifests/<name>.json` whose body records `body_step`, listing `keys` as ranks 0...
+async fn put_manifest_of_step(
+    store: &FaultStore,
+    name: &str,
+    body_step: u64,
+    keys: &[&str],
+) -> Result<()> {
+    let mut manifest = Manifest::new("torch".to_string(), body_step, 1, keys.len() as u32);
+    manifest.wall_time = "2026-10-18T10:00:00Z".to_string();
+    manifest.status = "complete".to_string();
+    for (rank, key) in keys.iter().enumerate() {
+        manifest.add_shard(ShardMeta {
+            rank: rank as u32,
+            key: key.to_string(),
+            size: SHARD_DATA.len() as u64,
+            etag: None,
+            checksum: Some(checksum_of(SHARD_DATA)),
+        });
+    }
+    store
+        .put(
+            &format!("{FAULT_BASE}/manifests/{name}.json"),
+            Bytes::from(serde_json::to_vec(&manifest)?),
+        )
+        .await
+}
+
+/// A manifest FILE named for step 3 whose body records step 4 is not the checkpoint of step 3:
+/// `delete_checkpoint(3)` fails naming the mismatch and changes nothing (no manifest, shard or
+/// `latest.json` is touched, and the real step-4 checkpoint still loads).
+#[tokio::test]
+async fn a_manifest_whose_body_step_differs_from_its_file_name_is_not_deleted() -> Result<()> {
+    const S4: &str = "shards/ckpt-4-t4/rank-0.bin";
+    const OWN3: &str = "shards/ckpt-3-t3/rank-0.bin";
+    const CUSTOM4: &str = "custom/step4-rank-0.bin";
+    // (label, shard keys of the mismatched file, whether the real step-4 manifest is present)
+    let cases: [(&str, &[&str], bool); 4] = [
+        ("step-4 writer shard", &[S4], true),
+        ("caller-chosen shard, step 4 listed", &[CUSTOM4], true),
+        ("caller-chosen shard, only the file", &[CUSTOM4], false),
+        ("shard directory valid for step 3", &[OWN3], false),
+    ];
+    for (label, keys, with_step4) in cases {
+        let store = FaultStore::default();
+        for key in [S4, CUSTOM4, OWN3] {
+            store
+                .put(
+                    &format!("{FAULT_BASE}/{key}"),
+                    Bytes::from_static(SHARD_DATA),
+                )
+                .await?;
+        }
+        if with_step4 {
+            put_manifest_of_step(&store, "ckpt-4-t4", 4, &[S4]).await?;
+            put_latest(&store, 4).await?;
+        }
+        put_manifest_of_step(&store, "ckpt-3-t3", 4, keys).await?;
+        let before = store.inner.lock()?.clone();
+
+        let reader = Reader::new(&store, FAULT_BASE.to_string());
+        let err = match reader.delete_checkpoint(3).await {
+            Ok(deleted) => bail!("{label}: delete_checkpoint(3) returned Ok({deleted})"),
+            Err(e) => e,
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("global_step") && text.contains("ckpt-3-t3.json"),
+            "{label}: the error must name the mismatch and the manifest: {text}"
+        );
+        assert!(
+            text.contains("is named for step 3 but records global_step 4"),
+            "{label}: exact phrase missing: {text}"
+        );
+        assert!(
+            store.deleted()?.is_empty(),
+            "{label}: deleted {:?}",
+            store.deleted()?
+        );
+        assert_eq!(
+            store.inner.lock()?.clone(),
+            before,
+            "{label}: the store changed"
+        );
+        for key in [S4, CUSTOM4, OWN3, "manifests/ckpt-3-t3.json"] {
+            assert!(present(&store, key).await, "{label}: {key} is gone");
+        }
+        if with_step4 {
+            let latest = latest_of(&store).await?.expect("latest.json");
+            assert_eq!(latest.manifest_key, "manifests/ckpt-4-t4.json", "{label}");
+            let loaded = reader.load_latest_manifest().await?.expect("step 4");
+            assert_eq!(loaded.global_step, 4, "{label}");
+            assert_eq!(&reader.read_shard(S4).await?[..], SHARD_DATA, "{label}");
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
 // Review round 2 of delete_checkpoint / latest.json: directory-valued and cross-checkpoint shard
 // keys (#291), a repoint that must never write a pointer it is not sure of (#290), valid-only
 // choice of the new latest, and a corrupt latest.json.

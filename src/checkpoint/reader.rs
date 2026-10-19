@@ -1060,6 +1060,14 @@ impl<'a> Reader<'a> {
     /// other manifests of the step, and `latest.json` is only changed when it names the manifest
     /// that was deleted (or is corrupt).
     ///
+    /// The manifest is selected by its FILE NAME (`ckpt-<step>-<ts>.json`) and must also record
+    /// that step (`global_step`); otherwise the call fails with nothing deleted.
+    ///
+    /// **Coordinate saves and deletes.** The caller must quiesce checkpoint saves and
+    /// finalizations under the same base while a delete runs: no transaction or lock is
+    /// provided, and shared-shard protection uses a listing snapshot, so a checkpoint published
+    /// after it can lose a shard it lists.
+    ///
     /// Everything that can fail is settled BEFORE the first delete: the manifests are listed
     /// once, every listed `.json` entry must be placeable under the base (an entry that is not
     /// is an error, as in `find_manifest_by_step`), the manifest of `step` is read, parsed and
@@ -1098,8 +1106,9 @@ impl<'a> Reader<'a> {
     ///    pointer);
     /// 3. the shards are deleted, best effort: a failure to delete a shard is ignored and the
     ///    call still returns `Ok(true)`. The manifest is already gone, so such a shard is
-    ///    unreferenced garbage that a rerun cannot find (the step now reports `Ok(false)`), but
-    ///    there is never a complete manifest that points at deleted shards.
+    ///    unreferenced garbage that a rerun cannot find (the step now reports `Ok(false)`). With
+    ///    saves under the base quiesced as required above, no complete manifest points at a
+    ///    deleted shard; a checkpoint published concurrently with the delete can.
     ///
     /// If step 2 fails (an unverifiable scan, a failed write) the shards are still deleted and
     /// the call then returns an error saying the checkpoint WAS deleted and `latest.json` was
@@ -1125,6 +1134,16 @@ impl<'a> Reader<'a> {
             return Ok(false);
         };
         let manifest = self.load_manifest(&rel_key).await?;
+        // The manifest was selected by its file name: its body must record the same step, or
+        // the shards below would belong to a different checkpoint. Nothing is deleted.
+        if manifest.global_step != step {
+            anyhow::bail!(
+                "checkpoint step {step} was not deleted: manifest '{}' is named for step {step} \
+                 but records global_step {}",
+                crate::redact::redact_and_escape(&rel_key),
+                manifest.global_step
+            );
+        }
         let shared = self
             .check_shards_deletable(step, &rel_key, &listed, &manifest)
             .await
