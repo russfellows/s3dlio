@@ -3239,20 +3239,38 @@ fn clamp_in_flight(max_in_flight: usize) -> usize {
 
 /// Run the puts of a batch with at most `max_in_flight` of them running at once.
 ///
-/// **Ordered admission.** The batch itself takes a permit for item `i` BEFORE it spawns item `i`'s
-/// task, so item `i` starts before item `i + 1` and the batch stops spawning the moment the
-/// semaphore is closed. (Spawning every task up front and letting each wait for a permit does not
-/// keep that order: tokio's scheduling of tasks spawned from a worker thread is not FIFO.)
-/// `max_in_flight` above tokio's maximum is clamped ([`clamp_in_flight`]).
+/// **Ordered admission.** Every item's request for a permit is registered with the (FIFO) semaphore
+/// IN LIST ORDER, before any item runs: the batch polls item `i`'s `acquire` once, in order, and
+/// only then spawns item `i`'s task, which owns that already-queued request. Permits are therefore
+/// granted to item `i` before item `i + 1`, whichever thread later runs the tasks. (Spawning every
+/// task and letting each one ask for a permit when it first runs does not keep that order:
+/// tokio's scheduling of tasks spawned from a worker thread is not FIFO.) `max_in_flight` above
+/// tokio's maximum is clamped ([`clamp_in_flight`]).
+///
+/// **Why the requests are not made by the batch task itself.** The obvious ordered design - the
+/// batch task takes a permit, spawns item `i`, takes the next - was measured 24% slower than the
+/// unordered one for large objects (`put_many` of 16 x 256 MiB, 4 in flight: 2.3 against 3.1 GB/s
+/// on loopback). A signed S3 PUT hashes the whole body (SigV4 payload SHA-256, about 160 ms for
+/// 256 MiB) inside ONE poll of the request future, so a worker is blocked for that long. When
+/// several items finish together, the single batch task is woken once and then spawns all the
+/// replacements from ONE worker: they sit in that worker's queue and LIFO slot (a LIFO slot is
+/// never stolen) behind each other's hashing, and the other workers stay idle. Here each item
+/// task is woken by its OWN permit, released by a different finishing item on a different
+/// worker, so the replacements start on the workers that just finished, side by side.
 ///
 /// **Failure.** A failing item closes the semaphore BEFORE it gives its permit back, so no item
-/// that has not been admitted yet can start after that failure: the rule is exact. Items already
-/// running keep running only until the batch notices: it then aborts every task that has not
-/// finished, so each payload (which may be a held buffer export) is dropped at once, and returns
-/// the FIRST failure once the aborted tasks are reaped. Only a write that already runs in a
-/// blocking thread cannot be stopped, and only those are waited for by the completion barrier of
-/// the call. The failure returned is the item's own error, not a barrier error, whenever the
-/// drain finishes within `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`.
+/// that has not been admitted yet can start after that failure: the rule is exact (a request
+/// still queued fails with "closed", and an item that holds a permit but has not begun checks the
+/// semaphore first). Items already running keep running only until the batch notices: it then
+/// aborts every task that has not finished, so each payload (which may be a held buffer export)
+/// is dropped at once, and returns the FIRST failure once the aborted tasks are reaped. Only a
+/// write that already runs in a blocking thread cannot be stopped, and only those are waited for
+/// by the completion barrier of the call. The failure returned is the item's own error, not a
+/// barrier error, whenever the drain finishes within `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`.
+///
+/// A `put` that PANICS is a failure too: the item's task closes the semaphore from a drop guard
+/// while it unwinds, before its permit is released, and the batch returns the panic (as `join_failed`
+/// makes it) once it reaps the task.
 ///
 /// **Cancellation.** Dropping the returned future (cancelling the awaitable of
 /// `put_many_async`) closes the semaphore first and then aborts the tasks (`JoinSet` aborts on
@@ -3266,6 +3284,10 @@ where
     E: Send + 'static,
     Fut: Future<Output = Result<(), E>> + Send + 'static,
 {
+    use futures::FutureExt;
+    use std::pin::Pin;
+    use tokio::sync::{AcquireError, OwnedSemaphorePermit};
+
     /// Closes the semaphore when dropped, so that a dropped batch (cancellation) stops handing
     /// permits out BEFORE its `JoinSet` aborts the tasks: otherwise a permit released by the
     /// first aborted task could let the next, not yet aborted, task start its write.
@@ -3276,43 +3298,74 @@ where
         }
     }
 
+    /// Closes the semaphore when dropped WHILE UNWINDING (a `put` that panicked); a normal drop
+    /// does nothing, so a successful or failed-with-`Err` item is handled by its own code.
+    struct ClosePanicking(Arc<tokio::sync::Semaphore>);
+    impl Drop for ClosePanicking {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.close();
+            }
+        }
+    }
+
+    type Granted = Result<OwnedSemaphorePermit, AcquireError>;
+
+    /// An item's permit request: already granted when it was registered, or queued (and so
+    /// already in its place in the semaphore's FIFO) until a permit is released.
+    enum Admission {
+        Granted(Granted),
+        Queued(Pin<Box<dyn Future<Output = Granted> + Send>>),
+    }
+
     let sem = Arc::new(tokio::sync::Semaphore::new(clamp_in_flight(max_in_flight)));
     let mut tasks = tokio::task::JoinSet::new();
     // Declared AFTER `tasks`, so on a drop (cancellation) it runs FIRST: the semaphore is closed
     // before the JoinSet aborts its tasks.
     let stop = CloseOnDrop(Arc::clone(&sem));
-    let mut first_failure: Option<E> = None;
 
-    'admit: for put in puts {
-        // Wait for a permit, in input order. A failure that finishes meanwhile is handled at
-        // once (it has closed the semaphore, so the wait ends too).
-        let permit = loop {
-            tokio::select! {
-                biased;
-                Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Err(e) = joined.unwrap_or_else(|e| Err(join_failed(e))) {
-                        first_failure = Some(e);
-                        break 'admit;
-                    }
-                }
-                acquired = Arc::clone(&sem).acquire_owned() => match acquired {
-                    Ok(permit) => break permit,
-                    Err(_) => break 'admit, // closed: a failure ended the batch
-                },
-            }
+    for put in puts {
+        if sem.is_closed() {
+            // A failure already ended the batch: nothing more is admitted (the rest of `puts`
+            // is dropped here, releasing its payloads).
+            break;
+        }
+        // Register this item's permit request NOW, in list order: the first poll of `acquire`
+        // takes a free permit or joins the semaphore's FIFO queue. The no-op waker of this
+        // single poll is replaced by the task's own waker when the task polls it again.
+        // `unconstrained`: tokio's cooperative budget (128 operations per poll of THIS task)
+        // would otherwise make a poll after the budget is spent return `Pending` WITHOUT joining
+        // the queue, which breaks the order for a limit above 128.
+        let mut acquire: Pin<Box<dyn Future<Output = Granted> + Send>> =
+            Box::pin(tokio::task::unconstrained(Arc::clone(&sem).acquire_owned()));
+        let admission = match acquire.as_mut().now_or_never() {
+            Some(granted) => Admission::Granted(granted),
+            None => Admission::Queued(acquire),
         };
         let task_sem = Arc::clone(&sem);
         tasks.spawn(async move {
-            // `permit` is dropped AFTER the semaphore is closed on a failure (declaration order
-            // does not matter here: the close is explicit and happens first).
-            let permit = permit;
+            let granted = match admission {
+                Admission::Granted(granted) => granted,
+                Admission::Queued(queued) => queued.await,
+            };
+            // `Err`: the semaphore was closed while this item waited - a failure ended the
+            // batch, this item does not start, and it is not a failure of its own (the real
+            // one is reported).
+            let Ok(permit) = granted else {
+                return Ok(());
+            };
             if task_sem.is_closed() {
-                // A failure closed the batch between this item's admission and its start: it
-                // does not start, and it is not a failure of its own (the real one is reported).
+                // The same, for a permit granted just before the close.
                 return Ok(());
             }
+            // Declared AFTER `permit`, so it drops BEFORE it: if `put` panics, the unwinding
+            // closes the semaphore first and only then gives the permit back. Without it the
+            // permit would go to the next queued item, which could start before the batch has
+            // reaped this task's `JoinError` and closed the semaphore.
+            let _close_on_panic = ClosePanicking(Arc::clone(&task_sem));
             let outcome = put.await;
             if outcome.is_err() {
+                // Closed BEFORE the permit is given back: no later item can start.
                 task_sem.close();
             }
             drop(permit);
@@ -3320,13 +3373,13 @@ where
         });
     }
 
-    if first_failure.is_none() {
-        // Everything is admitted (or admission stopped on a closed semaphore): collect results.
-        while let Some(joined) = tasks.join_next().await {
-            if let Err(e) = joined.unwrap_or_else(|e| Err(join_failed(e))) {
-                first_failure = Some(e);
-                break;
-            }
+    // Everything is admitted (or admission stopped on a closed semaphore): collect the results,
+    // and stop at the first failure.
+    let mut first_failure: Option<E> = None;
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(e) = joined.unwrap_or_else(|e| Err(join_failed(e))) {
+            first_failure = Some(e);
+            break;
         }
     }
     if first_failure.is_some() {
@@ -9917,6 +9970,78 @@ mod bounded_puts_tests {
         }
     }
 
+    /// The ordered registration of the permit requests must not depend on tokio's cooperative
+    /// task budget (128 operations per poll of the batch task): with a limit above it, the
+    /// requests made after the budget is spent must still be queued in list order. With the
+    /// permits all held, each release must go to the NEXT item of the list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_order_holds_for_a_limit_above_the_task_budget() {
+        const LIMIT: usize = 200;
+        const ITEMS: usize = 400;
+        const STEPS: usize = 60;
+
+        async fn until_started(order: &Arc<Mutex<Vec<usize>>>, count: usize) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while started(order).len() < count {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "only {} of {count} items started",
+                    started(order).len()
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let gates: Vec<Arc<tokio::sync::Notify>> = (0..LIMIT)
+            .map(|_| Arc::new(tokio::sync::Notify::new()))
+            .collect();
+        let puts: Vec<Put> = (0..ITEMS)
+            .map(|i| {
+                let order = Arc::clone(&order);
+                let gate = gates.get(i).cloned();
+                Box::pin(async move {
+                    order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(i);
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    Ok(())
+                }) as Put
+            })
+            .collect();
+        let batch = tokio::spawn(run_bounded_puts(puts, LIMIT, joined));
+
+        // The first LIMIT items fill every permit and hold them.
+        until_started(&order, LIMIT).await;
+        let mut first_wave = started(&order);
+        first_wave.sort_unstable();
+        assert_eq!(first_wave, (0..LIMIT).collect::<Vec<_>>());
+
+        // Each release goes to the next item in the list.
+        for step in 0..STEPS {
+            gates[step].notify_one();
+            until_started(&order, LIMIT + step + 1).await;
+            assert_eq!(
+                started(&order)[LIMIT + step],
+                LIMIT + step,
+                "release {step} did not admit the next item of the list"
+            );
+        }
+        for gate in &gates[STEPS..] {
+            gate.notify_one();
+        }
+        assert_eq!(
+            batch
+                .await
+                .unwrap_or_else(|e| Err(format!("batch task: {e}"))),
+            Ok(())
+        );
+        assert_eq!(started(&order).len(), ITEMS);
+    }
+
     /// The first failure is returned, no later item starts, and every payload is dropped before
     /// the call returns (queued items are never started, running ones are aborted).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9954,6 +10079,42 @@ mod bounded_puts_tests {
                 1,
                 "round {round}: a payload is still held after the batch returned"
             );
+        }
+    }
+
+    /// An item whose put PANICS fails the batch like an error does: the panic is returned as that
+    /// item's failure (through `join_failed`) and no item that had not started yet starts after
+    /// it. The unwinding task gives its permit back without any code of its own running, so the
+    /// semaphore must be closed by a drop guard BEFORE the permit is released: otherwise the next
+    /// queued item can be granted that permit and start before the batch reaps the `JoinError`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_panicking_put_stops_the_rest_before_any_later_item_starts() {
+        for round in 0..200 {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let payload = Arc::new(());
+            let mut puts: Vec<Put> = Vec::new();
+            let panicking = Arc::clone(&payload);
+            puts.push(Box::pin(async move {
+                // Let the batch register every later item's permit request first.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                drop(panicking);
+                let () = Err::<(), String>("boom".to_string()).expect("item 0 panics on purpose");
+                Ok(())
+            }));
+            for i in 1..8 {
+                puts.push(put(&order, &payload, i, 10_000));
+            }
+            let result = run_in_worker(puts, 1).await;
+            match &result {
+                Err(e) if e.starts_with("join: ") && e.contains("panic") => {}
+                other => panic!("round {round}: the panic was not item 0's failure: {other:?}"),
+            }
+            assert!(
+                started(&order).is_empty(),
+                "round {round}: items {:?} started after the panic",
+                started(&order)
+            );
+            assert_eq!(Arc::strong_count(&payload), 1, "round {round}");
         }
     }
 
