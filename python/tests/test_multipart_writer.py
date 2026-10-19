@@ -158,17 +158,55 @@ class MiniS3:
             return None
         return start, end
 
+    @staticmethod
+    def parse_part_list(body):
+        """Return [(int PartNumber, stripped ETag), ...] in document order, or raise
+        ValueError when malformed.  No XML parser is used (CodeQL py/xml-bomb): the
+        mock only needs the part list, so it rejects any DOCTYPE/ENTITY declaration."""
+        text = body.decode("utf-8")  # UnicodeDecodeError is a ValueError
+        if "<!" in text:
+            raise ValueError("DOCTYPE/ENTITY declarations are not accepted")
+        entities = (("&quot;", '"'), ("&apos;", "'"), ("&lt;", "<"), ("&gt;", ">"))
+
+        def field(block, name):
+            start = block.find(f"<{name}>")
+            end = block.find(f"</{name}>", start)
+            if start < 0 or end < 0:
+                raise ValueError(f"missing or unterminated <{name}>")
+            value = block[start + len(name) + 2 : end]
+            if "<" in value:
+                raise ValueError(f"unexpected markup inside <{name}>")
+            check = value
+            for entity, _ in entities + (("&amp;", "&"),):
+                check = check.replace(entity, "")
+            if "&" in check:  # numeric or unknown reference: treat as malformed
+                raise ValueError(f"unsupported entity inside <{name}>")
+            for entity, char in entities:
+                value = value.replace(entity, char)
+            return value.replace("&amp;", "&")  # &amp; last, as ElementTree does
+
+        listed = []
+        pos = 0
+        while True:
+            start = text.find("<Part>", pos)
+            if start < 0:
+                return listed
+            end = text.find("</Part>", start)
+            if end < 0:
+                raise ValueError("unterminated <Part>")
+            block = text[start + len("<Part>") : end]
+            listed.append(
+                (int(field(block, "PartNumber")), field(block, "ETag").strip())
+            )
+            pos = end + len("</Part>")
+
     def complete(self, bucket, key, upload_id, body):
         if upload_id not in self.uploads:
             return s3_error(404, "NoSuchUpload", "The specified upload does not exist.")
         up_bucket, up_key, parts = self.uploads[upload_id]
         try:
-            root = ET.fromstring(body)
-            listed = []
-            for part in root:
-                fields = {c.tag.rsplit("}", 1)[-1]: (c.text or "") for c in part}
-                listed.append((int(fields["PartNumber"]), fields["ETag"].strip()))
-        except (ET.ParseError, KeyError, ValueError):
+            listed = self.parse_part_list(body)
+        except ValueError:
             return s3_error(
                 400, "MalformedXML", "The XML you provided was not well-formed."
             )
@@ -341,6 +379,31 @@ class TestMiniS3Strictness(unittest.TestCase):
             return None
         self.assertEqual(status, 400, resp)
         return ET.fromstring(resp).find("Code").text
+
+    def test_part_list_parser_namespaced_root_and_field_order(self):
+        body = (
+            b'<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            b"<Part><ETag> abc </ETag><PartNumber>2</PartNumber></Part>"
+            b"<Part><PartNumber>1</PartNumber><ETag>def</ETag></Part>"
+            b"</CompleteMultipartUpload>"
+        )
+        self.assertEqual(MiniS3.parse_part_list(body), [(2, "abc"), (1, "def")])
+
+    def test_part_list_parser_unescapes_predefined_entities(self):
+        body = b"<Part><PartNumber>1</PartNumber><ETag>&quot;a&amp;lt;b&quot;</ETag></Part>"
+        self.assertEqual(MiniS3.parse_part_list(body), [(1, '"a&lt;b"')])
+
+    def test_part_list_parser_refuses_doctype_and_malformed(self):
+        for body in (
+            b'<!DOCTYPE x [<!ENTITY a "b">]><Part></Part>',
+            b"<Part><PartNumber>x</PartNumber><ETag>e</ETag></Part>",
+            b"<Part><PartNumber>1</PartNumber></Part>",
+            b"<Part><PartNumber>1</PartNumber><ETag>e</ETag>",
+            b"<Part><PartNumber>1</PartNumber><ETag>&#34;</ETag></Part>",
+            b"\xff",
+        ):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                MiniS3.parse_part_list(body)
 
     def test_valid_complete_assembles_in_part_order(self):
         big = b"a" * MIN_PART
