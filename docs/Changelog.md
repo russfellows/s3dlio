@@ -2,9 +2,9 @@
 
 ## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 
-This release adds a new public API surface (#264) and fixes twenty issues (#224, #230, #233,
-#235, #261, #263, #269, #270, #271, #272, #277, #278, #279, #280, #281, #282, #284, #285, #286 and
-#287);
+This release adds a new public API surface (#264) and fixes twenty-three issues (#224, #230,
+#233, #235, #261, #263, #269, #270, #271, #272, #277, #278, #279, #280, #281, #282, #283, #284,
+#285, #286, #287, #290 and #291);
 #250's test import is fixed and its event-loop report did not reproduce (see Fixed), and a Python
 3.11 standard-library limitation is documented (#288). The new Python calls read an
 object straight into memory the caller owns (a `bytearray`, a NumPy array, an `mmap`, a ctypes
@@ -45,6 +45,10 @@ under "Changed (BEHAVIOUR CHANGE)".
   `<dest>/<key path relative to the listing base>` instead of `<dest>/<last key segment>`, so nested
   keys no longer collide; keys that would escape the destination are refused. This also applies to
   `s3-cli cp -r` and the Python `download`.
+- **`PyLoaderOptions` gains readable values (#283).** `pin_memory_value`, `num_workers_value`,
+  `shuffle_value`, `drop_last_value`, `prefetch_value`, `persistent_workers_value`,
+  `non_blocking_value` and `to_dict()`; every builder method is unchanged.
+- **`delete_checkpoint` is safer (#290, #291)** and keeps `latest.json` consistent.
 - **Python 3.11 and `asyncio.wait_for` (#288).** On 3.11, do not cancel a task that is inside
   `wait_for` around a borrowed-buffer call; use `asyncio.timeout()` (see Known limitations).
 - **Times are RFC 3339 (#263).** GCS bucket creation dates, GCS object times and `file://`/`direct://`
@@ -222,6 +226,26 @@ under "Changed (BEHAVIOUR CHANGE)".
   only the object `dl` is refused, with a message that names the trailing-slash alternative. URIs
   in these messages are redacted by the same function the Python errors use, and control
   characters in a remote key are escaped.
+- **#283.** Seven `PyLoaderOptions` values (`pin_memory`, `num_workers`, `shuffle`, `drop_last`,
+  `prefetch`, `persistent_workers`, `non_blocking`) could not be read back: the builder methods of
+  the same names shadow a property. The builders are unchanged (existing code keeps working); the
+  values are now readable as `pin_memory_value`, `num_workers_value`, `shuffle_value`,
+  `drop_last_value`, `prefetch_value`, `persistent_workers_value` and `non_blocking_value`, and the
+  new `to_dict()` returns every option.
+- **#290, #291.** `delete_checkpoint` left `latest.json` pointing at a deleted manifest (so
+  `load_latest()` failed although older checkpoints existed) and trusted the manifest's shard keys.
+  It now validates every shard key before deleting anything: a key that is absolute, contains
+  `..`/`.`/empty components, `?`, `#` or a percent-encoded dot, names a control object
+  (`manifests`, `latest`, `latest.json`) at any depth, or names another step's shard directory
+  refuses the delete. It deletes the manifest before its shards, keeps a shard that another
+  complete checkpoint also lists, deletes nothing when another manifest cannot be read, and
+  repoints `latest.json` to the newest remaining complete checkpoint (or removes it). `load_latest`
+  falls back to the newest complete checkpoint when the pointer is missing, corrupt or names a
+  missing manifest. A delete reads every other manifest once (one listing plus one GET each).
+- **Credential redaction in error text.** Every `s3-cli` error and the download/upload library
+  errors and logs pass through one redactor: credentials (userinfo and signed query strings) are
+  removed from every URI in the text, including messages relayed from the storage service, and
+  control and bidi characters are escaped.
 - **#277.** A `get_into_async` destination refused for holding pointers said it "cannot upload";
   it now says it cannot be used as a read destination.
 - **#278.** On CPython 3.11 four borrowed-PUT barrier tests failed and one hung (also with 0.9.128).
@@ -262,8 +286,8 @@ under "Changed (BEHAVIOUR CHANGE)".
 ### Validation
 
 - Rust: `cargo fmt`, clippy with `-D warnings` in seven feature configurations, and the full
-  default-feature test run (1728 passed, 0 failed), the full-backend library tests (1076 passed)
-  and the Python-extension unit tests (1008 passed), including fault-injection tests for the S3,
+  default-feature test run (1811 passed, 0 failed), the full-backend library tests (1113 passed)
+  and the Python-extension unit tests (1050 passed), including fault-injection tests for the S3,
   Azure and GCS receive paths (exact request counts, version pinning, wrong lengths, mid-stream
   failures, cancellation, no whole-object allocation), the download-layout safety tests and the
   checkpoint validation tests.
@@ -310,13 +334,12 @@ under "Changed (BEHAVIOUR CHANGE)".
 - **Pointer detection is format-based (#282).** A ctypes `Union` containing a pointer reports a
   plain byte format, and a `:` inside a ctypes structure field name can hide a following pointer
   code, so neither can be detected from the buffer format.
-- **`PyLoaderOptions` values (#283).** Seven option values (`pin_memory`, `num_workers`, `shuffle`,
-  `drop_last`, `prefetch`, `persistent_workers`, `non_blocking`) cannot be read back as properties:
-  the builder methods of the same names shadow them. Setting them through the builder works.
-- **Older async APIs touch the interpreter inside the native future (#276).** `stat_async`,
-  `stat_many_async`, `get_async`, `get_range_async`, `upload_async`, the `MultiEndpointStore` `get`
-  and `get_range`, and the other sites listed in #276 can attach to the interpreter after the work
-  finishes, outside the exit-safe delivery. The new calls and those fixed in this release do not.
+- **Older async APIs touch the interpreter inside the native future (#276, deferred to the next
+  release).** `stat_async`, `stat_many_async`, `get_async`, `get_range_async`, `upload_async`, the
+  `MultiEndpointStore` `get` and `get_range`, and the other sites listed in #276 build their Python
+  result on a worker thread after the I/O finishes, outside the exit-safe delivery. If such a call
+  is still in flight while the interpreter exits, the process can crash or hang at exit. Normal
+  operation is not affected. The new calls and those fixed in this release use the safe delivery.
 
 ## Version 0.9.128 — Zero-copy Python writes, opt-in `.env` loading for library users, Azure credential modes, real CRC-32C, shared `direct://` bounce pool, Arrow-backend and `get_many` fixes
 

@@ -255,6 +255,12 @@ directory swapped for a symlink by another local process in that instant is not 
 only in case can still merge on a case-insensitive file system, a file left by an earlier run is overwritten,
 and a write that fails after its directories were created leaves those directories behind, empty.)
 
+**Scope of these protections.** They reject ordinary hostile remote KEYS (traversal, absolute and drive-letter
+forms, collisions, a pre-existing symlink). They are not containment against a hostile LOCAL directory, and they
+are not a Windows file-name mapping: Windows is not a supported or tested platform of the release (the release
+matrix is Linux), and alternate data streams, reserved device names and path aliases are not handled. Download
+only to a destination whose directory entries are not being modified by an untrusted actor.
+
 The base is one for the whole listing. `download -r s3://b/dl ./out/` where `dl` is both an object (typically a
 zero-byte folder marker) and a directory (`dl/a`, `dl/b/c`) places everything relative to the parent: `dl/a`
 goes to `./out/dl/a` and `dl/b/c` to `./out/dl/b/c`, never to `./out/a`. A file system cannot hold the
@@ -273,7 +279,7 @@ that was only partly written (disk full, interrupted write) is NOT removed: the 
 exits non-zero, and the partial file stays in the destination for you to delete or overwrite. The CLI refuses per object (the rest is downloaded, the exit status is non-zero); the Rust library helpers
 `s3dlio::s3_copy::download_objects*` are fail-fast: one bad key (or an object and directory of one name)
 refuses the whole call before anything is created or fetched. Control characters in a remote key (newline,
-ESC, bidi and other invisible format characters) are shown escaped (`\n`, `\u{1b}`, `\u{202e}`) in the error text, the failure reasons and the log lines of a download, including the cause text of a failed fetch, and credentials in the URI are redacted.
+ESC, bidi and other invisible format characters) are shown escaped (`\n`, `\u{1b}`, `\u{202e}`) in the error text, the failure reasons and the log lines of a download, including the cause text of a failed fetch, and credentials are redacted from every `scheme://` URI in that text (userinfo, signed query strings), not only from the object URI. This covers what `s3-cli download` and `s3-cli cp <uri> <dir>` print for a failed listing or a failed fetch, and the failure of the Rust `s3_copy::upload_files` and `download_objects*` helpers. Documented limits of the redaction: a schemeless `user:password@host` in the text is not recognised; a password that contains whitespace, `/`, `?` or `#` is not fully removed (one `/` is handled in `http(s)` URIs only; a leading `?`/`#` removes the rest of the word, otherwise the part in front of the character stays); everything up to the last `@` of the authority (the text after `://` up to the first whitespace, `/`, `?` or `#`) is treated as userinfo, so a bare-host URI directly followed by text with an `@` and no whitespace (`https://h,user=a@b`) is over-redacted and `abfs://container@account` loses `container@`; a credential parameter is cut from `http(s)` URIs by dropping the whole query, but from other schemes (`s3://`, `gs://`, `az://`) only when it is one of the well-known names (`sig`, `signature`, `token`, `x-amz-*`, `x-goog-*`); and a cut query runs to the next whitespace, quote, backtick or angle bracket (`)`, `]`, `}`, `,` and `;` do not end it), the text after that boundary is kept, so compact JSON / XML keep their other fields. The same redaction and escaping is applied to ALL `s3-cli` error output (`ls`, `get`, `stat`, `put`, `delete`, `create-bucket`, `cp` upload, ...): the final error of every command is rendered through it before `main` prints it (`Error: ...` on stderr, non-zero exit status), and so are the per-object `GET failed` / `PUT failed` and `Failed to create bucket` log lines.
 
 ```bash
 s3-cli download [OPTIONS] <SOURCE_URI> <LOCAL_PATH>

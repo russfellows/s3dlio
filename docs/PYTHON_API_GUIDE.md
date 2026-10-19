@@ -755,7 +755,9 @@ objects are still written, and then it raises an error that lists the counts and
 object URI and the reason), `... failed=2: s3://b/dl/../x: ... refused; ... (and N more; see the log)`. Control
 characters in a remote key (newline, ESC, bidi and other invisible format characters) appear escaped (`\n`,
 `\u{1b}`, `\u{202e}`) in these messages, including the cause text of a failed fetch, and
-credentials in the URI are redacted.
+credentials are redacted from every `scheme://` URI in that text (userinfo, signed query strings), not only from
+the object URI. Documented limits of the redaction: a schemeless `user:password@host` in the text is not recognised;
+a password that contains whitespace, or two or more `/`, is not fully removed (one `/` is handled in `http(s)` URIs only); everything up to the last `@` before the first whitespace or `/` after `://` is treated as userinfo, and when that removed part holds a `?` or `#` (a password with a raw `?`/`#`, or an `@` inside a query such as `https://h?e=a@b&sig=S`) the text after it is treated as a query too and removed (other schemes: when it holds a credential parameter), favouring redaction (`https://u:p?w@h/x` becomes `https://`); so a bare-host URI directly followed by text with an `@` and no whitespace (`https://h,user=a@b`) is over-redacted and `abfs://container@account` loses `container@`; a credential parameter is cut from `http(s)` URIs by dropping the whole query, but from other schemes (`s3://`, `gs://`, `az://`) only when it is one of the well-known names (`sig`, `signature`, `token`, `x-amz-*`, `x-goog-*`); and a cut query runs to the next whitespace, quote, backtick or angle bracket (`)`, `]`, `}`, `,` and `;` do not end it), the text after that boundary is kept, so compact JSON / XML keep their other fields (when the removed part holds another `scheme://`, the rest of the word is removed too, so a later URI glued to it never survives in part); a raw quote or angle bracket inside a query in front of a credential parameter therefore ends the removed part early (`?name=O'Brien&X-Amz-Signature=...` keeps the text after the quote; signed URLs percent-encode these characters). URIs JSON-escaped (`https:\/\/...`) or percent-encoded as a whole, and secrets outside a URI (an `Authorization:` header, an XML `<SignatureProvided>`), are not recognised.
 (The Rust library helpers `s3dlio::s3_copy::download_objects*` are fail-fast instead: one bad key, or an object
 and directory of one name, refuses the whole call
 before anything is created or fetched.) A symlink below `dest_dir` is checked before the write and, for the
@@ -764,6 +766,12 @@ another local process in the instant between check and write is not detected. A 
 directories were created leaves those directories, empty, behind, and a file that was only partly written is
 NOT removed (delete or overwrite it). Zero-length "folder" keys (ending in `/`) are
 skipped.
+
+**Scope of these protections.** They reject ordinary hostile remote KEYS (traversal, absolute and drive-letter
+forms, collisions, a pre-existing symlink). They are not containment against a hostile LOCAL directory, and they
+are not a Windows file-name mapping: Windows is not a supported or tested platform of the release (the release
+matrix is Linux), and alternate data streams, reserved device names and path aliases are not handled. Download
+only to a destination whose directory entries are not being modified by an untrusted actor.
 
 ### mp_get() — Multi-Process GET
 
@@ -991,6 +999,77 @@ from s3dlio import make_tf_dataset
 ds = make_tf_dataset(uri="s3://bucket/train/", batch_size=32, shuffle=True)
 for batch in ds:
     pass  # TF training
+```
+
+### PyLoaderOptions — Builders and Readable Values
+
+`PyLoaderOptions` is configured with chained builder methods. Each builder returns a **new**
+options object and leaves the original unchanged, so you must use the returned value:
+`opts.pin_memory(True)` with the result discarded has no effect.
+
+```python
+import s3dlio
+
+opts = (
+    s3dlio.PyLoaderOptions()
+    .with_batch_size(128)
+    .num_workers(8)
+    .pin_memory(True)
+    .shuffle(True, 42)
+    .drop_last(True)
+    .prefetch(4)
+)
+```
+
+`opts.pin_memory`, `opts.num_workers`, `opts.shuffle`, `opts.drop_last`, `opts.prefetch`,
+`opts.persistent_workers` and `opts.non_blocking` **remain builder methods** (a Python class
+cannot have a method and a property with the same name). To read the current value, use the
+read-only `*_value` properties:
+
+| Builder method | Read-only property | Type |
+|---|---|---|
+| `pin_memory(bool)` | `pin_memory_value` | `bool` |
+| `num_workers(int)` | `num_workers_value` | `int` |
+| `shuffle(bool, seed)` | `shuffle_value` | `bool` |
+| `drop_last(bool)` | `drop_last_value` | `bool` |
+| `prefetch(int)` | `prefetch_value` | `int` |
+| `persistent_workers(bool)` | `persistent_workers_value` | `bool` |
+| `non_blocking(bool)` | `non_blocking_value` | `bool` |
+
+`batch_size`, `seed`, `timeout_seconds`, `shard_rank` and `shard_world_size` have no
+same-named builder and are plain read-only properties.
+
+`opts.to_dict()` returns a plain `dict` of every option that `PyLoaderOptions` can set, with
+its current value (keys: `batch_size`, `drop_last`, `shuffle`, `seed`, `num_workers`,
+`prefetch`, `auto_tune`, `pin_memory`, `persistent_workers`, `timeout_seconds`,
+`non_blocking`, `shard_rank`, `shard_world_size`, `generator_seed`, `enable_transforms`,
+`collate_buffer_size`, `multiprocessing_context`, `memory_format`, `sampler_type`,
+`sampler_replacement`, `sampler_rank`, `sampler_world_size`). Options that cannot be set from
+Python (such as `loading_mode`, `reader_mode`, `part_size`, `max_inflight_parts`, `worker_id`)
+are not included. `auto_tune`, `generator_seed`, `enable_transforms` and `collate_buffer_size`
+have no `*_value` property and are readable only through `to_dict()`.
+
+Enum-valued options are reported by lower-case name (for example `"channels_last"`,
+`"forkserver"`). `sampler_type` is one of `"sequential"`, `"random"`, `"weighted_random"` or
+`"distributed_random"`; its parameters are reported by separate keys:
+
+| Key | Value |
+|---|---|
+| `sampler_replacement` | `bool` when `sampler_type` is `"random"` (the `random_sampling(replacement)` argument), otherwise `None` |
+| `sampler_rank` | `int` when `sampler_type` is `"distributed_random"`, otherwise `None` |
+| `sampler_world_size` | `int` when `sampler_type` is `"distributed_random"`, otherwise `None` |
+
+```python
+opts = s3dlio.PyLoaderOptions().num_workers(8).pin_memory(True)
+assert opts.num_workers_value == 8 and opts.pin_memory_value is True
+assert opts.to_dict()["num_workers"] == 8
+
+a = s3dlio.PyLoaderOptions()
+b = a.pin_memory(True)  # a new object; `a` is unchanged
+assert a.pin_memory_value is False and b.pin_memory_value is True
+
+d = a.distributed_sampling(1, 4).to_dict()
+assert (d["sampler_type"], d["sampler_rank"], d["sampler_world_size"]) == ("distributed_random", 1, 4)
 ```
 
 ---
@@ -1236,6 +1315,19 @@ state_bytes = bytes(view)   # or memoryview(view) for zero-copy access
 # manifest of the same step that lists the shard used (newest by parsed wall_time, compared
 # as an instant), and only after that a scan of all the other manifests. A manifest that
 # cannot be read or parsed raises that error rather than being reported as an unlisted shard.
+# A store may list an object in a different spelling from the base you gave (an Azure
+# `https://<account>.blob.core.windows.net/...` base lists as `az://`, `gcs://` as `gs://`,
+# `s3://host:port/bucket/...` as bucket-form `s3://`, a relative `file://rel/ck` as `rel/ck/...`).
+# Listed manifests are matched to the base by provider identity (bucket, or account and
+# container; the server when both name one) and then by key, with the base followed by exactly
+# one `/` (`ckpt` does not own `ckpt2/...`). A listed `.json` manifest that cannot be placed
+# under the base (another bucket, container, account or server, a sibling prefix, or a
+# spelling no rule maps) raises an error naming it (credentials redacted) -- in this fallback
+# AND in `PyCheckpointStore.list_checkpoints` and `delete_checkpoint` (and the Rust by-step
+# lookup) -- it is never skipped silently.
+# `delete_checkpoint(step)` checks the whole listing, reads the manifest and validates every
+# shard key it lists before deleting anything, then deletes the manifest first and its shards
+# after (best effort). See "Deleting a checkpoint" below.
 data = s3dlio.load_checkpoint_with_validation(
     "s3://bucket/checkpoints/run1/shards/<ckpt-id>/rank-0.bin", validate_integrity=True
 )
@@ -1253,6 +1345,66 @@ store.load_latest()                                   # -> BytesView | None
 store.list_checkpoints()                              # -> [PyCheckpointInfo]
 store.delete_checkpoint(step)                         # -> bool
 ```
+
+#### Deleting a checkpoint
+
+`store.delete_checkpoint(step)` returns `True` when a checkpoint of `step` was found and its
+manifest deleted, `False` when there is none.
+
+- **One checkpoint per call.** If two checkpoints share a step (saved twice at different
+  times), a call deletes exactly one -- the first the store lists, whatever its status; the
+  listing order is the store's and is not specified. Call again to delete the next; the result
+  is `False` once none is left. `latest.json` changes only when it names the manifest that was
+  deleted or is corrupt.
+- **Validated before anything is deleted.** Every listed manifest must be placeable under the
+  base, the manifest must parse and validate (a complete manifest that fails validation, for
+  example one missing a rank, cannot be deleted by step), and every shard key it lists must be
+  a safe key: relative, with a non-empty final component (never a directory or prefix), no
+  leading `/`, no backslash, no `?` or `#`, no percent-encoded dot (`%2e`, any case; a
+  URL-based store could normalise it to `..`), no empty / `.` / `..` component, no component
+  named `manifests`, `latest`, `latest.json` or `latest.json.tmp` at any position, no final
+  component `shards`, and no `ckpt-<step>-<ts>` directory of a different step at any position
+  (a different timestamp of the same step is fine; a hand-built manifest that reuses another
+  step's shard directory therefore cannot be deleted by step). On a `file://` or `direct://`
+  base every target is also checked and a directory is refused. Keys outside `shards/`
+  (written with a caller-chosen key) are fine. A manifest that fails the check makes the call
+  raise with nothing deleted.
+- **Shared shards are kept.** Every other manifest of the base is read; a shard key that
+  another *complete* manifest also lists belongs to that checkpoint as well, so it is NOT
+  deleted. The call deletes this checkpoint's manifest and only the shards no other complete
+  manifest lists; the shared shards are kept (reported in an info-level log line per kept
+  shard) and the other checkpoint stays whole and loadable. A manifest that does not parse or
+  is not complete is ignored.
+- **Cost, and all-or-nothing on unreadable manifests.** Each call makes one listing of
+  `manifests/` plus one GET of each other manifest (a bounded number at a time). Deleting the
+  checkpoint `latest.json` names also scans the remaining manifests once more to choose the new
+  latest. If any other manifest cannot be read (a failure other than not-found), the call
+  raises and NOTHING is deleted, because that manifest could list a shard of this checkpoint.
+- **Order and failures.** The manifest is deleted first. If that delete fails the call raises
+  and nothing was deleted. Shards are deleted after it, best effort: a shard that cannot be
+  deleted is ignored and the call still returns `True`; it is then an unreferenced object
+  that a rerun cannot find (the step now reports `False`), but a complete manifest never
+  points at deleted shards.
+- **`latest.json` follows the delete.** If `latest.json` named the deleted checkpoint (or is
+  corrupt) it is pointed at the newest remaining complete, *valid* checkpoint (a complete
+  manifest that fails validation is skipped, as is one whose key is not
+  `ckpt-<step>-<ts>.json` with `<step>` equal to its recorded step), or removed when none
+  remains, so
+  `load_latest()` returns the previous checkpoint. A pointer is only written when it is
+  certain: if any remaining `ckpt-<step>-<ts>.json` manifest cannot be read or parsed it could
+  be the newest, so `latest.json` is left untouched and the call raises. If updating it fails
+  the shards are still deleted and the call raises an error that says the checkpoint WAS
+  deleted and `latest.json` was not updated. The pointer is re-read just before it is written
+  and left alone if a concurrent save changed it; a save that publishes in that instant can
+  still be overwritten, because `latest.json` has no conditional write.
+- **Reading follows the same rule.** `load_latest()` / `load_latest_manifest()` scan the
+  manifests (newest complete, valid one, by the same key rule) when `latest.json` is missing, unreadable or
+  corrupt, or names a manifest that no longer exists, so a stale pointer never hides older
+  checkpoints. Tradeoff: if the GET of the named manifest fails with something other than
+  not-found and a successful listing of `manifests/` does not show it (for example a
+  transient failure on a store whose listing lags), the newest remaining complete checkpoint
+  is loaded, which can be older than the one `latest.json` names. A named manifest that
+  exists but cannot be read or parsed is still an error.
 
 ### Distributed Checkpointing
 
