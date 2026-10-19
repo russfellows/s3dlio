@@ -567,8 +567,9 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
   reservation raises `ValueError` and leaves the reservation pending. The shrink of a short commit is
   gone (a realloc may move memory a view points at), so a short commit keeps the whole reservation
   allocated until its part is uploaded and its views are gone. Writing through a retained view after
-  `commit()` changes the payload in flight (or makes a signed part fail its checksum); it can never
-  corrupt memory. The writer no longer pins itself while a reservation is pending.
+  `commit()` changes the payload in flight (the object may mix old and new bytes; a signed part may, but
+  need not, fail its checksum), so the contract is not to write after `commit()`, as for a borrowed
+  `write()`. The writer no longer pins itself while a reservation is pending.
 - **A cancelled owned write to a `file://` writer can no longer be overtaken (stage G review G-F3;
   introduced in this release).** `FileSystemWriter::write_owned_bytes` runs the write on a blocking
   thread; if the caller dropped its future, the write went on untracked, so a later write could run

@@ -1179,10 +1179,10 @@ with s3dlio.MultipartUploadWriter.from_uri("s3://bucket/big.bin") as w:
   the reserved memory, with no copy (a commit smaller than the threshold is copied once into the part buffer instead,
   like any small write). Two consequences, both by design: a **short commit keeps the whole reservation allocated**
   until its part is uploaded and every view is gone (it is not shrunk: shrinking can relocate the memory), so reserve
-  what you will fill; and **writing through a retained view after `commit()` changes the payload in flight**, so the
-  object contains whatever the upload happened to read, or a signed part is rejected for a payload checksum mismatch
-  (a data-integrity contract, like a borrowed `write()`; it can
-  never corrupt memory). Nothing of yours is borrowed, so `close()` has no buffer of yours to wait for.
+  what you will fill; and **writing through a retained view after `commit()` changes the payload in flight**, while the
+  upload reads it: the stored object may contain a mix of old and new bytes, and a signed part may (but is not
+  guaranteed to) fail its payload checksum; the same contract as a borrowed `write()`, so do not write after
+  `commit()`. Nothing of yours is borrowed, so `close()` has no buffer of yours to wait for.
 
 ---
 

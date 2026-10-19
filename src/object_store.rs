@@ -2626,7 +2626,8 @@ where
 /// When the first response carries no identity, nothing can pin the ranges and unpinned ranges
 /// are never combined: the other ranges fail at once, and `one_response` reads the WHOLE object as
 /// a single response instead (`None` in place of the engine's statistics, as no ranges were
-/// planned). The size still comes from the caller, which guards it as for the engine.
+/// planned). That read does not use the caller's size: each provider's whole-response path takes
+/// the object's current size from its own response (for Azure the size is passed only as a hint).
 #[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
 pub(crate) async fn range_engine_download_versioned<T, F, Fut, S, SFut>(
     config: RangeEngineConfig,

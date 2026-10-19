@@ -141,10 +141,12 @@ pub(crate) struct ReservedBlock {
     len: usize,
 }
 
-// SAFETY: a plain heap allocation of bytes with no thread affinity. Python code may write to it
-// through a retained view while an upload reads it: that is the documented data-integrity
-// contract of `reserve()` (the payload in flight changes), the same as for a borrowed
-// `write()`, and it never affects memory safety.
+// SAFETY: a plain heap allocation of bytes with no thread affinity; it stays allocated (never
+// moved or freed) while any owner lives. Sharing it across threads is sound only under the
+// documented contract of `reserve()`, the same as for a borrowed `write()`: the caller does not
+// write through a retained view while the committed payload is in flight. Keeping the allocation
+// alive does not make such a concurrent write harmless (it is a data race on the bytes the
+// upload reads), and a payload checksum is not guaranteed to detect it.
 unsafe impl Send for ReservedBlock {}
 unsafe impl Sync for ReservedBlock {}
 
@@ -194,7 +196,9 @@ struct ReservedOwner(Arc<ReservedBlock>);
 impl AsRef<[u8]> for ReservedOwner {
     fn as_ref(&self) -> &[u8] {
         // SAFETY: the block is `len` initialised (zero-filled) bytes that stay allocated while
-        // this `Arc` lives. Python may write to them concurrently (documented data contract).
+        // this `Arc` lives. The shared slice is sound only while nobody writes to those bytes:
+        // `reserve()`'s contract forbids writing through a view after `commit()` (see the
+        // `Send`/`Sync` note on `ReservedBlock`).
         unsafe { std::slice::from_raw_parts(self.0.as_ptr(), self.0.len()) }
     }
 }
@@ -600,9 +604,9 @@ impl PyMultipartUploadWriter {
     ///
     /// After ``commit()`` the bytes you committed are being uploaded straight out of this
     /// memory (zero copy). Do not write through a retained view after ``commit()``: that
-    /// changes the payload in flight, so the object contains whatever the upload happened to
-    /// read, or a signed part is rejected for a payload checksum mismatch (a data-integrity
-    /// contract, like a borrowed ``write()``; it can never corrupt memory).
+    /// changes the payload in flight while the upload reads it: the stored object may contain
+    /// a mix of old and new bytes, and a signed part may (but is not guaranteed to) fail its
+    /// payload checksum. The same contract applies to a borrowed ``write()``.
     /// A SHORT commit keeps the whole reservation allocated until its part is uploaded and
     /// every view is gone (the allocation is not shrunk, which would be a realloc that may
     /// move it): reserve what you will fill.
