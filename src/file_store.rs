@@ -1096,7 +1096,7 @@ impl ObjectStore for FileSystemObjectStore {
         }
     }
     // =========================================================================
-    // Metadata Operations (v0.10.0+) - ported from sai3-bench fs_metadata.rs
+    // Metadata Operations - ported from sai3-bench fs_metadata.rs
     // =========================================================================
 
     async fn mkdir(&self, uri: &str) -> Result<()> {

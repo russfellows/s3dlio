@@ -282,7 +282,7 @@ pub enum Scheme {
     Gcs,
     Unknown,
 }
-/// Object properties for metadata update operations (v0.10.0+)
+/// Object properties for metadata update operations
 ///
 /// Used with `update_properties()` to modify object metadata without re-uploading data.
 /// Only non-None fields will be updated. For cloud backends, this typically requires
@@ -902,7 +902,7 @@ pub trait ObjectStore: Send + Sync {
     }
 
     // =========================================================================
-    // Metadata Operations (v0.10.0+)
+    // Metadata Operations
     // =========================================================================
 
     /// Create a directory.

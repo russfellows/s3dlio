@@ -58,6 +58,10 @@ copying. The few copies that remain are listed, with when they apply and how to 
   borrowed forms still compile and copy once. Rust no longer auto-dereferences a reference into
   `&[u8]` for a generic parameter, so a call that passed a reference to a type outside the list in the
   trait documentation (`&&[u8]`, `&String`, `&Rc<[u8]>`, ...) needs `.as_slice()` or `&x[..]`.
+- **Rust: the legacy community GCS client is removed.** The `gcs-community` feature no longer exists
+  (use `backend-gcs`). `GCS_ENDPOINT_URL` and `STORAGE_EMULATOR_HOST`, which only the community client
+  read, now configure the official client (anonymous credentials). No PyPI wheel contained the community
+  client.
 - **`put_bytes` and `put_bytes_async` payloads are strict (#261).** They raise `TypeError` for an
   `int`, a `bool` or an arbitrary iterable instead of writing a payload made from it
   (`put_bytes(uri, 42)` used to write 42 zero bytes), as the streaming writers already did. Buffers
@@ -167,6 +171,9 @@ copying. The few copies that remain are listed, with when they apply and how to 
   Parquet items support `memoryview(item)` and `np.frombuffer(item)` (read-only, zero copy) and a `.data`
   property that returns a read-only `BytesView` over the same buffer. `bytes(item)` is the documented
   copy.
+- **`s3dlio.ReservedBuffer`** (stage G review G-F1). The exporter object behind the memoryview that
+  `MultipartUploadWriter.reserve()` returns (`mv.obj`); it owns the reserved memory for as long as any view,
+  slice or NumPy array over it exists (see "Fixed").
 - **Rust:** `checkpoint::IntoShardBytes`, the trait behind the generic checkpoint writer calls (see
   "Read the behaviour changes before upgrading"): implemented for `Bytes`, `&Bytes` and `Vec<u8>` (zero
   copy) and for `&[u8]`, `&mut [u8]`, `&Vec<u8>`, `&mut Vec<u8>`, `&[u8; N]`, `&Box<[u8]>`,
@@ -202,8 +209,9 @@ copying. The few copies that remain are listed, with when they apply and how to 
 
 - **The legacy community GCS client is removed.** The `gcs-community` feature and the `gcloud-storage`
   dependency (and with them `src/gcs_client.rs` and the `gcs-community` test and script variants) are
-  gone. The `GCS_ENDPOINT_URL` and `STORAGE_EMULATOR_HOST` settings are KEPT: they now configure the
-  official client with anonymous credentials, as before (see "Added", "GCS custom endpoint and
+  gone. The `GCS_ENDPOINT_URL` and `STORAGE_EMULATOR_HOST` settings are KEPT: only the community client read
+  them before, and the official client ignored them; they now configure the official client, with the
+  anonymous credentials the community client used for them (see "Added", "GCS custom endpoint and
   emulator"). A Rust build that enables `gcs-community` now fails with an unknown-feature
   error; use `backend-gcs`, the official GCS client (the patched `google-cloud-storage` fork), which
   the full wheel already uses. No PyPI wheel ever included the community client, so no installed
@@ -282,8 +290,9 @@ copying. The few copies that remain are listed, with when they apply and how to 
   of the part size never copy. A signed upload gathers a part that spans two writes (and the final short part, if
   it spans writes) once: one copy of at most `part_size` bytes. An unsigned upload sends it as a multi-chunk body
   with no copy (see "Zero copy" below for the connector). **`reserve()` / `commit()`.** `commit` gives the
-  reserved buffer to the writer, shrunk to the committed length first (a short commit does not pin the whole
-  reservation); a commit below the threshold is coalesced into the part buffer. A new hidden test and benchmark
+  reserved buffer to the writer as it is, with no copy and no shrink (a short commit keeps the whole reservation
+  allocated until its part is uploaded; see "Fixed", G-F1); a commit below the threshold is coalesced into the
+  part buffer. A new hidden test and benchmark
   hook, `s3dlio._mpu_coalesce_below`, sets the threshold for writers created afterwards.
 - **`put_many` and `put_many_async` stop at the first failure (stage G).** They used to start every
   remaining item and, after the first error, returned it while the other items kept uploading in the
@@ -340,7 +349,7 @@ copying. The few copies that remain are listed, with when they apply and how to 
 
 Each removal below is proven by a test that fails with the copy present (pointer identity, an owner
 check, or an allocation / peak-memory bound), not by a claim. No throughput number is claimed for
-this stage in this entry.
+this stage in this section; the measured changes are in the Performance table under Validation.
 
 - **S3 `get` and `get_range` receive into one pre-sized buffer.** The response body used to be
   collected chunk by chunk and then joined into a second buffer (two copies of the object live at the
@@ -438,6 +447,20 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
 
 ### Fixed
 
+- **Defects in 0.9.128 found by the zero-copy reviews (stage G).** Each is now covered by a regression
+  test:
+  - the range engine looped without end (or exhausted memory) when `chunk_size` was 0; it is now a
+    configuration error (see "Changed");
+  - Azure large-blob `get` returned only the first partition, as if it were the whole blob, when a server
+    or proxy stripped `Content-Range` from the first response; that response is now an error
+    (see "Zero copy");
+  - `read_npz` panicked on a hostile NPY header (a `)` before the `(`), did not check the size arithmetic
+    for overflow, and read `float32` data through a possibly misaligned pointer; all three are fixed;
+  - `direct://` `get_range(uri, offset, 2**64 - 1)` panicked (see "Changed");
+  - `get_many`, `put_many` and `put_many_async` panicked for a `max_in_flight` above tokio's semaphore
+    limit (about `2**61`); such a value now means no limit;
+  - `put_many` and `put_many_async` kept uploading the remaining items after the first failure (see
+    "Changed").
 - **#250.** `python/tests/test_buffer_protocol_support.py` imported the source tree instead of the
   installed wheel; the `sys.path` insertion is removed. The reported "no running event loop" error
   does not reproduce with pytest-asyncio against the installed wheel (the async tests were already
@@ -588,27 +611,36 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
 - `azure_storage_blob` 1.0.0 → 1.1.0 (adds `azure_storage_common`); the download behaviour the new
   Azure receive depends on is unchanged.
 - `reqwest` 0.13.4 → 0.13.5. The pinned GCS fork, `azure_core` and `azure_identity` are unchanged.
+- `gcloud-storage` 1.3.0 (the community GCS client) is removed with the `gcs-community` feature, together
+  with the crates only it used (`gcloud-auth`, `gcloud-metadata`, `token-source`, `reqwest-middleware`,
+  `jsonwebtoken`, `simple_asn1`, and others). `google-cloud-auth`, already in the lock file through
+  `google-cloud-storage`, is now a direct optional dependency of `backend-gcs`. `Cargo.lock` also moves `lru`
+  0.16.4 → 0.18.5 (a transitive dependency).
 
 ### Validation
 
 - Rust: `cargo fmt`, clippy with `-D warnings` in the feature configurations (default,
   full-backends, tests, extension-module variants and the Arrow backend), and the full
-  default-feature test run (1889 tests: 1888 passed and one intermittent
-  request-count failure of a test-harness kind that also occurs on the code before the zero-copy
-  stage, tracked in #292), the full-backend library tests (1152 passed) and the Python-extension
-  unit tests (1099 passed), including fault-injection tests for the S3, Azure and GCS receive
+  default-feature test run on the release source (1893 passed, 0 failed, 59 ignored; one
+  request-count test fails about one run in 30 for a test-harness reason, also on the code before
+  the zero-copy stage, tracked in #292), the full-backend library tests (1179 passed) and the
+  Python-extension unit tests (1113 passed), including fault-injection tests for the S3, Azure and GCS receive
   paths (exact request counts, version pinning, wrong lengths, mid-stream failures, cancellation,
   no whole-object allocation), the download-layout safety tests and the checkpoint validation
   tests.
-- Installed wheels (x86_64; CPython 3.11 default build, 3.12 and 3.13 default and full builds): the
-  caller-buffer suite, the borrowed-PUT barrier suite, the stage F tests and the zero-copy suites
-  (473-475 tests per wheel) pass on every wheel, including the Python 3.11 cancellation cases; the
-  whole `python/tests` directory runs with no failures and no collection errors on 3.11 (938
-  passed) and 3.13 full (941 passed) with all cloud credentials removed (tests that need a live
-  endpoint skip with a reason). The release workflow also builds aarch64 wheels, which were not run here.
+- Installed wheels built from the release source (x86_64; CPython 3.11 default build, 3.12 and 3.13
+  default and full builds): the caller-buffer suite, the borrowed-PUT barrier suite, the stage F
+  tests, the zero-copy suites and the multipart writer tests (481-483 tests per wheel) pass on every
+  wheel, including the Python 3.11 cancellation cases; the whole `python/tests` directory runs with no
+  failures and no collection errors on 3.11 (939 passed) and 3.13 full (942 passed) with all cloud
+  credentials removed (tests that need a live endpoint skip with a reason). The release workflow also builds aarch64 wheels, which were not run here.
 - Live: GCS (through its S3 endpoint and natively, including `%` and `\` keys) and Azure Blob, from
   Rust and from Python through the installed wheels, with isolated prefixes and nothing left behind.
   The GCS Rapid (zonal bucket) route was not run live (see Known limitations).
+- Live against a local S3-compatible test server, with the final 3.11 default and 3.13 full wheels: the whole
+  `python/tests` directory with a test bucket set (956 and 959 passed). The 10 tests that did not pass fail the
+  same way with 0.9.128: they need objects seeded beforehand, or read back a multipart or streamed upload,
+  whose bytes that server does not keep.
 - Stage G (zero copy): every removed copy has a failing-before test (pointer identity, owner check or
   an allocation / peak-memory bound) in the Rust unit tests, the integration tests
   (`tests/test_zero_copy_*.rs`) and the installed-wheel suites (`python/tests/test_zero_copy_*.py`).
@@ -652,7 +684,8 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
 
 - **Unsupported stores.** `file://`, `direct://` and the Arrow backend do not offer
   `get_into_async`/`head_async` and report so through `object_capabilities`.
-  The Rust `MultiEndpointStore` keeps the trait's "unsupported" default for `get_into`/`head`.
+  The Rust `MultiEndpointStore` keeps the trait's "unsupported" default for `get_into`/`head`, and its
+  operations are still not written to the op-log (#175).
 - **HEAD absence is ambiguous on S3 and GCS** (see Added).
 - **Azure trailing dot.** On the tested Azure path, a blob named `name.` and one named `name` are the
   same blob. The layer responsible was not identified.
@@ -685,7 +718,9 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
   `copy=True`; the reuse guard refuses an overlapping buffer rather than letting it corrupt parts in flight.
 - **Whole-object streaming writers are not redesigned.** `create_s3_writer` and `create_azure_writer`
   (and the Rust GCS writer) keep the whole object in one buffer, so each borrowed `write_chunk` is
-  copied once into it (see "Remaining copies"). Use `put_bytes` to upload an object with no copy.
+  copied once into it (see "Remaining copies"). Use `put_bytes` to upload an object with no copy. This is
+  the remaining copy named in #254 (Python write paths that copy the payload); it is documented here, not
+  removed.
 - **Azure SDK parser overflow (debug builds only).** `azure_storage_blob` 1.1.0 computes `end + 1` on
   the end of a response's `Content-Range` without a check (`models/http_ranges.rs`). A hostile or broken
   reply with an end of `usize::MAX` panics inside the SDK in a debug build; a release build (the PyPI
@@ -703,6 +738,11 @@ listed with how to avoid it in "Remaining copies (Rule #1)" of the Python API gu
   result on a worker thread after the I/O finishes, outside the exit-safe delivery. If such a call
   is still in flight while the interpreter exits, the process can crash or hang at exit. Normal
   operation is not affected. The new calls and those fixed in this release use the safe delivery.
+- **Planned after 0.10.0.** Settings move from `S3DLIO_*` environment variables to per-store configuration
+  objects (environment variables become the fallback), for embedding s3dlio in applications that need
+  independent settings. The SigV4 payload hash of a large signed PUT runs on a runtime worker for its whole
+  duration (about 0.6 ms per MiB); offloading it is a follow-up. Tests that assert exact timings or request
+  counts are tracked in #292; one of them fails about one run in 30.
 
 ## Version 0.9.128 — Zero-copy Python writes, opt-in `.env` loading for library users, Azure credential modes, real CRC-32C, shared `direct://` bounce pool, Arrow-backend and `get_many` fixes
 

@@ -954,7 +954,7 @@ The storage account comes from the URI (`az://account/container/key`). Set
 `auto` is a fallback chain over workload identity, client secret, client certificate, managed identity and `cli`
 (members whose variables are not set are skipped; one that fails to give a token falls through to the next). Credentials
 are created once per process, so rotating a secret needs a restart. A bearer-token mode needs an `https` endpoint. Account keys (Shared Key) and
-connection strings are **not** supported (the Azure SDK s3dlio is built on, `azure_storage_blob` 1.0, signs
+connection strings are **not** supported (the Azure SDK s3dlio is built on, `azure_storage_blob` 1.1, signs
 only with bearer tokens or a SAS). The full table of modes and the variables each reads is in
 [Environment_Variables.md](Environment_Variables.md#azure-blob-storage-configuration).
 ```python
@@ -976,7 +976,7 @@ os.environ['AZURE_STORAGE_ENDPOINT'] = 'http://127.0.0.1:10000'  # Azurite
 |---------|------------------|-------------|
 | S3 | `AWS_ENDPOINT_URL` | — |
 | Azure | `AZURE_STORAGE_ENDPOINT` | `AZURE_BLOB_ENDPOINT_URL` |
-| GCS | `GCS_ENDPOINT_URL` | `STORAGE_EMULATOR_HOST` (either one: anonymous credentials) |
+| GCS (builds with the GCS backend) | `GCS_ENDPOINT_URL` | `STORAGE_EMULATOR_HOST` (either one: anonymous credentials, official client) |
 
 ### S3 Bucket Management
 
@@ -2063,10 +2063,13 @@ meta = s3dlio.stat_object("s3://bucket/key")
 |----------|-------------|---------|
 | `configure_s3(endpoint_url, region, ca_bundle)` | Configure S3 endpoint, region, and CA bundle; clears store cache — **call before first S3 op** | None |
 | `put_bytes(uri, data)` | Upload bytes | None |
-| `put_bytes_async(uri, data)` | Async upload | Coroutine |
-| `put_many(items)` | Batch upload `[(uri, data), ...]` | None |
-| `put_many_async(items)` | Async batch upload | Coroutine |
+| `put_bytes_async(uri, data, *, borrow=True)` | Async upload; reads a mutable buffer in place until the awaitable completes (`borrow=False`: one copy now) | Coroutine[None] |
+| `put_many(items)` | Batch upload `[(uri, data), ...]`; stops at the first failure | None |
+| `put_many_async(items, max_in_flight=64, *, borrow=True)` | Async batch upload; stops at the first failure | Coroutine[None] |
 | `get(uri)` | Download object | BytesView |
+| `get_into_async(uri, dst, *, expected_len)` | Read a whole object into your own writable byte buffer (v0.10.0) | Coroutine[int] (`expected_len`) |
+| `head_async(uri)` | Size and version identity without reading the object (v0.10.0) | Coroutine[`ObjectMetadata` or `None`] |
+| `object_capabilities(uri)` | Whether this build supports `get_into_async` / `head_async` for the URI; no network (v0.10.0) | dict |
 | `get_range(uri, offset, length=None)` | Server-side range request | BytesView |
 | `get_many(uris, max_in_flight=64)` | Parallel download (s3://, az://, gs://, file://, direct://) | List[(uri, BytesView)] |
 | `get_many_async(uris, max_in_flight=64)` | Async parallel download (s3:// only) | Coroutine |
@@ -2078,12 +2081,25 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `exists_async(uri)` | Async existence check | Coroutine |
 | `delete(uri)` | Delete object | None |
 | `mkdir(uri)` | Create directory (`file://`, `direct://`); no-op on object stores | None |
-| `mkdir_async(uri)` | Async mkdir | Coroutine |
+| `mkdir_async(uri)` | Async mkdir | Coroutine[None] |
 | `upload(src_uri, dest_uri)` | Bulk upload files | None |
 | `download(src_uri, dest_dir)` | Bulk download files | None |
 | `mp_get(uri, procs, jobs, num, template)` | Multi-process GET | dict |
 | `create_bucket(name)` | Create S3 bucket | None |
 | `delete_bucket(name)` | Delete S3 bucket | None |
+
+### Types and exceptions added in v0.10.0
+
+| Name | Description |
+|------|-------------|
+| `ObjectMetadata` | Frozen value returned by `head_async`: `size`, `etag` (opaque, not an MD5), `version_id` (S3 or Azure version ID when versioning is on, the GCS generation) |
+| `ObjectNotFoundError` | `FileNotFoundError` subclass: `get_into_async` on a missing object |
+| `LengthMismatchError` | `ValueError` subclass with `.expected` and `.actual` (`None` when unknown): the object's size is not `expected_len` |
+| `UnsupportedOperationError` | `NotImplementedError` subclass: the build or provider lacks the operation (no fallback download is attempted) |
+| `ExportStillReferencedError` | A backend still references your buffer after `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`; the buffer stays pinned |
+| `ReservedBuffer` | Owner of the memory behind a `MultipartUploadWriter.reserve()` memoryview (`mv.obj`) |
+
+See [get_into_async() / head_async()](#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100) for the contracts.
 
 ### Data Generation Functions (v0.9.94+)
 
@@ -2187,6 +2203,23 @@ snapshot).
 ---
 
 ## Migration Guide
+
+### From v0.9.128 to v0.10.0
+
+The full list is in [docs/Changelog.md](Changelog.md); the changes that can break existing code:
+
+| Change | What to do |
+|--------|-----------|
+| `put_bytes_async`, `put_many_async` and the `MultiEndpointStore` writes borrow a mutable buffer by default | Do not modify, resize or free the buffer until the `await` has finished, or pass `borrow=False` (one copy) |
+| `MultipartUploadWriter.write()` borrows a large buffer until `close()` | Use a fresh buffer per write, or `copy=True`; see [the write contract](#multipartuploadwriterwrite-the-buffer-is-borrowed-until-close) |
+| `put_bytes`, `put_bytes_async`, `put_many`, `put_many_async` and the `MultiEndpointStore` writes raise `TypeError` for an `int`, a `bool` or an arbitrary iterable | Wrap a list of byte values in `bytes(...)` |
+| `put_many` and `put_many_async` stop at the first failed item | Catch that item's own error; queued items are not started |
+| `mkdir_async`, `put_bytes_async`, `put_many_async` and the `MultiEndpointStore` writes resolve to `None`, not `()` | Do not compare the result with `()` |
+| Recursive `download` writes `<dest>/<key path relative to the listing base>` | Expect nested directories instead of one flat directory |
+| `load_checkpoint_with_validation(..., validate_integrity=True)` now validates | A shard with no recorded checksum (written before 0.10.0) raises; pass `validate_integrity=False`, or use `load_checkpoint` / `load_latest` |
+| `PyDataset.from_uris(uris, opts=None)` | The ignored keyword `_opts` is renamed `opts` |
+| `S3DLIO_CHUNK_SIZE=0` and `S3DLIO_RANGE_CONCURRENCY=0` are errors on the S3 range paths | Unset them or set a positive value |
+| Rust: the `gcs-community` feature is removed | Use `backend-gcs`; `GCS_ENDPOINT_URL` and `STORAGE_EMULATOR_HOST` now configure it |
 
 ### From v0.9.40
 
