@@ -1365,8 +1365,10 @@ The shared-shard and manifest-preservation guarantees below assume this coordina
   is `False` once none is left. `latest.json` changes only when it names the manifest that was
   deleted or is corrupt.
 - **Validated before anything is deleted.** Every listed manifest must be placeable under the
-  base, the manifest must parse and validate (a complete manifest that fails validation, for
-  example one missing a rank, cannot be deleted by step), and every shard key it lists must be
+  base, the manifest (selected by its file name `ckpt-<step>-<ts>.json`) must record the same step
+  in its `global_step` (otherwise the call raises with nothing deleted), it must parse and
+  validate (a complete manifest that fails validation, for example one missing a rank, cannot
+  be deleted by step), and every shard key it lists must be
   a safe key: relative, with a non-empty final component (never a directory or prefix), no
   leading `/`, no backslash, no `?` or `#`, no percent-encoded dot (`%2e`, any case; a
   URL-based store could normalise it to `..`), no empty / `.` / `..` component, no component

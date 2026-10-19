@@ -537,19 +537,33 @@ def test_put_many_error_drops_the_query_of_an_https_sas_uri():
 
 
 @pytest.mark.parametrize(
-    "uri",
+    ("uri", "rendered"),
     [
-        "https://user:p?w@host.example/c/k?sig=TOPSECRETSIG",
-        "https://user:p#w@host.example/c/k?sig=TOPSECRETSIG",
-        "https://user:p/w@host.example/c/k?sig=TOPSECRETSIG",
+        ("https://user:p?w@host.example/c/k?sig=TOPSECRETSIG", "https://"),
+        ("https://user:p#w@host.example/c/k?sig=TOPSECRETSIG", "https://"),
+        (
+            "https://user:p/w@host.example/c/k?sig=TOPSECRETSIG",
+            "https://host.example/c/k",
+        ),
     ],
 )
-def test_put_many_error_hides_a_password_holding_a_delimiter(uri):
+def test_put_many_error_hides_a_password_holding_a_delimiter(uri, rendered):
+    """Redaction rule (src/redact.rs module docs; docs/PYTHON_API_GUIDE.md).
+
+    Userinfo runs to the last ``@`` before the first ``/``. When that removed span holds ``?``
+    or ``#`` it is indistinguishable from an ``@`` inside a query (``https://h?e=a@b&sig=S``),
+    so the rest of the URI is treated as its query and, for http(s), removed: the URI renders
+    as just ``https://`` (over-redaction, by design). One ``/`` in an http(s) password is
+    recognised by the one-slash rule, so the host and path survive. No secret appears in any
+    case.
+    """
     with pytest.raises(TypeError) as info:
         s3dlio.put_many([(uri, 42)])
     message = str(info.value)
-    assert "host.example/c/k" in message, message
-    for secret in ("user", "p?w", "p#w", "p/w", "TOPSECRETSIG"):
+    assert f"item 0 ({rendered}):" in message, message
+    if rendered == "https://":
+        assert "host.example" not in message, message
+    for secret in ("user", "p?w", "p#w", "p/w", "TOPSECRETSIG", "sig="):
         assert secret not in message, f"{secret!r} leaked: {message}"
 
 

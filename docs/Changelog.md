@@ -234,7 +234,8 @@ under "Changed (BEHAVIOUR CHANGE)".
   new `to_dict()` returns every option.
 - **#290, #291.** `delete_checkpoint` left `latest.json` pointing at a deleted manifest (so
   `load_latest()` failed although older checkpoints existed) and trusted the manifest's shard keys.
-  It now validates every shard key before deleting anything: a key that is absolute, contains
+  It now checks that the manifest named for the step records that step (`global_step`) and
+  validates every shard key before deleting anything: a key that is absolute, contains
   `..`/`.`/empty components, `?`, `#` or a percent-encoded dot, names a control object
   (`manifests`, `latest`, `latest.json`) at any depth, or names another step's shard directory
   refuses the delete. It deletes the manifest before its shards, keeps a shard that another
@@ -286,7 +287,7 @@ under "Changed (BEHAVIOUR CHANGE)".
 ### Validation
 
 - Rust: `cargo fmt`, clippy with `-D warnings` in seven feature configurations, and the full
-  default-feature test run (1811 passed, 0 failed), the full-backend library tests (1113 passed)
+  default-feature test run (1812 passed, 0 failed), the full-backend library tests (1113 passed)
   and the Python-extension unit tests (1050 passed), including fault-injection tests for the S3,
   Azure and GCS receive paths (exact request counts, version pinning, wrong lengths, mid-stream
   failures, cancellation, no whole-object allocation), the download-layout safety tests and the

@@ -1,7 +1,7 @@
 # s3dlio - Universal Storage I/O Library
 
 [![CI](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-1811-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-1812-brightgreen)](docs/Changelog.md)
 [![Version](https://img.shields.io/badge/version-0.10.0-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
