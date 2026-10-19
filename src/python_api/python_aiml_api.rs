@@ -8,7 +8,10 @@
 use super::async_bridge::future_into_py;
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
-use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyStopIteration, PyTypeError};
+use pyo3::exceptions::{
+    PyBufferError, PyRuntimeError, PyStopAsyncIteration, PyStopIteration, PyTypeError,
+};
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyDictMethods, PyList};
 use pyo3::Bound;
@@ -35,6 +38,10 @@ use crate::data_loader::{
     DataLoader,
 };
 use crate::object_store::store_for_uri_with_helper_rows;
+#[cfg(feature = "extension-module")]
+use crate::python_api::put_payload::{put_payload, quiesce_blocking, PayloadUse};
+#[cfg(feature = "extension-module")]
+use crate::python_api::python_core_api::ExportStillReferencedError;
 use crate::python_api::python_core_api::PyBytesView;
 use crate::s3_utils::get_object_uri;
 use futures::stream::FuturesUnordered;
@@ -530,13 +537,29 @@ impl PyBytesAsyncDataLoader {
 /// -------------------
 /// ``item.uri``        — full URI of the object (``s3://…``, ``file://…``, …)
 /// ``item.byte_count`` — number of bytes transferred (same as ``len(item)``)
-/// ``bytes(item)``     — raw bytes; creates a Python ``bytes`` copy
+/// ``memoryview(item)`` / ``np.frombuffer(item)`` — read the object in place (zero copy)
+/// ``item.data``       — the object as a read-only ``BytesView`` (zero copy)
+/// ``bytes(item)``     — raw bytes; creates a Python ``bytes`` copy (documented compatibility copy)
 /// ``len(item)``       — alias for ``byte_count``
 #[pyclass]
 pub struct PyObjectItem {
     #[pyo3(get)]
     pub uri: String,
     data: Bytes,
+    /// `data.len()` cached in the heap object: the buffer protocol hands out a pointer to it as
+    /// `shape`, which must stay valid as long as any memoryview of this item lives.
+    shape_len: isize,
+}
+
+impl PyObjectItem {
+    fn new(uri: String, data: Bytes) -> Self {
+        let shape_len = data.len() as isize;
+        Self {
+            uri,
+            data,
+            shape_len,
+        }
+    }
 }
 
 #[pymethods]
@@ -550,10 +573,30 @@ impl PyObjectItem {
         self.data.len()
     }
 
-    /// Return the raw bytes as a Python ``bytes`` object (one copy).
+    /// The object as a read-only `BytesView`: zero copies (it shares this item's buffer).
+    #[getter]
+    fn data(&self) -> PyBytesView {
+        PyBytesView::new(self.data.clone())
+    }
+
+    /// Return the raw bytes as a Python ``bytes`` object. This is the COPY: use `memoryview(item)`,
+    /// `np.frombuffer(item)` or `item.data` to read the object in place.
     fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.data)
     }
+
+    /// Read-only buffer protocol: `memoryview(item)` / `np.frombuffer(item, dtype=...)` read the
+    /// fetched object in place, with no copy.
+    unsafe fn __getbuffer__(
+        slf: PyRef<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        fill_read_only_bytes_buffer(view, flags, slf.as_ptr(), &slf.data, &slf.shape_len)
+    }
+
+    /// Nothing to release: CPython drops the reference taken in `__getbuffer__`.
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
 
     fn __repr__(&self) -> String {
         format!(
@@ -562,6 +605,62 @@ impl PyObjectItem {
             self.data.len()
         )
     }
+}
+
+/// Fill `view` as a read-only, C-contiguous 1-D `uint8` buffer over `bytes`, kept alive by `obj`
+/// (the Python object that owns `bytes` and `shape_len`; this takes a reference to it).
+///
+/// Mirrors `BytesView.__getbuffer__`. `shape_len` must live in `obj`'s heap object and equal
+/// `bytes.len()`, so the `shape` pointer outlives the view. A writable request is a `BufferError`.
+///
+/// # Safety
+/// `view` must be the valid `Py_buffer` CPython passed to `__getbuffer__`, and `obj` the object
+/// whose `__getbuffer__` is running, with `bytes`/`shape_len` fields of that object.
+unsafe fn fill_read_only_bytes_buffer(
+    view: *mut ffi::Py_buffer,
+    flags: std::os::raw::c_int,
+    obj: *mut ffi::PyObject,
+    bytes: &Bytes,
+    shape_len: &isize,
+) -> PyResult<()> {
+    if view.is_null() {
+        return Err(PyBufferError::new_err("null Py_buffer"));
+    }
+    if (flags & ffi::PyBUF_WRITABLE) != 0 {
+        return Err(PyBufferError::new_err(
+            "this object is read-only and does not support writable buffers",
+        ));
+    }
+    // Unit stride: 1 byte per element, a 'static address.
+    static UNIT_STRIDE: isize = 1;
+    unsafe {
+        (*view).buf = bytes.as_ptr() as *mut std::os::raw::c_void;
+        (*view).len = bytes.len() as isize;
+        (*view).readonly = 1;
+        (*view).itemsize = 1;
+        (*view).ndim = 1;
+        (*view).format = if (flags & ffi::PyBUF_FORMAT) != 0 {
+            c"B".as_ptr() as *mut std::os::raw::c_char
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).shape = if (flags & ffi::PyBUF_ND) != 0 {
+            shape_len as *const isize as *mut isize
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).strides = if (flags & ffi::PyBUF_STRIDES) != 0 {
+            &UNIT_STRIDE as *const isize as *mut isize
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).suboffsets = std::ptr::null_mut();
+        (*view).internal = std::ptr::null_mut();
+        // Keep the owning object (and so the `Bytes`) alive for the lifetime of the view.
+        (*view).obj = obj;
+        ffi::Py_INCREF(obj);
+    }
+    Ok(())
 }
 
 /// Synchronous iterator returned by `PyBytesAsyncDataLoader.items()`.
@@ -588,7 +687,7 @@ impl PyObjectDataLoaderSyncIter {
         let result = py.detach(|| blocking_recv_locked(&self.rx));
 
         match result {
-            Some(Ok((uri, data))) => Py::new(py, PyObjectItem { uri, data }),
+            Some(Ok((uri, data))) => Py::new(py, PyObjectItem::new(uri, data)),
             Some(Err(e)) => Err(py_err(e)),
             None => Err(PyStopIteration::new_err("end of dataset")),
         }
@@ -648,7 +747,7 @@ impl PyObjectDataLoaderSyncIter {
         let mut items = Vec::with_capacity(raw.len());
         for result in raw {
             match result {
-                Ok((uri, data)) => items.push(Py::new(py, PyObjectItem { uri, data })?),
+                Ok((uri, data)) => items.push(Py::new(py, PyObjectItem::new(uri, data))?),
                 Err(e) => return Err(py_err(e)),
             }
         }
@@ -906,10 +1005,15 @@ pub fn read_npz(py: Python<'_>, uri: &str, array_name: Option<&str>) -> PyResult
             .ok_or_else(|| PyRuntimeError::new_err("NPZ file is empty"))?
     };
 
-    // Read array using our custom implementation
+    // Read array using our custom implementation. RULE #1: a STORED (uncompressed) entry is
+    // sliced out of the fetched object in place (`npz_entry`), never copied. The ONE copy is the
+    // format decode: the little-endian f32 payload is decoded into the owned, aligned `Vec<f32>`
+    // below, which the numpy array then takes over without another copy (the entry's bytes are
+    // only 1-byte aligned inside the archive, so numpy cannot view them in place).
     let arr: ndarray::ArrayD<f32> = read_npz_array(&bytes, &name).map_err(py_err)?;
 
     let shape = arr.shape().to_vec();
+    // Moves the `Vec<f32>` out of the ndarray (no copy) and into the numpy array.
     let (data, _offset) = arr.into_raw_vec_and_offset();
     let arr_np = nd_np::ArrayD::from_shape_vec(nd_np::IxDyn(&shape), data).map_err(py_err)?;
     let py_arr = PyArrayDyn::<f32>::from_owned_array(py, arr_np);
@@ -1490,6 +1594,44 @@ fn build_checkpoint_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
+/// Run a blocking checkpoint save over `data`, read IN PLACE (RULE #1, zero copy).
+///
+/// `data` may be `bytes`, a `BytesView` or any buffer-protocol object (bytearray, memoryview,
+/// numpy array, ...). The payload becomes the `Bytes` the writer hands to the object store
+/// (no `to_vec`, no `copy_from_slice`): for a buffer export the `Py_buffer` is the `Bytes`'
+/// owner, read with the GIL released, exactly like `put_bytes`. The save blocks until the object
+/// is written, so holding the export for the call is correct; the call does not return - with
+/// success or an error - until every native reader is done and the export is released
+/// (`put_payload.rs`, "The completion barrier"), else it raises `ExportStillReferencedError`.
+/// While it runs the caller must not modify the buffer from another thread.
+///
+/// An unsupported type is a `TypeError` naming what is accepted.
+#[cfg(feature = "extension-module")]
+fn with_blocking_payload<T, F>(py: Python<'_>, data: &Bound<'_, PyAny>, run: F) -> PyResult<T>
+where
+    T: Send,
+    F: FnOnce(Bytes) -> PyResult<T> + Send,
+{
+    let payload = put_payload(py, data, PayloadUse::Blocking)?;
+    let bytes = payload.bytes;
+    let result = py.detach(move || run(bytes));
+    if let Some(latch) = &payload.latch {
+        if quiesce_blocking(py, latch).is_err() {
+            let outcome = match &result {
+                Ok(_) => "the save itself succeeded".to_string(),
+                Err(e) => format!("the save itself failed: {e}"),
+            };
+            return Err(ExportStillReferencedError::new_err(format!(
+                "a storage backend still references the buffer {:?} after the save finished \
+                 ({outcome}); the buffer stays pinned - do not modify, resize or free it \
+                 (S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS)",
+                crate::constants::export_quiesce_timeout()
+            )));
+        }
+    }
+    result
+}
+
 #[cfg(feature = "extension-module")]
 #[pyclass]
 pub struct PyCheckpointStore {
@@ -1552,7 +1694,7 @@ impl PyCheckpointStore {
         step: u64,
         epoch: u64,
         framework: String,
-        data: &[u8],
+        data: &Bound<'_, PyAny>,
         user_meta: Option<Py<PyAny>>,
     ) -> PyResult<String> {
         let user_meta = user_meta.map(|_obj| {
@@ -1562,15 +1704,17 @@ impl PyCheckpointStore {
         });
 
         let inner = self.inner.clone();
-        let data = data.to_vec();
 
-        py.detach(|| {
-            self.runtime.block_on(async {
-                let store = inner.lock().await;
-                store.save(step, epoch, &framework, &data, user_meta).await
-            })
+        // `data` is read in place (any buffer-protocol object), not copied: see
+        // `with_blocking_payload`.
+        with_blocking_payload(py, data, |data| {
+            self.runtime
+                .block_on(async {
+                    let store = inner.lock().await;
+                    store.save(step, epoch, &framework, data, user_meta).await
+                })
+                .map_err(|e| py_err(e.context("Save failed")))
         })
-        .map_err(|e| py_err(e.context("Save failed")))
     }
 
     /// Load the latest checkpoint
@@ -1781,25 +1925,36 @@ pub struct PyCheckpointStream {
 #[cfg(feature = "extension-module")]
 #[pymethods]
 impl PyCheckpointStream {
-    /// Write a chunk of data to the stream (zero-copy)
+    /// Write a chunk of data to the stream. `data` may be bytes, bytearray, memoryview, a numpy
+    /// array or a BytesView; it is read in place and must not be modified until the call returns.
     #[pyo3(text_signature = "(self, data)")]
-    fn write_chunk(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<usize> {
+    fn write_chunk(&mut self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<usize> {
         if self.finalized {
             return Err(PyRuntimeError::new_err("Stream has been finalized"));
         }
 
-        // Lazy initialization of the writer
-        if self.writer.is_none() {
-            let store = self.store.clone();
-            let world_size = self.world_size;
-            let rank = self.rank;
-            let step = self.step;
-            let _epoch = self.epoch; // May be used in future for enhanced metadata
-            let _framework = self.framework.clone(); // May be used in future for enhanced metadata
+        let store = self.store.clone();
+        let world_size = self.world_size;
+        let rank = self.rank;
+        let step = self.step;
+        let _epoch = self.epoch; // May be used in future for enhanced metadata
+        let _framework = self.framework.clone(); // May be used in future for enhanced metadata
+        let runtime = self.runtime.clone();
+        let writer_slot = &mut self.writer;
+        let key_slot = &mut self.key;
 
-            let (writer, key) = py
-                .detach(|| {
-                    self.runtime.block_on(async {
+        // RULE #1: `data` (bytes, bytearray, memoryview, numpy, BytesView, ...) is read in
+        // place: the export is held for this blocking call (`with_blocking_payload`) and the
+        // writer reads it as a slice, so this layer makes no copy.
+        //
+        // The payload is converted BEFORE the lazy writer is created: an unsupported payload
+        // raises its TypeError without creating (and truncating) a shard, so a later
+        // `finalize()` still reports "No data written to stream".
+        with_blocking_payload(py, data, |chunk| {
+            // Lazy initialization of the writer (first valid chunk only).
+            if writer_slot.is_none() {
+                let (writer, key) = runtime
+                    .block_on(async {
                         let store_guard = store.lock().await;
                         let ckpt_writer = store_guard.writer(world_size, rank);
                         let layout = crate::checkpoint::paths::KeyLayout::new(
@@ -1808,25 +1963,21 @@ impl PyCheckpointStream {
                         );
                         ckpt_writer.get_shard_writer(&layout).await
                     })
-                })
-                .map_err(|e| py_err(e.context("Failed to create writer")))?;
+                    .map_err(|e| py_err(e.context("Failed to create writer")))?;
+                *writer_slot = Some(writer);
+                *key_slot = Some(key);
+            }
 
-            self.writer = Some(writer);
-            self.key = Some(key);
-        }
-
-        // Write the chunk
-        if let Some(ref mut writer) = self.writer {
-            py.detach(|| {
-                self.runtime
-                    .block_on(async { writer.write_chunk(data).await })
-            })
-            .map_err(|e| py_err(e.context("Write failed")))?;
-
-            Ok(data.len())
-        } else {
-            Err(PyRuntimeError::new_err("Writer initialization failed"))
-        }
+            match writer_slot.as_mut() {
+                Some(writer) => {
+                    runtime
+                        .block_on(async { writer.write_chunk(&chunk).await })
+                        .map_err(|e| py_err(e.context("Write failed")))?;
+                    Ok(chunk.len())
+                }
+                None => Err(PyRuntimeError::new_err("Writer initialization failed")),
+            }
+        })
     }
 
     /// Get the number of bytes written so far
@@ -1919,23 +2070,25 @@ impl PyCheckpointWriter {
         step: u64,
         epoch: u64,
         framework: String,
-        data: &[u8],
+        data: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let store = self.store.clone();
-        let data = data.to_vec();
         let world_size = self.world_size;
         let rank = self.rank;
 
-        py.detach(|| {
-            self.runtime.block_on(async {
-                let store_guard = store.lock().await;
-                let writer = store_guard.writer(world_size, rank);
-                writer
-                    .save_distributed_shard(step, epoch, &framework, &data)
-                    .await
-            })
+        // `data` is read in place (any buffer-protocol object), not copied: see
+        // `with_blocking_payload`.
+        with_blocking_payload(py, data, |data| {
+            self.runtime
+                .block_on(async {
+                    let store_guard = store.lock().await;
+                    let writer = store_guard.writer(world_size, rank);
+                    writer
+                        .save_distributed_shard(step, epoch, &framework, data)
+                        .await
+                })
+                .map_err(|e| py_err(e.context("Save shard failed")))
         })
-        .map_err(|e| py_err(e.context("Save shard failed")))
         .and_then(|(layout, shard_meta)| {
             let dict = PyDict::new(py);
             dict.set_item("step", layout.step)?;
@@ -2187,7 +2340,7 @@ fn save_checkpoint(
     step: u64,
     epoch: u64,
     framework: String,
-    data: &[u8],
+    data: &Bound<'_, PyAny>,
     user_meta: Option<Py<PyAny>>,
 ) -> PyResult<String> {
     let store = PyCheckpointStore::new(uri, None, None, None)?;
@@ -2212,7 +2365,7 @@ fn save_distributed_shard(
     step: u64,
     epoch: u64,
     framework: String,
-    data: &[u8],
+    data: &Bound<'_, PyAny>,
     world_size: u32,
     rank: u32,
 ) -> PyResult<Py<PyAny>> {
@@ -2248,20 +2401,9 @@ fn finalize_distributed_checkpoint(
 // Phase 3 Priority 4: Rich Python-Rust Data Exchange Enhancements
 // ---------------------------------------------------------------------------
 
-/// Read one checkpoint shard by URI.
-///
-/// With `validate_integrity=True` (default) the bytes are verified against the checksum
-/// the checkpoint's manifest recorded when the shard was written: a mismatch, a shard no
-/// manifest lists, or a manifest that recorded no checksum for it raises an error (the
-/// check is never skipped silently). A `.zst` shard is decoded first and the decoded bytes
-/// are returned. With `validate_integrity=False` the object is read as stored, unverified.
-#[pyfunction]
-#[pyo3(signature = (uri, validate_integrity=true))]
-pub fn load_checkpoint_with_validation(
-    py: Python<'_>,
-    uri: &str,
-    validate_integrity: bool,
-) -> PyResult<Py<PyAny>> {
+/// Fetch one checkpoint shard (the shared body of [`load_checkpoint_with_validation`] and
+/// [`load_checkpoint_with_validation_view`]); the GIL is released while it runs.
+fn load_checkpoint_shard(py: Python<'_>, uri: &str, validate_integrity: bool) -> PyResult<Bytes> {
     let store = store_for_uri_with_helper_rows(uri).map_err(py_err)?;
     let uri_owned = uri.to_owned();
 
@@ -2274,15 +2416,54 @@ pub fn load_checkpoint_with_validation(
                 crate::checkpoint::Reader::new(&*store, base.to_string())
                     .read_shard_against_manifest(shard_rel_key)
                     .await
-                    .map(|b| b.to_vec())
             } else {
-                // get returns Bytes, convert to Vec<u8>
-                store.get(&uri_owned).await.map(|b| b.to_vec())
+                // `get` returns refcounted `Bytes`: handed on as they are.
+                store.get(&uri_owned).await
             }
         })
     })
     .map_err(py_err)
-    .map(|data| PyBytes::new(py, &data).into())
+}
+
+/// Read one checkpoint shard by URI.
+///
+/// With `validate_integrity=True` (default) the bytes are verified against the checksum
+/// the checkpoint's manifest recorded when the shard was written: a mismatch, a shard no
+/// manifest lists, or a manifest that recorded no checksum for it raises an error (the
+/// check is never skipped silently). A `.zst` shard is decoded first and the decoded bytes
+/// are returned. With `validate_integrity=False` the object is read as stored, unverified.
+///
+/// Returns Python `bytes`: this is a compatibility API, and building a `bytes` from the
+/// fetched buffer is ONE copy (documented; RULE #1 exception "an API that explicitly returns
+/// `bytes`"). Use [`load_checkpoint_with_validation_view`] for the same result with zero
+/// copies.
+#[pyfunction]
+#[pyo3(signature = (uri, validate_integrity=true))]
+pub fn load_checkpoint_with_validation(
+    py: Python<'_>,
+    uri: &str,
+    validate_integrity: bool,
+) -> PyResult<Py<PyAny>> {
+    let data = load_checkpoint_shard(py, uri, validate_integrity)?;
+    // Compatibility API returns `bytes`: this single copy is unavoidable (a Python `bytes` owns
+    // its memory). It is built straight from the fetched `Bytes`, with no intermediate `Vec`.
+    Ok(PyBytes::new(py, &data).into())
+}
+
+/// Like `load_checkpoint_with_validation`, but returns a `BytesView` over the fetched buffer:
+/// ZERO copies. Same arguments, same validation, same errors.
+///
+/// `memoryview(view)` / `np.frombuffer(view, dtype=...)` read the checkpoint in place; the
+/// buffer lives as long as any view or memoryview of it does.
+#[pyfunction]
+#[pyo3(signature = (uri, validate_integrity=true))]
+pub fn load_checkpoint_with_validation_view(
+    py: Python<'_>,
+    uri: &str,
+    validate_integrity: bool,
+) -> PyResult<Py<PyAny>> {
+    let data = load_checkpoint_shard(py, uri, validate_integrity)?;
+    PyBytesView::new(data).into_py_any(py)
 }
 
 /// Save NumPy array with compression and validation
@@ -2336,7 +2517,11 @@ pub fn create_dataset(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Py
 ///   `item.file_uri`   → full S3/file URI of the containing Parquet file
 ///   `item.rg_idx`     → row-group index within that file
 ///   `item.byte_count` → compressed byte count (length of the raw data)
-///   `bytes(item)`     → raw compressed column-chunk bytes (for PyArrow decode)
+///   `memoryview(item)` / `np.frombuffer(item)` → the raw compressed column-chunk bytes read in
+///                       place (zero copy)
+///   `item.data`       → the same bytes as a read-only `BytesView` (zero copy)
+///   `bytes(item)`     → raw compressed column-chunk bytes as Python `bytes` (a copy, kept for
+///                       compatibility)
 ///   `len(item)`       → same as `byte_count`
 #[pyclass]
 pub struct PyParquetItem {
@@ -2345,6 +2530,20 @@ pub struct PyParquetItem {
     #[pyo3(get)]
     pub rg_idx: usize,
     data: Bytes,
+    /// `data.len()` cached in the heap object for the buffer protocol's `shape` pointer.
+    shape_len: isize,
+}
+
+impl PyParquetItem {
+    fn new(file_uri: String, rg_idx: usize, data: Bytes) -> Self {
+        let shape_len = data.len() as isize;
+        Self {
+            file_uri,
+            rg_idx,
+            data,
+            shape_len,
+        }
+    }
 }
 
 #[pymethods]
@@ -2358,11 +2557,30 @@ impl PyParquetItem {
         self.data.len()
     }
 
-    /// Return the raw compressed bytes.  Creates a Python bytes copy.
-    /// For `decode_mode="none"` use `item.byte_count` instead to avoid the copy.
+    /// The row group as a read-only `BytesView`: zero copies (it shares this item's buffer).
+    #[getter]
+    fn data(&self) -> PyBytesView {
+        PyBytesView::new(self.data.clone())
+    }
+
+    /// Return the raw compressed bytes as Python `bytes`. This is the COPY (kept for
+    /// compatibility): use `memoryview(item)`, `np.frombuffer(item)` or `item.data` to read the
+    /// bytes in place.
     fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.data)
     }
+
+    /// Read-only buffer protocol: `memoryview(item)` reads the row group in place, no copy.
+    unsafe fn __getbuffer__(
+        slf: PyRef<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        fill_read_only_bytes_buffer(view, flags, slf.as_ptr(), &slf.data, &slf.shape_len)
+    }
+
+    /// Nothing to release: CPython drops the reference taken in `__getbuffer__`.
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
 
     fn __repr__(&self) -> String {
         format!(
@@ -2403,11 +2621,7 @@ impl ParquetStreamIter {
             Some(Ok((global_idx, bytes))) => {
                 let (file_uri_idx, rg_idx) = self.rg_info[global_idx];
                 let file_uri = self.file_uris[file_uri_idx].clone();
-                let item = PyParquetItem {
-                    file_uri,
-                    rg_idx,
-                    data: bytes,
-                };
+                let item = PyParquetItem::new(file_uri, rg_idx, bytes);
                 Py::new(py, item)?.into_py_any(py)
             }
             Some(Err(e)) => Err(py_err(e)),
@@ -3609,6 +3823,7 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(save_distributed_shard, m)?)?;
         m.add_function(wrap_pyfunction!(finalize_distributed_checkpoint, m)?)?;
         m.add_function(wrap_pyfunction!(load_checkpoint_with_validation, m)?)?;
+        m.add_function(wrap_pyfunction!(load_checkpoint_with_validation_view, m)?)?;
     }
 
     Ok(())
@@ -4019,6 +4234,196 @@ mod checkpoint_286_287_tests {
             let raw = load_checkpoint_with_validation(py, &shard_uri, false).unwrap();
             let raw: Vec<u8> = raw.extract(py).unwrap();
             assert_eq!(raw, bad);
+        });
+    }
+}
+
+/// R8 (RULE #1): `PyObjectItem` / `PyParquetItem` expose the buffer protocol and `.data`
+/// (a `BytesView`), so reading them in place is zero copy; `bytes(item)` stays the one copy.
+#[cfg(all(test, feature = "extension-module"))]
+mod item_buffer_protocol_tests {
+    use super::*;
+    use pyo3::buffer::PyBuffer;
+
+    fn payload() -> Bytes {
+        Bytes::from((0..4096u32).map(|i| (i % 253) as u8).collect::<Vec<u8>>())
+    }
+
+    /// Address of the first byte `obj` exposes through the buffer protocol.
+    fn buffer_address(obj: &Bound<'_, PyAny>) -> usize {
+        let buf = PyBuffer::<u8>::get(obj).expect("buffer protocol");
+        assert!(buf.readonly(), "the item's buffer must be read-only");
+        buf.buf_ptr() as usize
+    }
+
+    fn check_in_place(py: Python<'_>, item: Bound<'_, PyAny>, data: &Bytes) {
+        let want = data.as_ptr() as usize;
+
+        // memoryview(item): zero copy, read-only, repeatable, same address every time.
+        let builtins = py.import("builtins").expect("builtins");
+        let mv1 = builtins
+            .call_method1("memoryview", (&item,))
+            .expect("memoryview");
+        let mv2 = builtins
+            .call_method1("memoryview", (&item,))
+            .expect("memoryview");
+        assert_eq!(
+            buffer_address(&mv1),
+            want,
+            "memoryview(item) copied the data"
+        );
+        assert_eq!(buffer_address(&mv2), want);
+        assert_eq!(mv1.len().expect("len"), data.len());
+        let readonly: bool = mv1
+            .getattr("readonly")
+            .expect("readonly")
+            .extract()
+            .expect("bool");
+        assert!(readonly);
+
+        // item.data: a BytesView over the same allocation.
+        let view = item.getattr("data").expect("data property");
+        assert_eq!(buffer_address(&view), want, "item.data copied the data");
+        let view = view.cast::<PyBytesView>().expect("BytesView").borrow();
+        assert_eq!(view.bytes.as_ptr() as usize, want);
+        drop(view);
+
+        // The memoryview keeps the item (and so the Bytes) alive after the last name is dropped.
+        drop(item);
+        assert_eq!(buffer_address(&mv1), want);
+        let first: u8 = mv1.get_item(0).expect("item").extract().expect("u8");
+        assert_eq!(first, data[0]);
+    }
+
+    #[test]
+    fn object_item_reads_in_place() {
+        Python::initialize();
+        Python::attach(|py| {
+            let data = payload();
+            let item = Py::new(py, PyObjectItem::new("file:///x".to_string(), data.clone()))
+                .expect("item")
+                .into_bound(py)
+                .into_any();
+            // `bytes(item)` still works and IS the copy (a different address).
+            let copied = py
+                .import("builtins")
+                .expect("builtins")
+                .call_method1("bytes", (&item,))
+                .expect("bytes(item)");
+            let copied = copied.cast::<PyBytes>().expect("bytes").as_bytes().to_vec();
+            assert_eq!(copied, data.to_vec());
+            check_in_place(py, item, &data);
+        });
+    }
+
+    #[test]
+    fn parquet_item_reads_in_place() {
+        Python::initialize();
+        Python::attach(|py| {
+            let data = payload();
+            let item = Py::new(
+                py,
+                PyParquetItem::new("file:///x.parquet".to_string(), 3, data.clone()),
+            )
+            .expect("item")
+            .into_bound(py)
+            .into_any();
+            check_in_place(py, item, &data);
+        });
+    }
+
+    #[test]
+    fn writable_buffer_request_is_refused() {
+        Python::initialize();
+        Python::attach(|py| {
+            let item = Py::new(py, PyObjectItem::new("file:///x".to_string(), payload()))
+                .expect("item")
+                .into_bound(py);
+            let mut view = std::mem::MaybeUninit::<ffi::Py_buffer>::zeroed();
+            // SAFETY: `item` is a live object and `view` is writable storage for a Py_buffer;
+            // on failure CPython leaves it untouched and sets BufferError.
+            let rc = unsafe {
+                ffi::PyObject_GetBuffer(item.as_ptr(), view.as_mut_ptr(), ffi::PyBUF_WRITABLE)
+            };
+            assert_eq!(rc, -1, "a writable buffer must be refused");
+            let err = PyErr::fetch(py);
+            assert!(err.is_instance_of::<PyBufferError>(py), "{err}");
+        });
+    }
+
+    #[test]
+    fn empty_item_is_a_valid_empty_buffer() {
+        Python::initialize();
+        Python::attach(|py| {
+            let item = Py::new(py, PyObjectItem::new("file:///e".to_string(), Bytes::new()))
+                .expect("item")
+                .into_bound(py)
+                .into_any();
+            let mv = py
+                .import("builtins")
+                .expect("builtins")
+                .call_method1("memoryview", (&item,))
+                .expect("memoryview");
+            assert_eq!(mv.len().expect("len"), 0);
+        });
+    }
+}
+
+/// A `write_chunk` with an unsupported payload must not create (and truncate) the shard: the
+/// payload is converted before the lazy writer is created.
+#[cfg(all(test, feature = "extension-module"))]
+mod stream_write_chunk_tests {
+    use super::*;
+
+    fn files_below(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    found.extend(files_below(&path));
+                } else {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn unsupported_payload_creates_no_shard_and_finalize_still_fails() {
+        Python::initialize();
+        Python::attach(|py| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let uri = format!("file://{}", dir.path().display());
+            let store = PyCheckpointStore::new(uri, None, None, None).expect("store");
+            let writer = store.writer(1, 0).expect("writer");
+            let mut stream = writer
+                .get_distributed_shard_stream(py, 5, 1, "test".to_string())
+                .expect("stream");
+
+            let bad = 123i32.into_pyobject(py).expect("int").into_any();
+            let err = stream
+                .write_chunk(py, &bad)
+                .expect_err("an int is not a payload");
+            assert!(err.is_instance_of::<PyTypeError>(py), "{err}");
+            assert!(
+                files_below(dir.path()).is_empty(),
+                "a rejected payload created a shard file: {:?}",
+                files_below(dir.path())
+            );
+
+            let err = stream
+                .finalize(py)
+                .expect_err("nothing was written, finalize must say so");
+            assert!(err.to_string().contains("No data written"), "{err}");
+
+            // A valid chunk afterwards still works on a fresh stream.
+            let mut stream = writer
+                .get_distributed_shard_stream(py, 6, 1, "test".to_string())
+                .expect("stream");
+            let ok = PyBytes::new(py, b"abc").into_any();
+            assert_eq!(stream.write_chunk(py, &ok).expect("write"), 3);
         });
     }
 }

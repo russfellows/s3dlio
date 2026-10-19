@@ -79,6 +79,29 @@ impl ReadBuffer {
     }
 }
 
+/// A zero-filled `Vec<u8>` of exactly `len` bytes, or `None` when the allocation fails.
+///
+/// A destination buffer that the network (or an SDK) will fill in place, sized from a length the
+/// SERVER announced: an absurd announced length must be an error, never an allocator abort
+/// (`vec![0; n]` aborts). The memory comes from `alloc_zeroed`, so the operating system supplies
+/// zero pages lazily and no byte is written before the data arrives.
+#[cfg(feature = "backend-azure")]
+pub(crate) fn try_zeroed_vec(len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<u8>(len).ok()?;
+    // SAFETY: `layout` has a non-zero size (len > 0). The pointer is checked for null below.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` was just allocated by the global allocator with the layout of exactly `len`
+    // `u8` (alignment 1), is initialised (zeroed) for all `len` bytes, and is owned by nobody
+    // else; capacity equals the allocation size, which is what `Vec<u8>` deallocates with.
+    Some(unsafe { Vec::from_raw_parts(ptr, len, len) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

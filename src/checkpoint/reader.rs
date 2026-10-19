@@ -295,6 +295,46 @@ fn manifest_match(
     })
 }
 
+/// Decode a `.zst` shard into a contiguous `Bytes` (a transform: the decoded bytes are the one
+/// unavoidable copy).
+///
+/// The output buffer is allocated ONCE at its final size when the zstd frame header records the
+/// content size (frames written with a known size, e.g. `zstd::bulk::compress`), so decoding
+/// never grows the `Vec` by doubling (which re-copies the output on every growth). A frame
+/// written by a streaming encoder (what the s3dlio compressing writers produce) carries no
+/// content size; for those the output grows as it is read, exactly as before.
+///
+/// A header can lie (a corrupt or hostile object), so the hint is only used when it is plausible
+/// (no more than zstd's maximum expansion of the stored size) and the reservation is fallible:
+/// otherwise the hint is ignored and decoding proceeds without it.
+fn decode_zstd_shard(stored: &[u8]) -> Result<Bytes> {
+    use std::io::Read;
+    /// zstd cannot expand data by more than 128 KiB per 4-byte RLE block (32768x); 65536x leaves
+    /// slack for headers.
+    const MAX_EXPANSION: u64 = 1 << 16;
+
+    let mut decoder = zstd::Decoder::new(stored)?;
+    let mut decompressed = Vec::new();
+    let mut presized = false;
+    if let Ok(Some(claimed)) = zstd::zstd_safe::get_frame_content_size(stored) {
+        let plausible = claimed <= (stored.len() as u64).saturating_mul(MAX_EXPANSION);
+        if let (true, Ok(claimed)) = (plausible, usize::try_from(claimed)) {
+            // A failed reservation just means no pre-sizing; the read below still works.
+            presized = decompressed.try_reserve_exact(claimed).is_ok();
+        }
+    }
+    decoder.read_to_end(&mut decompressed)?;
+    // `Bytes::from(Vec)` keeps the whole capacity alive. libzstd rejects a frame whose decoded
+    // size differs from the header's claim, so after a successful decode a pre-sized buffer is
+    // exactly full; this guard only matters if that ever stops being true (a lying header whose
+    // frame still decodes). `shrink_to_fit` is a realloc copy, acceptable ONLY in that hostile
+    // case, to avoid retaining a reservation far larger than the data.
+    if presized && decompressed.capacity() > decompressed.len().saturating_mul(2) {
+        decompressed.shrink_to_fit();
+    }
+    Ok(Bytes::from(decompressed))
+}
+
 /// Fetch a shard and decode it, validating `expected_checksum` when there is one.
 ///
 /// A checksum a writer reports (and the manifest stores) covers the UNCOMPRESSED shard
@@ -312,15 +352,12 @@ async fn fetch_shard_validated(
         crate::checksum::parse_expected_crc32c(expected)?;
     }
     if shard_rel_key.ends_with(".zst") {
-        use std::io::Read;
         let stored = store.get(uri).await?;
-        let mut decoder = zstd::Decoder::new(&stored[..])?;
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
+        let decompressed = decode_zstd_shard(&stored)?;
         if let Some(expected) = expected_checksum {
             crate::checksum::verify_crc32c(&decompressed, expected, uri)?;
         }
-        Ok(Bytes::from(decompressed))
+        Ok(decompressed)
     } else {
         // Return Bytes directly - zero copy!
         store.get_with_validation(uri, expected_checksum).await
@@ -384,11 +421,7 @@ async fn read_shard_owned(
         None => {
             let data = store.get(&uri).await?;
             if shard_rel_key.ends_with(".zst") {
-                use std::io::Read;
-                let mut decoder = zstd::Decoder::new(&data[..])?;
-                let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed)?;
-                Ok(Bytes::from(decompressed))
+                decode_zstd_shard(&data)
             } else {
                 Ok(data)
             }
@@ -580,12 +613,7 @@ impl<'a> Reader<'a> {
 
         // Check if this is a compressed file and decompress if needed
         if shard_rel_key.ends_with(".zst") {
-            use std::io::Read;
-            let mut decoder = zstd::Decoder::new(&data[..])?;
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed)?;
-            // Convert Vec<u8> to Bytes for consistency
-            Ok(Bytes::from(decompressed))
+            decode_zstd_shard(&data)
         } else {
             // Return Bytes directly - zero copy!
             Ok(data)

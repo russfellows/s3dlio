@@ -217,13 +217,33 @@ async def test_multi_endpoint_writes_accept_bytes_buffers_and_dunder_bytes(
 
 @needs_asyncio_plugin
 @pytest.mark.asyncio
-async def test_multi_endpoint_put_owns_its_copy_of_a_mutable_buffer(tmp_path):
+async def test_multi_endpoint_put_borrow_false_owns_its_copy_of_a_mutable_buffer(
+    tmp_path,
+):
+    store, ep0, ep1 = two_file_endpoints(tmp_path)
+    buf = bytearray(b"before")
+    awaitable = store.put_all_endpoints(file_uri(ep0, "own.bin"), buf, borrow=False)
+    buf[:] = b"AFTER!"
+    buf.extend(
+        b"-resized"
+    )  # no BufferError: borrow=False holds no export past the call
+    await awaitable
+    assert (ep0 / "own.bin").read_bytes() == b"before"
+    assert (ep1 / "own.bin").read_bytes() == b"before"
+
+
+@needs_asyncio_plugin
+@pytest.mark.asyncio
+async def test_multi_endpoint_put_borrows_a_mutable_buffer_by_default(tmp_path):
+    """Stage G: the default is borrow=True. The buffer is locked while the put is in flight
+    and released once the awaitable completed."""
     store, ep0, ep1 = two_file_endpoints(tmp_path)
     buf = bytearray(b"before")
     awaitable = store.put_all_endpoints(file_uri(ep0, "own.bin"), buf)
-    buf[:] = b"AFTER!"
-    buf.extend(b"-resized")  # no BufferError: no export is held past the call
+    with pytest.raises(BufferError):
+        buf.extend(b"-resized")  # exported until the awaitable completes
     await awaitable
+    buf.extend(b"-resized")  # released
     assert (ep0 / "own.bin").read_bytes() == b"before"
     assert (ep1 / "own.bin").read_bytes() == b"before"
 
@@ -278,13 +298,31 @@ async def test_put_many_async_accepts_bytes_buffers_and_dunder_bytes(tmp_path, k
 
 @needs_asyncio_plugin
 @pytest.mark.asyncio
-async def test_put_many_async_owns_its_copy_of_a_mutable_buffer(tmp_path):
-    """The batch may not read the caller's buffer after the call returned its awaitable."""
+async def test_put_many_async_borrow_false_owns_its_copy_of_a_mutable_buffer(tmp_path):
+    """borrow=False: the batch may not read the caller's buffer after the call returned."""
+    buf = bytearray(b"before")
+    awaitable = s3dlio.put_many_async(
+        [(file_uri(tmp_path, "own.bin"), buf)], borrow=False
+    )
+    buf[:] = b"AFTER!"
+    buf.extend(
+        b"-resized"
+    )  # no BufferError: borrow=False holds no export past the call
+    await awaitable
+    assert (tmp_path / "own.bin").read_bytes() == b"before"
+
+
+@needs_asyncio_plugin
+@pytest.mark.asyncio
+async def test_put_many_async_borrows_a_mutable_buffer_by_default(tmp_path):
+    """Stage G: the default is borrow=True. The buffer is locked while the batch is in flight
+    and released once the awaitable completed."""
     buf = bytearray(b"before")
     awaitable = s3dlio.put_many_async([(file_uri(tmp_path, "own.bin"), buf)])
-    buf[:] = b"AFTER!"
-    buf.extend(b"-resized")  # no BufferError: no export is held past the call
+    with pytest.raises(BufferError):
+        buf.extend(b"-resized")  # exported until the awaitable completes
     await awaitable
+    buf.extend(b"-resized")  # released
     assert (tmp_path / "own.bin").read_bytes() == b"before"
 
 

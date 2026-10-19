@@ -8,6 +8,97 @@ use crate::object_store::ObjectStore;
 use anyhow::Result;
 use bytes::Bytes;
 
+/// A shard payload accepted by the writer's one-shot APIs ([`Writer::put_shard`],
+/// [`Writer::put_shard_with_key`], [`Writer::save_checkpoint`],
+/// [`Writer::save_distributed_shard`], `CheckpointStore::save`).
+///
+/// RULE #1 (zero copy): the store receives the caller's own [`Bytes`]. `Bytes`, `&Bytes` (a
+/// refcount clone) and `Vec<u8>` (which `Bytes::from` adopts without copying) are passed along by
+/// reference count; a Python buffer export is wrapped by `Bytes::from_owner` before it gets here.
+/// The other borrowed forms (`&[u8]`, `&Vec<u8>`, `&[u8; N]`, `&mut Vec<u8>`, `&mut [u8]`,
+/// `&Box<[u8]>`, `&Arc<[u8]>`, `&Cow<[u8]>`, `&BytesMut`) exist so existing callers compile: a
+/// borrowed slice has no owner a refcounted `Bytes` could keep alive, so those forms take ONE
+/// copy, made only where a `Bytes` is really needed (the uncompressed upload). A compressing
+/// writer only needs a slice ([`as_shard_slice`](Self::as_shard_slice)): the zstd encoder is the
+/// transform, so there the borrowed forms are not copied at all. Pass a `Bytes` to avoid the copy.
+///
+/// Because the parameter is generic, Rust no longer auto-derefs a reference into `&[u8]`: a
+/// reference to a type not listed above (`&&[u8]`, `&String`, `&Rc<[u8]>`, ...) needs
+/// `.as_slice()` / `&x[..]` at the call site.
+pub trait IntoShardBytes: Send {
+    /// The payload as a slice (no copy), for writers that only read it.
+    fn as_shard_slice(&self) -> &[u8];
+    /// Convert into the refcounted payload handed to the object store.
+    fn into_shard_bytes(self) -> Bytes;
+}
+
+impl IntoShardBytes for Bytes {
+    fn as_shard_slice(&self) -> &[u8] {
+        self
+    }
+    fn into_shard_bytes(self) -> Bytes {
+        self
+    }
+}
+
+impl IntoShardBytes for &Bytes {
+    fn as_shard_slice(&self) -> &[u8] {
+        self
+    }
+    fn into_shard_bytes(self) -> Bytes {
+        // A refcount clone, not a copy of the payload.
+        self.clone()
+    }
+}
+
+impl IntoShardBytes for Vec<u8> {
+    fn as_shard_slice(&self) -> &[u8] {
+        self
+    }
+    fn into_shard_bytes(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+/// The borrowed (compat) forms: one copy, only when a `Bytes` is needed.
+macro_rules! borrowed_shard_data {
+    ($($ty:ty => |$this:ident| $slice:expr),+ $(,)?) => {$(
+        impl IntoShardBytes for $ty {
+            fn as_shard_slice(&self) -> &[u8] {
+                let $this = self;
+                $slice
+            }
+            fn into_shard_bytes(self) -> Bytes {
+                // Compatibility form: a borrowed slice cannot be kept alive by a `Bytes`, so this
+                // is the one unavoidable copy of the borrowed API (never made when compressing);
+                // callers that own the data pass `Bytes`.
+                Bytes::copy_from_slice(self.as_shard_slice())
+            }
+        }
+    )+};
+}
+
+borrowed_shard_data! {
+    &[u8] => |t| t,
+    &mut [u8] => |t| t,
+    &Vec<u8> => |t| t.as_slice(),
+    &mut Vec<u8> => |t| t.as_slice(),
+    &Box<[u8]> => |t| t,
+    &std::sync::Arc<[u8]> => |t| t,
+    &std::borrow::Cow<'_, [u8]> => |t| t,
+    &bytes::BytesMut => |t| t,
+}
+
+impl<const N: usize> IntoShardBytes for &[u8; N] {
+    fn as_shard_slice(&self) -> &[u8] {
+        self.as_slice()
+    }
+    fn into_shard_bytes(self) -> Bytes {
+        // Compatibility form, see the other borrowed forms.
+        Bytes::copy_from_slice(self.as_slice())
+    }
+}
+
 pub struct Writer<'a> {
     pub store: &'a dyn ObjectStore,
     pub base_uri: String, // e.g., "s3://bucket/prefix" | "file:///dir" | "direct:///dir" | "az://account/container/prefix"
@@ -53,15 +144,23 @@ impl<'a> Writer<'a> {
         self
     }
 
-    /// Upload a shard for this rank and return metadata
-    pub async fn put_shard(&self, layout: &KeyLayout, data: &[u8]) -> Result<ShardMeta> {
+    /// Upload a shard for this rank and return metadata.
+    ///
+    /// Zero copy for a `Bytes` payload ([`IntoShardBytes`]): the store receives the caller's
+    /// `Bytes`. With compression configured the compressing writer reads it as a slice (the
+    /// zstd transform is the only copy).
+    pub async fn put_shard<D: IntoShardBytes>(
+        &self,
+        layout: &KeyLayout,
+        data: D,
+    ) -> Result<ShardMeta> {
         let key = layout.shard_key(self.rank, self.strategy);
         let uri = layout.to_uri(&self.base_uri, &key);
 
         // If compression is enabled, use streaming writer for compression support
         if let Some(compression) = &self.compression {
             let (mut writer, _) = self.get_shard_writer(layout).await?;
-            writer.write_chunk(data).await?;
+            writer.write_chunk(data.as_shard_slice()).await?;
             // The checksum of the logical (uncompressed) bytes, taken before finalize consumes
             // the writer.
             let checksum = writer.checksum();
@@ -82,12 +181,15 @@ impl<'a> Writer<'a> {
             })
         } else {
             // Choose upload method based on size for uncompressed data
+            // The store needs a refcounted `Bytes`: made here, only on this path, so a compressing
+            // save from a borrowed slice never copies it.
+            let data = data.into_shard_bytes();
             if data.len() >= self.multipart_threshold {
                 self.store
-                    .put_multipart(&uri, Bytes::copy_from_slice(data), self.part_size)
+                    .put_multipart(&uri, data.clone(), self.part_size)
                     .await?;
             } else {
-                self.store.put(&uri, Bytes::copy_from_slice(data)).await?;
+                self.store.put(&uri, data.clone()).await?;
             }
 
             // Collect metadata
@@ -98,20 +200,25 @@ impl<'a> Writer<'a> {
                 size: meta.size,
                 etag: meta.e_tag,
                 checksum: Some(crate::checksum::crc32c_label(crate::checksum::crc32c_of(
-                    data,
+                    &data,
                 ))),
             })
         }
     }
 
-    /// Upload a shard with custom key (for flexibility)
-    pub async fn put_shard_with_key(&self, key: &str, data: &[u8]) -> Result<ShardMeta> {
+    /// Upload a shard with custom key (for flexibility). Zero copy for a `Bytes` payload, like
+    /// [`put_shard`](Self::put_shard).
+    pub async fn put_shard_with_key<D: IntoShardBytes>(
+        &self,
+        key: &str,
+        data: D,
+    ) -> Result<ShardMeta> {
         let uri = format!("{}/{}", self.base_uri.trim_end_matches('/'), key);
 
         // If compression is enabled, use streaming writer for compression support
         if let Some(compression) = &self.compression {
             let mut writer = self.get_shard_writer_with_key(key).await?;
-            writer.write_chunk(data).await?;
+            writer.write_chunk(data.as_shard_slice()).await?;
             // The checksum of the logical (uncompressed) bytes, taken before finalize consumes
             // the writer.
             let checksum = writer.checksum();
@@ -132,12 +239,15 @@ impl<'a> Writer<'a> {
             })
         } else {
             // Choose upload method based on size for uncompressed data
+            // The store needs a refcounted `Bytes`: made here, only on this path, so a compressing
+            // save from a borrowed slice never copies it.
+            let data = data.into_shard_bytes();
             if data.len() >= self.multipart_threshold {
                 self.store
-                    .put_multipart(&uri, Bytes::copy_from_slice(data), self.part_size)
+                    .put_multipart(&uri, data.clone(), self.part_size)
                     .await?;
             } else {
-                self.store.put(&uri, Bytes::copy_from_slice(data)).await?;
+                self.store.put(&uri, data.clone()).await?;
             }
 
             let meta = self.store.stat(&uri).await?;
@@ -147,7 +257,7 @@ impl<'a> Writer<'a> {
                 size: meta.size,
                 etag: meta.e_tag,
                 checksum: Some(crate::checksum::crc32c_label(crate::checksum::crc32c_of(
-                    data,
+                    &data,
                 ))),
             })
         }
@@ -278,12 +388,12 @@ impl<'a> Writer<'a> {
 
     /// Convenience method to save a complete checkpoint in one call
     /// This is for single-rank or when coordination is handled externally
-    pub async fn save_checkpoint(
+    pub async fn save_checkpoint<D: IntoShardBytes>(
         &self,
         step: u64,
         epoch: u64,
         framework: &str,
-        data: &[u8],
+        data: D,
         user_meta: Option<serde_json::Value>,
     ) -> Result<String> {
         let layout = KeyLayout::new(self.base_uri.clone(), step);
@@ -310,12 +420,12 @@ impl<'a> Writer<'a> {
     }
 
     /// Distributed checkpoint: each rank uploads its shard
-    pub async fn save_distributed_shard(
+    pub async fn save_distributed_shard<D: IntoShardBytes>(
         &self,
         step: u64,
         _epoch: u64,
         _framework: &str,
-        data: &[u8],
+        data: D,
     ) -> Result<(KeyLayout, ShardMeta)> {
         let layout = KeyLayout::new(self.base_uri.clone(), step);
         let shard_meta = self.put_shard(&layout, data).await?;

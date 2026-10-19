@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use ndarray::ArrayD;
+use std::borrow::Cow;
 use std::io::{Cursor, Read, Write};
 use zip::{read::ZipArchive, write::FileOptions, CompressionMethod, ZipWriter};
 
@@ -507,10 +508,17 @@ pub fn read_npy_bytes(data: &[u8]) -> Result<ArrayD<f32>> {
     }
 
     // Calculate expected data size
-    let num_elements: usize = shape.iter().product();
-    let data_size = num_elements * std::mem::size_of::<f32>();
+    let num_elements = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| anyhow!("NPY shape {:?} overflows", shape))?;
+    let data_size = num_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("NPY shape {:?} overflows", shape))?;
     let data_start = header_end;
-    let data_end = data_start + data_size;
+    let data_end = data_start
+        .checked_add(data_size)
+        .ok_or_else(|| anyhow!("NPY shape {:?} overflows", shape))?;
 
     if data.len() < data_end {
         return Err(anyhow!(
@@ -520,17 +528,15 @@ pub fn read_npy_bytes(data: &[u8]) -> Result<ArrayD<f32>> {
         ));
     }
 
-    // Read data as f32 slice (little-endian)
-    let float_data = unsafe {
-        std::slice::from_raw_parts(
-            data[data_start..data_end].as_ptr() as *const f32,
-            num_elements,
-        )
-    };
+    // Format decode (the one copy of the NPZ read): the little-endian f32 payload is decoded
+    // into the owned, aligned `Vec<f32>` the ndarray (and then the numpy array) takes over. The
+    // source bytes are only 1-byte aligned inside the archive, so they cannot be viewed as
+    // `&[f32]` in place; each element is read unaligned.
+    let (elements, _) = data[data_start..data_end].as_chunks::<4>();
+    let float_data: Vec<f32> = elements.iter().map(|b| f32::from_le_bytes(*b)).collect();
 
     // Create ndarray
-    ArrayD::from_shape_vec(shape, float_data.to_vec())
-        .context("Failed to create ndarray from NPY data")
+    ArrayD::from_shape_vec(shape, float_data).context("Failed to create ndarray from NPY data")
 }
 
 /// Parse shape tuple from NPY header string.
@@ -546,11 +552,16 @@ fn parse_npy_shape(header: &str) -> Result<Vec<usize>> {
     let tuple_start = after_shape
         .find('(')
         .ok_or_else(|| anyhow!("NPY header 'shape' field malformed (no '(')"))?;
-    let tuple_end = after_shape
+    // The ')' must come AFTER the '(' (a hostile header can have it first); `get` keeps a bad
+    // range an error instead of a slice panic.
+    let tuple_end = after_shape[tuple_start..]
         .find(')')
-        .ok_or_else(|| anyhow!("NPY header 'shape' field malformed (no ')')"))?;
+        .map(|i| tuple_start + i)
+        .ok_or_else(|| anyhow!("NPY header 'shape' field malformed (no ')' after '(')"))?;
 
-    let tuple_content = &after_shape[tuple_start + 1..tuple_end];
+    let tuple_content = after_shape
+        .get(tuple_start + 1..tuple_end)
+        .ok_or_else(|| anyhow!("NPY header 'shape' field malformed"))?;
 
     // Handle empty shape (scalar)
     if tuple_content.trim().is_empty() {
@@ -596,17 +607,69 @@ pub fn read_npz_array(data: &[u8], array_name: &str) -> Result<ArrayD<f32>> {
         format!("{}.npy", array_name)
     };
 
+    let npy = entry_of(&mut archive, data, &npy_name, array_name)?;
+
+    // Parse NPY format
+    read_npy_bytes(&npy)
+}
+
+/// The `.npy` member `array_name` of an NPZ archive, without copying it when it is STORED.
+///
+/// NPZ writers (this crate's included) store the members uncompressed, so the member is a
+/// sub-range of the archive's own bytes: `Cow::Borrowed` points into `data`. A compressed member
+/// is a transform (it has to be inflated into a new buffer): `Cow::Owned`.
+pub fn npz_entry<'a>(data: &'a [u8], array_name: &str) -> Result<Cow<'a, [u8]>> {
+    let mut archive =
+        ZipArchive::new(Cursor::new(data)).context("Failed to open NPZ file as ZIP archive")?;
+    let npy_name = if array_name.ends_with(".npy") {
+        array_name.to_string()
+    } else {
+        format!("{}.npy", array_name)
+    };
+    entry_of(&mut archive, data, &npy_name, array_name)
+}
+
+fn entry_of<'a>(
+    archive: &mut ZipArchive<Cursor<&'a [u8]>>,
+    data: &'a [u8],
+    npy_name: &str,
+    array_name: &str,
+) -> Result<Cow<'a, [u8]>> {
     let mut file = archive
-        .by_name(&npy_name)
+        .by_name(npy_name)
         .with_context(|| format!("Array '{}' not found in NPZ archive", array_name))?;
 
-    // Read entire .npy file into buffer
+    if file.compression() == CompressionMethod::Stored && !file.encrypted() {
+        // A STORED member's bytes are the archive's bytes at `data_start()`: slice them out
+        // (RULE #1: no copy). The range is checked against the archive, not trusted.
+        let start = usize::try_from(file.data_start()).ok();
+        let len = usize::try_from(file.compressed_size()).ok();
+        let range = start
+            .zip(len)
+            .and_then(|(start, len)| Some(start..start.checked_add(len)?));
+        if let Some(entry) = range.and_then(|r| data.get(r)) {
+            // Integrity: the zip layer verified the member's CRC-32 while copying it out; reading
+            // it in place must not weaken that. The CRC is computed over the borrowed slice
+            // (read only, no copy) and compared with the one the archive recorded, with the same
+            // error the zip reader reports ("Invalid checksum").
+            if crc32fast::hash(entry) != file.crc32() {
+                return Err(anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid checksum",
+                ))
+                .context("Failed to read NPY data from NPZ archive"));
+            }
+            return Ok(Cow::Borrowed(entry));
+        }
+    }
+
+    // A compressed member is a transform (inflate into a new buffer), the one copy that cannot
+    // be avoided. (Also the defensive fallback for a stored member whose range does not check
+    // out: reading through the zip layer then reports the real error.)
     let mut npy_bytes = Vec::new();
     file.read_to_end(&mut npy_bytes)
         .context("Failed to read NPY data from NPZ archive")?;
-
-    // Parse NPY format
-    read_npy_bytes(&npy_bytes)
+    Ok(Cow::Owned(npy_bytes))
 }
 
 /// List all array names in an NPZ archive.

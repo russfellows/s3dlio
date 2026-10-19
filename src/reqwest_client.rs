@@ -210,16 +210,15 @@ impl HttpConnector for ReqwestHttpConnector {
             let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
                 .map_err(|e| ConnectorError::other(e.into(), None))?;
 
-            // Collect body bytes before the first attempt so we can retry
-            // with a different client if the h2c probe fails.
-            // bytes::Bytes is cheaply cloneable (Arc-backed reference count).
-            let req_body = sdk_body
-                .collect()
-                .await
-                .map_err(|e: Box<dyn std::error::Error + Send + Sync + 'static>| {
-                    ConnectorError::io(e)
-                })?
-                .to_bytes();
+            // Collect the body before the first attempt so we can retry with a different
+            // client if the h2c probe fails. A body that arrives as one segment (every normal
+            // PUT) is held as one `Bytes`; a body of several segments (a multipart part that
+            // straddles writes) is held as the list of its refcounted segments and is never
+            // gathered into one buffer (Rule #1). `Bytes` clones are Arc-backed, so a retry
+            // resends the same memory.
+            let req_body = RequestBody::from_segments(
+                body_segments(sdk_body).await.map_err(ConnectorError::io)?,
+            );
 
             // ── Pick client for first attempt ─────────────────────────────
             // h2c (prior-knowledge HTTP/2 cleartext) is only valid on plain
@@ -246,7 +245,7 @@ impl HttpConnector for ReqwestHttpConnector {
             if let Some(timeout) = read_timeout {
                 builder = builder.timeout(timeout);
             }
-            builder = builder.body(reqwest::Body::from(req_body.clone()));
+            builder = builder.body(req_body.to_reqwest());
 
             let first_result = builder.send().await;
 
@@ -296,7 +295,7 @@ impl HttpConnector for ReqwestHttpConnector {
                     if let Some(timeout) = read_timeout {
                         rb = rb.timeout(timeout);
                     }
-                    rb = rb.body(reqwest::Body::from(req_body.clone()));
+                    rb = rb.body(req_body.to_reqwest());
                     rb.send().await.map_err(|e| {
                         if e.is_connect() || e.is_timeout() {
                             ConnectorError::timeout(e.into())
@@ -388,6 +387,102 @@ impl HttpConnector for ReqwestHttpConnector {
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory function
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Every data segment of `body`, as the very `Bytes` the body yields (no gather; trailers, if
+/// any, are dropped exactly as `collect().to_bytes()` dropped them).
+pub(crate) async fn body_segments(
+    body: SdkBody,
+) -> Result<Vec<bytes::Bytes>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let mut body = std::pin::pin!(body);
+    let mut segments = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame?.into_data() {
+            segments.push(data);
+        }
+    }
+    Ok(segments)
+}
+
+/// The request body the connector sends: one `Bytes` (the normal case) or the refcounted
+/// segments of a multi-chunk body, never a gathered copy of them.
+pub(crate) enum RequestBody {
+    /// Zero or one segment: exactly what `to_bytes()` of the collected body used to give
+    /// (zero-copy for one segment).
+    Single(bytes::Bytes),
+    /// Two or more non-empty segments, sent as a stream of those segments with an exact length.
+    Segments(Vec<bytes::Bytes>),
+}
+
+impl RequestBody {
+    pub(crate) fn from_segments(segments: Vec<bytes::Bytes>) -> Self {
+        let mut segments = segments;
+        segments.retain(|s| !s.is_empty());
+        if segments.len() <= 1 {
+            RequestBody::Single(segments.pop().unwrap_or_default())
+        } else {
+            RequestBody::Segments(segments)
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            RequestBody::Single(b) => b.len(),
+            RequestBody::Segments(s) => s.iter().map(bytes::Bytes::len).sum(),
+        }
+    }
+
+    /// A reqwest body over the same memory (refcount bumps only). A one-segment body is a
+    /// reusable `Bytes` body exactly as before; several segments are a streaming body whose
+    /// exact `size_hint` makes hyper send `Content-Length` (no chunked encoding).
+    pub(crate) fn to_reqwest(&self) -> reqwest::Body {
+        match self {
+            RequestBody::Single(b) => reqwest::Body::from(b.clone()),
+            RequestBody::Segments(s) => reqwest::Body::wrap(SegmentBody::new(s.clone())),
+        }
+    }
+}
+
+/// An HTTP body that yields a list of `Bytes` segments as they are, with an exact length.
+pub(crate) struct SegmentBody {
+    segments: std::collections::VecDeque<bytes::Bytes>,
+    remaining: u64,
+}
+
+impl SegmentBody {
+    pub(crate) fn new(segments: Vec<bytes::Bytes>) -> Self {
+        let remaining = segments.iter().map(|s| s.len() as u64).sum();
+        Self {
+            segments: segments.into(),
+            remaining,
+        }
+    }
+}
+
+impl http_body::Body for SegmentBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, Self::Error>>> {
+        match self.segments.pop_front() {
+            Some(seg) => {
+                self.remaining = self.remaining.saturating_sub(seg.len() as u64);
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(seg))))
+            }
+            None => std::task::Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
+}
 
 /// Whether a request must be given an explicit `Content-Length: 0` (issue #236).
 ///
@@ -1725,5 +1820,245 @@ mod tests {
             &te,
             0
         ));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Connector: multi-segment request bodies are sent as segments, never gathered (Rule #1)
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod request_body_tests {
+    use super::*;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Incoming;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    /// One request as the test server saw it.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        content_length: Option<String>,
+        transfer_encoding: Option<String>,
+        body: Bytes,
+    }
+
+    /// An HTTP/1.1-only server that records every request (headers and the whole body).
+    async fn spawn_http1_server() -> (u16, Arc<Mutex<Vec<Seen>>>) {
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let record = record.clone();
+                        async move {
+                            let header = |n: &str| {
+                                req.headers()
+                                    .get(n)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_string)
+                            };
+                            let content_length = header("content-length");
+                            let transfer_encoding = header("transfer-encoding");
+                            let body = req
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|c| c.to_bytes())
+                                .unwrap_or_default();
+                            if let Ok(mut r) = record.lock() {
+                                r.push(Seen {
+                                    content_length,
+                                    transfer_encoding,
+                                    body,
+                                });
+                            }
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    fn connector(mode: H2cMode) -> ReqwestHttpConnector {
+        let http1 = reqwest::Client::builder()
+            .http1_only()
+            .build()
+            .expect("http1 client");
+        let h2c = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .expect("h2c client");
+        ReqwestHttpConnector {
+            h2c_client: h2c,
+            http1_client: http1,
+            mode,
+            read_timeout: None,
+        }
+    }
+
+    fn put(port: u16, body: SdkBody) -> HttpRequest {
+        let req = http::Request::builder()
+            .method("PUT")
+            .uri(format!("http://127.0.0.1:{port}/obj"))
+            .body(body)
+            .expect("request");
+        HttpRequest::try_from(req).expect("smithy request")
+    }
+
+    fn segments() -> Vec<Bytes> {
+        (0..3u8)
+            .map(|i| Bytes::from(vec![i + 1; 1000 + 500 * i as usize]))
+            .collect()
+    }
+
+    fn joined(segs: &[Bytes]) -> Vec<u8> {
+        segs.iter().flat_map(|s| s.iter().copied()).collect()
+    }
+
+    fn multi_segment_body(segs: Vec<Bytes>) -> SdkBody {
+        SdkBody::retryable(move || SdkBody::from_body_1_x(SegmentBody::new(segs.clone())))
+    }
+
+    fn only(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        seen.lock().expect("lock").clone()
+    }
+
+    /// A 3-segment body arrives byte-exact with the exact Content-Length and no chunked
+    /// encoding.
+    #[tokio::test]
+    async fn a_multi_segment_body_arrives_exact_with_a_content_length() {
+        let (port, seen) = spawn_http1_server().await;
+        let segs = segments();
+        let want = joined(&segs);
+        let resp = connector(H2cMode::ForceHttp1)
+            .call(put(port, multi_segment_body(segs)))
+            .await
+            .expect("response");
+        assert_eq!(resp.status().as_u16(), 200);
+        let got = only(&seen);
+        assert_eq!(got.len(), 1);
+        assert_eq!(&got[0].body[..], &want[..]);
+        assert_eq!(got[0].content_length, Some(want.len().to_string()));
+        assert_eq!(got[0].transfer_encoding, None);
+    }
+
+    /// A one-segment body (every normal PUT) takes the old path: same bytes, same headers.
+    #[tokio::test]
+    async fn a_single_segment_body_is_unchanged() {
+        let (port, seen) = spawn_http1_server().await;
+        let payload = Bytes::from(vec![9u8; 4096]);
+        connector(H2cMode::ForceHttp1)
+            .call(put(port, SdkBody::from(payload.clone())))
+            .await
+            .expect("response");
+        let got = only(&seen);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, payload);
+        assert_eq!(got[0].content_length, Some("4096".to_string()));
+        assert_eq!(got[0].transfer_encoding, None);
+        // An empty body still gets its explicit Content-Length: 0 (issue #236).
+        connector(H2cMode::ForceHttp1)
+            .call(put(port, SdkBody::empty()))
+            .await
+            .expect("response");
+        let got = only(&seen);
+        assert_eq!(got[1].content_length, Some("0".to_string()));
+    }
+
+    /// The segments are not gathered: collecting the connector's view of the body yields the
+    /// original `Bytes` (pointer identity), and a single segment is returned as it is.
+    #[test]
+    fn segments_keep_their_memory() {
+        let segs = segments();
+        let ptrs: Vec<usize> = segs.iter().map(|s| s.as_ptr() as usize).collect();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        let collected = rt
+            .block_on(body_segments(multi_segment_body(segs.clone())))
+            .expect("segments");
+        match RequestBody::from_segments(collected) {
+            RequestBody::Segments(got) => {
+                assert_eq!(
+                    got.iter().map(|s| s.as_ptr() as usize).collect::<Vec<_>>(),
+                    ptrs
+                );
+            }
+            RequestBody::Single(_) => panic!("three segments must stay three segments"),
+        }
+        let one = Bytes::from(vec![5u8; 64]);
+        let p = one.as_ptr();
+        let collected = rt
+            .block_on(body_segments(SdkBody::from(one)))
+            .expect("segments");
+        match RequestBody::from_segments(collected) {
+            RequestBody::Single(b) => assert_eq!(b.as_ptr(), p, "one segment is not copied"),
+            RequestBody::Segments(_) => panic!("one segment must be Single"),
+        }
+    }
+
+    /// An SDK-level retry rebuilds the body from the same refcounted segments: both attempts
+    /// reach the server with identical bytes.
+    #[tokio::test]
+    async fn a_retried_request_resends_the_same_bytes() {
+        let (port, seen) = spawn_http1_server().await;
+        let segs = segments();
+        let want = joined(&segs);
+        let body = multi_segment_body(segs);
+        let retry = body
+            .try_clone()
+            .expect("the multi-segment body is retryable");
+        let c = connector(H2cMode::ForceHttp1);
+        c.call(put(port, body)).await.expect("first attempt");
+        c.call(put(port, retry)).await.expect("retry");
+        let got = only(&seen);
+        assert_eq!(got.len(), 2);
+        for s in &got {
+            assert_eq!(&s.body[..], &want[..]);
+            assert_eq!(s.content_length, Some(want.len().to_string()));
+        }
+    }
+
+    /// The connector's own retry (h2c auto-probe against a server that only speaks HTTP/1.1)
+    /// resends the body from the same segments: the server receives it exactly once, intact.
+    #[tokio::test]
+    async fn the_h2c_probe_fallback_resends_the_same_segments() {
+        let (port, seen) = spawn_http1_server().await;
+        H2C_AUTO_STATE.store(H2C_AUTO_UNKNOWN, Ordering::Relaxed);
+        let segs = segments();
+        let want = joined(&segs);
+        let resp = connector(H2cMode::Auto)
+            .call(put(port, multi_segment_body(segs)))
+            .await
+            .expect("response after the fallback");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            H2C_AUTO_STATE.load(Ordering::Relaxed),
+            H2C_AUTO_FAILED,
+            "the probe must have failed and fallen back to HTTP/1.1"
+        );
+        let got = only(&seen);
+        assert_eq!(got.len(), 1);
+        assert_eq!(&got[0].body[..], &want[..]);
+        assert_eq!(got[0].content_length, Some(want.len().to_string()));
+        H2C_AUTO_STATE.store(H2C_AUTO_UNKNOWN, Ordering::Relaxed);
     }
 }

@@ -1112,6 +1112,84 @@ pub(crate) async fn get_object_range_async(
     get_object_range_with_client(&client, bucket, key, offset, length).await
 }
 
+/// Receive an S3 response body into ONE buffer (Rule #1, stage G R2).
+///
+/// `ByteStream::collect().into_bytes()` keeps every network chunk alive and then, when the body
+/// arrived in more than one chunk (always, for a large object), copies the whole body into a
+/// new contiguous buffer: two copies of the object in memory at the peak. This instead
+/// allocates the destination ONCE (`expected_len`, the response's `Content-Length`) and streams
+/// each chunk into it as it arrives, so each chunk is freed as soon as it is copied. The one
+/// chunk-to-destination copy is the unavoidable "network chunk into the final buffer" copy. The
+/// result is the `Vec`'s allocation handed over as `Bytes` (no further copy).
+///
+/// * `expected_len = Some(n)`: the body must be exactly `n` bytes; longer or shorter is an
+///   error (never silently truncated or padded). The allocation is fallible, so an absurd
+///   `Content-Length` is an error, not an abort.
+/// * `expected_len = None` (a chunked body of unknown size): the chunks are kept, a single
+///   chunk is returned as it is (no copy), and several are gathered ONCE into a buffer of the
+///   now-known total. That path peaks at 2x the body (documented, unavoidable without a
+///   length) and is rare: S3 sends `Content-Length` on every GET.
+pub(crate) async fn receive_body_presized(
+    mut body: aws_sdk_s3::primitives::ByteStream,
+    expected_len: Option<u64>,
+) -> Result<Bytes> {
+    let Some(expected) = expected_len else {
+        let mut chunks: Vec<Bytes> = Vec::new();
+        let mut total: usize = 0;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.context("read response body chunk")?;
+            total = total
+                .checked_add(chunk.len())
+                .context("response body length overflows usize")?;
+            chunks.push(chunk);
+        }
+        if chunks.len() <= 1 {
+            return Ok(chunks.pop().unwrap_or_default());
+        }
+        let mut whole: Vec<u8> = Vec::new();
+        whole.try_reserve_exact(total).map_err(|e| {
+            anyhow::anyhow!("cannot allocate {total} bytes for the response body: {e}")
+        })?;
+        for chunk in &chunks {
+            // Gather copy: a body of unknown length arrived in several chunks and the caller
+            // needs it contiguous; this is the one copy (see the function comment).
+            whole.extend_from_slice(chunk);
+        }
+        return Ok(Bytes::from(whole));
+    };
+
+    let expected = usize::try_from(expected)
+        .map_err(|_| anyhow::anyhow!("response Content-Length {expected} exceeds usize"))?;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(expected).map_err(|e| {
+        anyhow::anyhow!("cannot allocate {expected} bytes for the response body: {e}")
+    })?;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.context("read response body chunk")?;
+        if chunk.len() > expected - buf.len() {
+            bail!("response body longer than its Content-Length: got more than {expected} bytes");
+        }
+        // The one allowed copy: the network chunk into the final destination buffer.
+        buf.extend_from_slice(&chunk);
+    }
+    if buf.len() != expected {
+        bail!(
+            "response body shorter than its Content-Length: got {} of {expected} bytes",
+            buf.len()
+        );
+    }
+    Ok(Bytes::from(buf))
+}
+
+/// [`receive_body_presized`] for a `GetObject` response: sized from the response's own
+/// `Content-Length` (an absent or negative header means "unknown").
+pub(crate) async fn receive_get_output_body(
+    output: aws_sdk_s3::operation::get_object::GetObjectOutput,
+) -> Result<Bytes> {
+    let expected = output.content_length().and_then(|n| u64::try_from(n).ok());
+    receive_body_presized(output.body, expected).await
+}
+
 /// [`get_object_range_async`] on a caller-chosen client (issue #208): a
 /// per-endpoint store passes ITS client, so the read goes to the store's own
 /// server, never to the process-wide one.  `get_object_range_async` is this
@@ -1161,9 +1239,10 @@ pub(crate) async fn get_object_range_with_client(
             .send()
             .await
             .sdk_context(format!("GET range for s3://{}/{} failed", bucket, key))?;
-        let body = resp.body.collect().await.context("collect range body")?;
-        // Zero-copy: return Bytes directly
-        Ok::<Bytes, anyhow::Error>(body.into_bytes())
+        // Zero-copy (Rule #1): one pre-sized buffer, each chunk copied into it once.
+        receive_get_output_body(resp)
+            .await
+            .context("collect range body")
     })
     .await?;
 
@@ -1221,10 +1300,12 @@ pub async fn get_object_range_uri_timed_async(
             bucket, key
         ))?;
     let ttfb = t0.elapsed();
-    let body = resp.body.collect().await.context("collect range body")?;
+    // Zero-copy (Rule #1): one pre-sized buffer, each chunk copied into it once.
+    let bytes = receive_get_output_body(resp)
+        .await
+        .context("collect range body")?;
     let total = t0.elapsed();
     let transfer = total.saturating_sub(ttfb);
-    let bytes = body.into_bytes();
     Ok((bytes, ttfb, transfer))
 }
 
@@ -1515,63 +1596,9 @@ async fn concurrent_range_get_impl(
                 .await
                 .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
-            let range_header = format!("bytes={}-{}", range_start, range_end - 1);
-
-            // Bounded retry over send() + body-stream (issue #148
-            // Phase 4b). Once the reqwest connector streams response
-            // bodies, smithy's own retry stops covering body-transfer
-            // failures — we retry the whole send()+stream pair here.
-            //
-            // Inline (not `crate::retry::retry_get_body`) because that
-            // helper's `FnMut() -> Fut` signature can't share `&mut seg`
-            // across attempts without Arc<Mutex> or unsafe. Semantics
-            // match: max_retry_attempts() budget + linear 100ms*attempt
-            // backoff, and (issue #240) no retry of a definite client error.
-            //
-            // Silent-data-corruption gate (audit §2.4): `written`
-            // MUST be declared inside `attempt_range_chunk_fill` so
-            // each retry attempt starts writing at position 0. If it
-            // leaked across attempts, a partial failed stream's bytes
-            // would remain at [0..old_written] mixed with successful
-            // retry bytes, length would still be seg_len but content
-            // would be a mix of two attempts — no error raised.
-            // Locked in by tests/test_phase4_retry_fault_injection.rs.
-            let attempts = crate::constants::max_retry_attempts().max(1);
-            let mut last_err: Option<anyhow::Error> = None;
-            let mut succeeded = false;
-            for attempt in 1..=attempts {
-                match attempt_range_chunk_fill(
-                    &client,
-                    &bucket,
-                    &key,
-                    &range_header,
-                    range_start,
-                    range_end,
-                    &mut seg,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        succeeded = true;
-                        break;
-                    }
-                    Err(e) => {
-                        // Issue #240: same rule as `retry_get_body` -- a
-                        // definite answer (404, 403, 412, ...) ends the loop.
-                        let definite = !crate::retry::RetryClassify::is_retryable(&e);
-                        last_err = Some(e);
-                        if definite {
-                            break;
-                        }
-                        if attempt < attempts {
-                            tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                        }
-                    }
-                }
-            }
-            if !succeeded {
-                return Err(last_err.expect("attempts >= 1"));
-            }
+            // Bounded retry over send() + body-stream; see `fill_range_segment_with_retry`.
+            fill_range_segment_with_retry(&client, &bucket, &key, range_start, range_end, &mut seg)
+                .await?;
 
             Ok::<(usize, BytesMut), anyhow::Error>((idx, seg))
         });
@@ -1605,6 +1632,86 @@ async fn concurrent_range_get_impl(
     );
 
     Ok(output.freeze())
+}
+
+/// One range GET of `[range_start, range_end)` received straight into `seg` (whose length is
+/// the range length), with the bounded retry that covers the send() + body-stream pair.
+///
+/// Bounded retry over send() + body-stream (issue #148 Phase 4b). Once the reqwest connector
+/// streams response bodies, smithy's own retry stops covering body-transfer failures - we retry
+/// the whole send()+stream pair here.
+///
+/// Inline (not `crate::retry::retry_get_body`) because that helper's `FnMut() -> Fut`
+/// signature can't share `&mut seg` across attempts without Arc<Mutex> or unsafe. Semantics
+/// match: max_retry_attempts() budget + linear 100ms*attempt backoff, and (issue #240) no retry
+/// of a definite client error.
+///
+/// Silent-data-corruption gate (audit §2.4): `written` MUST be declared inside
+/// `attempt_range_chunk_fill` so each retry attempt starts writing at position 0. If it leaked
+/// across attempts, a partial failed stream's bytes would remain at [0..old_written] mixed with
+/// successful retry bytes, length would still be seg_len but content would be a mix of two
+/// attempts - no error raised. Locked in by tests/test_phase4_retry_fault_injection.rs.
+async fn fill_range_segment_with_retry(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    range_start: u64,
+    range_end: u64,
+    seg: &mut BytesMut,
+) -> Result<()> {
+    let range_header = format!("bytes={}-{}", range_start, range_end - 1);
+    let attempts = crate::constants::max_retry_attempts().max(1);
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts {
+        match attempt_range_chunk_fill(
+            client,
+            bucket,
+            key,
+            &range_header,
+            range_start,
+            range_end,
+            seg,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Issue #240: same rule as `retry_get_body` -- a definite answer (404, 403,
+                // 412, ...) ends the loop.
+                let definite = !crate::retry::RetryClassify::is_retryable(&e);
+                last_err = Some(e);
+                if definite {
+                    break;
+                }
+                if attempt < attempts {
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("range GET made no attempt")))
+}
+
+/// Range GET of `[start, start + seg.len())` of `bucket`/`key` on the process-wide client,
+/// received STRAIGHT into the caller's `seg` (the chunk-to-destination copy is the only copy),
+/// with the same bounded retry as the range engine. A short or long body is an error. Returns
+/// the filled segment so a caller that pre-split one master buffer can `unsplit` it back with
+/// no copy (stage G R4: the dataset range mode).
+pub(crate) async fn get_object_range_into_segment_async(
+    bucket: &str,
+    key: &str,
+    start: u64,
+    mut seg: BytesMut,
+) -> Result<BytesMut> {
+    if seg.is_empty() {
+        return Ok(seg);
+    }
+    let end = start
+        .checked_add(seg.len() as u64)
+        .context("range end overflows u64")?;
+    let client = aws_s3_client_async().await?;
+    fill_range_segment_with_retry(&client, bucket, key, start, end, &mut seg).await?;
+    Ok(seg)
 }
 
 /// One attempt at streaming a range GET's body into a pre-allocated
@@ -3311,7 +3418,8 @@ async fn put_object_multipart_on(
             Some(client) => MultipartUploadSink::new_with_client(client, &bucket, &key, cfg)?,
             None => MultipartUploadSink::new(&bucket, &key, cfg)?,
         };
-        sink.write_blocking(&data)?;
+        // Owned `Bytes` goes in as `Bytes`: sliced into parts, never copied (Rule #1).
+        sink.write_bytes_blocking(data)?;
         sink.finish_blocking()?;
         Ok::<(), anyhow::Error>(())
     })
@@ -4436,5 +4544,92 @@ mod receive_path_tests {
             "{text}"
         );
         assert!(!attempt_is_retryable(&err));
+    }
+}
+
+/// `receive_body_presized` (stage G R2): one pre-sized buffer, length-checked, no re-copy.
+#[cfg(test)]
+mod receive_body_presized_tests {
+    use super::*;
+    use aws_sdk_s3::primitives::{ByteStream, SdkBody};
+    use http_body_util::StreamBody;
+
+    fn stream_of(chunks: Vec<Vec<u8>>) -> ByteStream {
+        let frames = chunks
+            .into_iter()
+            .map(|c| Ok::<_, std::io::Error>(http_body::Frame::data(Bytes::from(c))));
+        ByteStream::new(SdkBody::from_body_1_x(StreamBody::new(
+            futures::stream::iter(frames),
+        )))
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    #[test]
+    fn a_multi_chunk_body_is_assembled_exactly_in_one_buffer() {
+        let chunks = vec![
+            vec![1u8; 700],
+            vec![2u8; 1],
+            vec![3u8; 4000],
+            vec![4u8; 299],
+        ];
+        let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+        let got = rt()
+            .block_on(receive_body_presized(
+                stream_of(chunks),
+                Some(expected.len() as u64),
+            ))
+            .expect("body");
+        assert_eq!(&got[..], &expected[..]);
+    }
+
+    #[test]
+    fn a_body_longer_or_shorter_than_its_length_is_an_error() {
+        let chunks = vec![vec![9u8; 600], vec![9u8; 600]];
+        let long = rt().block_on(receive_body_presized(stream_of(chunks.clone()), Some(1000)));
+        assert!(format!("{:#}", long.expect_err("long")).contains("longer"));
+        let short = rt().block_on(receive_body_presized(stream_of(chunks), Some(2000)));
+        assert!(format!("{:#}", short.expect_err("short")).contains("shorter"));
+    }
+
+    #[test]
+    fn an_absurd_content_length_is_an_error_not_an_abort() {
+        let got = rt().block_on(receive_body_presized(
+            stream_of(vec![vec![1u8; 4]]),
+            Some(u64::MAX / 2),
+        ));
+        assert!(got.is_err());
+    }
+
+    #[test]
+    fn an_unknown_length_body_is_gathered_once_and_a_single_chunk_is_not_copied() {
+        let got = rt()
+            .block_on(receive_body_presized(
+                stream_of(vec![vec![5u8; 10], vec![6u8; 20]]),
+                None,
+            ))
+            .expect("body");
+        assert_eq!(got.len(), 30);
+        assert_eq!(&got[..10], &[5u8; 10]);
+        assert_eq!(&got[10..], &[6u8; 20]);
+
+        let one = vec![7u8; 64];
+        let ptr = one.as_ptr();
+        let got = rt()
+            .block_on(receive_body_presized(stream_of(vec![one]), None))
+            .expect("body");
+        assert_eq!(got.as_ptr(), ptr, "a single chunk is returned as it is");
+    }
+
+    #[test]
+    fn an_empty_body_is_empty() {
+        let got = rt()
+            .block_on(receive_body_presized(stream_of(vec![]), Some(0)))
+            .expect("body");
+        assert!(got.is_empty());
     }
 }

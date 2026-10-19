@@ -14,12 +14,11 @@ use crate::page_cache::apply_page_cache_hint;
 use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::constants::DEFAULT_FILE_RANGE_ENGINE_THRESHOLD;
 use crate::object_store::{
@@ -99,9 +98,102 @@ pub struct FileSystemObjectStore {
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
 }
 
+/// Fill `buf` completely from `file` starting at byte `offset` with positional reads
+/// (`pread(2)`), straight into the caller's memory; an end of file before `buf` is full is an
+/// `UnexpectedEof` error.
+#[cfg(unix)]
+pub(crate) fn read_exact_at_std(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_exact_at_std(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek};
+    let mut file = file;
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    file.read_exact(buf)
+}
+
+/// Read from `file` at byte `offset` into `buf` with positional reads (`pread(2)`) until `buf`
+/// is full or the file ends; returns the number of bytes read (less than `buf.len()` only at the
+/// end of the file). Straight into the caller's memory: nothing is buffered or copied.
+pub(crate) fn read_full_at_std(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    let mut total = 0usize;
+    while total < buf.len() {
+        let at = offset.saturating_add(total as u64);
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            match file.read_at(&mut buf[total..], at) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        #[cfg(not(unix))]
+        let n = {
+            use std::io::{Read, Seek};
+            let mut f = file;
+            f.seek(std::io::SeekFrom::Start(at))?;
+            match f.read(&mut buf[total..]) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        if n == 0 {
+            break; // end of file
+        }
+        total += n;
+    }
+    Ok(total)
+}
+
+/// Write `data` completely to `file` at its current position with plain `write(2)` calls
+/// straight from the caller's memory (`&File` implements `Write`, so a shared handle works).
+pub(crate) fn write_all_std(file: &std::fs::File, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = file;
+    file.write_all(data)
+}
+
+/// Write a BORROWED slice completely to `file` without copying it (Rule #1).
+///
+/// A borrowed `&[u8]` cannot be moved into `spawn_blocking` without a copy, so the write runs on
+/// the calling task's thread: on the multi-thread runtime `block_in_place` hands the worker's
+/// other tasks to a fresh thread first (the same off-loading `spawn_blocking` gives); a
+/// current-thread runtime has no other thread to hand them to (and `block_in_place` would panic
+/// there), so the write simply runs inline. Owned data should use `spawn_blocking` instead.
+pub(crate) fn write_borrowed_blocking(file: &std::fs::File, data: &[u8]) -> std::io::Result<()> {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(|| write_all_std(file, data))
+        }
+        _ => write_all_std(file, data),
+    }
+}
+
 /// Streaming writer for filesystem operations
+///
+/// Rule #1 (zero copy): the file is a plain `std::fs::File` written directly from the
+/// caller's bytes. `tokio::fs::File::write_all` copies every chunk into tokio's own internal
+/// buffer (up to 2 MiB per call) before a blocking task writes it, which is a payload copy
+/// the data never needed.
 pub struct FileSystemWriter {
-    file: Option<fs::File>,
+    file: Option<Arc<std::fs::File>>,
     path: PathBuf,
     bytes_written: u64,
     compressed_bytes: u64,
@@ -130,7 +222,7 @@ impl FileSystemWriter {
         let final_path = compression.stored_path(&path);
 
         // Create and open the file for writing
-        let file = fs::File::create(&final_path).await?;
+        let file = fs::File::create(&final_path).await?.into_std().await;
 
         let compressor = match compression {
             CompressionConfig::None => None,
@@ -142,7 +234,7 @@ impl FileSystemWriter {
         };
 
         Ok(Self {
-            file: Some(file),
+            file: Some(Arc::new(file)),
             path: final_path,
             bytes_written: 0,
             compressed_bytes: 0,
@@ -173,17 +265,43 @@ impl ObjectWriter for FileSystemWriter {
             if let Some(ref mut compressor) = self.compressor {
                 // Compress the chunk using std::io::Write trait
                 use std::io::Write;
+                // (Compression is a transform: its output is new data, not a copy of the input.)
                 compressor.write_all(chunk)?;
 
                 // Don't update compressed_bytes here - we don't know the compressed size until finalize()
             } else {
-                // No compression - write directly to file
-                file.write_all(chunk).await?;
+                // No compression - write straight from the caller's slice, no intermediate
+                // buffer (see `write_borrowed_blocking` for why it runs on this thread).
+                // Trade-off, documented: on a multi-thread runtime the write is off-loaded with
+                // `block_in_place`; on a CURRENT-THREAD runtime it runs inline and blocks that
+                // thread for the duration of the write (a borrowed slice cannot be moved to
+                // another thread without the copy Rule #1 forbids).
+                // Owned data goes through `write_owned_bytes`, which uses `spawn_blocking`.
+                write_borrowed_blocking(file, chunk)?;
             }
             Ok(())
         } else {
             bail!("Writer has been finalized or cancelled");
         }
+    }
+
+    /// Owned data goes to a blocking task that writes it as-is: no copy, and the runtime's
+    /// workers are never blocked.
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        if self.compressor.is_some() {
+            // Compression path: the encoder consumes the slice (a transform).
+            return self.write_chunk(&data).await;
+        }
+        let Some(file) = self.file.as_ref().map(Arc::clone) else {
+            bail!("Writer has been finalized or cancelled");
+        };
+        self.hasher.update(&data);
+        self.bytes_written += data.len() as u64;
+        tokio::task::spawn_blocking(move || write_all_std(&file, &data)).await??;
+        Ok(())
     }
 
     async fn finalize(mut self: Box<Self>) -> Result<()> {
@@ -192,20 +310,29 @@ impl ObjectWriter for FileSystemWriter {
             return Ok(());
         }
 
-        if let Some(mut file) = self.file.take() {
+        if let Some(file) = self.file.take() {
             // Finalize compression if enabled
-            if let Some(compressor) = self.compressor.take() {
-                debug!(
-                    "FileSystemWriter::finalize: finalizing compression, path: {}",
-                    self.path.display()
-                );
-                let final_compressed = compressor.finish()?;
-                self.compressed_bytes = final_compressed.len() as u64; // Update with actual compressed size
-                file.write_all(&final_compressed).await?;
-            }
+            let final_compressed = match self.compressor.take() {
+                Some(compressor) => {
+                    debug!(
+                        "FileSystemWriter::finalize: finalizing compression, path: {}",
+                        self.path.display()
+                    );
+                    let out = compressor.finish()?;
+                    self.compressed_bytes = out.len() as u64; // Update with actual compressed size
+                    Some(out)
+                }
+                None => None,
+            };
 
-            file.flush().await?;
-            file.sync_all().await?;
+            // The compressed tail is an owned Vec: moved into the blocking task, not copied.
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                if let Some(out) = final_compressed {
+                    write_all_std(&file, &out)?;
+                }
+                file.sync_all()
+            })
+            .await??;
         }
 
         self.finalized = true;
@@ -391,17 +518,28 @@ impl FileSystemObjectStore {
     async fn get_with_range_engine(&self, uri: &str, file_size: u64) -> Result<Bytes> {
         let engine = RangeEngine::new(self.config.range_engine.clone());
 
-        // Create closure that captures uri for get_range calls
-        let uri_owned = uri.to_string();
-        let self_clone = self.clone();
-
-        let get_range_fn = move |offset: u64, length: u64| {
-            let uri = uri_owned.clone();
-            let store = self_clone.clone();
-            async move { store.get_range(&uri, offset, Some(length)).await }
+        // Rule #1 (zero copy): every range is read with a positional read straight into its own
+        // segment of the engine's ONE master buffer (`download_into_master`). Going through
+        // `get_range` would allocate a `Bytes` per range and copy each into the master buffer.
+        // The page-cache hint is the one `get_range` applies to range reads.
+        let path = Self::uri_to_path(uri)?;
+        let cache_mode = self.config.page_cache_mode.unwrap_or(PageCacheMode::Random);
+        let fill_range = move |offset: u64, mut segment: BytesMut| {
+            let path = path.clone();
+            async move {
+                tokio::task::spawn_blocking(move || -> Result<(BytesMut, usize)> {
+                    let file = std::fs::File::open(&path)?;
+                    let _ = apply_page_cache_hint(&file, cache_mode, file_size);
+                    let read = read_full_at_std(&file, &mut segment, offset)?;
+                    Ok((segment, read))
+                })
+                .await?
+            }
         };
 
-        let (bytes, stats) = engine.download(file_size, get_range_fn, None).await?;
+        let (bytes, stats) = engine
+            .download_into_master(file_size, false, fill_range, None)
+            .await?;
 
         info!(
             "RangeEngine downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
@@ -419,25 +557,29 @@ impl FileSystemObjectStore {
         let path = Self::uri_to_path(uri)?;
 
         // Open file and apply page cache hint based on size
-        let file = fs::File::open(&path).await?;
-        let std_file = file
-            .try_into_std()
-            .map_err(|_| anyhow::anyhow!("Failed to convert to std file"))?;
-
         // Apply page cache hint (use configured mode or Auto by default)
         let cache_mode = self.config.page_cache_mode.unwrap_or(PageCacheMode::Auto);
         debug!(
             "Applying page cache hint {:?} for file {} (size: {} bytes)",
             cache_mode, uri, file_size
         );
-        let _ = apply_page_cache_hint(&std_file, cache_mode, file_size);
+        let capacity = usize::try_from(file_size)
+            .map_err(|_| anyhow::anyhow!("file {uri} of {file_size} bytes is too large to read"))?;
 
-        // Convert back to tokio file and read
-        let mut file = fs::File::from_std(std_file);
-
-        // Pre-allocate to avoid reallocation churn (v0.9.9+)
-        let mut data = Vec::with_capacity(file_size as usize);
-        file.read_to_end(&mut data).await?;
+        // Rule #1 (zero copy): read with plain `std::fs` in a blocking task, straight into the
+        // destination Vec (which becomes the returned `Bytes`). `tokio::fs::File::read*` reads
+        // into tokio's own internal buffer (up to 2 MiB) and copies from there into the caller's
+        // buffer, one extra copy of every byte.
+        let data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            use std::io::Read;
+            let mut file = std::fs::File::open(&path)?;
+            let _ = apply_page_cache_hint(&file, cache_mode, file_size);
+            // Pre-allocate to avoid reallocation churn (v0.9.9+)
+            let mut data = Vec::with_capacity(capacity);
+            file.read_to_end(&mut data)?;
+            Ok(data)
+        })
+        .await??;
 
         // Convert to Bytes (cheap, just wraps in Arc)
         Ok(Bytes::from(data))
@@ -549,19 +691,10 @@ impl ObjectStore for FileSystemObjectStore {
         let metadata = fs::metadata(&path).await?;
         let file_size = metadata.len();
 
-        let file = fs::File::open(&path).await?;
-        let std_file = file
-            .try_into_std()
-            .map_err(|_| anyhow::anyhow!("Failed to convert to std file"))?;
-
         // Apply page cache hint (use configured mode, or Random for range reads by default)
         let cache_mode = self.config.page_cache_mode.unwrap_or(PageCacheMode::Random);
         debug!("Applying page cache hint {:?} for range read {} offset={} length={:?} (file size: {} bytes)", 
                cache_mode, uri, offset, length, file_size);
-        let _ = apply_page_cache_hint(&std_file, cache_mode, file_size);
-
-        let mut file = fs::File::from_std(std_file);
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
 
         // Calculate how many bytes are actually available from offset to end of file
         let bytes_available = file_size.saturating_sub(offset);
@@ -570,19 +703,25 @@ impl ObjectStore for FileSystemObjectStore {
             None => bytes_available,               // Read to end
         };
 
-        let mut buffer = Vec::new();
-
         if read_length == 0 {
             // Nothing to read (offset >= file_size)
             return Ok(Bytes::new());
-        } else if read_length < u64::MAX {
-            // Read specific length - only what's available
-            buffer.resize(read_length as usize, 0);
-            file.read_exact(&mut buffer).await?;
-        } else {
-            // Read to end of file
-            file.read_to_end(&mut buffer).await?;
         }
+        let read_len = usize::try_from(read_length)
+            .map_err(|_| anyhow::anyhow!("range of {read_length} bytes is too large to read"))?;
+
+        // Rule #1 (zero copy): a positional read with plain `std::fs` in a blocking task, straight
+        // into the destination Vec (which becomes the returned `Bytes`). `tokio::fs::File::read*`
+        // goes through tokio's internal buffer (up to 2 MiB) and copies from there, an extra copy
+        // of every byte.
+        let buffer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let file = std::fs::File::open(&path)?;
+            let _ = apply_page_cache_hint(&file, cache_mode, file_size);
+            let mut buffer = vec![0u8; read_len];
+            read_exact_at_std(&file, &mut buffer, offset)?;
+            Ok(buffer)
+        })
+        .await??;
 
         // Convert to Bytes (cheap, just wraps in Arc)
         Ok(Bytes::from(buffer))

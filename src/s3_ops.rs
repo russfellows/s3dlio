@@ -174,12 +174,10 @@ impl S3Ops {
                 .await
                 .sdk_context(format!("S3 GET for s3://{}/{} failed", bucket, key))?;
             let first_byte = SystemTime::now();
-            let body = output
-                .body
-                .collect()
+            // Zero-copy (Rule #1): one pre-sized buffer, each chunk copied into it once.
+            let body = crate::s3_utils::receive_get_output_body(output)
                 .await
-                .context("S3 GET body stream failed")?
-                .into_bytes();
+                .context("S3 GET body stream failed")?;
             Ok((body, first_byte))
         })
         .await;
@@ -238,12 +236,10 @@ impl S3Ops {
                     bucket, key, start, end
                 ))?;
             let first_byte = SystemTime::now();
-            let body = output
-                .body
-                .collect()
+            // Zero-copy (Rule #1): one pre-sized buffer, each chunk copied into it once.
+            let body = crate::s3_utils::receive_get_output_body(output)
                 .await
-                .context("S3 GET_RANGE body stream failed")?
-                .into_bytes();
+                .context("S3 GET_RANGE body stream failed")?;
             Ok((body, first_byte))
         })
         .await;

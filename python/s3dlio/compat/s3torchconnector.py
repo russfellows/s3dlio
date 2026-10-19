@@ -577,12 +577,23 @@ class S3Checkpoint:
                 return self.buffer.seek(offset, whence)
 
             def close(self):
-                # getbuffer() returns a memoryview — no copy; bytes(mv) is the one
-                # copy here (put_bytes itself does not copy a bytes object)
+                # getbuffer() returns a memoryview over the BytesIO's own memory — no copy —
+                # and put_bytes reads any buffer-protocol object in place (it holds the
+                # export for the blocking call), so the payload is never copied here.
                 mv = self.buffer.getbuffer()
-                _core.put_bytes(self.uri, bytes(mv))
-                mv.release()
-                self.buffer.close()
+                try:
+                    _core.put_bytes(self.uri, mv)
+                finally:
+                    try:
+                        mv.release()
+                    except BufferError:
+                        pass  # still exported elsewhere: freed when its last user lets go
+                # Only after a SUCCESSFUL upload: a failed close() leaves the data in the
+                # buffer, so the caller can retry it.
+                try:
+                    self.buffer.close()
+                except BufferError:
+                    pass  # an export is still alive; the BytesIO is freed with it
 
             def __enter__(self):
                 return self  # Return self — torch.save needs write()+tell()
@@ -688,8 +699,8 @@ class S3Client:
         Create a writer for uploading object data.
 
         The writer accumulates data in a BytesIO buffer, then uploads
-        via put_bytes() on close() (put_bytes does not copy the payload;
-        the bytes(...) / read() that builds it is the only copy).
+        via put_bytes() on close(). The BytesIO's own memory is passed to put_bytes
+        as a buffer (getbuffer()), which reads it in place: no copy is made here.
 
         Args:
             bucket (str): Bucket name
@@ -710,12 +721,24 @@ class S3Client:
                 return self.buffer.write(data)
 
             def close(self):
-                """Upload accumulated data via put_bytes (read() makes the only copy)"""
+                """Upload accumulated data via put_bytes (getbuffer(): no copy)"""
                 if self.buffer.tell() > 0:
-                    self.buffer.seek(0)
-                    payload = self.buffer.read()
-                    _core.put_bytes(self.uri, payload)
-                self.buffer.close()
+                    # A memoryview over the BytesIO's own memory, read in place by
+                    # put_bytes (it holds the export for the blocking call).
+                    payload = self.buffer.getbuffer()
+                    try:
+                        _core.put_bytes(self.uri, payload)
+                    finally:
+                        try:
+                            payload.release()
+                        except BufferError:
+                            pass  # still exported elsewhere: freed when its last user lets go
+                # Only after a SUCCESSFUL upload: a failed close() leaves the data in the
+                # buffer, so the caller can retry it.
+                try:
+                    self.buffer.close()
+                except BufferError:
+                    pass  # an export is still alive; the BytesIO is freed with it
 
         return _S3Writer(uri)
 

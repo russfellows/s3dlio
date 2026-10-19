@@ -58,6 +58,26 @@ pub const ABORT_FAILS_MARKER: &str = "abort-fails";
 /// coordinator into its error path without ever reaching Complete.
 pub const UPLOAD_PART_FAILS_MARKER: &str = "part-fails";
 
+/// Key-path marker that makes the mock server stall every UploadPart on that object for
+/// [`UPLOAD_PART_STALL`] after the body has been read, then answer 500. Used to prove that
+/// aborting an upload does not wait for stalled part requests.
+pub const UPLOAD_PART_STALLS_MARKER: &str = "part-stalls";
+
+/// How long [`UPLOAD_PART_STALLS_MARKER`] objects stall an UploadPart.
+pub const UPLOAD_PART_STALL: Duration = Duration::from_secs(30);
+
+/// One UploadPart request as the server received it (the body is kept so a test can check the
+/// stored object byte for byte).
+#[derive(Clone, Debug)]
+pub struct PartRecord {
+    pub part_number: u32,
+    pub body: Bytes,
+    /// `x-amz-content-sha256` header (`UNSIGNED-PAYLOAD` when payload signing is off).
+    pub content_sha256: Option<String>,
+    pub content_length: Option<u64>,
+    pub transfer_encoding: Option<String>,
+}
+
 /// Key substring marker that makes the mock server report a per-object
 /// error for that key in a `DeleteObjects` response, while still
 /// returning HTTP 200 overall — this is exactly the real S3 behavior
@@ -215,9 +235,21 @@ pub struct MockS3State {
     catalogs: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Registered objects (see [`MockS3State::put_object`]): raw request path -> object.
     objects: Arc<Mutex<HashMap<String, MockObject>>>,
+    /// UploadPart requests received, by raw request path (see [`MockS3State::part_records`]).
+    parts: Arc<Mutex<HashMap<String, Vec<PartRecord>>>>,
 }
 
 impl MockS3State {
+    /// Every UploadPart received for `bucket`/`key`, in arrival order.
+    pub fn part_records(&self, bucket: &str, key: &str) -> Vec<PartRecord> {
+        self.parts
+            .lock()
+            .unwrap()
+            .get(&key_path(bucket, key))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Seed `bucket` with exactly `keys`. ListObjectsV2 on a seeded bucket is
     /// answered from this catalog the way S3 answers it: only keys that start
     /// with `prefix`; with `delimiter`, keys whose remainder (after the prefix)
@@ -792,6 +824,19 @@ pub fn start_isolated_mock_s3_server() -> (u16, MockS3State) {
     spawn_mock_server()
 }
 
+thread_local! {
+    /// Set on every thread that runs a mock server (its `block_on` thread and its runtime
+    /// workers). A test that counts allocations uses [`on_mock_server_thread`] to leave the
+    /// server's own buffering (it collects request bodies) out of the count.
+    static MOCK_SERVER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True on a thread that belongs to a mock server (see `MOCK_SERVER_THREAD`). Safe to call
+/// from inside a global allocator: the thread-local is const-initialised and has no destructor.
+pub fn on_mock_server_thread() -> bool {
+    MOCK_SERVER_THREAD.try_with(|c| c.get()).unwrap_or(false)
+}
+
 fn spawn_mock_server() -> (u16, MockS3State) {
     let state = MockS3State::default();
     let server_state = state.clone();
@@ -800,8 +845,12 @@ fn spawn_mock_server() -> (u16, MockS3State) {
     std::thread::Builder::new()
         .name("mock-s3-server".to_string())
         .spawn(move || {
-            let rt =
-                tokio::runtime::Runtime::new().expect("failed to build mock-s3-server runtime");
+            MOCK_SERVER_THREAD.with(|c| c.set(true));
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .on_thread_start(|| MOCK_SERVER_THREAD.with(|c| c.set(true)))
+                .build()
+                .expect("failed to build mock-s3-server runtime");
             rt.block_on(async move {
                 let listener = TcpListener::bind("127.0.0.1:0")
                     .await
@@ -869,6 +918,15 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         host: host_header,
         if_match: if_match_header,
     });
+    let header_text = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let content_sha256 = header_text("x-amz-content-sha256");
+    let content_length = header_text("content-length").and_then(|v| v.parse::<u64>().ok());
+    let transfer_encoding = header_text("transfer-encoding");
     // Collect the body — DeleteObjects needs to inspect which keys were
     // requested (see below); every other route just needs it drained so
     // the connection can be cleanly reused/closed.
@@ -957,6 +1015,26 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     // UploadPart: PUT .../{key}?partNumber=N&uploadId=...
     if method == Method::PUT && query.contains("partNumber") {
         state.record(&path, |c| c.upload_part_calls += 1);
+        let part_number = query_param(&query, "partNumber")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        state
+            .parts
+            .lock()
+            .unwrap()
+            .entry(path.clone())
+            .or_default()
+            .push(PartRecord {
+                part_number,
+                body: body_bytes.clone(),
+                content_sha256: content_sha256.clone(),
+                content_length,
+                transfer_encoding: transfer_encoding.clone(),
+            });
+        if path.contains(UPLOAD_PART_STALLS_MARKER) {
+            tokio::time::sleep(UPLOAD_PART_STALL).await;
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockUploadPartStalled");
+        }
         if path.contains(UPLOAD_PART_FAILS_MARKER) {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockUploadPartFailure");
         }

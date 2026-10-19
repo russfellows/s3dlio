@@ -2048,11 +2048,39 @@ mod caller_buffer {
         progress: &ReceiveProgress,
         cfg: &ReceiveConfig,
     ) -> Result<()> {
+        receive_span(opener, what, 0, false, dst, progress, cfg)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`receive_into`] for a span of the object: the bytes `base..base + dst.len()`.
+    ///
+    /// * `ranged == false`: the whole object (`base == 0`), exactly as [`receive_into`]: the
+    ///   object's size must equal `dst.len()` and exactly that many bytes are written.
+    /// * `ranged == true` (the range engine, stage G R3): every request names its window
+    ///   (`start`, `limit`), the object must be at least `base` bytes long, and the bytes that
+    ///   exist in the window are written (`min(dst.len(), size - base)`; the service clamps a
+    ///   range to the end of the object). The count written is returned and the caller decides
+    ///   whether a short answer is an error. Retries and repairs are pinned to the first
+    ///   response's generation and size exactly as for the whole object.
+    pub(super) async fn receive_span<O: ReadOpener + ?Sized>(
+        opener: &O,
+        what: &str,
+        base: u64,
+        ranged: bool,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+        cfg: &ReceiveConfig,
+    ) -> Result<usize> {
         let len = dst.len();
         let expected = to_u64(len)?;
+        if ranged && len == 0 {
+            return Ok(0);
+        }
         let mut span = SpanMark::new(progress);
         let mut cursor = 0usize;
         let mut pinned: Option<i64> = None;
+        let mut first_size: Option<u64> = None;
         let mut budget = Budget::default();
         // A Rapid zero-length read is answered by the descriptor alone: no data range is
         // requested, so an empty object cannot fail with OUT_OF_RANGE and no HTTP size header
@@ -2064,10 +2092,13 @@ mod caller_buffer {
             let remaining = expected
                 .checked_sub(cursor64)
                 .ok_or_else(|| anyhow!("cursor {cursor} is past the end of the span"))?;
-            // The first request reads to the end; a repair asks for exactly the missing suffix.
+            // The first whole-object request reads to the end; a repair, and every ranged
+            // request, asks for exactly the missing part of its window.
             let request = OpenRequest {
-                start: cursor64,
-                limit: (cursor > 0).then_some(remaining),
+                start: base
+                    .checked_add(cursor64)
+                    .ok_or_else(|| anyhow!("range start {base} + {cursor64} overflows"))?,
+                limit: (cursor > 0 || ranged).then_some(remaining),
                 generation: pinned,
             };
             let was_pinned = pinned.is_some();
@@ -2124,14 +2155,37 @@ mod caller_buffer {
             }
 
             let size = size_to_u64(opened.facts.size, what)?;
-            if size != expected {
-                // The body is dropped unread.
-                return Err(if was_pinned {
-                    version_changed(what, "size differs on a pinned retry or repair")
-                } else {
-                    length_mismatch(what, expected, Some(size))
-                });
-            }
+            // How many bytes this span can deliver.
+            let target: usize = if ranged {
+                match first_size {
+                    Some(known) if known != size => {
+                        return Err(version_changed(
+                            what,
+                            "size differs on a pinned retry or repair",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => first_size = Some(size),
+                }
+                // The window may run past the end of the object (the service clamps it); one
+                // that starts at or past the end holds nothing and is a length mismatch.
+                let available = match size.checked_sub(base) {
+                    Some(available) if available > 0 => available,
+                    _ => return Err(length_mismatch(what, expected, Some(size))),
+                };
+                usize::try_from(available.min(expected))
+                    .map_err(|_| anyhow!("span length does not fit in memory"))?
+            } else {
+                if size != expected {
+                    // The body is dropped unread.
+                    return Err(if was_pinned {
+                        version_changed(what, "size differs on a pinned retry or repair")
+                    } else {
+                        length_mismatch(what, expected, Some(size))
+                    });
+                }
+                len
+            };
 
             let before = cursor;
             let mut stream = opened.stream;
@@ -2151,7 +2205,8 @@ mod caller_buffer {
                         if chunk.is_empty() {
                             continue;
                         }
-                        let Some(end) = cursor.checked_add(chunk.len()).filter(|end| *end <= len)
+                        let Some(end) =
+                            cursor.checked_add(chunk.len()).filter(|end| *end <= target)
                         else {
                             return Err(length_mismatch(what, expected, None));
                         };
@@ -2183,8 +2238,8 @@ mod caller_buffer {
                 }
             }
 
-            if cursor == len {
-                return Ok(());
+            if cursor == target {
+                return Ok(cursor);
             }
             // A clean end that is short.  A pinned read that made progress repairs the suffix;
             // anything else is a length mismatch.
@@ -2439,6 +2494,52 @@ mod caller_buffer {
                     object,
                 };
                 receive_into(&opener, &what, dst, progress, &cfg).await
+            }
+        }
+
+        /// Read the bytes `offset..offset + dst.len()` of an object straight into `dst` and
+        /// return how many were written (stage G, R3: the range engine's per-range receive).
+        ///
+        /// The count is `dst.len()` unless the range runs past the end of the object (the
+        /// service clamps it): the caller decides whether a short answer is an error. A range
+        /// that starts at or past the end is a `LengthMismatch`. Rapid buckets use the Rapid route,
+        /// others HTTP; retries and repairs are pinned to the first response's generation (see
+        /// [`receive_span`]). `progress` counts the positions written.
+        pub async fn get_object_range_into(
+            &self,
+            bucket: &str,
+            object: &str,
+            offset: u64,
+            dst: &mut [u8],
+            progress: &ReceiveProgress,
+        ) -> Result<usize> {
+            let what = format!("gs://{bucket}/{object}");
+            let bucket_name = format_bucket_name(bucket);
+            let rapid = self.is_rapid_bucket(bucket).await;
+            let cfg = read_config(rapid, dst.len())?;
+            if rapid {
+                debug!(
+                    "GCS GET RANGE INTO (gRPC): {what}, offset={offset}, {} bytes",
+                    dst.len()
+                );
+                let opener = RapidOpener {
+                    storage: &self.storage,
+                    bucket_name: &bucket_name,
+                    object,
+                    attempt_timeout: gcs_bidi_attempt_timeout(),
+                };
+                receive_span(&opener, &what, offset, true, dst, progress, &cfg).await
+            } else {
+                debug!(
+                    "GCS GET RANGE INTO (HTTP): {what}, offset={offset}, {} bytes",
+                    dst.len()
+                );
+                let opener = HttpOpener {
+                    storage: &self.storage,
+                    bucket_name: &bucket_name,
+                    object,
+                };
+                receive_span(&opener, &what, offset, true, dst, progress, &cfg).await
             }
         }
 
@@ -3789,6 +3890,11 @@ mod head_typed_tests;
 #[cfg(all(test, not(feature = "gcs-community")))]
 #[path = "gcs_get_into_tests.rs"]
 mod get_into_tests;
+
+// Tests of the ranged receive (the range engine's per-range receive), driven by a small fake.
+#[cfg(all(test, not(feature = "gcs-community")))]
+#[path = "gcs_range_into_tests.rs"]
+mod range_into_tests;
 
 // Tests of the real HTTP opener against a local HTTP server (generation, range, size facts).
 #[cfg(all(test, not(feature = "gcs-community")))]

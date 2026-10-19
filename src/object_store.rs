@@ -620,8 +620,18 @@ pub trait ObjectStore: Send + Sync {
             crate::checksum::verify_crc32c(&data, expected, checkpoint_uri)?;
         }
 
-        // Convert Bytes to Vec<u8> for backward compatibility
-        Ok(data.to_vec())
+        // This public trait method has returned `Vec<u8>` since it was introduced and
+        // `ObjectStore` is implemented outside this crate (and by `LoggedObjectStore` and
+        // several test doubles), so the return type cannot change without breaking every
+        // implementor (RULE #1 exception: an API that returns an owned `Vec<u8>` for
+        // compatibility). `Vec::from(Bytes)` takes the allocation over WITHOUT a copy whenever
+        // the `Bytes` is the sole owner of a `Vec`-backed buffer, which is what every store's
+        // `get` returns. When that `Bytes` has been sliced from the front (a nonzero offset) the
+        // data is moved to the start of the same allocation with one in-place `memmove` (still
+        // one pass over the payload, but no second allocation); only a shared or non-`Vec`
+        // buffer is copied into a new `Vec`. A caller that must never copy calls
+        // `get_with_validation`, which returns the `Bytes` itself.
+        Ok(Vec::from(data))
     }
 
     /// `true` only when this store's [`ObjectStore::copy`] is a NATIVE operation of the
@@ -1101,6 +1111,13 @@ pub trait ObjectWriter: Send + Sync {
 
     /// Write owned bytes for zero-copy optimization.
     /// Takes ownership of the data to avoid copying.
+    ///
+    /// The default implementation calls [`ObjectWriter::write_chunk`] with a borrow, which
+    /// copies into whatever the writer accumulates. Writers that buffer the whole object
+    /// (`BufferedObjectWriter`, the S3, Azure and GCS buffered writers) override it: into an
+    /// empty, uncompressed writer the `Vec` is MOVED in (no copy at all); once the writer
+    /// already holds data, `data` is appended to it (one copy, the accumulation copy that the
+    /// whole-object buffering design requires; it is not redesigned in this release).
     async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
         // Default implementation: convert to slice and call write_chunk
         self.write_chunk(&data).await
@@ -1146,6 +1163,22 @@ pub trait ObjectWriter: Send + Sync {
     }
 }
 
+/// Add an owned chunk to a writer's accumulation buffer (see [`ObjectWriter::write_owned_bytes`]).
+///
+/// An empty buffer ADOPTS `data`: the allocation is moved, nothing is copied, and the writer's
+/// final `put` hands that same allocation to the store. A buffer that already holds data must
+/// append: the whole-object buffered writers keep ONE contiguous allocation, so the second and
+/// later chunks are copied into it. That accumulation copy is unavoidable without a rope-shaped
+/// buffer, a redesign the maintainer deferred; callers who want none pass the whole object in a
+/// single `write_owned_bytes`, or use `put` / the multipart writers.
+fn adopt_owned_chunk(buffer: &mut Vec<u8>, data: Vec<u8>) {
+    if buffer.is_empty() {
+        *buffer = data;
+    } else {
+        buffer.extend_from_slice(&data);
+    }
+}
+
 /// Default buffered implementation that collects chunks and calls put()
 pub struct BufferedObjectWriter<'a> {
     uri: String,
@@ -1175,9 +1208,21 @@ impl<'a> ObjectWriter for BufferedObjectWriter<'a> {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
+        // Accumulation copy of a BORROWED chunk into the writer's single buffer: unavoidable
+        // (the caller keeps its slice); `write_owned_bytes` moves an owned Vec in instead.
         self.buffer.extend_from_slice(chunk);
         self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
+        Ok(())
+    }
+
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.hasher.update(&data);
+        self.bytes_written += data.len() as u64;
+        adopt_owned_chunk(&mut self.buffer, data);
         Ok(())
     }
 
@@ -1186,6 +1231,7 @@ impl<'a> ObjectWriter for BufferedObjectWriter<'a> {
             return Ok(());
         }
         self.finalized = true;
+        // `Bytes::from(Vec)` moves the allocation: the store receives the writer's buffer.
         self.store
             .put(&self.uri, Bytes::from(std::mem::take(&mut self.buffer)))
             .await
@@ -1605,12 +1651,10 @@ impl ObjectStore for S3ObjectStore {
                     .send()
                     .await
                     .sdk_context(format!("S3 GET failed for '{}'", uri))?;
-                let data = resp
-                    .body
-                    .collect()
+                // One pre-sized buffer, one chunk-to-destination copy (stage G, R2).
+                crate::s3_utils::receive_get_output_body(resp)
                     .await
-                    .context("Failed to read S3 GET response body")?;
-                Ok::<_, anyhow::Error>(data.into_bytes())
+                    .context("Failed to read S3 GET response body")
             })
             .await?;
             return Ok(data);
@@ -1677,12 +1721,10 @@ impl ObjectStore for S3ObjectStore {
                     .send()
                     .await
                     .sdk_context(format!("S3 range GET failed for '{}'", uri))?;
-                let data = resp
-                    .body
-                    .collect()
+                // One pre-sized buffer, one chunk-to-destination copy (stage G, R2).
+                crate::s3_utils::receive_get_output_body(resp)
                     .await
-                    .context("Failed to read S3 range GET response body")?;
-                Ok::<_, anyhow::Error>(data.into_bytes())
+                    .context("Failed to read S3 range GET response body")
             })
             .await?;
             return Ok(data);
@@ -2375,6 +2417,14 @@ impl S3BufferedWriter {
         self.compressed_bytes = self.buffer.len() as u64;
         Ok(())
     }
+
+    /// Close the compression frame and hand the accumulated buffer over as `Bytes`: the
+    /// `Vec`'s allocation becomes the `Bytes` with no copy, so the store receives the very
+    /// buffer the writer accumulated.
+    fn take_payload(&mut self) -> Result<Bytes> {
+        self.seal_compression()?;
+        Ok(Bytes::from(std::mem::take(&mut self.buffer)))
+    }
 }
 
 #[async_trait]
@@ -2394,10 +2444,27 @@ impl ObjectWriter for S3BufferedWriter {
             let compressed = compressor.get_mut();
             self.buffer.append(compressed);
         } else {
-            // No compression - direct to buffer
+            // No compression - direct to buffer. Accumulation copy of a BORROWED chunk into
+            // the writer's single buffer: unavoidable (the caller keeps its slice). Whole-
+            // object buffering is not redesigned in this release; `write_owned_bytes` moves an
+            // owned Vec in without a copy while the buffer is empty.
             self.buffer.extend_from_slice(chunk);
         }
 
+        Ok(())
+    }
+
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if self.compressor.is_some() {
+            // Compression is a transform: the input is read, never kept.
+            return self.write_chunk(&data).await;
+        }
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.hasher.update(&data);
+        self.bytes_written += data.len() as u64;
+        adopt_owned_chunk(&mut self.buffer, data);
         Ok(())
     }
 
@@ -2407,7 +2474,7 @@ impl ObjectWriter for S3BufferedWriter {
         }
         self.finalized = true;
 
-        self.seal_compression()?;
+        let payload = self.take_payload()?;
 
         // Append compression extension if needed
         let final_uri = self.compression.stored_name(&self.uri);
@@ -2420,19 +2487,14 @@ impl ObjectWriter for S3BufferedWriter {
                 &target.client,
                 &target.bucket,
                 &key,
-                Bytes::from(std::mem::take(&mut self.buffer)),
+                payload,
                 None,
             )
             .await;
         }
 
         // Use S3 multipart upload for the buffered data
-        s3_put_object_multipart_uri_async(
-            &final_uri,
-            Bytes::from(std::mem::take(&mut self.buffer)),
-            None,
-        )
-        .await
+        s3_put_object_multipart_uri_async(&final_uri, payload, None).await
     }
 
     fn bytes_written(&self) -> u64 {
@@ -2514,28 +2576,33 @@ fn gcs_size_key(uri: &str) -> String {
         .unwrap_or_else(|_| uri.to_string())
 }
 
-/// Run the s3dlio RangeEngine for `object_size` bytes.
+/// Run the s3dlio RangeEngine for `object_size` bytes, every range received straight into its
+/// own window of ONE master buffer (stage G, R3): no per-range `Bytes` and no copy into the
+/// master afterwards.
 ///
-/// The engine plans its ranges from `object_size` and treats any short or over read as an
-/// error. When `guarded` (the size came from a cache and may be stale) the LAST range asks for
-/// one byte more than planned, so a blob that has grown makes that range an over read, and one
-/// that has shrunk a short read or a range error: the caller sees an error instead of a silently
-/// truncated body, at no extra request. An unchanged blob returns exactly the planned bytes.
+/// `fill(offset, window)` fills `window` and returns it with the number of bytes written (see
+/// [`RangeEngine::download_into_master`]). The engine plans its ranges from `object_size` and
+/// treats any short or over read as an error. When `guarded` (the size came from a cache and may
+/// be stale) the engine's tail probe applies: the LAST window is one byte longer than the range,
+/// so a blob that has grown fills the probe byte and is refused as an over read, and one that
+/// has shrunk answers fewer bytes (or a range error): the caller sees an error instead of a
+/// silently truncated body, at no extra request. An unchanged blob returns exactly the planned
+/// bytes (the service clamps the range to its end).
 ///
 /// An object below `min_split_size` is one request, and the engine holds that request to the
 /// same exact length. A CACHED size of 0 is an error too (the engine would return empty without
 /// any request): the caller's fresh-size retry settles it, and a size just learned from the
 /// service (`guarded == false`) stays a legitimate empty read.
 #[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
-async fn range_engine_download<F, Fut>(
+async fn range_engine_download_into<F, Fut>(
     config: RangeEngineConfig,
     object_size: u64,
     guarded: bool,
-    get_range: F,
+    fill: F,
 ) -> Result<(Bytes, crate::range_engine_generic::RangeDownloadStats)>
 where
-    F: Fn(u64, u64) -> Fut + Send + Sync + Clone + 'static,
-    Fut: std::future::Future<Output = Result<Bytes>> + Send,
+    F: Fn(u64, bytes::BytesMut) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Result<(bytes::BytesMut, usize)>> + Send,
 {
     // The engine reads a zero size as an empty object WITHOUT a request. That is right for a size
     // just learned from the service, but a cached zero may be stale (the object may have grown),
@@ -2544,16 +2611,44 @@ where
     if guarded && object_size == 0 {
         bail!("cached object size 0 cannot be verified without a request; refresh the size");
     }
-    let engine = RangeEngine::new(config);
-    let get_range = move |offset: u64, length: u64| {
-        let ask = if guarded && offset.checked_add(length) == Some(object_size) {
-            length.saturating_add(1)
-        } else {
-            length
-        };
-        get_range(offset, ask)
-    };
-    engine.download(object_size, get_range, None).await
+    RangeEngine::new(config)
+        .download_into_master(object_size, guarded, fill, None)
+        .await
+}
+
+/// The future a range filler returns: the window it was given and the count of bytes written.
+#[cfg(any(all(feature = "backend-gcs", feature = "gcs-community"), test))]
+type RangeFillFuture =
+    Pin<Box<dyn std::future::Future<Output = Result<(bytes::BytesMut, usize)>> + Send>>;
+
+/// A range filler for a source that can only return each range as `Bytes` (the community GCS
+/// client, which has no receive-into-a-buffer loop): the range is fetched with `get_range` and
+/// copied into its window. That copy (the provider's `Bytes` into the master) is the documented
+/// remaining copy of that client; the official GCS client and Azure receive into the window.
+///
+/// The count returned is the number of bytes the source returned. A source that returns FEWER
+/// than the window leaves the rest of the window untouched, and one that returns MORE than the
+/// window is not copied at all; both are for the range engine to refuse (it checks the count).
+#[cfg(any(all(feature = "backend-gcs", feature = "gcs-community"), test))]
+fn fill_from_get_range<G, Fut>(
+    get_range: G,
+) -> impl Fn(u64, bytes::BytesMut) -> RangeFillFuture + Send + Sync + Clone + 'static
+where
+    G: Fn(u64, u64) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Result<Bytes>> + Send + 'static,
+{
+    move |offset: u64, mut window: bytes::BytesMut| {
+        let fetched = get_range(offset, window.len() as u64);
+        Box::pin(async move {
+            let bytes = fetched.await?;
+            let n = bytes.len();
+            if let Some(head) = window.get_mut(..n) {
+                // Documented copy: the community client returns an owned `Bytes` per range.
+                head.copy_from_slice(&bytes);
+            }
+            Ok((window, n))
+        })
+    }
 }
 
 /// Split an Azure URI into `(account, container, key)`.
@@ -2966,6 +3061,30 @@ impl AzureObjectStore {
         Ok((cli, key))
     }
 
+    /// Read the bytes `offset..offset + dst.len()` of a blob straight into the caller's buffer
+    /// and return how many were written (stage G, R3).
+    ///
+    /// The count is `dst.len()` unless the range runs past the end of the blob, which Azure
+    /// answers with only the bytes that exist; a range that starts at or past the end is an
+    /// error. Each SDK chunk is copied once, into its place in `dst`. Not a method of the
+    /// [`ObjectStore`] trait: a logging wrapper would otherwise answer `Unsupported` for it.
+    pub async fn get_range_into(
+        &self,
+        uri: &str,
+        offset: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+    ) -> Result<usize> {
+        let (cli, key) = Self::client_for_object(uri, "GET")?;
+        debug!(
+            "AzureObjectStore::get_range_into uri='{}', offset={}, len={}",
+            uri,
+            offset,
+            dst.len()
+        );
+        cli.get_range_into(&key, offset, dst, progress).await
+    }
+
     /// Download using RangeEngine for concurrent range requests
     ///
     /// This method uses the generic RangeEngine to split large Azure blobs into
@@ -2977,28 +3096,38 @@ impl AzureObjectStore {
     /// Concurrent ranges hide per-request latency on large blobs. (An earlier version of this
     /// comment quoted percentage speed-ups; they were never measured and are removed.)
     ///
-    /// `guarded`: the size came from a cache; see [`range_engine_download`].
+    /// `guarded`: the size came from a cache; see [`range_engine_download_into`].
+    ///
+    /// Every range is received straight into its window of one master buffer
+    /// ([`AzureObjectStore::get_range_into`]): the SDK chunk is copied once, into its final
+    /// place, and nothing is copied again when the ranges are joined.
     async fn get_with_range_engine(
         &self,
         uri: &str,
         object_size: u64,
         guarded: bool,
     ) -> Result<Bytes> {
-        // Create closure that captures uri for get_range calls
+        // Create closure that captures uri for the range receives
         let uri_owned = uri.to_string();
         let self_clone = self.clone();
 
-        let get_range_fn = move |offset: u64, length: u64| {
+        let fill = move |offset: u64, mut window: bytes::BytesMut| {
             let uri = uri_owned.clone();
             let store = self_clone.clone();
-            async move { store.get_range(&uri, offset, Some(length)).await }
+            async move {
+                let progress = ReceiveProgress::new();
+                let written = store
+                    .get_range_into(&uri, offset, &mut window[..], &progress)
+                    .await?;
+                Ok((window, written))
+            }
         };
 
-        let (bytes, stats) = range_engine_download(
+        let (bytes, stats) = range_engine_download_into(
             self.config.range_engine.clone(),
             object_size,
             guarded,
-            get_range_fn,
+            fill,
         )
         .await?;
 
@@ -3426,6 +3555,14 @@ impl AzureBufferedWriter {
         self.compressed_bytes = self.buffer.len() as u64;
         Ok(())
     }
+
+    /// Close the compression frame and hand the accumulated buffer over as `Bytes`: the
+    /// `Vec`'s allocation becomes the `Bytes` with no copy, so the store receives the very
+    /// buffer the writer accumulated.
+    fn take_payload(&mut self) -> Result<Bytes> {
+        self.seal_compression()?;
+        Ok(Bytes::from(std::mem::take(&mut self.buffer)))
+    }
 }
 
 #[async_trait]
@@ -3446,10 +3583,27 @@ impl ObjectWriter for AzureBufferedWriter {
             let compressed = compressor.get_mut();
             self.buffer.append(compressed);
         } else {
-            // No compression - direct to buffer
+            // No compression - direct to buffer. Accumulation copy of a BORROWED chunk into
+            // the writer's single buffer: unavoidable (the caller keeps its slice). Whole-
+            // object buffering is not redesigned in this release; `write_owned_bytes` moves an
+            // owned Vec in without a copy while the buffer is empty.
             self.buffer.extend_from_slice(chunk);
         }
 
+        Ok(())
+    }
+
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if self.compressor.is_some() {
+            // Compression is a transform: the input is read, never kept.
+            return self.write_chunk(&data).await;
+        }
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.hasher.update(&data);
+        self.bytes_written += data.len() as u64;
+        adopt_owned_chunk(&mut self.buffer, data);
         Ok(())
     }
 
@@ -3459,15 +3613,16 @@ impl ObjectWriter for AzureBufferedWriter {
         }
         self.finalized = true;
 
-        self.seal_compression()?;
+        let payload = self.take_payload()?;
 
         // Append compression extension if needed
         let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
         let final_key = self.compression.stored_name(&key);
 
         // Use Azure multipart upload for the buffered data
-        cli.put(&final_key, Bytes::from(self.buffer.clone()), true)
-            .await
+        // `Bytes::from(Vec)` takes ownership of the allocation: no copy. (This was
+        // `self.buffer.clone()`, a full duplicate of the object.)
+        cli.put(&final_key, payload, true).await
     }
 
     fn bytes_written(&self) -> u64 {
@@ -3680,34 +3835,83 @@ impl GcsObjectStore {
         Ok(client.clone())
     }
 
+    /// Read the bytes `offset..offset + dst.len()` of an object straight into the caller's
+    /// buffer and return how many were written (stage G, R3), official GCS client only.
+    ///
+    /// The count is `dst.len()` unless the range runs past the end of the object (the service
+    /// clamps it); a range that starts past the end is an error. Each chunk is copied once,
+    /// into its place in `dst`. Not a method of the [`ObjectStore`] trait: a logging wrapper
+    /// would otherwise answer `Unsupported` for it.
+    #[cfg(not(feature = "gcs-community"))]
+    pub async fn get_range_into(
+        &self,
+        uri: &str,
+        offset: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+    ) -> Result<usize> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        if object.is_empty() {
+            return Err(empty_key_error(uri, "GET"));
+        }
+        debug!(
+            "GcsObjectStore::get_range_into uri='{}', offset={}, len={}",
+            uri,
+            offset,
+            dst.len()
+        );
+        let client = self.get_client().await?;
+        client
+            .get_object_range_into(&bucket, &object, offset, dst, progress)
+            .await
+    }
+
     /// Download using RangeEngine for concurrent range requests
     ///
     /// This method uses the generic RangeEngine to split large GCS objects into
     /// concurrent range requests, hiding per-request latency. (An earlier version of this
     /// comment quoted percentage speed-ups; they were never measured and are removed.)
     ///
-    /// `guarded`: the size came from a cache; see [`range_engine_download`].
+    /// `guarded`: the size came from a cache; see [`range_engine_download_into`].
+    ///
+    /// With the official GCS client every range is received straight into its window of one
+    /// master buffer ([`GcsObjectStore::get_range_into`]). The community client has no receive
+    /// loop of that kind; its ranges are copied into their windows (documented at
+    /// `fill_from_get_range`).
     async fn get_with_range_engine(
         &self,
         uri: &str,
         object_size: u64,
         guarded: bool,
     ) -> Result<Bytes> {
-        // Create closure that captures uri for get_range calls
+        // Create closure that captures uri for the range receives
         let uri_owned = uri.to_string();
         let self_clone = self.clone();
 
-        let get_range_fn = move |offset: u64, length: u64| {
+        #[cfg(not(feature = "gcs-community"))]
+        let fill = move |offset: u64, mut window: bytes::BytesMut| {
             let uri = uri_owned.clone();
             let store = self_clone.clone();
-            async move { store.get_range(&uri, offset, Some(length)).await }
+            async move {
+                let progress = ReceiveProgress::new();
+                let written = store
+                    .get_range_into(&uri, offset, &mut window[..], &progress)
+                    .await?;
+                Ok((window, written))
+            }
         };
+        #[cfg(feature = "gcs-community")]
+        let fill = fill_from_get_range(move |offset: u64, length: u64| {
+            let store = self_clone.clone();
+            let uri = uri_owned.clone();
+            async move { store.get_range(&uri, offset, Some(length)).await }
+        });
 
-        let (bytes, stats) = range_engine_download(
+        let (bytes, stats) = range_engine_download_into(
             self.config.range_engine.clone(),
             object_size,
             guarded,
-            get_range_fn,
+            fill,
         )
         .await?;
 
@@ -4137,6 +4341,14 @@ impl GcsBufferedWriter {
         self.compressed_bytes = self.buffer.len() as u64;
         Ok(())
     }
+
+    /// Close the compression frame and hand the accumulated buffer over as `Bytes`: the
+    /// `Vec`'s allocation becomes the `Bytes` with no copy, so the store receives the very
+    /// buffer the writer accumulated.
+    fn take_payload(&mut self) -> Result<Bytes> {
+        self.seal_compression()?;
+        Ok(Bytes::from(std::mem::take(&mut self.buffer)))
+    }
 }
 
 #[async_trait]
@@ -4157,10 +4369,27 @@ impl ObjectWriter for GcsBufferedWriter {
             let compressed = compressor.get_mut();
             self.buffer.append(compressed);
         } else {
-            // No compression - direct to buffer
+            // No compression - direct to buffer. Accumulation copy of a BORROWED chunk into
+            // the writer's single buffer: unavoidable (the caller keeps its slice). Whole-
+            // object buffering is not redesigned in this release; `write_owned_bytes` moves an
+            // owned Vec in without a copy while the buffer is empty.
             self.buffer.extend_from_slice(chunk);
         }
 
+        Ok(())
+    }
+
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        if self.compressor.is_some() {
+            // Compression is a transform: the input is read, never kept.
+            return self.write_chunk(&data).await;
+        }
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.hasher.update(&data);
+        self.bytes_written += data.len() as u64;
+        adopt_owned_chunk(&mut self.buffer, data);
         Ok(())
     }
 
@@ -4170,7 +4399,7 @@ impl ObjectWriter for GcsBufferedWriter {
         }
         self.finalized = true;
 
-        self.seal_compression()?;
+        let payload = self.take_payload()?;
 
         // Append compression extension if needed
         let final_uri = self.compression.stored_name(&self.uri);
@@ -4185,13 +4414,7 @@ impl ObjectWriter for GcsBufferedWriter {
         // names. `Bytes::from(Vec<u8>)` transfers ownership without
         // copying — zero-cost. `std::mem::take` moves the buffer out so
         // the encoder can be dropped too.
-        client
-            .put_object(
-                &bucket,
-                &object,
-                Bytes::from(std::mem::take(&mut self.buffer)),
-            )
-            .await
+        client.put_object(&bucket, &object, payload).await
     }
 
     fn bytes_written(&self) -> u64 {
@@ -6866,5 +7089,135 @@ mod gcs_empty_object_tests {
             store.client.get().is_none(),
             "a client was built for a URI that names no object"
         );
+    }
+}
+
+/// Stage G (RULE #1): the buffered writers hand the buffer they accumulated to the store as the
+/// `Bytes` of that very allocation, and `write_owned_bytes` moved the caller's `Vec` into it.
+#[cfg(test)]
+mod zero_copy_writer_tests {
+    use super::*;
+
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// RED on the pre-fix code: `write_owned_bytes` fell back to `write_chunk(&data)`, which
+    /// copied the Vec into the writer's own buffer, so the `Bytes` pointer differed.
+    #[tokio::test]
+    async fn s3_writer_gives_the_store_the_callers_allocation() {
+        let data = payload(3 << 20);
+        let origin = data.as_ptr();
+        let mut writer = S3BufferedWriter::new("s3://bucket/key".to_string());
+        writer.write_owned_bytes(data).await.expect("write");
+        let bytes = writer.take_payload().expect("payload");
+        assert_eq!(bytes.len(), 3 << 20);
+        assert_eq!(bytes.as_ptr(), origin, "the owned Vec was copied");
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[tokio::test]
+    async fn azure_writer_gives_the_store_the_callers_allocation() {
+        let data = payload(3 << 20);
+        let origin = data.as_ptr();
+        let mut writer = AzureBufferedWriter::new("az://acct/ctr/key".to_string());
+        writer.write_owned_bytes(data).await.expect("write");
+        let bytes = writer.take_payload().expect("payload");
+        assert_eq!(bytes.as_ptr(), origin, "the owned Vec was copied");
+    }
+
+    #[cfg(feature = "backend-gcs")]
+    #[tokio::test]
+    async fn gcs_writer_gives_the_store_the_callers_allocation() {
+        let data = payload(3 << 20);
+        let origin = data.as_ptr();
+        let mut writer = GcsBufferedWriter::new("gs://bucket/key".to_string());
+        writer.write_owned_bytes(data).await.expect("write");
+        let bytes = writer.take_payload().expect("payload");
+        assert_eq!(bytes.as_ptr(), origin, "the owned Vec was copied");
+    }
+
+    /// A second owned chunk is appended (the documented accumulation copy); the data is intact.
+    #[tokio::test]
+    async fn a_second_owned_chunk_is_appended_in_order() {
+        let first = payload(1000);
+        let second: Vec<u8> = payload(500).iter().map(|b| b.wrapping_add(1)).collect();
+        let mut writer = S3BufferedWriter::new("s3://bucket/key".to_string());
+        writer
+            .write_owned_bytes(first.clone())
+            .await
+            .expect("first");
+        writer
+            .write_owned_bytes(second.clone())
+            .await
+            .expect("second");
+        let bytes = writer.take_payload().expect("payload");
+        assert_eq!(&bytes[..1000], &first[..]);
+        assert_eq!(&bytes[1000..], &second[..]);
+    }
+
+    // ---- `fill_from_get_range`: the copy-into-the-window adapter of the community GCS client ----
+
+    use bytes::BytesMut;
+
+    fn source(
+        data: Vec<u8>,
+    ) -> impl Fn(u64, u64) -> std::future::Ready<Result<Bytes>> + Send + Sync + Clone + 'static
+    {
+        move |offset: u64, length: u64| {
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(data.len());
+            let end = start
+                .saturating_add(usize::try_from(length).unwrap_or(usize::MAX))
+                .min(data.len());
+            std::future::ready(Ok(Bytes::copy_from_slice(&data[start..end])))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_range_filler_copies_the_range_into_its_window() {
+        let data = payload(100);
+        let fill = fill_from_get_range(source(data.clone()));
+        let window = BytesMut::zeroed(30);
+        let origin = window.as_ptr();
+        let (window, n) = fill(20, window).await.expect("fill");
+        assert_eq!(n, 30);
+        assert_eq!(&window[..], &data[20..50]);
+        assert_eq!(window.as_ptr(), origin, "the window itself is returned");
+    }
+
+    /// A source that returns fewer bytes than asked (the range ran past the end): only those
+    /// are copied and counted; the rest of the window stays untouched.
+    #[tokio::test]
+    async fn the_range_filler_reports_a_short_read_and_leaves_the_rest_untouched() {
+        let data = payload(100);
+        let fill = fill_from_get_range(source(data.clone()));
+        let (window, n) = fill(95, BytesMut::zeroed(10)).await.expect("fill");
+        assert_eq!(n, 5);
+        assert_eq!(&window[..5], &data[95..]);
+        assert!(window[5..].iter().all(|b| *b == 0));
+    }
+
+    /// A source that returns MORE than the window (a misbehaving service): nothing is copied
+    /// and the larger count is reported for the engine to refuse.
+    #[tokio::test]
+    async fn the_range_filler_reports_an_over_read_without_copying_it() {
+        let data = payload(100);
+        let fill = fill_from_get_range(move |_offset: u64, _length: u64| {
+            std::future::ready(Ok(Bytes::copy_from_slice(&data[..40])))
+        });
+        let (window, n) = fill(0, BytesMut::zeroed(10)).await.expect("fill");
+        assert_eq!(n, 40);
+        assert!(window.iter().all(|b| *b == 0), "nothing may be copied");
+    }
+
+    #[tokio::test]
+    async fn the_range_filler_passes_a_source_error_on() {
+        let fill = fill_from_get_range(|_offset: u64, _length: u64| {
+            std::future::ready(Err::<Bytes, _>(anyhow!("the source failed")))
+        });
+        let err = fill(0, BytesMut::zeroed(4)).await.expect_err("error");
+        assert!(format!("{err:#}").contains("the source failed"));
     }
 }

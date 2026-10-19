@@ -459,16 +459,25 @@ class S3dlioStorage(DataStorage):
         """
         uri = self._make_uri(id)
 
-        # Handle BytesIO objects (from numpy.save, etc.)
-        if hasattr(data, "getvalue"):
+        # Handle BytesIO objects (from numpy.save, etc.). Zero copy (Rule #1): getbuffer() is a
+        # memoryview over the BytesIO's own memory, which put_bytes / the multipart writer
+        # read in place; getvalue() would copy the whole payload into a new bytes object.
+        held = None
+        if hasattr(data, "getbuffer"):
+            held = data.getbuffer()
+            content = held
+        elif hasattr(data, "getvalue"):
             content = data.getvalue()
         elif hasattr(data, "read"):
             if hasattr(data, "seek"):
                 data.seek(0)
+            # A generic stream can only hand its bytes over by reading them: this read() is
+            # the one unavoidable copy (stream -> memory) on this path.
             content = data.read()
         else:
             content = data
 
+        view = None  # derived memoryview of `content`; released in `finally`
         try:
             size = len(content)
             threshold = _multipart_config.multipart_threshold_bytes()
@@ -485,10 +494,15 @@ class S3dlioStorage(DataStorage):
                     abort_on_drop=True,
                 )
                 try:
+                    # Slices of a memoryview are views, not copies (slicing bytes copies).
+                    view = memoryview(content)
+                    if view.ndim != 1 or view.format != "B":
+                        view = view.cast("B")  # a view too: still no copy
+                    total = view.nbytes
                     offset_pos = 0
-                    while offset_pos < size:
-                        n = min(part_size, size - offset_pos)
-                        writer.write(content[offset_pos : offset_pos + n])
+                    while offset_pos < total:
+                        n = min(part_size, total - offset_pos)
+                        writer.write(view[offset_pos : offset_pos + n])
                         offset_pos += n
                     writer.close()
                 except Exception:
@@ -505,6 +519,17 @@ class S3dlioStorage(DataStorage):
         except Exception as e:
             print(f"[s3dlio] Error writing to {uri}: {e}")
             raise
+        finally:
+            # A failed write leaves this frame alive in the traceback, and with it the derived
+            # `view` (and the buffer export it shares with `held`): the caller's `with
+            # io.BytesIO(...)` would then fail in close() with BufferError and mask the real
+            # upload error. Release both explicitly.
+            for export in (view, held):
+                if export is not None:
+                    try:
+                        export.release()
+                    except BufferError:
+                        pass  # still referenced elsewhere: freed when its last user lets go
 
     @dlp.log
     def get_data(self, id, data=None, offset=None, length=None):

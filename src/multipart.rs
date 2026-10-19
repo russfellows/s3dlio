@@ -21,18 +21,18 @@
 // while slots are available.
 
 use anyhow::{bail, Result};
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, SdkBody};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use std::collections::VecDeque;
 
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::constants::{
-    DEFAULT_MULTIPART_BUFFER_CAPACITY, DEFAULT_S3_MULTIPART_PART_SIZE, MAX_MULTIPART_PARTS,
-    MIN_S3_MULTIPART_PART_SIZE,
+    DEFAULT_S3_MULTIPART_PART_SIZE, MAX_MULTIPART_PARTS, MIN_S3_MULTIPART_PART_SIZE,
 };
 
 use std::time::SystemTime;
@@ -120,9 +120,150 @@ pub struct MultipartCompleteInfo {
 // Internal message type sent from Python thread → coordinator task
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Writes smaller than the threshold are COPIED ONCE into the part buffer instead of being
+/// queued as refcounted slices (and, from Python, instead of holding a buffer export per write).
+/// The default ("auto") threshold is `part_size` for a SIGNED upload and
+/// [`UNSIGNED_COALESCE_BELOW`] (2 KiB) for an unsigned one.
+///
+/// Rule #1 allows a single bounded copy when it is MEASURED faster. SIGNED: borrowing a write
+/// smaller than a part does not avoid the copy, because a part is made of several writes and
+/// must be gathered into one body anyway. Benchmark (`python/tests/test_zero_copy_multipart.py`,
+/// `S3DLIO_ZC_BENCH=1`; 16 MiB parts, 128 MiB per case, best of 3, write loop + `close()`,
+/// borrow/copy time): 1.07-1.25 at 1 KiB and below (copy faster), 0.87-1.04 from 2 KiB up
+/// (typically ~0.93: a gain of at most ~7%, about the run-to-run noise). The gain is not worth
+/// the lock and the pinned buffers, so signed uploads keep the part size.
+pub(crate) const COALESCE_AUTO: usize = usize::MAX;
+
+/// The auto threshold of an UNSIGNED upload (`S3DLIO_UNSIGNED_PAYLOAD`): 2 KiB. Unsigned parts
+/// that span writes are sent as multi-chunk bodies with no gather copy (the connector streams
+/// the segments), so borrowing a sub-part write IS zero-copy end to end. Measured (two runs, best
+/// of 3, 16 MiB parts, 128 MiB per case, write loop + `close()`; borrow/copy time): 0.72-0.93
+/// from 2 KiB to 32 KiB (faster), 0.94-1.10 from 64 KiB up (parity), 1.05-1.19 at 1 KiB and
+/// below (slower: per-write bookkeeping dominates). 2 KiB is the lowest size where borrowing was
+/// not slower in both runs. CAVEATS: a multi-chunk body is a streaming body, so reqwest's own
+/// redirect policy cannot replay it on a 307/308 (`S3DLIO_FOLLOW_REDIRECTS` still works); and the
+/// 2 KiB was measured over plain HTTP/1.1 - TLS or h2 may favour larger writes.
+pub(crate) const UNSIGNED_COALESCE_BELOW: usize = 2 * 1024;
+
+static COALESCE_BELOW: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(COALESCE_AUTO);
+
+/// The configured small-write threshold; [`COALESCE_AUTO`] means "the part size".
+pub(crate) fn coalesce_below() -> usize {
+    COALESCE_BELOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The threshold a sink with this part size uses (see [`COALESCE_AUTO`]).
+pub(crate) fn resolve_coalesce_below(part_size: usize, unsigned: bool) -> usize {
+    match coalesce_below() {
+        COALESCE_AUTO if unsigned => UNSIGNED_COALESCE_BELOW,
+        COALESCE_AUTO => part_size,
+        explicit => explicit,
+    }
+}
+
+/// Set the threshold for sinks created AFTER this call (`COALESCE_AUTO` restores the default);
+/// returns the previous value. Test and benchmark hook (hidden Python function
+/// `s3dlio._mpu_coalesce_below`).
+#[cfg(feature = "extension-module")]
+pub(crate) fn set_coalesce_below(bytes: usize) -> usize {
+    COALESCE_BELOW.swap(bytes, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count copied payload bytes in test builds only (proves the copy count in unit tests); expands
+/// to nothing in release code.
+macro_rules! note_copy {
+    ($sink:expr, $n:expr) => {
+        #[cfg(test)]
+        {
+            $sink.copied += $n;
+        }
+    };
+}
+
+/// One part ready for upload: a single contiguous `Bytes`, or - only for an UNSIGNED upload -
+/// the refcounted slices of a part that straddles several writes, sent as one multi-chunk body.
+struct PartData {
+    chunks: Vec<Bytes>,
+    len: usize,
+}
+
+impl PartData {
+    fn new(chunks: Vec<Bytes>) -> Self {
+        let len = chunks.iter().map(Bytes::len).sum();
+        Self { chunks, len }
+    }
+
+    fn single(part: Bytes) -> Self {
+        let len = part.len();
+        Self {
+            chunks: vec![part],
+            len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The request body. One chunk is the ordinary in-memory body (`ByteStream::from(Bytes)`:
+    /// the redirect client's `try_clone()` succeeds, so AIStore 307 redirects on UploadPart are
+    /// followed). Several chunks are a body of KNOWN length (so `Content-Length` is sent, not
+    /// chunked encoding) that yields the slices as they are; it is retryable and clonable, each
+    /// attempt rebuilding the body from the same refcounted slices.
+    fn into_byte_stream(mut self) -> ByteStream {
+        if self.chunks.len() == 1 {
+            if let Some(only) = self.chunks.pop() {
+                return ByteStream::from(only);
+            }
+        }
+        let chunks = self.chunks;
+        let len = self.len as u64;
+        ByteStream::new(SdkBody::retryable(move || {
+            SdkBody::from_body_1_x(ChunkedBody {
+                chunks: chunks.iter().cloned().collect(),
+                remaining: len,
+            })
+        }))
+    }
+}
+
+/// An HTTP body that yields a list of `Bytes` slices without copying them and reports its exact
+/// length.
+struct ChunkedBody {
+    chunks: VecDeque<Bytes>,
+    remaining: u64,
+}
+
+impl http_body::Body for ChunkedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Bytes>, Self::Error>>> {
+        match self.chunks.pop_front() {
+            Some(chunk) => {
+                self.remaining = self.remaining.saturating_sub(chunk.len() as u64);
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+            }
+            None => std::task::Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
+}
+
 enum PartMsg {
     /// A complete part ready for upload. `part_number` is 1-based.
-    Part { data: Bytes, part_number: i32 },
+    Part { data: PartData, part_number: i32 },
     /// Signal the coordinator that all parts have been sent; close the channel.
     Finish,
 }
@@ -145,7 +286,22 @@ pub struct MultipartUploadSink {
     cancel: CancellationToken,
 
     // buffering (same as before — happens before channel send)
-    buf: Vec<u8>,
+    /// Owned input not yet cut into parts: refcounted slices of the callers' data, in order.
+    pending: VecDeque<Bytes>,
+    /// The part buffer being filled by BORROWED input (copied once into it); it logically follows
+    /// `pending`.
+    open: BytesMut,
+    /// Total bytes in `pending` and `open` (always < `part_size` between writes).
+    pending_len: usize,
+    /// Payload signing is off (`S3DLIO_UNSIGNED_PAYLOAD`): parts that straddle writes are sent as
+    /// multi-chunk bodies instead of being gathered, and every part is sent unsigned.
+    unsigned: bool,
+    /// Owned writes smaller than this are copied once into the part buffer (see
+    /// [`COALESCE_AUTO`]); `0` disables the coalescing.
+    coalesce_below: usize,
+    /// Test builds: payload bytes copied by the part assembly.
+    #[cfg(test)]
+    copied: usize,
     next_part_number: i32,
     total_bytes: u64,
     cfg: MultipartUploadConfig,
@@ -263,22 +419,34 @@ impl MultipartUploadSink {
         // (audit #151 f11/f12). Cloned into the coordinator task below.
         let cancel = CancellationToken::new();
 
+        // Latched for the process: payload signing off => unsigned UploadPart bodies, multi-chunk
+        // straddling parts (no gather copy).
+        let unsigned = crate::s3_client::unsigned_payload_enabled();
         // Spawn the coordinator task on the global runtime.
         let coordinator = spawn_on_global_rt(coordinator_task(
             client.clone(),
-            bucket.to_string(),
-            key.to_string(),
-            upload_id.clone(),
+            UploadTarget {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.clone(),
+            },
             resolved_mif,
             part_rx,
             cancel.clone(),
+            unsigned,
         ));
 
         Ok(Self {
             part_tx,
             coordinator: Some(coordinator),
             cancel,
-            buf: Vec::with_capacity(DEFAULT_MULTIPART_BUFFER_CAPACITY),
+            pending: VecDeque::new(),
+            open: BytesMut::new(),
+            pending_len: 0,
+            unsigned,
+            coalesce_below: resolve_coalesce_below(cfg.part_size, unsigned),
+            #[cfg(test)]
+            copied: 0,
             next_part_number: 1,
             total_bytes: 0,
             cfg,
@@ -291,36 +459,244 @@ impl MultipartUploadSink {
         })
     }
 
+    /// Writes smaller than this are copied once into the part buffer (`0`: never).
+    #[cfg(feature = "extension-module")]
+    pub(crate) fn coalesce_below(&self) -> usize {
+        self.coalesce_below
+    }
+
     /// Return the resolved `max_in_flight` (after auto formula, if applicable).
     pub fn max_in_flight(&self) -> usize {
         self.resolved_mif
     }
 
     // ── write paths ──────────────────────────────────────────────────────────
+    //
+    // ZERO-COPY PART ASSEMBLY (Rule #1, stage G W3).
+    //
+    // The stream is held as `pending` (a queue of refcounted slices of OWNED input) followed by
+    // `open` (a part buffer being filled by BORROWED input). `pending_len` counts both and is
+    // below `part_size` between writes.
+    //
+    //   * Owned `Bytes` (or a `Vec`, which becomes `Bytes` without a copy) is queued as slices
+    //     and never copied. A part that lies inside one slice is a zero-copy `split_to`.
+    //   * A part that STRADDLES slices (the tail of one write plus the head of the next) must
+    //     be one contiguous request body for a SIGNED upload, so it is gathered with ONE copy
+    //     of at most `part_size` bytes (the "non-contiguous source that must be gathered"
+    //     exception). When payload signing is off (`S3DLIO_UNSIGNED_PAYLOAD`, see
+    //     `unsigned_payload_enabled`) it is NOT gathered: the part is handed to the uploader as
+    //     the list of slices and sent as a multi-chunk body of known length, zero copies.
+    //   * Borrowed `&[u8]` input cannot outlive the call, so it is copied once, straight into
+    //     the part buffer that will be uploaded (`open`, or a fresh part buffer when the input
+    //     holds whole parts). A borrowed byte is therefore copied exactly once, whatever the
+    //     tail state. (Signed mode only: owned slices queued before a borrowed write are
+    //     gathered once into `open` first, so every byte still has at most one copy.)
+
+    /// Test-only copy accounting: the number of payload bytes the assembly has copied.
+    #[cfg(test)]
+    fn copied_bytes(&self) -> usize {
+        self.copied
+    }
+
+    /// Move the open (borrowed-input) buffer behind the queued slices, as one more slice.
+    fn seal_open(&mut self) {
+        if !self.open.is_empty() {
+            let sealed = self.open.split().freeze();
+            self.pending.push_back(sealed);
+        }
+    }
+
+    /// Queue owned `Bytes` for part assembly. Signed mode only: when an open part buffer is
+    /// filling, the head of `data` that completes it is copied into it (the bounded gather).
+    fn push_owned(&mut self, mut data: Bytes) {
+        if data.is_empty() {
+            return;
+        }
+        self.total_bytes += data.len() as u64;
+        if self.unsigned {
+            // No copy ever: the open buffer becomes one more slice, `data` another.
+            self.seal_open();
+            self.pending_len += data.len();
+            self.pending.push_back(data);
+            return;
+        }
+        if !self.open.is_empty() {
+            let need = self.cfg.part_size.saturating_sub(self.pending_len);
+            let take = need.min(data.len());
+            // Gather copy: bounded by part_size, completes the part buffer being filled.
+            self.open.extend_from_slice(&data[..take]);
+            note_copy!(self, take);
+            self.pending_len += take;
+            data = data.slice(take..);
+            if data.is_empty() {
+                return;
+            }
+            // `open` is now a full part: it goes first, ahead of the rest of `data`.
+            self.seal_open();
+        }
+        self.pending_len += data.len();
+        self.pending.push_back(data);
+    }
+
+    /// Cut the next complete part (`part_size` bytes) off the stream, if there is one.
+    fn next_part(&mut self) -> Result<Option<PartData>> {
+        let part_size = self.cfg.part_size;
+        if self.pending_len < part_size {
+            return Ok(None);
+        }
+        match self.pending.front_mut() {
+            Some(front) if front.len() >= part_size => {
+                let part = front.split_to(part_size);
+                if front.is_empty() {
+                    self.pending.pop_front();
+                }
+                self.pending_len -= part_size;
+                return Ok(Some(PartData::single(part)));
+            }
+            None => {
+                if self.open.len() < part_size {
+                    bail!("internal error: pending length exceeds the buffered bytes");
+                }
+                let part = self.open.split_to(part_size).freeze();
+                self.pending_len -= part_size;
+                return Ok(Some(PartData::single(part)));
+            }
+            Some(_) => {}
+        }
+        // A part that straddles slices.
+        let mut chunks: Vec<Bytes> = Vec::new();
+        let mut left = part_size;
+        while left > 0 {
+            match self.pending.front_mut() {
+                Some(front) if front.len() <= left => {
+                    left -= front.len();
+                    if let Some(whole) = self.pending.pop_front() {
+                        chunks.push(whole);
+                    }
+                }
+                Some(front) => {
+                    chunks.push(front.split_to(left));
+                    left = 0;
+                }
+                None => {
+                    if self.open.len() < left {
+                        bail!("internal error: pending length exceeds the buffered bytes");
+                    }
+                    chunks.push(self.open.split_to(left).freeze());
+                    left = 0;
+                }
+            }
+        }
+        self.pending_len -= part_size;
+        if self.unsigned || chunks.len() == 1 {
+            // Unsigned: sent as a multi-chunk body, no copy.
+            return Ok(Some(PartData::new(chunks)));
+        }
+        // Signed: one contiguous body is required. Gather copy of exactly `part_size` bytes.
+        let mut gathered = BytesMut::with_capacity(part_size);
+        for chunk in &chunks {
+            gathered.extend_from_slice(chunk);
+        }
+        note_copy!(self, part_size);
+        Ok(Some(PartData::single(gathered.freeze())))
+    }
+
+    /// Take everything still pending as the final (possibly short) part.
+    fn take_tail(&mut self) -> Option<PartData> {
+        if self.pending_len == 0 {
+            return None;
+        }
+        self.pending_len = 0;
+        let mut chunks: Vec<Bytes> = self.pending.drain(..).collect();
+        if !self.open.is_empty() {
+            chunks.push(self.open.split().freeze());
+        }
+        if chunks.len() > 1 && !self.unsigned {
+            // Signed: one contiguous body is required; the tail is shorter than a part.
+            let total: usize = chunks.iter().map(Bytes::len).sum();
+            let mut gathered = BytesMut::with_capacity(total);
+            for chunk in &chunks {
+                gathered.extend_from_slice(chunk);
+            }
+            note_copy!(self, total);
+            return Some(PartData::single(gathered.freeze()));
+        }
+        Some(PartData::new(chunks))
+    }
+
+    /// Signed mode, before borrowed input is appended: turn the queued owned slices into the
+    /// open part buffer (one gather copy of bytes shorter than a part), so the borrowed bytes
+    /// can be copied once, straight behind them, into the buffer that will be uploaded.
+    fn gather_queue_into_open(&mut self) {
+        let mut open = BytesMut::with_capacity(self.cfg.part_size);
+        for chunk in self.pending.drain(..) {
+            open.extend_from_slice(&chunk);
+            note_copy!(self, chunk.len());
+        }
+        open.extend_from_slice(&self.open);
+        self.open = open;
+    }
+
+    /// One step of a borrowed write: copy as much of `rest` as completes (or extends) the
+    /// current part, advance `rest`, and return the part if one is now complete. `Ok(None)`
+    /// means nothing more is ready and `rest` is fully absorbed.
+    fn step_borrowed(&mut self, rest: &mut &[u8]) -> Result<Option<PartData>> {
+        // A part left complete by an earlier failed enqueue goes first (in order).
+        if let Some(part) = self.next_part()? {
+            return Ok(Some(part));
+        }
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        let part_size = self.cfg.part_size;
+        if !self.unsigned && !self.pending.is_empty() {
+            self.gather_queue_into_open();
+        }
+        if self.pending_len == 0 && rest.len() >= part_size {
+            // Whole part straight from the borrowed slice: one copy, into the upload buffer.
+            let (head, tail) = rest.split_at(part_size);
+            let mut part = BytesMut::with_capacity(part_size);
+            part.extend_from_slice(head);
+            note_copy!(self, part_size);
+            *rest = tail;
+            self.total_bytes += part_size as u64;
+            return Ok(Some(PartData::single(part.freeze())));
+        }
+        let need = part_size.saturating_sub(self.pending_len);
+        let take = need.min(rest.len());
+        if self.open.is_empty() && self.open.capacity() < need {
+            self.open = BytesMut::with_capacity(need);
+        } else if self.open.capacity() - self.open.len() < take {
+            self.open.reserve(take);
+        }
+        let (head, tail) = rest.split_at(take);
+        self.open.extend_from_slice(head);
+        note_copy!(self, take);
+        self.pending_len += take;
+        self.total_bytes += take as u64;
+        *rest = tail;
+        self.next_part()
+    }
 
     /// Blocking write from a borrowed slice.
+    ///
+    /// `data` cannot outlive this call, so it must be copied: each byte exactly ONCE, straight
+    /// into the part buffer that is uploaded (also when it completes a buffered tail). Callers
+    /// that own their data should use [`write_bytes_blocking`](Self::write_bytes_blocking) or
+    /// [`write_owned_blocking`](Self::write_owned_blocking), which never copy it.
     pub fn write_blocking(&mut self, data: &[u8]) -> Result<()> {
-        if self.buf.is_empty() && data.len() >= self.cfg.part_size {
-            let mut offset = 0usize;
-            while data.len() - offset >= self.cfg.part_size {
-                let end = offset + self.cfg.part_size;
-                let chunk = Bytes::copy_from_slice(&data[offset..end]);
-                offset = end;
-                self.enqueue_part(chunk)?;
-            }
-            if offset < data.len() {
-                self.buf.extend_from_slice(&data[offset..]);
-            }
-            self.total_bytes += data.len() as u64;
-            return Ok(());
+        let mut rest = data;
+        while let Some(part) = self.step_borrowed(&mut rest)? {
+            self.enqueue_part(part)?;
         }
+        Ok(())
+    }
 
-        self.buf.extend_from_slice(data);
-        self.total_bytes += data.len() as u64;
-        while self.buf.len() >= self.cfg.part_size {
-            let chunk = Bytes::copy_from_slice(&self.buf[..self.cfg.part_size]);
-            self.buf.drain(..self.cfg.part_size);
-            self.enqueue_part(chunk)?;
+    /// Async variant of [`write_blocking`](Self::write_blocking).
+    async fn write_borrowed_async(&mut self, data: &[u8]) -> Result<()> {
+        let mut rest = data;
+        while let Some(part) = self.step_borrowed(&mut rest)? {
+            self.enqueue_part_async(part).await?;
         }
         Ok(())
     }
@@ -330,94 +706,51 @@ impl MultipartUploadSink {
     /// Uses `part_tx.send().await` so the task yields instead of parking an OS
     /// thread when the channel is full.  The Python hot-path uses
     /// `write_blocking()` which is unchanged.
+    ///
+    /// The `Vec` is turned into `Bytes` without a copy and sliced into parts (see
+    /// [`write_bytes`](Self::write_bytes)).
     #[cfg_attr(feature = "profiling", instrument(
         name = "mpu.write",
         skip(self, data),
         fields(data_len = data.len())
     ))]
     pub async fn write(&mut self, data: Vec<u8>) -> Result<()> {
-        let data_len = data.len();
-        if self.buf.is_empty() && data_len >= self.cfg.part_size {
-            let bytes = Bytes::from(data);
-            let mut offset = 0usize;
-            while bytes.len() - offset >= self.cfg.part_size {
-                let end = offset + self.cfg.part_size;
-                let chunk = bytes.slice(offset..end);
-                offset = end;
-                self.enqueue_part_async(chunk).await?;
-            }
-            if offset < bytes.len() {
-                self.buf.extend_from_slice(&bytes[offset..]);
-            }
-            self.total_bytes += data_len as u64;
-            return Ok(());
+        self.write_bytes(Bytes::from(data)).await
+    }
+
+    /// Async zero-copy write of owned `Bytes`: the data is sliced into parts, never copied
+    /// (apart from the bounded gather of a part that straddles two writes in a SIGNED upload).
+    pub async fn write_bytes(&mut self, data: Bytes) -> Result<()> {
+        if data.len() < self.coalesce_below {
+            return self.write_borrowed_async(&data).await;
         }
-        self.buf.extend_from_slice(&data);
-        self.total_bytes += data_len as u64;
-        while self.buf.len() >= self.cfg.part_size {
-            let chunk = Bytes::copy_from_slice(&self.buf[..self.cfg.part_size]);
-            self.buf.drain(..self.cfg.part_size);
-            self.enqueue_part_async(chunk).await?;
+        self.push_owned(data);
+        while let Some(part) = self.next_part()? {
+            self.enqueue_part_async(part).await?;
         }
         Ok(())
     }
 
     /// True zero-copy blocking write: accepts already-owned Bytes (e.g. from BytesView Arc clone).
-    /// No memcpy at all — just slices the shared Arc into part-sized chunks.
+    /// No memcpy of the payload: the shared allocation is sliced into part-sized chunks. Only a
+    /// part that straddles this write and a previously buffered tail is gathered, with one copy
+    /// of at most `part_size` bytes, and only when payload signing is on (unsigned uploads send
+    /// such a part as a multi-chunk body instead).
     pub fn write_bytes_blocking(&mut self, data: Bytes) -> Result<()> {
-        let data_len = data.len() as u64;
-
-        if self.buf.is_empty() && data.len() >= self.cfg.part_size {
-            let mut offset = 0usize;
-            while data.len() - offset >= self.cfg.part_size {
-                let end = offset + self.cfg.part_size;
-                let chunk = data.slice(offset..end); // zero-copy Arc slice
-                offset = end;
-                self.enqueue_part(chunk)?;
-            }
-            if offset < data.len() {
-                self.buf.extend_from_slice(&data[offset..]);
-            }
-        } else {
-            self.buf.extend_from_slice(&data);
-            while self.buf.len() >= self.cfg.part_size {
-                let chunk = Bytes::copy_from_slice(&self.buf[..self.cfg.part_size]);
-                self.buf.drain(..self.cfg.part_size);
-                self.enqueue_part(chunk)?;
-            }
+        if data.len() < self.coalesce_below {
+            // Small write: one bounded copy into the part buffer (see `COALESCE_AUTO`).
+            return self.write_blocking(&data);
         }
-
-        self.total_bytes += data_len;
+        self.push_owned(data);
+        while let Some(part) = self.next_part()? {
+            self.enqueue_part(part)?;
+        }
         Ok(())
     }
 
-    /// Zero-copy blocking write: accepts an owned Vec, converts to Bytes.
+    /// Zero-copy blocking write: accepts an owned Vec, converts to Bytes (no copy).
     pub fn write_owned_blocking(&mut self, data: Vec<u8>) -> Result<()> {
-        let data_len = data.len() as u64;
-
-        if self.buf.is_empty() && data.len() >= self.cfg.part_size {
-            let bytes = Bytes::from(data);
-            let mut offset = 0usize;
-            while bytes.len() - offset >= self.cfg.part_size {
-                let end = offset + self.cfg.part_size;
-                let chunk = bytes.slice(offset..end); // zero-copy slice
-                offset = end;
-                self.enqueue_part(chunk)?;
-            }
-            if offset < bytes.len() {
-                self.buf.extend_from_slice(&bytes[offset..]);
-            }
-        } else {
-            self.buf.extend_from_slice(&data);
-            while self.buf.len() >= self.cfg.part_size {
-                let chunk = Bytes::copy_from_slice(&self.buf[..self.cfg.part_size]);
-                self.buf.drain(..self.cfg.part_size);
-                self.enqueue_part(chunk)?;
-            }
-        }
-
-        self.total_bytes += data_len;
-        Ok(())
+        self.write_bytes_blocking(Bytes::from(data))
     }
 
     /// Async version of `write_owned_blocking` — safe to call from a Tokio async task.
@@ -427,8 +760,7 @@ impl MultipartUploadSink {
 
     /// Flush any buffered data as a (possibly short) part.
     pub fn flush_blocking(&mut self) -> Result<()> {
-        if !self.buf.is_empty() {
-            let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        if let Some(chunk) = self.take_tail() {
             self.enqueue_part(chunk)?;
         }
         Ok(())
@@ -436,8 +768,7 @@ impl MultipartUploadSink {
 
     /// Async flush — safe to call from a Tokio async task.
     pub async fn flush(&mut self) -> Result<()> {
-        if !self.buf.is_empty() {
-            let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        if let Some(chunk) = self.take_tail() {
             self.enqueue_part_async(chunk).await?;
         }
         Ok(())
@@ -452,8 +783,7 @@ impl MultipartUploadSink {
         if self.finished {
             bail!("finish() called more than once");
         }
-        if !self.buf.is_empty() {
-            let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        if let Some(chunk) = self.take_tail() {
             self.enqueue_part_async(chunk).await?;
         }
         self.part_tx
@@ -479,8 +809,7 @@ impl MultipartUploadSink {
         }
 
         // Flush tail
-        if !self.buf.is_empty() {
-            let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        if let Some(chunk) = self.take_tail() {
             self.enqueue_part(chunk)?;
         }
 
@@ -586,7 +915,7 @@ impl MultipartUploadSink {
     ///
     /// **Must only be called from non-Tokio threads** (e.g. Python threads).
     /// Use `enqueue_part_async` from async Tokio tasks.
-    fn enqueue_part(&mut self, data: Bytes) -> Result<()> {
+    fn enqueue_part(&mut self, data: PartData) -> Result<()> {
         let part_number = self.next_part_number;
         if part_number as usize > MAX_MULTIPART_PARTS {
             bail!(
@@ -603,7 +932,7 @@ impl MultipartUploadSink {
     }
 
     /// Async variant of `enqueue_part` — safe to call from a Tokio async task.
-    async fn enqueue_part_async(&mut self, data: Bytes) -> Result<()> {
+    async fn enqueue_part_async(&mut self, data: PartData) -> Result<()> {
         let part_number = self.next_part_number;
         if part_number as usize > MAX_MULTIPART_PARTS {
             bail!(
@@ -625,6 +954,13 @@ impl MultipartUploadSink {
 // Coordinator task (runs entirely on Tokio runtime)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Where one multipart upload goes.
+struct UploadTarget {
+    bucket: String,
+    key: String,
+    upload_id: String,
+}
+
 /// Background task that owns all async S3 work for one multipart upload.
 ///
 /// Receives parts from the bounded channel, acquires semaphore permits
@@ -632,13 +968,17 @@ impl MultipartUploadSink {
 /// UploadPart tasks, collects ETags, and finally calls CompleteMultipartUpload.
 async fn coordinator_task(
     client: Client,
-    bucket: String,
-    key: String,
-    upload_id: String,
+    target: UploadTarget,
     max_in_flight: usize,
     mut part_rx: mpsc::Receiver<PartMsg>,
     cancel: CancellationToken,
+    unsigned: bool,
 ) -> Result<MultipartCompleteInfo> {
+    let UploadTarget {
+        bucket,
+        key,
+        upload_id,
+    } = target;
     let sem = std::sync::Arc::new(Semaphore::new(max_in_flight));
     let started_at = SystemTime::now();
     let mut total_bytes: u64 = 0;
@@ -685,12 +1025,19 @@ async fn coordinator_task(
         );
 
         // Acquire a semaphore permit ASYNCHRONOUSLY.
-        // This never parks the Python caller thread.
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow::anyhow!("semaphore closed"))?;
+        // This never parks the Python caller thread. Raced against cancellation so an
+        // abort() / drop is honoured promptly even while every upload slot is busy (the part
+        // in hand is dropped, releasing its refcount on the caller's buffer).
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                cancelled = true;
+                break;
+            }
+            p = sem.clone().acquire_owned() => {
+                p.map_err(|_| anyhow::anyhow!("semaphore closed"))?
+            }
+        };
 
         let c = client.clone();
         let b = bucket.clone();
@@ -700,24 +1047,34 @@ async fn coordinator_task(
         let handle = tokio::task::spawn(async move {
             let _permit = permit; // released when task completes
 
-            // ByteStream::from(Bytes) creates an in-memory body; the redirect
-            // client's try_clone() succeeds, so AIStore 307 redirects on
-            // UploadPart are followed correctly.
-            let body = ByteStream::from(data);
+            // A one-chunk part is an in-memory body (`ByteStream::from(Bytes)`: the redirect
+            // client's try_clone() succeeds, so AIStore 307 redirects on UploadPart are
+            // followed correctly); a multi-chunk part (unsigned uploads only) is a retryable
+            // body of known length built from the same slices.
+            let body = data.into_byte_stream();
             // Build the error-context string before moving b/k into the request
             // builder.  Preserves the bucket+key+part_number in the message
             // even when the upload fails with a bare dispatch failure.
             let upload_ctx = format!("UploadPart {} failed for s3://{}/{}", part_number, b, k);
-            let resp = c
+            let request = c
                 .upload_part()
                 .bucket(&b)
                 .key(&k)
                 .upload_id(uid)
                 .part_number(part_number)
-                .body(body)
-                .send()
-                .await
-                .sdk_context(upload_ctx)?;
+                .body(body);
+            // Payload signing off (S3DLIO_UNSIGNED_PAYLOAD, same as PutObject): no SHA-256
+            // pass over the part, `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
+            let resp = if unsigned {
+                request
+                    .customize()
+                    .disable_payload_signing()
+                    .send()
+                    .await
+                    .sdk_context(upload_ctx)?
+            } else {
+                request.send().await.sdk_context(upload_ctx)?
+            };
 
             let etag = resp.e_tag().unwrap_or_default().to_string();
             if etag.is_empty() {
@@ -735,11 +1092,16 @@ async fn coordinator_task(
 
     if cancelled {
         // Deliberately do NOT join part_tasks or call CompleteMultipartUpload.
-        // Already-spawned UploadPart tasks keep running independently on
-        // this runtime (dropping their JoinHandles here just detaches,
-        // same as before) and either land as harmless uncommitted parts
-        // (cleaned up by AbortMultipartUpload, when it fires) or are left
-        // dangling if the caller opted out via abort_on_drop=false.
+        // Already-spawned UploadPart tasks are ABORTED (not merely detached): the upload is
+        // being discarded, and a running task would keep a refcount on its part's bytes (for
+        // the Python writer, on the caller's borrowed buffer) until its request finished. An
+        // aborted task drops its request future promptly, so `abort()` can hand the buffer
+        // back. Parts that already landed are harmless uncommitted parts (cleaned up by
+        // AbortMultipartUpload, when it fires) or are left dangling if the caller opted out
+        // via abort_on_drop=false.
+        for handle in &part_tasks {
+            handle.abort();
+        }
         debug!(
             "s3dlio MPU: coordinator cancelled before Finish for upload_id={} s3://{}/{} \
              ({} part upload task(s) were in flight and will not be awaited) — \
@@ -1093,5 +1455,464 @@ mod tests {
             info.stored_bytes, info.total_bytes,
             "stored size from HEAD must match bytes written"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zero-copy part assembly (stage G, W2/W3): pointer-identity and copy-count tests
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+impl MultipartUploadSink {
+    /// A sink with no coordinator and no S3 behind it: parts land on the returned receiver
+    /// instead of being uploaded. `part_size` may be below the S3 minimum (tests only).
+    /// `unsigned` selects the unsigned-payload assembly (multi-chunk straddling parts).
+    fn for_test(part_size: usize, unsigned: bool) -> (Self, mpsc::Receiver<PartMsg>) {
+        let (part_tx, part_rx) = mpsc::channel(4096);
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        let sink = Self {
+            part_tx,
+            coordinator: None,
+            cancel: CancellationToken::new(),
+            pending: VecDeque::new(),
+            open: BytesMut::new(),
+            pending_len: 0,
+            unsigned,
+            coalesce_below: 0,
+            copied: 0,
+            next_part_number: 1,
+            total_bytes: 0,
+            cfg: MultipartUploadConfig {
+                part_size,
+                max_in_flight: Some(4096),
+                abort_on_drop: false,
+                content_type: None,
+            },
+            resolved_mif: 4096,
+            upload_id: "test-upload".to_string(),
+            client: Client::from_conf(conf),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            // finished = true: Drop must not try to abort an upload that never existed.
+            finished: true,
+        };
+        (sink, part_rx)
+    }
+}
+
+#[cfg(test)]
+mod zero_copy_tests {
+    use super::*;
+
+    const P: usize = 1000;
+
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<PartMsg>) -> Vec<PartData> {
+        let mut parts = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let PartMsg::Part { data, .. } = msg {
+                parts.push(data);
+            }
+        }
+        parts
+    }
+
+    fn flat(part: &PartData) -> Vec<u8> {
+        part.chunks.iter().flat_map(|c| c.iter().copied()).collect()
+    }
+
+    /// `part` lies entirely inside the allocation of `src`: it is a slice of it, not a copy.
+    fn is_slice_of(part: &Bytes, src: &Bytes) -> bool {
+        let (p, s) = (part.as_ptr() as usize, src.as_ptr() as usize);
+        !part.is_empty() && p >= s && p + part.len() <= s + src.len()
+    }
+
+    fn single(part: &PartData) -> &Bytes {
+        assert_eq!(part.chunks.len(), 1, "a contiguous body was expected");
+        &part.chunks[0]
+    }
+
+    /// Signed upload, owned inputs of 2.5 and 2.7 parts: the straddling part (tail of the first
+    /// write plus head of the second) is the one gather copy (exactly one part); every other part
+    /// must be a slice of its input.
+    #[test]
+    fn bytes_input_is_sliced_even_when_a_tail_is_buffered() {
+        let (mut sink, mut rx) = MultipartUploadSink::for_test(P, false);
+        let a = Bytes::from(pattern(2500, 1));
+        let b = Bytes::from(pattern(2700, 2));
+
+        sink.write_bytes_blocking(a.clone()).unwrap();
+        let first = drain(&mut rx);
+        assert_eq!(first.len(), 2);
+        assert!(is_slice_of(single(&first[0]), &a) && is_slice_of(single(&first[1]), &a));
+        assert_eq!(
+            sink.copied_bytes(),
+            0,
+            "whole parts of an owned write: no copy"
+        );
+
+        sink.write_bytes_blocking(b.clone()).unwrap();
+        let second = drain(&mut rx);
+        assert_eq!(second.len(), 3, "straddling part plus two whole parts of b");
+        let mut straddle = a[2000..].to_vec();
+        straddle.extend_from_slice(&b[..500]);
+        assert_eq!(flat(&second[0]), straddle, "straddling part content");
+        assert!(
+            is_slice_of(single(&second[1]), &b) && is_slice_of(single(&second[2]), &b),
+            "parts that lie inside one input must be slices of it, not copies"
+        );
+        assert_eq!(
+            sink.copied_bytes(),
+            P,
+            "only the straddling part is gathered"
+        );
+
+        // The tail left over is a slice of b as well, and flushes without a copy.
+        sink.flush_blocking().unwrap();
+        let tail = drain(&mut rx);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(flat(&tail[0]), b[2500..].to_vec());
+        assert!(
+            is_slice_of(single(&tail[0]), &b),
+            "a single-chunk tail is not copied"
+        );
+        assert_eq!(sink.copied_bytes(), P);
+    }
+
+    /// Unsigned upload: the same inputs, but the straddling part is NOT gathered. It is the two
+    /// slices, each pointing into its own input, and nothing is copied at all.
+    #[test]
+    fn unsigned_straddling_part_is_a_chunk_list_with_no_copy() {
+        let (mut sink, mut rx) = MultipartUploadSink::for_test(P, true);
+        let a = Bytes::from(pattern(2500, 1));
+        let b = Bytes::from(pattern(2700, 2));
+        sink.write_bytes_blocking(a.clone()).unwrap();
+        sink.write_bytes_blocking(b.clone()).unwrap();
+        let parts = drain(&mut rx);
+        assert_eq!(parts.len(), 5);
+        let straddle = &parts[2];
+        assert_eq!(straddle.chunks.len(), 2, "tail of a + head of b");
+        assert!(
+            is_slice_of(&straddle.chunks[0], &a),
+            "first chunk points into a"
+        );
+        assert!(
+            is_slice_of(&straddle.chunks[1], &b),
+            "second chunk points into b"
+        );
+        assert_eq!(straddle.len(), P);
+        let mut expected = a[2000..].to_vec();
+        expected.extend_from_slice(&b[..500]);
+        assert_eq!(flat(straddle), expected);
+        assert!(is_slice_of(single(&parts[3]), &b) && is_slice_of(single(&parts[4]), &b));
+        assert_eq!(sink.copied_bytes(), 0, "an unsigned upload copies nothing");
+        // The multi-chunk body has a known length (Content-Length, not chunked encoding).
+        let body = straddle.chunks.clone();
+        let stream = PartData::new(body).into_byte_stream();
+        assert_eq!(stream.size_hint(), (P as u64, Some(P as u64)));
+    }
+
+    /// Many small owned writes in an unsigned upload: a part spanning several slices is a list
+    /// of all of them, in order, still without a copy.
+    #[test]
+    fn unsigned_part_spanning_many_small_writes_has_no_copy() {
+        let (mut sink, mut rx) = MultipartUploadSink::for_test(P, true);
+        let inputs: Vec<Bytes> = (0..10).map(|i| Bytes::from(pattern(300, i))).collect();
+        for b in &inputs {
+            sink.write_bytes_blocking(b.clone()).unwrap();
+        }
+        let parts = drain(&mut rx);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(sink.copied_bytes(), 0);
+        let joined: Vec<u8> = parts.iter().flat_map(flat).collect();
+        let want: Vec<u8> = inputs.iter().flat_map(|b| b.iter().copied()).collect();
+        assert_eq!(&joined[..], &want[..3000]);
+        for chunk in parts.iter().flat_map(|p| p.chunks.iter()) {
+            assert!(
+                inputs.iter().any(|b| is_slice_of(chunk, b)),
+                "every chunk is a slice of one of the inputs"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_vec_input_is_sliced_even_when_a_tail_is_buffered() {
+        let (mut sink, mut rx) = MultipartUploadSink::for_test(P, false);
+        let first_vec = pattern(2500, 3);
+        let second_vec = pattern(3200, 4);
+        // Bytes::from(Vec) keeps the Vec's allocation, so the pointer range identifies it.
+        let second_ptr = second_vec.as_ptr() as usize;
+
+        sink.write_owned_blocking(first_vec).unwrap();
+        sink.write_owned_blocking(second_vec).unwrap();
+        let parts = drain(&mut rx);
+        assert_eq!(parts.len(), 5);
+        // part 3 straddles; parts 4 and 5 lie in the second input's own allocation.
+        for p in &parts[3..] {
+            let ptr = single(p).as_ptr() as usize;
+            assert!(
+                ptr >= second_ptr && ptr + p.len() <= second_ptr + 3200,
+                "part must point into the owned Vec's allocation"
+            );
+        }
+    }
+
+    #[test]
+    fn async_write_slices_owned_vec_with_a_tail() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (mut sink, mut rx) = MultipartUploadSink::for_test(P, false);
+        let second = pattern(3200, 6);
+        let second_ptr = second.as_ptr() as usize;
+        rt.block_on(async {
+            sink.write(pattern(2500, 5)).await.unwrap();
+            sink.write(second).await.unwrap();
+        });
+        let parts = drain(&mut rx);
+        assert_eq!(parts.len(), 5);
+        for p in &parts[3..] {
+            let ptr = single(p).as_ptr() as usize;
+            assert!(ptr >= second_ptr && ptr + p.len() <= second_ptr + 3200);
+        }
+    }
+
+    /// Many writes of every kind, in both modes: the whole stream comes out in order, every
+    /// part but the last exactly `part_size`, whatever the split points.
+    #[test]
+    fn many_small_writes_reassemble_exactly() {
+        for unsigned in [false, true] {
+            let (mut sink, mut rx) = MultipartUploadSink::for_test(P, unsigned);
+            let src = pattern(23_457, 9);
+            let mut seed = 12345u64;
+            let mut at = 0usize;
+            while at < src.len() {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let n = (((seed >> 33) as usize) % 2300 + 1).min(src.len() - at);
+                let chunk = Bytes::from(src[at..at + n].to_vec());
+                match (seed >> 20) % 3 {
+                    0 => sink.write_bytes_blocking(chunk).unwrap(),
+                    1 => sink.write_owned_blocking(chunk.to_vec()).unwrap(),
+                    _ => sink.write_blocking(&chunk).unwrap(),
+                }
+                at += n;
+            }
+            sink.flush_blocking().unwrap();
+            let parts = drain(&mut rx);
+            let (last, whole) = parts.split_last().unwrap();
+            assert!(whole.iter().all(|p| p.len() == P), "unsigned={unsigned}");
+            assert!(last.len() != 0 && last.len() <= P);
+            let joined: Vec<u8> = parts.iter().flat_map(flat).collect();
+            assert_eq!(joined, src, "unsigned={unsigned}");
+            assert_eq!(sink.total_bytes, src.len() as u64);
+        }
+    }
+
+    /// The borrowed-slice API cannot keep the caller's memory, so it copies - but each byte
+    /// exactly ONCE, also when a write completes a buffered tail (a borrowed write straddling a
+    /// borrowed tail used to be copied into the tail and then gathered again).
+    #[test]
+    fn borrowed_slice_straddling_a_buffered_tail_is_copied_exactly_once() {
+        for unsigned in [false, true] {
+            let (mut sink, mut rx) = MultipartUploadSink::for_test(P, unsigned);
+            let src = pattern(7_300, 7);
+            sink.write_blocking(&src[..400]).unwrap();
+            assert_eq!(sink.copied_bytes(), 400);
+            sink.write_blocking(&src[400..5_900]).unwrap();
+            sink.write_blocking(&src[5_900..]).unwrap();
+            assert_eq!(
+                sink.copied_bytes(),
+                src.len(),
+                "every borrowed byte is copied exactly once (unsigned={unsigned})"
+            );
+            sink.flush_blocking().unwrap();
+            let parts = drain(&mut rx);
+            assert_eq!(parts.len(), 8);
+            let joined: Vec<u8> = parts.iter().flat_map(flat).collect();
+            assert_eq!(joined, src);
+            // After flush a single-chunk tail is not copied again.
+            assert_eq!(sink.copied_bytes(), src.len());
+        }
+    }
+
+    /// An owned tail followed by a borrowed write (signed): the tail is gathered once, the
+    /// borrowed bytes copied once, so every byte is still copied at most once.
+    #[test]
+    fn owned_tail_then_borrowed_write_copies_each_byte_at_most_once() {
+        let (mut sink, mut rx) = MultipartUploadSink::for_test(P, false);
+        let owned = Bytes::from(pattern(500, 1));
+        let borrowed = pattern(700, 2);
+        sink.write_bytes_blocking(owned.clone()).unwrap();
+        sink.write_blocking(&borrowed).unwrap();
+        assert_eq!(sink.copied_bytes(), 500 + 700);
+        let parts = drain(&mut rx);
+        assert_eq!(parts.len(), 1);
+        let mut want = owned.to_vec();
+        want.extend_from_slice(&borrowed[..500]);
+        assert_eq!(flat(&parts[0]), want);
+    }
+
+    /// A write after a failed enqueue (the coordinator is gone) leaves `pending_len >=
+    /// part_size`; the next write must report the failure, not underflow `part_size -
+    /// pending_len` (a panic in debug builds).
+    #[test]
+    fn a_write_after_a_failed_enqueue_is_an_error_not_an_underflow() {
+        for unsigned in [false, true] {
+            let (mut sink, rx) = MultipartUploadSink::for_test(P, unsigned);
+            drop(rx); // every enqueue now fails
+            let err = sink
+                .write_bytes_blocking(Bytes::from(pattern(2_500, 1)))
+                .unwrap_err();
+            assert!(err.to_string().contains("coordinator"), "{err}");
+            // 1500 bytes are still pending (>= one part). Must not panic.
+            let err = sink.write_blocking(&pattern(10, 2)).unwrap_err();
+            assert!(err.to_string().contains("coordinator"), "{err}");
+            let err = sink
+                .write_bytes_blocking(Bytes::from(pattern(600, 3)))
+                .unwrap_err();
+            assert!(err.to_string().contains("coordinator"), "{err}");
+        }
+    }
+
+    /// Owned writes below the coalescing threshold are copied once into the part buffer (not
+    /// queued as one slice each); bigger writes are still sliced, never copied.
+    #[test]
+    fn small_owned_writes_are_coalesced_with_one_copy_big_ones_are_sliced() {
+        for unsigned in [false, true] {
+            let (mut sink, mut rx) = MultipartUploadSink::for_test(P, unsigned);
+            sink.coalesce_below = 300;
+            let small: Vec<Bytes> = (0..25).map(|i| Bytes::from(pattern(100, i))).collect();
+            for b in &small {
+                sink.write_bytes_blocking(b.clone()).unwrap();
+            }
+            let parts = drain(&mut rx);
+            assert_eq!(parts.len(), 2);
+            assert!(
+                parts.iter().all(|p| p.chunks.len() == 1),
+                "coalesced into contiguous part buffers"
+            );
+            assert_eq!(sink.copied_bytes(), 2_500, "each small byte copied once");
+            let big = Bytes::from(pattern(2 * P, 9));
+            sink.write_bytes_blocking(big.clone()).unwrap();
+            let parts = drain(&mut rx);
+            assert!(!parts.is_empty());
+            let head = if unsigned { 0 } else { 500 };
+            assert_eq!(
+                sink.copied_bytes(),
+                2_500 + head,
+                "only the head that completes the open buffer (signed)"
+            );
+            let last = parts.last().unwrap();
+            assert!(is_slice_of(&last.chunks[0], &big), "big write is sliced");
+        }
+    }
+
+    /// The request body of a straddling (unsigned) part hands the SDK the very slices it was
+    /// built from: collecting it yields segments that point into the original writes.
+    #[test]
+    fn multi_chunk_body_segments_are_the_original_slices() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let a = Bytes::from(pattern(2500, 1));
+        let b = Bytes::from(pattern(2700, 2));
+        let (mut sink, mut rx) = MultipartUploadSink::for_test(P, true);
+        sink.write_bytes_blocking(a.clone()).unwrap();
+        sink.write_bytes_blocking(b.clone()).unwrap();
+        let straddle = drain(&mut rx).remove(2);
+        let segments: Vec<Bytes> = rt
+            .block_on(async { straddle.into_byte_stream().collect().await })
+            .unwrap()
+            .into_segments()
+            .collect();
+        assert_eq!(segments.len(), 2);
+        assert!(is_slice_of(&segments[0], &a), "segment 0 points into a");
+        assert!(is_slice_of(&segments[1], &b), "segment 1 points into b");
+    }
+
+    /// The default small-write threshold is the part size: a write smaller than a part is
+    /// copied once into the part buffer, a write of at least one part is sliced.
+    #[test]
+    fn the_default_coalescing_threshold_is_the_part_size() {
+        assert_eq!(coalesce_below(), COALESCE_AUTO);
+        assert_eq!(resolve_coalesce_below(5 << 20, false), 5 << 20);
+        assert_eq!(resolve_coalesce_below(16 << 20, false), 16 << 20);
+        assert_eq!(
+            resolve_coalesce_below(16 << 20, true),
+            UNSIGNED_COALESCE_BELOW,
+            "unsigned uploads borrow down to a fixed small size"
+        );
+    }
+
+    /// The multi-chunk body yields its slices in order, byte for byte, and can be rebuilt
+    /// (retries) from the same slices.
+    #[test]
+    fn multi_chunk_body_is_exact_and_rebuildable() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let chunks = vec![
+            Bytes::from(pattern(700, 1)),
+            Bytes::from(pattern(1, 2)),
+            Bytes::from(pattern(3000, 3)),
+        ];
+        let want: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        let part = PartData::new(chunks);
+        assert_eq!(part.len(), want.len());
+        let got = rt
+            .block_on(async { part.into_byte_stream().collect().await })
+            .unwrap()
+            .into_bytes();
+        assert_eq!(&got[..], &want[..]);
+    }
+}
+
+#[cfg(all(test, feature = "extension-module"))]
+impl MultipartUploadSink {
+    /// A sink with no coordinator, for the Python writer's unit tests: parts pile up in a
+    /// channel that the returned guard keeps alive. `coalesce_below` is the small-write
+    /// threshold (0 borrows every write).
+    pub(crate) fn for_writer_test(
+        part_size: usize,
+        coalesce_below: usize,
+    ) -> (Self, WriterTestGuard) {
+        let (mut sink, rx) = Self::for_test(part_size, false);
+        sink.coalesce_below = coalesce_below;
+        (sink, WriterTestGuard(rx))
+    }
+}
+
+/// Keeps the parts channel of a [`MultipartUploadSink::for_writer_test`] sink alive and lets a
+/// test look at the parts the writer produced.
+#[cfg(all(test, feature = "extension-module"))]
+pub(crate) struct WriterTestGuard(mpsc::Receiver<PartMsg>);
+
+#[cfg(all(test, feature = "extension-module"))]
+impl WriterTestGuard {
+    /// `(length, allocation capacity)` of every single-chunk part queued so far. A part that is
+    /// a slice of a bigger allocation reports the whole allocation's capacity.
+    pub(crate) fn part_capacities(&mut self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = self.0.try_recv() {
+            if let PartMsg::Part { data, .. } = msg {
+                for chunk in data.chunks {
+                    let len = chunk.len();
+                    match chunk.try_into_mut() {
+                        Ok(owned) => out.push((len, owned.capacity())),
+                        Err(_) => out.push((len, usize::MAX)),
+                    }
+                }
+            }
+        }
+        out
     }
 }

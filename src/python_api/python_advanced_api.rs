@@ -14,12 +14,111 @@ use std::os::raw::c_char;
 
 // Project crates
 use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
-use crate::python_api::put_payload::{hold_for_call, snapshot_for_call};
-use crate::python_api::python_core_api::{py_err, require_max_in_flight, PyBytesView};
+use crate::python_api::put_payload::{
+    drain_pending_exports, put_payload, quiesce_blocking, snapshot_for_call, Latch, PayloadUse,
+};
+use crate::python_api::python_core_api::{
+    py_err, require_max_in_flight, ExportStillReferencedError, PyBytesView,
+};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Multipart upload code
 // ---------------------------------------------------------------------------
+
+/// The buffer exports a `MultipartUploadWriter` still holds on behalf of `write()` (zero-copy
+/// default): `[start, end)` memory ranges, disjoint, each with its completion latch.
+///
+/// Both operations are O(log n) (ordered map keyed by `start`); released entries are removed
+/// lazily - whenever one is found in the way, and in a batch each time the map has doubled since
+/// the last sweep - so the per-write bookkeeping is O(1) amortised, not a scan of the list.
+struct HeldExports {
+    ranges: BTreeMap<usize, HeldRange>,
+    /// Sweep released entries when `ranges` reaches this size.
+    sweep_at: usize,
+}
+
+struct HeldRange {
+    end: usize,
+    latch: Arc<Latch>,
+}
+
+const HELD_SWEEP_MIN: usize = 64;
+
+impl HeldExports {
+    fn new() -> Self {
+        Self {
+            ranges: BTreeMap::new(),
+            sweep_at: HELD_SWEEP_MIN,
+        }
+    }
+
+    /// The start of a held, not yet released range that overlaps `[start, end)`, removing any
+    /// released ranges met on the way.
+    fn find_overlap(&mut self, py: Python<'_>, start: usize, end: usize) -> Option<(usize, usize)> {
+        loop {
+            let candidate = self
+                .ranges
+                .range(..=start)
+                .next_back()
+                .filter(|(_, r)| r.end > start)
+                .or_else(|| self.ranges.range(start..end).next())
+                .map(|(s, r)| (*s, r.end));
+            let (s, e) = candidate?;
+            let released = match self.ranges.get(&s) {
+                Some(r) => {
+                    // A dropped owner sits in the release queue until a thread with the GIL
+                    // drains it; do that before judging the range still held.
+                    if r.latch.is_dropped() {
+                        drain_pending_exports(py);
+                    }
+                    r.latch.is_released()
+                }
+                None => true,
+            };
+            if !released {
+                return Some((s, e));
+            }
+            self.ranges.remove(&s);
+        }
+    }
+
+    /// `Ok` when `[start, end)` overlaps no export the writer still holds; otherwise the
+    /// `BufferError` message.
+    fn check_free(&mut self, py: Python<'_>, start: usize, end: usize) -> Result<(), String> {
+        match self.find_overlap(py, start, end) {
+            None => Ok(()),
+            Some(_) => Err(
+                "buffer reused while still borrowed; pass copy=True or use a fresh buffer \
+                 (this write's memory overlaps an earlier write() that has not been uploaded \
+                 yet)"
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn insert(&mut self, py: Python<'_>, start: usize, end: usize, latch: Arc<Latch>) {
+        if self.ranges.len() >= self.sweep_at {
+            drain_pending_exports(py);
+            self.ranges.retain(|_, r| !r.latch.is_released());
+            self.sweep_at = (self.ranges.len() * 2).max(HELD_SWEEP_MIN);
+        }
+        self.ranges.insert(start, HeldRange { end, latch });
+    }
+
+    fn drain(&mut self) -> Vec<Arc<Latch>> {
+        std::mem::take(&mut self.ranges)
+            .into_values()
+            .map(|r| r.latch)
+            .collect()
+    }
+}
+
 /// Streaming S3 multipart uploader.
 ///
 /// - Fully streaming (no temp files by default)
@@ -58,6 +157,10 @@ pub struct PyMultipartUploadWriter {
     // replaces, and the existing docstring already documents reserve() as
     // requiring a paired commit() call.
     self_pin_while_pending: Option<Py<PyMultipartUploadWriter>>,
+    /// Completion barriers of the borrowed buffer exports behind `write()` (zero-copy default):
+    /// the parts still reference the caller's memory until they are uploaded, so `close()` /
+    /// `abort()` / `__exit__` wait on every latch (bounded) before they return.
+    held: HeldExports,
 }
 
 impl PyMultipartUploadWriter {
@@ -68,6 +171,30 @@ impl PyMultipartUploadWriter {
     fn clear_pending_reservation(&mut self) {
         self.pending_buf = None;
         self.self_pin_while_pending = None;
+    }
+
+    /// Wait until every buffer export borrowed by `write()` has really been released, i.e. no
+    /// upload task or queued part references the caller's memory any more. Bounded by
+    /// `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` per export; on a timeout the buffers stay pinned and
+    /// `ExportStillReferencedError` is returned (the caller raises it in its own stack).
+    /// `outcome` says what the upload itself did, for the message. The sink MUST already be
+    /// dropped or finished: it is what drops the parts that still queue slices of the buffer.
+    fn release_held_exports(&mut self, py: Python<'_>, outcome: &str) -> PyResult<()> {
+        let mut timed_out = false;
+        for latch in self.held.drain() {
+            if quiesce_blocking(py, &latch).is_err() {
+                timed_out = true;
+            }
+        }
+        if timed_out {
+            return Err(ExportStillReferencedError::new_err(format!(
+                "a storage backend still references a buffer passed to write() {:?} after the \
+                 writer finished ({outcome}); the buffer stays pinned - do not modify, resize \
+                 or free it (S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS)",
+                crate::constants::export_quiesce_timeout()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -121,6 +248,7 @@ impl PyMultipartUploadWriter {
             inner: Some(inner),
             pending_buf: None,
             self_pin_while_pending: None,
+            held: HeldExports::new(),
         })
     }
 
@@ -166,18 +294,49 @@ impl PyMultipartUploadWriter {
             inner: Some(inner),
             pending_buf: None,
             self_pin_while_pending: None,
+            held: HeldExports::new(),
         })
     }
 
     /// Write a bytes-like object (bytes, bytearray, memoryview, NumPy buffer).
     ///
-    /// BORROWS the buffer by default: no copy is made by the Python layer (the sink then copies
-    /// it once into its part buffers, because parts are uploaded asynchronously and outlive the
-    /// call), and the GIL is released for the write. While the call runs the buffer is
-    /// exported (resizing it from another thread raises `BufferError`) and NO thread may modify
-    /// its bytes until the call returns: a concurrent write is a data race and the bytes
-    /// uploaded are undefined. The export is released before the call returns. BEHAVIOUR
-    /// CHANGE in 0.9.128: 0.9.126 and earlier copied a mutable buffer under the GIL first.
+    /// ZERO-COPY by default for a large write (threshold below): the buffer is NOT copied.
+    /// Its Python buffer export is held (so it cannot be resized or freed:
+    /// ``bytearray.extend()`` raises ``BufferError``) and the parts are uploaded straight out
+    /// of your memory, asynchronously, after this call returns. The export is kept until every
+    /// part that uses it has been uploaded; ``close()`` / ``abort()`` (and leaving a ``with``
+    /// block) wait for that before returning.
+    ///
+    /// **You must not modify the buffer until ``close()`` (or ``abort()``) has returned.** The
+    /// bytes are read by background upload tasks at any time until then, so changing them is a
+    /// data race and the object contains undefined bytes; allocate a fresh buffer for each
+    /// ``write()`` (or pass ``copy=True``). Reusing a buffer that the writer still holds (the
+    /// ``readinto(buf); write(buf)`` loop) is refused: ``write()`` raises ``BufferError``
+    /// ("buffer reused while still borrowed; pass copy=True or use a fresh buffer") when the
+    /// new buffer overlaps memory of an earlier write that has not been uploaded yet; the
+    /// writer stays usable and can be aborted. If a storage backend still references the buffer
+    /// long after the writer finished (``S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS``, 30 s),
+    /// ``close()``/``abort()`` raise ``s3dlio.ExportStillReferencedError`` and the buffer
+    /// stays pinned: do not modify, resize or free it.
+    ///
+    /// Which writes are borrowed. SIGNED uploads (the default): a write of at least ``part_size``
+    /// bytes is borrowed; a smaller write is copied ONCE into the part buffer and nothing is
+    /// borrowed (no ``BufferError`` lock, the buffer may be reused at once). A part is made of
+    /// several such writes and must be one contiguous request body, so a sub-part write is
+    /// copied into it anyway; borrowing it would not avoid that copy. Measured (16 MiB parts,
+    /// 128 MiB per case, best of 3, write loop + ``close()``, borrow/copy time): 1.07-1.25 at
+    /// 1 KiB and below, 0.87-1.04 from 2 KiB up (typically ~0.93, about the run-to-run noise).
+    /// UNSIGNED uploads (``S3DLIO_UNSIGNED_PAYLOAD``): a part that spans writes is sent as a
+    /// multi-chunk body, so borrowing a sub-part write IS zero-copy end to end; writes of 2 KiB
+    /// or more are borrowed, smaller ones copied. Measured the same way: 0.72-0.93 from 2 KiB
+    /// to 32 KiB, parity (0.94-1.10) from 64 KiB up, 1.05-1.19 at 1 KiB and below.
+    /// Two notes on the unsigned multi-chunk bodies: they are streaming bodies, so reqwest's own
+    /// redirect policy cannot replay one on a 307/308 (``S3DLIO_FOLLOW_REDIRECTS`` still works);
+    /// and the 2 KiB threshold was measured over plain HTTP/1.1, TLS/h2 may favour larger writes.
+    ///
+    /// BEHAVIOUR CHANGE in 0.10.0: the buffer is no longer copied by the writer. It is borrowed
+    /// until ``close()`` / ``abort()`` returns; ``copy=True`` is the explicit independent
+    /// snapshot.
     ///
     /// Args:
     ///     data: bytes-like object (or an object with ``__bytes__()``).
@@ -187,11 +346,15 @@ impl PyMultipartUploadWriter {
     ///         that HOLD the GIL (pure-Python threads); a writer that releases the GIL (large
     ///         NumPy operations, ``readinto``/``recv_into``, CUDA or torch copies) can still tear
     ///         it and must be serialised by the caller. Exact ``bytes`` and ``BytesView`` are
-    ///         immutable and never copied.
+    ///         immutable, shared and never copied by ``write()``.
     ///
-    /// Only a ``BytesView`` takes an owned zero-copy fast path (>= 8 MiB: its shared bytes are
-    /// sliced into parts). Every other buffer is borrowed and the sink copies it once into its
-    /// part buffers. For maximum performance, prefer `reserve()`/`commit()`.
+    /// Data is sliced into parts without copying. The exceptions, each one bounded copy: a
+    /// write below the threshold (above); and, for a SIGNED upload, a part that straddles
+    /// two ``write()`` calls (the unfinished tail of the previous write plus the head of this one),
+    /// which must be one contiguous request body and is gathered with ONE copy of at most
+    /// ``part_size`` bytes. With ``S3DLIO_UNSIGNED_PAYLOAD`` on, a straddling part is sent as a
+    /// multi-chunk body and not copied. Writes that are multiples of ``part_size`` never copy.
+    /// For maximum performance, prefer `reserve()`/`commit()`.
     ///
     /// Returns:
     ///     int: number of bytes accepted.
@@ -206,31 +369,21 @@ impl PyMultipartUploadWriter {
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("writer is closed"))?;
+        let small_below = inner.coalesce_below();
 
-        const OWNED_THRESHOLD: usize = 8 * 1024 * 1024; // 8 MiB
-
-        // 0) Fast path: our own BytesView — Arc clone, NO GIL-held memcpy.
-        //    Caller passes generate_npz_bytes() result directly; 32 concurrent
-        //    uploads can all share the same underlying Arc<[u8]> without any copy.
+        // 0) Our own BytesView: Arc clone, NO copy; the sink copies it once only when it is
+        //    below the small-write threshold.
         if let Ok(bv) = data.extract::<PyRef<PyBytesView>>() {
             let bytes = bv.bytes.clone(); // just atomic refcount++, no data movement
             let len = bytes.len();
-            let res = if len >= OWNED_THRESHOLD {
-                py.detach(|| inner.write_bytes_blocking(bytes))
-            } else {
-                py.detach(|| inner.write_blocking(&bytes))
-            };
-            return res
+            return py
+                .detach(|| inner.write_bytes_blocking(bytes))
                 .map(|_| len)
                 .map_err(|e| py_err(e.context("write failed")));
         }
 
         // 1) Any other bytes-like object (bytes, bytearray, memoryview, NumPy of any dtype, ...):
-        //    the same conversion as put_bytes(). The buffer is read in place, with the GIL
-        //    released, and NOT copied by the Python layer. The sink then copies it once into
-        //    its part buffers: the parts are uploaded asynchronously and outlive this call, so a
-        //    borrowed Python buffer cannot be handed to them without pinning it until they
-        //    finish. Contract: do not modify the buffer from another thread during the call.
+        //    the same strict conversion as put_bytes().
         let not_bytes_like = |e: PyErr| {
             if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
                 pyo3::exceptions::PyTypeError::new_err(format!(
@@ -250,10 +403,49 @@ impl PyMultipartUploadWriter {
                 .map(|_| len)
                 .map_err(|e| py_err(e.context("write failed")));
         }
-        let held = hold_for_call(py, data).map_err(not_bytes_like)?;
-        let len = held.len();
-        let res = py.detach(|| inner.write_blocking(held.as_slice()));
-        held.release(py);
+
+        // Default: BORROW the buffer. `Bytes::from_owner` over the held export lets the sink
+        // slice it into parts and upload them after this call returns; the export is released
+        // when the last part clone is dropped, and `close()`/`abort()` wait for that through
+        // the latch (the same barrier `put_bytes(borrow=True)` uses). Exact `bytes` and other
+        // immutable payloads have no latch: nothing to wait for.
+        let payload = put_payload(py, data, PayloadUse::Borrowed).map_err(not_bytes_like)?;
+        let len = payload.bytes.len();
+        let Some(latch) = payload.latch else {
+            // Immutable payload (exact bytes, empty): nothing to hold.
+            return py
+                .detach(|| inner.write_bytes_blocking(payload.bytes))
+                .map(|_| len)
+                .map_err(|e| py_err(e.context("write failed")));
+        };
+        // Refuse a buffer that overlaps memory the writer still holds (the `readinto(buf);
+        // write(buf)` loop, including its short final chunk): the earlier parts would be
+        // rewritten under the uploader. Checked BEFORE anything is handed to the sink, for
+        // EVERY write - also one below the coalescing threshold - whenever something is held
+        // (an O(log n) lookup; when nothing is held nothing is checked).
+        let start = payload.bytes.as_ptr() as usize;
+        let end = start.saturating_add(len);
+        if !self.held.is_empty() {
+            if let Err(msg) = self.held.check_free(py, start, end) {
+                drop(payload.bytes);
+                drain_pending_exports(py);
+                return Err(pyo3::exceptions::PyBufferError::new_err(msg));
+            }
+        }
+        if len < small_below {
+            // Small write: ONE copy into the part buffer, nothing borrowed. The export is
+            // dropped (queued) and released right here with the GIL token.
+            let res = py.detach(|| inner.write_blocking(&payload.bytes));
+            drop(payload.bytes);
+            drain_pending_exports(py);
+            return res
+                .map(|_| len)
+                .map_err(|e| py_err(e.context("write failed")));
+        }
+        // Large borrowed write (the overlap check above has passed).
+        let res = py.detach(|| inner.write_bytes_blocking(payload.bytes));
+        // Tracked even when the write failed: part slices may already be queued.
+        self.held.insert(py, start, end, latch);
         res.map(|_| len)
             .map_err(|e| py_err(e.context("write failed")))
     }
@@ -358,6 +550,14 @@ impl PyMultipartUploadWriter {
         unsafe {
             buf.set_len(nbytes);
         }
+        // A commit much smaller than the reservation must not pin the whole reserved capacity
+        // for as long as its part is in flight (`Bytes::from(Vec)` keeps the allocation):
+        // shrink it first. This is a realloc of the allocation (the kernel remaps big blocks), not
+        // a copy of the payload. Commits below the small-write threshold are copied once into
+        // the part buffer by the sink, and this buffer is freed.
+        if buf.capacity() > buf.len() {
+            buf.shrink_to_fit();
+        }
         py.detach(|| inner.write_owned_blocking(buf))
             .map_err(|e| py_err(e.context("commit failed")))
     }
@@ -377,6 +577,13 @@ impl PyMultipartUploadWriter {
 
     /// Complete the multipart upload and close the writer.
     ///
+    /// Waits for every part, including parts that read buffers you passed to ``write()``, and
+    /// releases those buffers before it returns. If a storage backend still references one of
+    /// them after ``S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`` (30 s), ``s3dlio.ExportStillReferencedError``
+    /// is raised INSTEAD of the upload result: it takes precedence over an upload failure too,
+    /// which is then only quoted in its message ("the upload itself failed: ..."). The buffers
+    /// stay pinned; do not modify, resize or free them.
+    ///
     /// Returns:
     ///     dict: {
     ///        'etag': str or None,
@@ -395,12 +602,20 @@ impl PyMultipartUploadWriter {
             .inner
             .take()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("writer already closed"))?;
-        let info = py
-            .detach(|| {
-                let mut owned = inner;
-                owned.finish_blocking()
-            })
-            .map_err(|e| py_err(e.context("finish failed")))?;
+        let finished = py.detach(|| {
+            // `owned` (the sink, with any parts it still queues) is dropped before the closure
+            // returns, so no clone of a borrowed buffer survives it except in-flight uploads.
+            let mut owned = inner;
+            owned.finish_blocking()
+        });
+        // Zero-copy writes: wait until no part references the caller's buffers any more, and
+        // release the exports, however the upload ended.
+        let outcome = match &finished {
+            Ok(_) => "the upload itself succeeded".to_string(),
+            Err(e) => format!("the upload itself failed: {e}"),
+        };
+        self.release_held_exports(py, &outcome)?;
+        let info = finished.map_err(|e| py_err(e.context("finish failed")))?;
         let dict = PyDict::new(py);
         // Always set the key, even when there is no etag (info.e_tag is
         // None) -- PyO3 converts Option<String> to None/str automatically.
@@ -428,7 +643,8 @@ impl PyMultipartUploadWriter {
 
     /// Abort the multipart upload and close the writer.
     ///
-    /// Best effort: outstanding tasks are joined and the MPU is aborted.
+    /// Best effort: outstanding upload tasks are cancelled and the MPU is aborted. Buffers
+    /// passed to `write()` are released before this returns (see `write()`).
     /// After abort, the writer is unusable.
     #[pyo3(text_signature = "(self)")]
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -436,11 +652,18 @@ impl PyMultipartUploadWriter {
         // `self_pin_while_pending`'s field doc) — otherwise a reserve()
         // that was never commit()'d would leak the writer permanently.
         self.clear_pending_reservation();
+        let mut aborted: PyResult<()> = Ok(());
         if let Some(mut inner) = self.inner.take() {
-            py.detach(|| inner.abort_blocking())
-                .map_err(|e| py_err(e.context("abort failed")))?;
+            aborted = py
+                .detach(|| inner.abort_blocking())
+                .map_err(|e| py_err(e.context("abort failed")));
+            // Drop the sink (and the parts it still queues) before waiting for the buffers.
+            drop(inner);
         }
-        Ok(())
+        // Zero-copy writes: the in-flight uploads were cancelled; wait until no part references
+        // the caller's buffers any more (bounded) and release the exports.
+        self.release_held_exports(py, "the upload was aborted")?;
+        aborted
     }
 
     /// Context manager enter: returns the writer.
@@ -455,6 +678,11 @@ impl PyMultipartUploadWriter {
     /// the upload is aborted and the original exception is re-raised unchanged.
     /// If no exception occurred, `finish_blocking()` is called; any error it
     /// returns is surfaced as a new `RuntimeError`.
+    ///
+    /// Like ``close()``, it waits for and releases the buffers passed to ``write()``; if that
+    /// wait times out (``S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS``) ``s3dlio.ExportStillReferencedError``
+    /// is raised and takes precedence over both the in-flight exception and an upload failure
+    /// (the upload error is quoted in its message).
     ///
     /// Audit #151 bug 1.4 (C4): both `let _ = ...abort_blocking()` calls
     /// below look like they discard a failure signal, but they don't —
@@ -480,22 +708,41 @@ impl PyMultipartUploadWriter {
         // `self_pin_while_pending`'s field doc) — otherwise a reserve()
         // that was never commit()'d would leak the writer permanently.
         self.clear_pending_reservation();
+        let mut result: PyResult<()> = Ok(());
+        let mut outcome = "the writer was closed".to_string();
         if let Some(mut inner) = self.inner.take() {
             if !_t.bind(py).is_none() {
                 // An exception propagated from inside the `with` block — abort the
                 // upload and let the original exception propagate unchanged.
                 // Safe to discard: see the infallibility note above.
                 let _ = py.detach(|| inner.abort_blocking());
-                return Ok(()); // returning Ok(()) (falsy) does NOT suppress the exception
-            }
-            if let Err(e) = py.detach(|| inner.finish_blocking()) {
+                outcome = "the upload was aborted".to_string();
+            } else if let Err(e) = py.detach(|| inner.finish_blocking()) {
                 // Best-effort cleanup after a failed finish; safe to
                 // discard for the same reason as above.
                 let _ = py.detach(|| inner.abort_blocking());
-                return Err(py_err(e.context("multipart upload failed")));
+                outcome = format!("the upload itself failed: {e}");
+                result = Err(py_err(e.context("multipart upload failed")));
             }
+            // Drop the sink (and the parts it still queues) before waiting for the buffers.
+            drop(inner);
         }
-        Ok(())
+        // Zero-copy writes: no part may reference the caller's buffers when we return. A
+        // timeout is raised (the buffers stay pinned); otherwise the upload's own result stands.
+        self.release_held_exports(py, &outcome)?;
+        result
+    }
+}
+
+/// Hidden test/benchmark hook: the size below which `MultipartUploadWriter.write()` copies a
+/// write once instead of borrowing it. With an argument, sets it (for writers created after the
+/// call) and returns the previous value; without, returns the current value.
+#[pyfunction]
+#[pyo3(signature = (bytes=None))]
+fn _mpu_coalesce_below(bytes: Option<usize>) -> usize {
+    match bytes {
+        Some(n) => crate::multipart::set_coalesce_below(n),
+        None => crate::multipart::coalesce_below(),
     }
 }
 
@@ -505,6 +752,7 @@ impl PyMultipartUploadWriter {
 pub fn register_advanced_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Multipart upload writer
     m.add_class::<PyMultipartUploadWriter>()?;
+    m.add_function(wrap_pyfunction!(_mpu_coalesce_below, m)?)?;
 
     // TODO: Add checkpoint system when re-enabled
     // #[cfg(feature = "extension-module")]
@@ -515,4 +763,122 @@ pub fn register_advanced_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests: the reuse guard and the commit shrink, driven through the real `write()` /
+// `commit()` methods on a writer whose sink has no S3 behind it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+    use crate::multipart::WriterTestGuard;
+    use pyo3::types::PyByteArray;
+
+    const MIB: usize = 1 << 20;
+
+    fn writer(
+        py: Python<'_>,
+        part_size: usize,
+        coalesce_below: usize,
+    ) -> (Bound<'_, PyMultipartUploadWriter>, WriterTestGuard) {
+        let (sink, guard) = MultipartUploadSink::for_writer_test(part_size, coalesce_below);
+        let w = PyMultipartUploadWriter {
+            inner: Some(sink),
+            pending_buf: None,
+            self_pin_while_pending: None,
+            held: HeldExports::new(),
+        };
+        (Bound::new(py, w).expect("writer object"), guard)
+    }
+
+    fn write(w: &Bound<'_, PyMultipartUploadWriter>, data: &Bound<'_, PyAny>) -> PyResult<usize> {
+        w.call_method1("write", (data,))?.extract()
+    }
+
+    fn view_of<'py>(data: &Bound<'py, PyAny>) -> Bound<'py, PyAny> {
+        data.py()
+            .import("builtins")
+            .and_then(|b| b.call_method1("memoryview", (data,)))
+            .expect("memoryview")
+    }
+
+    fn slice_of<'py>(view: &Bound<'py, PyAny>, from: usize, to: usize) -> Bound<'py, PyAny> {
+        view.get_item(pyo3::types::PySlice::new(
+            view.py(),
+            from as isize,
+            to as isize,
+            1,
+        ))
+        .expect("slice")
+    }
+
+    /// The `readinto(buf); write(buf)` loop ends with a SHORT chunk (below the coalescing
+    /// threshold): it overwrites memory the writer still reads, so it must be refused like any
+    /// other reuse. (It used to return before the overlap check.)
+    #[test]
+    fn a_short_final_chunk_over_a_still_borrowed_buffer_is_refused() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (w, _guard) = writer(py, MIB, 4096);
+            let buf = PyByteArray::new(py, &[1u8; 8192]);
+            assert_eq!(write(&w, buf.as_any()).expect("first write"), 8192);
+            // readinto(buf) refilled the buffer; the last chunk is only 100 bytes long.
+            let short = slice_of(&view_of(buf.as_any()), 0, 100);
+            let err = write(&w, &short).expect_err("the short chunk reuses borrowed memory");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyBufferError>(py),
+                "{err}"
+            );
+            // A short write of unrelated memory is still fine (copied).
+            let other = PyByteArray::new(py, &[2u8; 100]);
+            assert_eq!(write(&w, other.as_any()).expect("distinct buffer"), 100);
+        });
+    }
+
+    /// `memoryview(bytes)` is immutable memory: writing the same view twice is not a reuse,
+    /// and nothing is held for it.
+    #[test]
+    fn a_memoryview_of_bytes_is_not_a_reuse() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (w, _guard) = writer(py, MIB, 4096);
+            let data = pyo3::types::PyBytes::new(py, &[3u8; 8192]);
+            let view = view_of(data.as_any());
+            assert_eq!(write(&w, &view).expect("first"), 8192);
+            assert_eq!(write(&w, &view).expect("same immutable view again"), 8192);
+            assert!(
+                w.borrow().held.is_empty(),
+                "an immutable view needs no export and no latch"
+            );
+        });
+    }
+
+    /// `commit(n)` of a small part of a large reservation must not pin the reservation: the
+    /// unused capacity is given back (a realloc, not a copy of the payload). Without it each
+    /// queued part is a slice that keeps its whole 64 MiB allocation alive.
+    #[test]
+    fn commit_does_not_pin_the_whole_reservation() {
+        Python::initialize();
+        Python::attach(|py| {
+            // Commits of exactly one part (2 MiB): each becomes a part that is a zero-copy slice
+            // of its Vec, so the Vec stays alive as long as the part does.
+            let (w, mut guard) = writer(py, 2 * MIB, MIB);
+            for _ in 0..4 {
+                let mv = w.call_method1("reserve", (64 * MIB,)).expect("reserve");
+                w.call_method1("commit", (2 * MIB,)).expect("commit");
+                drop(mv);
+            }
+            let parts = guard.part_capacities();
+            assert_eq!(parts.len(), 4);
+            for (len, capacity) in parts {
+                assert_eq!(len, 2 * MIB);
+                assert!(
+                    capacity <= 4 * MIB,
+                    "a {len}-byte part pins a {} MiB allocation",
+                    capacity >> 20
+                );
+            }
+        });
+    }
 }

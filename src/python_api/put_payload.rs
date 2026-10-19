@@ -12,11 +12,12 @@
 //! for every C-contiguous buffer, whatever its item type (`uint8`, `float32`, `bool`,
 //! `array('b')`, ctypes `'<B'`, a multi-dimensional C-contiguous array, ...).
 //!
-//! | `data`                                              | `put_bytes`              | `put_bytes_async`, default | `put_bytes_async(borrow=True)` |
+//! | `data`                                              | `put_bytes`, `put_many`  | `put_bytes_async` / `put_many_async` / `MultiEndpointStore` puts, default (`borrow=True`) | same with `borrow=False` (the opt-in snapshot) |
 //! |-----------------------------------------------------|--------------------------|----------------------------|--------------------------------|
 //! | `s3dlio.BytesView`                                  | 0 copies                 | 0 copies                   | 0 copies                       |
 //! | exact `bytes`                                       | 0 copies                 | 0 copies                   | 0 copies                       |
-//! | any other C-contiguous buffer (bytearray, memoryview, numpy, `array.array`, ctypes, mmap, ...) | 0 copies | 1 snapshot copy (GIL released above 256 KiB) | 0 copies |
+//! | an immutable source behind a buffer export (`memoryview(bytes)`, a `bytes` subclass) | 0 copies | 0 copies | 0 copies (kept alive by a reference, read in place) |
+//! | any other C-contiguous buffer (bytearray, memoryview, numpy, `array.array`, ctypes, mmap, ...) | 0 copies | 0 copies | 1 snapshot copy (GIL released above 256 KiB for `put_bytes_async`, held for the batch/endpoint puts) |
 //! | non-contiguous (strided, reversed, transposed) view | 1 gather copy, GIL held  | same                       | same                           |
 //! | not a buffer, only `__bytes__()`                    | 1 copy, made by Python   | same                       | same                           |
 //!
@@ -29,8 +30,10 @@
 //!
 //! # Contract with the caller
 //!
-//! While the export is held (for `put_bytes`: the whole call; for `put_bytes_async`: until
-//! the awaitable completes with `borrow=True`, or only during the snapshot copy otherwise):
+//! While the export is held (for `put_bytes` and `put_many`: the whole call; for
+//! `put_bytes_async`, `put_many_async` and the `MultiEndpointStore` puts: until the awaitable
+//! completes, which is the DEFAULT (`borrow=True`); only during the snapshot copy with
+//! `borrow=False`):
 //!
 //! * the exporter cannot be resized or freed: `bytearray.extend()/clear()` from another
 //!   thread raises `BufferError`;
@@ -164,11 +167,13 @@ use crate::constants::{
 pub(crate) enum PayloadUse {
     /// The call blocks until the store is done (`put_bytes`): read the caller's memory in place.
     Blocking,
-    /// `put_bytes_async` default: the store keeps reading after the call returns, so mutable
-    /// memory is copied once, now (a snapshot).
+    /// `put_bytes_async(borrow=False)`, the opt-in snapshot: the store keeps reading after the
+    /// call returns, so MUTABLE memory is copied once, now. An immutable source (exact `bytes`,
+    /// `BytesView`, `memoryview(bytes)`, a `bytes` subclass) is never copied.
     Snapshot,
-    /// `put_bytes_async(borrow=True)`: the caller promised not to modify or free the buffer
-    /// until the awaitable completes, so it is read in place like `Blocking`.
+    /// `put_bytes_async` (DEFAULT, `borrow=True`), `put_many_async`, the `MultiEndpointStore`
+    /// puts: the caller promised not to modify or free the buffer until the awaitable completes,
+    /// so it is read in place like `Blocking`.
     Borrowed,
     /// The streaming writers' `copy=True`: a mutable exporter is copied once, with the GIL held
     /// for the whole copy (no pure-Python thread can interleave; a writer that RELEASES the GIL -
@@ -205,10 +210,44 @@ pub(crate) struct Latch {
     redrain_slice_used: AtomicBool,
 }
 
-#[derive(Default)]
 struct LatchState {
     dropped: bool,
     released: bool,
+    /// Owners that have not yet been dropped / exports not yet released. A single-export latch
+    /// ([`Latch::new`]) starts at 1 each; a batch latch ([`Latch::new_batch`]) counts up as
+    /// exports are added and reports `dropped`/`released` only once the batch is sealed and every
+    /// counted export has been dropped/released.
+    drops_left: usize,
+    releases_left: usize,
+    /// A batch latch that is still being filled (see [`Latch::batch_seal`]).
+    batch_open: bool,
+    /// Exports counted on a batch latch so far.
+    added: usize,
+}
+
+impl LatchState {
+    fn single() -> Self {
+        Self {
+            dropped: false,
+            released: false,
+            drops_left: 1,
+            releases_left: 1,
+            batch_open: false,
+            added: 0,
+        }
+    }
+
+    /// Set the flags whose counts have reached zero (once the batch, if any, is sealed).
+    fn settle(&mut self) {
+        if !self.batch_open {
+            if self.drops_left == 0 {
+                self.dropped = true;
+            }
+            if self.releases_left == 0 {
+                self.released = true;
+            }
+        }
+    }
 }
 
 /// Times a wait for native readers hit its deadline (a backend kept a clone past the timeout).
@@ -244,7 +283,7 @@ pub(crate) fn deadline_warning_text(n: u64) -> String {
 impl Latch {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(LatchState::default()),
+            state: Mutex::new(LatchState::single()),
             cv: Condvar::new(),
             notify: tokio::sync::Notify::new(),
             notify_released: tokio::sync::Notify::new(),
@@ -252,21 +291,81 @@ impl Latch {
         })
     }
 
+    /// A latch for ONE batch of exports (`put_many`, `put_many_async`, ...): the completion barrier
+    /// of every export added with [`batch_add`](Self::batch_add) at once. It reads as dropped /
+    /// released only after [`batch_seal`](Self::batch_seal) and when EVERY counted export has been
+    /// dropped / released (an empty batch is ready as soon as it is sealed).
+    pub(crate) fn new_batch() -> Arc<Self> {
+        let latch = Self::new();
+        {
+            let mut state = latch.lock();
+            state.drops_left = 0;
+            state.releases_left = 0;
+            state.batch_open = true;
+        }
+        latch
+    }
+
+    /// Count one more export of a batch latch. Call BEFORE the export's owner exists.
+    pub(crate) fn batch_add(&self) {
+        let mut state = self.lock();
+        state.drops_left += 1;
+        state.releases_left += 1;
+        state.added += 1;
+    }
+
+    /// How many exports were counted on this batch latch (0: the batch holds none, so no
+    /// barrier is needed).
+    pub(crate) fn batch_len(&self) -> usize {
+        self.lock().added
+    }
+
+    /// No more exports will be added: the latch may now report completion.
+    pub(crate) fn batch_seal(&self) {
+        let (dropped, released) = {
+            let mut state = self.lock();
+            state.batch_open = false;
+            state.settle();
+            (state.dropped, state.released)
+        };
+        self.cv.notify_all();
+        if dropped {
+            self.notify.notify_one();
+        }
+        if released {
+            self.notify_released.notify_one();
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, LatchState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn mark_dropped(&self) {
-        self.lock().dropped = true;
+        let dropped = {
+            let mut state = self.lock();
+            state.drops_left = state.drops_left.saturating_sub(1);
+            state.settle();
+            state.dropped
+        };
         self.cv.notify_all();
-        self.notify.notify_one();
+        if dropped {
+            self.notify.notify_one();
+        }
     }
 
     /// `PyBuffer_Release` has run: wake every blocking and async waiter.
     pub(crate) fn mark_released(&self) {
-        self.lock().released = true;
+        let released = {
+            let mut state = self.lock();
+            state.releases_left = state.releases_left.saturating_sub(1);
+            state.settle();
+            state.released
+        };
         self.cv.notify_all();
-        self.notify_released.notify_one();
+        if released {
+            self.notify_released.notify_one();
+        }
     }
 
     pub(crate) fn is_dropped(&self) -> bool {
@@ -1291,10 +1390,6 @@ impl Held {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.as_slice().len()
-    }
-
     /// Release the hold; the `py` token proves the GIL is held.
     pub(crate) fn release(self, py: Python<'_>) {
         if let Parts::Export(owner, _) = self.0 {
@@ -1336,6 +1431,22 @@ pub(crate) fn put_payload_from_py(
     put_payload(py, data, usage).map(|p| p.bytes)
 }
 
+/// One item of a batch (`put_many`, `put_many_async`): like [`put_payload`], but a held export
+/// is counted on the shared `batch` latch ([`Latch::new_batch`]) instead of getting its own, so
+/// ONE barrier covers the whole batch. A snapshot (`PayloadUse::Snapshot*`) or an immutable
+/// source yields plain `Bytes` and adds nothing to the latch. Strict, like [`put_payload`].
+pub(crate) fn put_payload_in_batch(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    usage: PayloadUse,
+    batch: &Arc<Latch>,
+) -> PyResult<Bytes> {
+    Ok(match payload_parts_in(py, data, usage, Some(batch))? {
+        Parts::Plain(bytes) => bytes,
+        Parts::Export(owner, _) => Bytes::from_owner(owner),
+    })
+}
+
 /// Like [`put_payload_from_py`] but also returns the completion barrier of a held export.
 /// Strict (issue #261): an int, a bool or an arbitrary iterable is a `TypeError`.
 pub(crate) fn put_payload(
@@ -1364,7 +1475,69 @@ pub(crate) fn put_payload(
     })
 }
 
+/// The immutable `bytes` object (or `bytes` subclass instance) behind `data`, looking through
+/// `memoryview` wrappers (`memoryview(b)`, `memoryview(memoryview(b))`, slices of them), or `None`
+/// when `data` is anything else. A buffer's own `readonly` flag is NOT enough: a read-only
+/// `memoryview(bytearray).toreadonly()`, a read-only mmap or a non-writeable NumPy view can still
+/// change through another handle, so only a `bytes` base proves the memory can never change.
+fn immutable_bytes_base<'py>(data: &Bound<'py, PyAny>) -> Option<Bound<'py, PyBytes>> {
+    use pyo3::types::PyMemoryView;
+    let mut current = data.clone();
+    // Bounded: a memoryview of a memoryview of ... is a short chain.
+    for _ in 0..16 {
+        if let Ok(b) = current.cast::<PyBytes>() {
+            return Some(b.clone());
+        }
+        if current.is_instance_of::<PyMemoryView>() {
+            let next = current.getattr("obj").ok()?;
+            if next.is_none() {
+                return None; // a released memoryview
+            }
+            current = next;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// `Bytes` over an export of an IMMUTABLE source, with no copy and no held export: the
+/// `bytes` object behind the export is kept alive by a reference instead (see
+/// [`immutable_bytes_base`]). `None` unless the export is read-only, its source is a `bytes`
+/// object and the exported memory lies inside that object's data; the caller then falls back to
+/// the snapshot copy of a mutable source.
+fn immutable_export_bytes(data: &Bound<'_, PyAny>, export: &RawExport) -> Option<Bytes> {
+    if export.view.readonly == 0 || export.view.buf.is_null() {
+        return None;
+    }
+    let base = immutable_bytes_base(data)?;
+    let base_data = base.as_bytes();
+    let start = base_data.as_ptr() as usize;
+    let end = start.checked_add(base_data.len())?;
+    let ptr = export.view.buf as usize;
+    let len = export.len();
+    if ptr < start || ptr.checked_add(len)? > end {
+        return None;
+    }
+    Some(Bytes::from_owner(PyBytesOwner {
+        ptr: ptr as *const u8,
+        len,
+        _keep: base.unbind(),
+    }))
+}
+
 fn payload_parts(py: Python<'_>, data: &Bound<'_, PyAny>, usage: PayloadUse) -> PyResult<Parts> {
+    payload_parts_in(py, data, usage, None)
+}
+
+/// [`payload_parts`], with the export (if any) counted on the shared `batch` latch instead of
+/// getting a latch of its own.
+fn payload_parts_in(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    usage: PayloadUse,
+    batch: Option<&Arc<Latch>>,
+) -> PyResult<Parts> {
     let plain = Parts::Plain;
     // 1. s3dlio's own BytesView: refcount clone. MUST come first: BytesView also implements
     //    the buffer protocol, which used to shadow this branch (issue #238).
@@ -1384,7 +1557,28 @@ fn payload_parts(py: Python<'_>, data: &Bound<'_, PyAny>, usage: PayloadUse) -> 
             export.release(py);
             return Ok(plain(Bytes::new()));
         }
-        let latch = Latch::new();
+        let snapshotting = matches!(usage, PayloadUse::Snapshot | PayloadUse::SnapshotUnderGil);
+        // A BORROWED export of an immutable source (the streaming writers, `borrow=True`) needs
+        // no hold either: the `bytes` is kept alive by a reference, so there is no export to
+        // guard or wait for, and the same view may be passed again while a part is in flight.
+        if snapshotting || usage == PayloadUse::Borrowed {
+            // Rule #1: an IMMUTABLE source (a `bytes` subclass, `memoryview(bytes)`, ...) cannot
+            // change after this call, so a snapshot of it would be a pointless copy: the source
+            // is kept alive by a reference and read in place, whatever the usage. Only a source
+            // that can change (bytearray, NumPy, mmap, a read-only view of a mutable object, ...)
+            // is copied; that copy is the documented opt-in of `borrow=False` / `copy=True`.
+            if let Some(bytes) = immutable_export_bytes(data, &export) {
+                export.release(py);
+                return Ok(plain(bytes));
+            }
+        }
+        let latch = match batch {
+            Some(shared) if !snapshotting => {
+                shared.batch_add();
+                Arc::clone(shared)
+            }
+            _ => Latch::new(),
+        };
         let owner = ExportOwner::new(export, latch.clone());
         return match usage {
             PayloadUse::Blocking | PayloadUse::Borrowed => Ok(Parts::Export(owner, latch)),
@@ -1668,6 +1862,143 @@ mod tests {
             ba.call_method1("__setitem__", (0, 6)).unwrap();
             assert_eq!(got.len(), 4096);
             assert!(got.iter().all(|&b| b == 5));
+        });
+    }
+
+    /// Stage G (W9, Rule #1): a snapshot never copies an IMMUTABLE source. `memoryview(bytes)`
+    /// (also nested, also a slice of it) and a `bytes` subclass yield `Bytes` over the very same
+    /// memory in both snapshot modes, with no export held (the bytes object is kept alive by a
+    /// reference instead), and the bytes stay valid after the Python names are dropped.
+    #[test]
+    fn snapshot_does_not_copy_an_immutable_source() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!(
+                    "class Sub(bytes):\n    pass\n\
+                     base = bytes(range(256)) * 16\n\
+                     sub = Sub(base)\n\
+                     mv = memoryview(base)\n\
+                     mv2 = memoryview(mv)\n\
+                     piece = memoryview(base)[100:3000]\n\
+                     mv_sub = memoryview(sub)"
+                ),
+            );
+            for name in ["sub", "mv", "mv2", "piece", "mv_sub"] {
+                let obj = l.get_item(name).unwrap().unwrap();
+                let src = exported_ptr(&obj);
+                for mode in [PayloadUse::Snapshot, PayloadUse::SnapshotUnderGil] {
+                    let got = put_payload_from_py(py, &obj, mode).unwrap();
+                    assert_eq!(got.as_ptr(), src, "{name} was copied ({mode:?})");
+                    let full = (name == "sub" || name == "mv" || name == "mv2" || name == "mv_sub")
+                        .then_some(4096);
+                    assert_eq!(got.len(), full.unwrap_or(2900), "{name} length");
+                    py.detach(move || drop(got)); // dropped off the GIL: never blocks
+                }
+            }
+            // The Bytes outlive every Python name for the source.
+            let got = put_payload_from_py(
+                py,
+                &l.get_item("mv").unwrap().unwrap(),
+                PayloadUse::Snapshot,
+            )
+            .unwrap();
+            py.run(c_str!("mv.release(); mv2.release()"), None, Some(&l))
+                .unwrap();
+            l.del_item("mv").unwrap();
+            l.del_item("mv2").unwrap();
+            l.del_item("base").unwrap();
+            l.del_item("sub").unwrap();
+            l.del_item("mv_sub").unwrap();
+            l.del_item("piece").unwrap();
+            assert_eq!(got.len(), 4096);
+            assert!(got.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8));
+        });
+    }
+
+    /// The `readonly` flag alone does not make a source immutable: a read-only VIEW of a
+    /// bytearray (or of anything else that can change) keeps the documented snapshot copy.
+    #[test]
+    fn snapshot_still_copies_a_readonly_view_of_a_mutable_source() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!(
+                    "ba = bytearray(4096)\n\
+                     ro = memoryview(ba).toreadonly()"
+                ),
+            );
+            let ro = l.get_item("ro").unwrap().unwrap();
+            let src = exported_ptr(&ro);
+            let ba = l.get_item("ba").unwrap().unwrap();
+            for mode in [PayloadUse::Snapshot, PayloadUse::SnapshotUnderGil] {
+                let got = put_payload_from_py(py, &ro, mode).unwrap();
+                assert_ne!(got.as_ptr(), src, "a mutable source must be snapshotted");
+                ba.call_method1("__setitem__", (0, 7)).unwrap();
+                assert_eq!(got[0], 0, "the snapshot must not see later changes");
+                ba.call_method1("__setitem__", (0, 0)).unwrap();
+            }
+        });
+    }
+
+    /// Stage G (W8): ONE batch latch is the barrier of every export of a `put_many` batch. It
+    /// reads as dropped/released only when the batch is sealed and EVERY export is dropped /
+    /// released; an item that is snapshotted or immutable adds nothing; the exports of a failed
+    /// batch are all released.
+    #[test]
+    fn batch_latch_covers_every_export_of_the_batch() {
+        init();
+        Python::attach(|py| {
+            let l = ns(
+                py,
+                c_str!(
+                    "a = bytearray(b'a' * 4096)\n\
+                     b = bytearray(b'b' * 4096)\n\
+                     frozen = b'immutable'"
+                ),
+            );
+            let a = l.get_item("a").unwrap().unwrap();
+            let b = l.get_item("b").unwrap().unwrap();
+            let frozen = l.get_item("frozen").unwrap().unwrap();
+            let batch = Latch::new_batch();
+            let pa = put_payload_in_batch(py, &a, PayloadUse::Blocking, &batch).unwrap();
+            let pb = put_payload_in_batch(py, &b, PayloadUse::Blocking, &batch).unwrap();
+            let pf = put_payload_in_batch(py, &frozen, PayloadUse::Blocking, &batch).unwrap();
+            assert_eq!(pa.as_ptr(), exported_ptr(&a), "item a was copied");
+            assert_eq!(pb.as_ptr(), exported_ptr(&b), "item b was copied");
+            assert_eq!(batch.batch_len(), 2, "bytes adds no export to the batch");
+            // Not sealed yet: nothing is complete, whatever has been dropped.
+            assert_eq!(latch_state(&batch), (false, false));
+            batch.batch_seal();
+            assert_eq!(latch_state(&batch), (false, false), "both exports are held");
+            assert!(!resizable(&a) && !resizable(&b), "both buffers are locked");
+            drop(pa);
+            assert!(!latch_ready(py, &batch), "one export is still held");
+            assert!(!resizable(&b));
+            drop(pb);
+            assert!(latch_ready(py, &batch), "all exports dropped and released");
+            assert_eq!(latch_state(&batch), (true, true));
+            assert!(resizable(&a) && resizable(&b), "both released");
+            drop(pf);
+        });
+    }
+
+    /// A sealed batch with no export is ready at once; a snapshot item adds nothing.
+    #[test]
+    fn empty_batch_latch_is_ready_when_sealed() {
+        init();
+        Python::attach(|py| {
+            let batch = Latch::new_batch();
+            assert!(!latch_ready(py, &batch), "an open batch is never ready");
+            let ba = PyByteArray::new(py, &[1u8; 64]);
+            let got = put_payload_in_batch(py, ba.as_any(), PayloadUse::SnapshotUnderGil, &batch)
+                .unwrap();
+            assert_ne!(got.as_ptr(), exported_ptr(ba.as_any()));
+            batch.batch_seal();
+            assert_eq!(batch.batch_len(), 0);
+            assert!(latch_ready(py, &batch));
         });
     }
 

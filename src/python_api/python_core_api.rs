@@ -6,8 +6,8 @@
 use super::async_bridge::future_into_py;
 use super::put_payload::{
     acquire_writable, deadline_warning_text, export_stats, hold_for_call, latch_ready,
-    note_internal_error, put_payload, quiesce_async, quiesce_blocking, snapshot_for_call, Latch,
-    PayloadUse, WritableExport,
+    note_internal_error, put_payload, put_payload_in_batch, quiesce_async, quiesce_blocking,
+    snapshot_for_call, Latch, PayloadUse, WritableExport,
 };
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
@@ -1612,17 +1612,15 @@ fn put_outcome_text(result: &PyResult<()>) -> String {
 /// Must be called with a running event loop, and awaited.
 ///
 /// What is copied:
-/// * `s3dlio.BytesView`, exact `bytes`: 0 copies.
+/// * `s3dlio.BytesView`, exact `bytes`: 0 copies. Also any other IMMUTABLE source whose
+///   `bytes` base is known (a `bytes` subclass, `memoryview(bytes)`): 0 copies, in either mode.
 /// * Any other C-contiguous buffer (bytearray, memoryview, numpy of any dtype,
-///   `array.array`, ctypes, mmap), DEFAULT (`borrow=False`): ONE snapshot copy, taken
-///   before this function returns, with the GIL released. The caller may then reuse,
-///   modify or resize the buffer immediately. The only requirement is not to modify it
-///   from another thread DURING that copy.
-/// * Same, with `borrow=True`: 0 copies. The buffer is held and read in place until the
-///   awaitable completes. By passing `borrow=True` the caller PROMISES not to modify, resize
-///   or free the buffer until the awaitable has completed (successfully or not); until
-///   then `bytearray.extend()/clear()` raise `BufferError` and any write to the bytes is a
-///   data race (the bytes uploaded are undefined). The awaitable is a `Future` that NEVER reaches
+///   `array.array`, ctypes, mmap), DEFAULT (`borrow=True`): 0 copies. The buffer is held and
+///   read in place until the awaitable completes. By default the caller PROMISES not to modify,
+///   resize or free the buffer until the awaitable has completed (successfully or not); until
+///   then `bytearray.extend()/clear()` raise `BufferError` (the buffer is locked against
+///   resizing) and any write to the bytes is a data race (the bytes uploaded are undefined). The
+///   awaitable is a `Future` that NEVER reaches
 ///   a terminal state - result, exception or cancelled - while any native reader of the buffer
 ///   remains or before the export has actually been released, under the supported consumer
 ///   operations: `await`, `cancel()`, `Task.cancel()` (also repeated), `asyncio.timeout()` and
@@ -1637,8 +1635,10 @@ fn put_outcome_text(result: &PyResult<()>) -> String {
 ///   fails, it polls instead; it still completes only after the release. (Await the future itself:
 ///   `asyncio.shield(fut)` bypasses the guard - the shield is cancelled at once while the put
 ///   still reads the buffer.)
-///   Use it for large buffers you own for the duration of the call (for example pinned host
-///   memory).
+/// * Same, with `borrow=False` (the opt-in snapshot): a mutable buffer is copied ONCE, before
+///   this function returns, with the GIL released above 256 KiB. The caller may then reuse,
+///   modify or resize the buffer immediately. The only requirement is not to modify it from
+///   another thread DURING that copy. This copy is the documented price of not borrowing.
 /// * A non-contiguous view: one gather copy with the GIL held; `__bytes__()`-only object:
 ///   one copy. (`borrow` has no effect on these.)
 ///
@@ -1646,7 +1646,7 @@ fn put_outcome_text(result: &PyResult<()>) -> String {
 /// `__bytes__()`. An int, a bool or an arbitrary iterable is refused with a `TypeError`
 /// before anything is submitted (`bytes(5)` used to write five zero bytes).
 #[pyfunction]
-#[pyo3(signature = (uri, data, *, borrow = false))]
+#[pyo3(signature = (uri, data, *, borrow = true))]
 fn put_bytes_async<'py>(
     py: Python<'py>,
     uri: &str,
@@ -1664,18 +1664,41 @@ fn put_bytes_async<'py>(
     let latch = payload.latch;
     let data_owned = payload.bytes;
 
-    // A payload that borrows the caller's memory may still be read by native code (a blocking
-    // file write that a cancelled future cannot stop, a backend task) after the Python future
-    // has become terminal. So the awaitable is a `GuardedFuture` whose cancel() cancels the put
-    // but whose own completion - result, error OR cancellation - is delayed until every native
-    // reader is done and the export has been released with a real GIL token.
-    // Everything that can fail is prepared BEFORE the native put is spawned.
+    guarded_put(py, latch, move || async move {
+        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+        put_verified_with_retry(store.as_ref(), &uri, data_owned)
+            .await
+            .map_err(py_err)?;
+        // Python `None` (the Rust unit would reach Python as `()`; issue #271). `Option<()>`
+        // converts to `None` INSIDE the exit-safe delivery (#192): this body never attaches.
+        Ok(None::<()>)
+    })
+}
+
+/// The awaitable of an asynchronous put whose payload may be borrowed from the caller.
+///
+/// A payload that borrows the caller's memory may still be read by native code (a blocking
+/// file write that a cancelled future cannot stop, a backend task) after the Python future
+/// has become terminal. So when `latch` is `Some` the awaitable is a `GuardedFuture` whose
+/// cancel() cancels the put but whose own completion - result, error OR cancellation - is
+/// delayed until every native reader is done and the export has been released with a real GIL
+/// token. `make` builds the put future; it owns the payload, and is dropped unrun if the guard
+/// cannot be prepared. Everything that can fail is prepared BEFORE the native put is spawned.
+fn guarded_put<'py, F, Fut>(
+    py: Python<'py>,
+    latch: Option<std::sync::Arc<Latch>>,
+    make: F,
+) -> PyResult<pyo3::Bound<'py, PyAny>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = PyResult<Option<()>>> + Send + 'static,
+{
     let guard = match &latch {
         None => None,
         Some(latch) => match prepare_guard(py, latch.clone()) {
             Ok(g) => Some(g),
             Err(e) => {
-                drop(data_owned); // nothing was spawned: this releases the (queued) export...
+                drop(make); // nothing was spawned: this releases the (queued) exports...
                 if quiesce_blocking(py, latch).is_err() {
                     return Err(still_referenced_error(&format!(
                         "the put could not be started: {e}"
@@ -1686,15 +1709,7 @@ fn put_bytes_async<'py>(
         },
     };
 
-    let inner = future_into_py(py, async move {
-        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
-        put_verified_with_retry(store.as_ref(), &uri, data_owned)
-            .await
-            .map_err(py_err)?;
-        // Python `None` (the Rust unit would reach Python as `()`; issue #271). `Option<()>`
-        // converts to `None` INSIDE the exit-safe delivery (#192): this body never attaches.
-        Ok(None::<()>)
-    });
+    let inner = future_into_py(py, make());
     // On EVERY error path from here the barrier is kept: the blocking wait + drain below.
     let fail = |py: Python<'py>, latch: &Option<std::sync::Arc<Latch>>, e: PyErr| -> PyErr {
         if let Some(latch) = latch {
@@ -2830,7 +2845,7 @@ pub fn get_many(
                 let uris_clone = uris.clone();
                 let res = submit_io(async move {
                     let store = Arc::new(ConfigurableFileSystemObjectStore::with_direct_io());
-                    let sem = Arc::new(Semaphore::new(max_in_flight));
+                    let sem = Arc::new(Semaphore::new(clamp_in_flight(max_in_flight)));
                     let mut futs = FuturesUnordered::new();
 
                     for uri in uris_clone.iter().cloned() {
@@ -2864,7 +2879,7 @@ pub fn get_many(
                 // Parallel buffered file reads
                 let uris_clone = uris.clone();
                 let res = submit_io(async move {
-                    let sem = Arc::new(Semaphore::new(max_in_flight));
+                    let sem = Arc::new(Semaphore::new(clamp_in_flight(max_in_flight)));
                     let mut futs = FuturesUnordered::new();
 
                     for uri in uris_clone.iter().cloned() {
@@ -3070,28 +3085,54 @@ pub fn upload(
 // put_many() - Batch put for maximum throughput (Python API)
 // ---------------------------------------------------------------------------
 
-/// The payloads of a `put_many` / `put_many_async` batch as owned `Bytes`, converted exactly like
+/// The payloads of a `put_many` / `put_many_async` batch as `Bytes`, converted exactly like
 /// `put_bytes` payloads (issue #272): `bytes`, any buffer-protocol object and any object with
 /// `__bytes__()` are accepted; an int, a bool or an arbitrary iterable (a list of ints) is a
 /// `TypeError`. Every item is converted before the caller sends anything, so one bad item means no
-/// request at all. A mutable buffer is copied once with the GIL held (no export is kept past this
-/// call, so no completion barrier is needed); exact `bytes` and `BytesView` are not copied.
+/// request at all.
+///
+/// Rule #1 (zero copy): with `PayloadUse::Blocking` (`put_many`) or `Borrowed`
+/// (`put_many_async(borrow=True)`) a buffer export is HELD, not copied, and counted on ONE shared
+/// batch latch; the caller waits on that barrier before it returns (or resolves the awaitable).
+/// With `SnapshotUnderGil` (`put_many_async(borrow=False)`, the opt-in) a mutable buffer is copied
+/// once with the GIL held. Exact `bytes`, `BytesView` and other immutable sources are never copied.
+struct BatchPayloads {
+    items: Vec<(String, Bytes)>,
+    /// `Some` only when at least one item holds a buffer export.
+    latch: Option<Arc<Latch>>,
+}
+
 fn batch_payloads(
     py: Python<'_>,
     items: Vec<(String, Bound<'_, PyAny>)>,
-) -> PyResult<Vec<(String, Bytes)>> {
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(index, (uri, data))| match snapshot_for_call(py, &data) {
-            Ok(bytes) => Ok((uri, bytes)),
-            Err(e) => Err(error_with_context(
-                py,
-                e,
-                &format!("item {index} ({})", redact_uri(&uri)),
-            )),
-        })
-        .collect()
+    usage: PayloadUse,
+) -> PyResult<BatchPayloads> {
+    let batch = Latch::new_batch();
+    let mut converted: Vec<(String, Bytes)> = Vec::with_capacity(items.len());
+    for (index, (uri, data)) in items.into_iter().enumerate() {
+        match put_payload_in_batch(py, &data, usage, &batch) {
+            Ok(bytes) => converted.push((uri, bytes)),
+            Err(e) => {
+                let e = error_with_context(py, e, &format!("item {index} ({})", redact_uri(&uri)));
+                // Nothing is sent. Release the exports already taken: dropping their `Bytes`
+                // queues them, and the barrier drains and waits for the release.
+                drop(converted);
+                batch.batch_seal();
+                if quiesce_blocking(py, &batch).is_err() {
+                    return Err(still_referenced_error(&format!(
+                        "the batch was rejected: {e}"
+                    )));
+                }
+                return Err(e);
+            }
+        }
+    }
+    batch.batch_seal();
+    let latch = (batch.batch_len() > 0).then_some(batch);
+    Ok(BatchPayloads {
+        items: converted,
+        latch,
+    })
 }
 
 /// `e` with `context` in front of its message, for a failure in one item of a batch.
@@ -3190,6 +3231,117 @@ fn rebuilt_with_context(py: Python<'_>, e: &PyErr, context: &str) -> Option<PyEr
 /// error, surfaced from that item's task): (uri, data, store).
 type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
 
+/// The largest `max_in_flight` a batch can use: tokio's semaphore panics above its own maximum,
+/// so a larger request (for example `2**62`) is clamped to it, which means "no limit".
+fn clamp_in_flight(max_in_flight: usize) -> usize {
+    max_in_flight.min(tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+/// Run the puts of a batch with at most `max_in_flight` of them running at once.
+///
+/// **Ordered admission.** The batch itself takes a permit for item `i` BEFORE it spawns item `i`'s
+/// task, so item `i` starts before item `i + 1` and the batch stops spawning the moment the
+/// semaphore is closed. (Spawning every task up front and letting each wait for a permit does not
+/// keep that order: tokio's scheduling of tasks spawned from a worker thread is not FIFO.)
+/// `max_in_flight` above tokio's maximum is clamped ([`clamp_in_flight`]).
+///
+/// **Failure.** A failing item closes the semaphore BEFORE it gives its permit back, so no item
+/// that has not been admitted yet can start after that failure: the rule is exact. Items already
+/// running keep running only until the batch notices: it then aborts every task that has not
+/// finished, so each payload (which may be a held buffer export) is dropped at once, and returns
+/// the FIRST failure once the aborted tasks are reaped. Only a write that already runs in a
+/// blocking thread cannot be stopped, and only those are waited for by the completion barrier of
+/// the call. The failure returned is the item's own error, not a barrier error, whenever the
+/// drain finishes within `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`.
+///
+/// **Cancellation.** Dropping the returned future (cancelling the awaitable of
+/// `put_many_async`) closes the semaphore first and then aborts the tasks (`JoinSet` aborts on
+/// drop): nothing further is admitted.
+async fn run_bounded_puts<E, Fut>(
+    puts: Vec<Fut>,
+    max_in_flight: usize,
+    join_failed: fn(tokio::task::JoinError) -> E,
+) -> Result<(), E>
+where
+    E: Send + 'static,
+    Fut: Future<Output = Result<(), E>> + Send + 'static,
+{
+    /// Closes the semaphore when dropped, so that a dropped batch (cancellation) stops handing
+    /// permits out BEFORE its `JoinSet` aborts the tasks: otherwise a permit released by the
+    /// first aborted task could let the next, not yet aborted, task start its write.
+    struct CloseOnDrop(Arc<tokio::sync::Semaphore>);
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(clamp_in_flight(max_in_flight)));
+    let mut tasks = tokio::task::JoinSet::new();
+    // Declared AFTER `tasks`, so on a drop (cancellation) it runs FIRST: the semaphore is closed
+    // before the JoinSet aborts its tasks.
+    let stop = CloseOnDrop(Arc::clone(&sem));
+    let mut first_failure: Option<E> = None;
+
+    'admit: for put in puts {
+        // Wait for a permit, in input order. A failure that finishes meanwhile is handled at
+        // once (it has closed the semaphore, so the wait ends too).
+        let permit = loop {
+            tokio::select! {
+                biased;
+                Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Err(e) = joined.unwrap_or_else(|e| Err(join_failed(e))) {
+                        first_failure = Some(e);
+                        break 'admit;
+                    }
+                }
+                acquired = Arc::clone(&sem).acquire_owned() => match acquired {
+                    Ok(permit) => break permit,
+                    Err(_) => break 'admit, // closed: a failure ended the batch
+                },
+            }
+        };
+        let task_sem = Arc::clone(&sem);
+        tasks.spawn(async move {
+            // `permit` is dropped AFTER the semaphore is closed on a failure (declaration order
+            // does not matter here: the close is explicit and happens first).
+            let permit = permit;
+            if task_sem.is_closed() {
+                // A failure closed the batch between this item's admission and its start: it
+                // does not start, and it is not a failure of its own (the real one is reported).
+                return Ok(());
+            }
+            let outcome = put.await;
+            if outcome.is_err() {
+                task_sem.close();
+            }
+            drop(permit);
+            outcome
+        });
+    }
+
+    if first_failure.is_none() {
+        // Everything is admitted (or admission stopped on a closed semaphore): collect results.
+        while let Some(joined) = tasks.join_next().await {
+            if let Err(e) = joined.unwrap_or_else(|e| Err(join_failed(e))) {
+                first_failure = Some(e);
+                break;
+            }
+        }
+    }
+    if first_failure.is_some() {
+        sem.close();
+        tasks.abort_all();
+    }
+    // Reap the aborted tasks: their futures (and so their payloads) are dropped before we return.
+    while tasks.join_next().await.is_some() {}
+    drop(stop);
+    match first_failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Put multiple objects in parallel from Python.
 ///
 /// Accepts a list of (uri, data) tuples where data is Python bytes.
@@ -3203,13 +3355,26 @@ type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
 ///   payloads `put_bytes` accepts. An int, a bool or an arbitrary iterable is refused with a
 ///   `TypeError` before any request is sent (issue #272)
 /// * `max_in_flight` - Maximum concurrent put operations (default: 64); must be
-///   an integer >= 1, otherwise `ValueError` is raised at once (issue #211)
+///   an integer >= 1, otherwise `ValueError` is raised at once (issue #211). A value above the
+///   largest the runtime supports (about 2**61) is clamped to it, which means "no limit".
 ///
 /// # Zero-copy path
-/// Exact `bytes` and `BytesView` payloads are not copied; any other buffer is copied once
-/// into an owned `Bytes` with the GIL held (so the caller may reuse it as soon as the call
-/// returns). After that, the Bytes (Arc-based) flows through the async pipeline with zero
-/// additional copies.
+/// No payload is copied. The call blocks until every object is written, so each buffer is
+/// HELD (exported) and read in place, exactly like `put_bytes`: while the call runs, a
+/// `bytearray` cannot be resized (`BufferError`) and no thread may modify any of the buffers (a
+/// data race otherwise). The call does not return - normally or with an error - until every
+/// native reader of every buffer is done and the exports are released (bounded by
+/// `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`; on expiry `ExportStillReferencedError` is raised and the
+/// buffers stay pinned), so every buffer is yours again as soon as the call returns. Exact
+/// `bytes` and `BytesView` payloads are immutable and are never exported.
+///
+/// # Failure
+/// Items are started in the order of the list. The first failed item ends the batch: no item
+/// that has not been started is started after that failure (the failing item closes the batch
+/// before it frees its slot), the items still queued are dropped (releasing their buffers at
+/// once), and that item's own error is raised. Items that were already being written are not
+/// interrupted; the call waits for them (it never returns while a write still reads one of your
+/// buffers), so a write that is already in progress may complete.
 ///
 /// # Examples
 /// ```python
@@ -3230,14 +3395,16 @@ pub fn put_many(
     max_in_flight: usize,
 ) -> PyResult<()> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
-    use futures::stream::{FuturesUnordered, StreamExt};
-    use tokio::sync::Semaphore;
 
     // Every payload is converted (strictly, like `put_bytes`) on the Python thread BEFORE any
-    // request is sent: one owned `Bytes` per item, after which everything is zero-copy via Arc.
-    let owned_items = batch_payloads(py, items)?;
+    // request is sent. A buffer is held (no copy), like `put_bytes`: this call blocks until the
+    // objects are written, so the exports outlive every reader (the barrier below).
+    let BatchPayloads {
+        items: owned_items,
+        latch,
+    } = batch_payloads(py, items, PayloadUse::Blocking)?;
 
-    py.detach(move || {
+    let result = py.detach(move || {
         // Build every store on the caller thread BEFORE submit_io (issue
         // #173): a host-form S3 URI creates its client via
         // `run_on_global_rt`, which must not be reached from a global-runtime
@@ -3257,61 +3424,72 @@ pub fn put_many(
 
         // Submit entire batch to global runtime (io_uring pattern)
         submit_io(async move {
-            let sem = Arc::new(Semaphore::new(max_in_flight));
-            let mut futs = FuturesUnordered::new();
-
-            for (uri, data, store) in prepared {
-                let sem = Arc::clone(&sem);
-                futs.push(tokio::spawn(async move {
-                    let _permit = sem.acquire_owned().await.unwrap();
-                    let store = store?;
-                    store.put(&uri, data).await?;
-                    Ok::<_, anyhow::Error>(())
-                }));
-            }
-
-            // Drain all futures, propagate first error
-            while let Some(res) = futs.next().await {
-                res.map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
-            }
-            Ok(())
+            let puts = prepared.into_iter().map(|(uri, data, store)| async move {
+                let store = store?;
+                store.put(&uri, data).await
+            });
+            run_bounded_puts(puts.collect(), max_in_flight, |e| {
+                anyhow::anyhow!("Task join error: {e}")
+            })
+            .await
         })
-    })
+    });
+    // The batch is over (it succeeded, failed, or gave up at the first error), but a spawned
+    // item may still hold a clone of its payload. Wait until the LAST clone of EVERY held export
+    // is gone, then release them with this thread's real GIL token (see `put_bytes`).
+    if let Some(latch) = &latch {
+        if quiesce_blocking(py, latch).is_err() {
+            return Err(still_referenced_error(&put_outcome_text(&result)));
+        }
+    }
+    result
 }
 
 /// Async version of put_many()
+///
+/// `borrow=True` (the DEFAULT) reads every mutable buffer in place, with no copy: the buffers
+/// are held until the awaitable completes. By default you PROMISE not to modify, resize or free
+/// any of them until it has completed (successfully or not); until then a `bytearray` raises
+/// `BufferError` on resize and any write to the bytes is a data race (the bytes uploaded are
+/// undefined). Like `put_bytes_async(borrow=True)` the awaitable never completes - result,
+/// error or cancelled - while a native reader remains or before every export is released.
+/// `borrow=False` is the opt-in snapshot: each mutable buffer is copied ONCE now with the GIL
+/// held, so you may reuse the buffers immediately. Exact `bytes`, `BytesView` and other
+/// immutable payloads are never copied in either mode.
+///
+/// Items are started in the order of the list. The first failed item ends the batch: no item
+/// that has not been started is started after that failure, queued items are dropped at once
+/// (releasing their buffers), and that item's own error is raised. Items
+/// already being written are not interrupted; the awaitable completes only after they are done.
+/// Cancelling the awaitable stops the batch the same way: no item that has not started is
+/// uploaded, and the cancellation completes once the writes already in progress are done.
 #[pyfunction]
-#[pyo3(signature = (items, max_in_flight = 64))]
+#[pyo3(signature = (items, max_in_flight = 64, *, borrow = true))]
 pub fn put_many_async<'py>(
     py: Python<'py>,
     items: Vec<(String, Bound<'py, PyAny>)>,
     max_in_flight: usize,
+    borrow: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
-    use futures::stream::{FuturesUnordered, StreamExt};
-    use tokio::sync::Semaphore;
 
-    // Strict conversion and one owned snapshot per item, taken NOW with the GIL held: the
-    // awaitable never reads the caller's buffers after this function returns.
-    let owned_items = batch_payloads(py, items)?;
+    let usage = if borrow {
+        PayloadUse::Borrowed
+    } else {
+        PayloadUse::SnapshotUnderGil
+    };
+    let BatchPayloads {
+        items: owned_items,
+        latch,
+    } = batch_payloads(py, items, usage)?;
 
-    future_into_py(py, async move {
-        let sem = Arc::new(Semaphore::new(max_in_flight));
-        let mut futs = FuturesUnordered::new();
-
-        for (uri, data) in owned_items {
-            let sem = Arc::clone(&sem);
-            futs.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.unwrap();
-                let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
-                store.put(&uri, data).await.map_err(py_err)?;
-                Ok::<_, PyErr>(())
-            }));
-        }
-
-        while let Some(res) = futs.next().await {
-            res.map_err(py_err)??;
-        }
+    guarded_put(py, latch, move || async move {
+        let puts = owned_items.into_iter().map(|(uri, data)| async move {
+            let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+            store.put(&uri, data).await.map_err(py_err)?;
+            Ok::<(), PyErr>(())
+        });
+        run_bounded_puts(puts.collect(), max_in_flight, py_err).await?;
         // Python `None`, converted inside the exit-safe delivery (issue #271; see `mkdir_async`).
         Ok(None::<()>)
     })
@@ -3468,8 +3646,10 @@ impl PyObjectWriter {
     /// `s3dlio.BytesView` are immutable, so they can never race. (Before 0.9.128 the GIL was
     /// held for mutable buffers, which made other Python threads wait for the whole write.)
     ///
-    /// Whether the writer then copies the data itself depends on the backend (a multipart
-    /// writer copies into its part buffers; a file writer does not).
+    /// Whether the writer then copies the data itself depends on the backend: the S3 and Azure
+    /// writers buffer the whole object, so each chunk is copied once into that buffer (a
+    /// documented exception; use `put_bytes` to upload a buffer with no copy), while the
+    /// `file://` and `direct://` writers write straight from your buffer.
     ///
     /// Calls on one writer from several threads run one after another.
     fn write_chunk(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -3666,6 +3846,24 @@ pub fn create_direct_filesystem_writer(
 use crate::multi_endpoint::{LoadBalanceStrategy, MultiEndpointStore};
 use crate::uri_utils;
 
+/// The payload of a `MultiEndpointStore` put: a held export when `borrow` (zero copy, completion
+/// barrier in `Payload::latch`), otherwise the opt-in snapshot of a mutable buffer (taken with
+/// the GIL held, like the streaming writers' `copy=True`). Immutable sources are never copied.
+fn endpoint_payload(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    borrow: bool,
+    uri: &str,
+) -> PyResult<super::put_payload::Payload> {
+    let usage = if borrow {
+        PayloadUse::Borrowed
+    } else {
+        PayloadUse::SnapshotUnderGil
+    };
+    put_payload(py, data, usage)
+        .map_err(|e| error_with_context(py, e, &format!("payload for {}", redact_uri(uri))))
+}
+
 /// Python wrapper for MultiEndpointStore
 #[pyclass(name = "MultiEndpointStore")]
 struct PyMultiEndpointStore {
@@ -3715,21 +3913,30 @@ impl PyMultiEndpointStore {
     ///
     /// `data` is converted like `put_bytes` payloads (issue #281): `bytes`, any buffer-protocol
     /// object or an object with `__bytes__()`; an int, a bool or an arbitrary iterable is a
-    /// `TypeError` before any request. A mutable buffer is copied once, now, with the GIL held.
+    /// `TypeError` before any request.
+    ///
+    /// `borrow=True` (the DEFAULT): a mutable buffer is read in place, with no copy, and held
+    /// until the awaitable completes. By default you PROMISE not to modify, resize or free it
+    /// until the awaitable has completed (a `bytearray` raises `BufferError` on resize
+    /// meanwhile; a write to the bytes is a data race). Like `put_bytes_async(borrow=True)` the
+    /// awaitable never completes while a native reader remains. `borrow=False` is the opt-in
+    /// snapshot: a mutable buffer is copied once, now, with the GIL held. Exact `bytes`,
+    /// `BytesView` and other immutable payloads are never copied.
+    #[pyo3(signature = (uri, data, *, borrow = true))]
     fn put<'py>(
         &self,
         py: Python<'py>,
         uri: &str,
         data: &Bound<'py, PyAny>,
+        borrow: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let data = snapshot_for_call(py, data)
-            .map_err(|e| error_with_context(py, e, &format!("payload for {}", redact_uri(&uri))))?;
+        let payload = endpoint_payload(py, data, borrow, &uri)?;
         let store = self.store.clone();
 
-        future_into_py(py, async move {
+        guarded_put(py, payload.latch, move || async move {
             store
-                .put(&uri, data)
+                .put(&uri, payload.bytes)
                 .await
                 .map_err(|e| py_err(e.context("Put failed")))?;
             // Python `None`, converted inside the exit-safe delivery (issue #271).
@@ -3826,21 +4033,26 @@ impl PyMultiEndpointStore {
     /// balancing entirely. See ``get_from_endpoint``.
     ///
     /// Raises if ``index`` is out of range for the configured endpoint count.
+    ///
+    /// `borrow` is as for ``put``: `True` (the default) reads a mutable buffer in place until
+    /// the awaitable completes (do not modify, resize or free it meanwhile); `False` copies it
+    /// once now.
+    #[pyo3(signature = (index, uri, data, *, borrow = true))]
     fn put_to_endpoint<'py>(
         &self,
         py: Python<'py>,
         index: usize,
         uri: &str,
         data: &Bound<'py, PyAny>,
+        borrow: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let data = snapshot_for_call(py, data)
-            .map_err(|e| error_with_context(py, e, &format!("payload for {}", redact_uri(&uri))))?;
+        let payload = endpoint_payload(py, data, borrow, &uri)?;
         let store = self.store.clone();
 
-        future_into_py(py, async move {
+        guarded_put(py, payload.latch, move || async move {
             store
-                .put_to_endpoint(index, &uri, data)
+                .put_to_endpoint(index, &uri, payload.bytes)
                 .await
                 .map_err(|e| py_err(e.context("Put to endpoint failed")))?;
             // Python `None`, converted inside the exit-safe delivery (issue #271).
@@ -3877,20 +4089,25 @@ impl PyMultiEndpointStore {
     /// eventually cover every endpoint. Mirrors ``list_all_endpoints`` for
     /// the write side. Raises if the write failed on any endpoint (not
     /// transactional -- some endpoints may already hold the write).
+    ///
+    /// `borrow` is as for ``put``: `True` (the default) reads a mutable buffer in place, once
+    /// for ALL endpoints, until the awaitable completes (do not modify, resize or free it
+    /// meanwhile); `False` copies it once now.
+    #[pyo3(signature = (uri, data, *, borrow = true))]
     fn put_all_endpoints<'py>(
         &self,
         py: Python<'py>,
         uri: &str,
         data: &Bound<'py, PyAny>,
+        borrow: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let data = snapshot_for_call(py, data)
-            .map_err(|e| error_with_context(py, e, &format!("payload for {}", redact_uri(&uri))))?;
+        let payload = endpoint_payload(py, data, borrow, &uri)?;
         let store = self.store.clone();
 
-        future_into_py(py, async move {
+        guarded_put(py, payload.latch, move || async move {
             store
-                .put_all_endpoints(&uri, data)
+                .put_all_endpoints(&uri, payload.bytes)
                 .await
                 .map_err(|e| py_err(e.context("Put-all-endpoints failed")))?;
             // Python `None`, converted inside the exit-safe delivery (issue #271).
@@ -9255,8 +9472,9 @@ def attribute_error():
                 ),
             ] {
                 let bad = 42i32.into_pyobject(py).unwrap().into_any();
-                let err = batch_payloads(py, vec![(uri.to_string(), bad)])
-                    .expect_err("an int payload must be refused");
+                let err = batch_payloads(py, vec![(uri.to_string(), bad)], PayloadUse::Blocking)
+                    .err()
+                    .expect("an int payload must be refused");
                 let message = text(py, &err);
                 assert!(message.contains(shown), "{message}");
                 assert!(hidden.is_empty() || !message.contains(hidden), "{message}");
@@ -9279,8 +9497,10 @@ def attribute_error():
                     ("file:///ok".to_string(), good),
                     (secret_uri.to_string(), bad),
                 ],
+                PayloadUse::Blocking,
             )
-            .expect_err("an int payload must be refused");
+            .err()
+            .expect("an int payload must be refused");
             let message = text(py, &err);
             assert!(err.is_instance_of::<PyTypeError>(py), "{message}");
             assert!(
@@ -9616,5 +9836,202 @@ mod stub_signature_tests {
         );
         options.with_compression("none", None).expect("none");
         assert_eq!(options.inner.compression, Some(CompressionConfig::None));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- run_bounded_puts: ordered admission; a failed or cancelled batch stops the rest.
+//
+// The production context matters: `put_many_async` runs the batch on a runtime WORKER thread, and
+// spawning many tasks from a worker without yielding is what scrambles tokio's scheduling order
+// (LIFO slot, stealing). Every test therefore runs the batch inside a spawned task on a
+// multi-thread runtime, and repeats it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod bounded_puts_tests {
+    use super::run_bounded_puts;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    type Put = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+    fn joined(e: tokio::task::JoinError) -> String {
+        format!("join: {e}")
+    }
+
+    /// Run the batch the way production does: inside a spawned task (a runtime worker).
+    async fn run_in_worker(puts: Vec<Put>, max_in_flight: usize) -> Result<(), String> {
+        tokio::spawn(run_bounded_puts(puts, max_in_flight, joined))
+            .await
+            .unwrap_or_else(|e| Err(format!("batch task: {e}")))
+    }
+
+    /// A put that records its index when it starts, "holds a payload" (an `Arc` clone) and takes
+    /// `ms` to finish.
+    fn put(order: &Arc<Mutex<Vec<usize>>>, payload: &Arc<()>, index: usize, ms: u64) -> Put {
+        let order = Arc::clone(order);
+        let payload = Arc::clone(payload);
+        Box::pin(async move {
+            order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(index);
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            drop(payload);
+            Ok(())
+        })
+    }
+
+    fn started(order: &Arc<Mutex<Vec<usize>>>) -> Vec<usize> {
+        order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn all_puts_run_and_succeed() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let payload = Arc::new(());
+        let puts: Vec<Put> = (0..12).map(|i| put(&order, &payload, i, 5)).collect();
+        assert_eq!(run_in_worker(puts, 3).await, Ok(()));
+        assert_eq!(started(&order).len(), 12);
+        assert_eq!(Arc::strong_count(&payload), 1);
+    }
+
+    /// Admission is in input order: with one permit item i starts before item i + 1, always,
+    /// even when the batch is spawned from a worker thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn puts_start_in_input_order() {
+        for round in 0..20 {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let payload = Arc::new(());
+            let puts: Vec<Put> = (0..150).map(|i| put(&order, &payload, i, 0)).collect();
+            assert_eq!(run_in_worker(puts, 1).await, Ok(()));
+            assert_eq!(
+                started(&order),
+                (0..150).collect::<Vec<_>>(),
+                "round {round}: items started out of input order"
+            );
+        }
+    }
+
+    /// The first failure is returned, no later item starts, and every payload is dropped before
+    /// the call returns (queued items are never started, running ones are aborted).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn first_failure_stops_the_rest_and_drops_their_payloads() {
+        for round in 0..20 {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let payload = Arc::new(());
+            let mut puts: Vec<Put> = Vec::new();
+            let failing = Arc::clone(&payload);
+            puts.push(Box::pin(async move {
+                drop(failing);
+                Err("the item's own error".to_string())
+            }));
+            for i in 1..200 {
+                puts.push(put(&order, &payload, i, 200));
+            }
+            let t0 = std::time::Instant::now();
+            let result = run_in_worker(puts, 1).await;
+            assert_eq!(
+                result,
+                Err("the item's own error".to_string()),
+                "round {round}"
+            );
+            assert!(
+                started(&order).is_empty(),
+                "round {round}: items {:?} started after the failure",
+                started(&order)
+            );
+            assert!(
+                t0.elapsed() < Duration::from_millis(1500),
+                "round {round}: the batch drained the rest instead of stopping"
+            );
+            assert_eq!(
+                Arc::strong_count(&payload),
+                1,
+                "round {round}: a payload is still held after the batch returned"
+            );
+        }
+    }
+
+    /// With several permits, items already running when a sibling fails are aborted; items not
+    /// yet admitted never start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failure_with_several_permits_starts_nothing_new() {
+        for round in 0..20 {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let payload = Arc::new(());
+            let mut puts: Vec<Put> = Vec::new();
+            for i in 0..3 {
+                puts.push(put(&order, &payload, i, 10_000));
+            }
+            puts.push(Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Err("late failure".to_string())
+            }));
+            for i in 4..100 {
+                puts.push(put(&order, &payload, i, 10_000));
+            }
+            let result = run_in_worker(puts, 4).await;
+            assert_eq!(result, Err("late failure".to_string()), "round {round}");
+            let mut begun = started(&order);
+            begun.sort_unstable();
+            assert_eq!(
+                begun,
+                vec![0, 1, 2],
+                "round {round}: an item started after the failure"
+            );
+            assert_eq!(Arc::strong_count(&payload), 1, "round {round}");
+        }
+    }
+
+    /// Dropping the batch (the cancellation of `put_many_async`) starts no further item and
+    /// drops every payload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_the_batch_stops_the_rest() {
+        for round in 0..10 {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let payload = Arc::new(());
+            let puts: Vec<Put> = (0..30).map(|i| put(&order, &payload, i, 10_000)).collect();
+            let batch = tokio::spawn(run_bounded_puts(puts, 1, joined));
+            while started(&order).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            batch.abort();
+            let _ = batch.await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                started(&order),
+                vec![0],
+                "round {round}: an item started after the batch was dropped"
+            );
+            assert_eq!(
+                Arc::strong_count(&payload),
+                1,
+                "round {round}: a payload outlived the batch"
+            );
+        }
+    }
+
+    /// A huge `max_in_flight` is clamped to the semaphore's maximum instead of panicking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_huge_limit_is_clamped_not_a_panic() {
+        for limit in [usize::MAX, 1usize << 62, (1usize << 61) + 1] {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let puts: Vec<Put> = (0..5)
+                .map(|_| {
+                    let counter = Arc::clone(&counter);
+                    Box::pin(async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }) as Put
+                })
+                .collect();
+            assert_eq!(run_in_worker(puts, limit).await, Ok(()), "limit {limit}");
+            assert_eq!(counter.load(Ordering::SeqCst), 5);
+        }
     }
 }

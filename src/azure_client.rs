@@ -31,6 +31,11 @@ use azure_storage_blob::models::{
 };
 use tracing::{debug, warn};
 
+/// The Azure SDK's own default partition size for a managed download (4 MiB;
+/// `azure_storage_blob` 1.1.0 `partitioned_transfer/defaults.rs`, crate-private there). A
+/// download that names no partition size gets the same first request the SDK would have made.
+const SDK_DEFAULT_DOWNLOAD_PARTITION: usize = 4 * 1024 * 1024;
+
 /// The partition size for a sequential download of a blob believed to be `object_size` bytes.
 fn sequential_partition_size(object_size: u64) -> usize {
     usize::try_from(object_size)
@@ -55,15 +60,6 @@ fn header_u64(headers: &azure_core::http::headers::Headers, name: &'static str) 
 /// else the requested length, capped (a caller-chosen length is not a promise).
 fn range_expected_len(content_length: Option<u64>, requested: Option<u64>) -> Option<u64> {
     content_length.or_else(|| range_presize(requested))
-}
-
-/// The blob's total length from a download response's headers: the total in `Content-Range`
-/// (`bytes 0-1023/4096`) if the response was a partial one, else `Content-Length`.
-fn total_len_from_headers(content_range: Option<&str>, content_length: Option<u64>) -> Option<u64> {
-    match content_range {
-        Some(range) => range.rsplit('/').next().and_then(|t| t.trim().parse().ok()),
-        None => content_length,
-    }
 }
 
 /// Receive a download body into one buffer sized from `expected_len` (see
@@ -730,6 +726,58 @@ fn usable_etag(etag: Option<&azure_core::http::Etag>) -> Option<String> {
     (!text.is_empty() && !text.starts_with("W/")).then(|| text.to_string())
 }
 
+/// The blob's sizes as a first partition reports them, for a blob larger than that partition.
+#[derive(Clone, Copy)]
+struct LargeBlob {
+    /// The whole blob, in bytes.
+    total: u64,
+    /// How many bytes the first response carries.
+    first_body_len: u64,
+}
+
+/// How many body bytes a response to a ranged request for bytes starting at `start` carries,
+/// from its headers; checked arithmetic throughout, because the headers are the server's.
+///
+/// * With a `Content-Range`: it must give a range that starts at `start` (anything else would
+///   put the wrong bytes at the window), and a `Content-Length` must agree with it.
+/// * Without one: only a whole-blob reply to a range that starts at 0 can be read this way (the
+///   service ignored the range, or the SDK repeated the request without a range for an empty
+///   blob); then `Content-Length` is the body length. For `start > 0` it is an error.
+fn range_response_body_len(
+    content_range: Option<&str>,
+    content_length: Option<u64>,
+    start: u64,
+) -> Result<u64> {
+    let Some(header) = content_range else {
+        if start != 0 {
+            return Err(az_other(
+                "the response to a range request carries no Content-Range",
+            ));
+        }
+        return content_length
+            .ok_or_else(|| az_other("the response has neither Content-Range nor Content-Length"));
+    };
+    let parsed = parse_content_range(header)?;
+    let (first, last) = parsed
+        .bytes
+        .ok_or_else(|| az_other("a successful response carries a Content-Range without a range"))?;
+    if first != start {
+        return Err(az_other(format!(
+            "the response range starts at byte {first}, not {start}"
+        )));
+    }
+    let body_len = last
+        .checked_sub(first)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| az_other("the Content-Range length overflows"))?;
+    if content_length.is_some_and(|length| length != body_len) {
+        return Err(az_other(
+            "the Content-Length disagrees with the Content-Range",
+        ));
+    }
+    Ok(body_len)
+}
+
 /// Receive a response body into `dst`, which is the exact expected length.
 ///
 /// A checked loop over the public response-body stream (not the SDK's `collect_into`, which
@@ -965,6 +1013,107 @@ impl AzureBlob {
         Ok(body)
     }
 
+    /// Range GET into the caller's buffer (stage G, R3): the bytes `start..start + dst.len()` of
+    /// the blob are received straight into `dst`, one copy from each SDK chunk to its place, and
+    /// the number of bytes written is returned.
+    ///
+    /// That number is `dst.len()` unless the range runs past the end of the blob, which the
+    /// service answers by sending only what exists: the caller decides whether a shorter answer
+    /// is an error (the range engine does, except for its one-byte growth probe). A range that
+    /// STARTS at or past the end is the service's `416`, an error, with one exception: an EMPTY
+    /// blob read from offset 0 is the SDK's unranged retry of that 416 and returns `Ok(0)`. A reply
+    /// carrying more than `dst.len()` bytes, a `Content-Range` that does not start at `start`, or
+    /// (for `start > 0`) no `Content-Range` at all, is refused before any byte is copied. No byte
+    /// is written past `dst`. `progress` counts the positions written.
+    pub async fn get_range_into(
+        &self,
+        key: &str,
+        start: u64,
+        dst: &mut [u8],
+        progress: &ReceiveProgress,
+    ) -> Result<usize> {
+        let wanted = len_u64(dst.len())?;
+        debug!(
+            "AzureBlob::get_range_into container='{}', key='{}', start={}, len={}",
+            self.container, key, start, wanted
+        );
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        let blob = self.blob_client(key)?;
+        let mut span = SpanMark::new(progress);
+        self.fetch_range_into(&blob, start, dst, &mut span, None)
+            .await
+    }
+
+    /// One ranged request for `start..start + dst.len()` and its checked receive into `dst`;
+    /// returns the number of bytes written (see [`Self::get_range_into`]). `if_match` pins the
+    /// request to a version: the service answers 412 for another one, and a reply that does not
+    /// carry the same strong ETag is a `VersionChanged`.
+    async fn fetch_range_into(
+        &self,
+        blob: &BlobClient,
+        start: u64,
+        dst: &mut [u8],
+        span: &mut SpanMark<'_>,
+        if_match: Option<&str>,
+    ) -> Result<usize> {
+        let wanted = len_u64(dst.len())?;
+        start
+            .checked_add(wanted)
+            .ok_or_else(|| az_other("the byte range runs past the largest possible offset"))?;
+        let partition_size = NonZeroUsize::new(dst.len())
+            .ok_or_else(|| az_other("a zero-length destination has no range"))?;
+        // One request for the whole range, and the SDK hands its body up without a partition
+        // buffer (the range ends where the first partition does: nothing remains to fetch).
+        let options = BlobClientDownloadOptions {
+            range: Some(HttpRange::new(start, wanted)),
+            parallel: NonZeroUsize::new(1),
+            partition_size: Some(partition_size),
+            if_match: if_match.map(azure_core::http::Etag::from),
+            ..Default::default()
+        };
+        let resp = blob
+            .download(Some(options))
+            .await
+            .map_err(|e| self.auth_err(e))?;
+        if let Some(pinned) = if_match {
+            if usable_etag(resp.properties.etag.as_ref()).as_deref() != Some(pinned) {
+                return Err(crate::object_error::attach_object_error(
+                    anyhow!("the blob's ETag changed between requests"),
+                    ObjectErrorKind::VersionChanged,
+                    "az",
+                    "response ETag differs from the pinned one",
+                ));
+            }
+        }
+        let content_range = resp
+            .headers
+            .get_optional_str(&azure_core::http::headers::HeaderName::from_static(
+                "content-range",
+            ))
+            .map(str::to_string);
+        let body_len = range_response_body_len(
+            content_range.as_deref(),
+            header_u64(&resp.headers, "content-length"),
+            start,
+        )?;
+        if body_len > wanted {
+            return Err(az_length_mismatch(
+                wanted,
+                None,
+                "the response carries more bytes than the range asked for",
+            ));
+        }
+        let received = usize::try_from(body_len)
+            .map_err(|_| az_other("the response length does not fit in memory"))?;
+        let window = dst
+            .get_mut(..received)
+            .ok_or_else(|| az_other("the response does not fit the destination"))?;
+        receive_into(resp.body, window, span, self.credential_mode).await?;
+        Ok(received)
+    }
+
     /// Full GET (single buffer).
     pub async fn get(&self, key: &str) -> Result<Bytes> {
         self.get_with_sdk_concurrency(key, None, None).await
@@ -993,8 +1142,34 @@ impl AzureBlob {
 
     /// [`Self::get_with_sdk_concurrency`] when the blob's size is known (from a `stat`):
     /// the destination buffer is allocated once at that size, so each received byte is copied
-    /// once (issue #252; the SDK's own `collect()` grows its buffer as chunks arrive). If the
-    /// blob turns out larger the buffer grows, so a stale size never loses data.
+    /// once (issue #252; the SDK's own `collect()` grows its buffer as chunks arrive).
+    ///
+    /// `expected_len` is only a hint, possibly stale: the length the server reports in this very
+    /// response is authoritative and the hint decides nothing.
+    ///
+    /// # Large blobs: one copy (stage G, R5)
+    ///
+    /// The first request is one ranged GET for the first partition (`partition_size`; the SDK's
+    /// own default of 4 MiB when `None`), which is also how the SDK's managed download starts
+    /// and needs no `HEAD`: its `Content-Range` carries the blob's size. A blob that fits in
+    /// that partition is received from that response into one buffer sized from the response.
+    ///
+    /// A larger blob is received into ONE buffer of the blob's size: the first response's body
+    /// goes straight into the front of it, and the rest is read in ranged requests of one
+    /// partition each, `concurrency` at a time, each received straight into its own disjoint
+    /// slice of the buffer and pinned to the first response's ETag with `If-Match`. The ranged
+    /// reads are futures of THIS call (a bounded `FuturesUnordered`; nothing is spawned), so
+    /// dropping or cancelling the call, or the first failed partition, stops every request.
+    /// Each received chunk is copied exactly once, into its final place. The SDK's plain
+    /// `download` instead copies every partition into a buffer of its own and hands those up, and
+    /// a second copy into the destination follows: twice the blob live and two copies of every
+    /// byte. (The SDK's `download_into` is not used: it spawns a manager task that nobody aborts,
+    /// which keeps requesting the rest of the blob after the caller has gone.)
+    ///
+    /// A first response that cannot be pinned (no ETag, or a weak one) starts no ranged tail:
+    /// unpinned responses are never combined, so the blob is read again as ONE request into the
+    /// buffer ([`Self::get_into`]). A first response with no `Content-Range` that is exactly as
+    /// long as the range asked for cannot be told from a truncated blob and is an error.
     pub async fn get_with_sdk_concurrency_sized(
         &self,
         key: &str,
@@ -1003,37 +1178,233 @@ impl AzureBlob {
         expected_len: Option<u64>,
     ) -> Result<Bytes> {
         debug!(
-            "AzureBlob::get container='{}', key='{}'",
-            self.container, key
+            "AzureBlob::get container='{}', key='{}', size hint {:?}",
+            self.container, key, expected_len
         );
         let blob = self.blob_client(key)?;
-        let options = BlobClientDownloadOptions {
-            parallel: concurrency.and_then(NonZeroUsize::new),
-            partition_size: partition_size.and_then(NonZeroUsize::new),
+        let first_len = partition_size
+            .filter(|p| *p > 0)
+            .unwrap_or(SDK_DEFAULT_DOWNLOAD_PARTITION);
+        let first_requested = len_u64(first_len)?;
+        let first_options = BlobClientDownloadOptions {
+            range: Some(HttpRange::new(0, first_requested)),
+            parallel: NonZeroUsize::new(1),
+            partition_size: NonZeroUsize::new(first_len),
             ..Default::default()
         };
         let resp = blob
-            .download(Some(options))
+            .download(Some(first_options))
             .await
             .map_err(|e| self.auth_err(e))?;
-        // The blob's length from the response (the SDK's first request is a ranged GET, so
-        // `Content-Range` carries the total) is what the server says NOW; the caller's hint (a
-        // possibly stale `stat`) is used only when the response has no length.
-        let headers = &resp.headers;
-        let expected_len = total_len_from_headers(
-            headers.get_optional_str(&azure_core::http::headers::HeaderName::from_static(
+        let content_range = resp
+            .headers
+            .get_optional_str(&azure_core::http::headers::HeaderName::from_static(
                 "content-range",
-            )),
-            header_u64(headers, "content-length"),
-        )
-        .or(expected_len);
-        let body = collect_body(resp.body, expected_len).await?;
+            ))
+            .map(str::to_string);
+        let content_length = header_u64(&resp.headers, "content-length");
+
+        let whole_blob_len = match content_range.as_deref() {
+            Some(header) => {
+                let parsed = parse_content_range(header)?;
+                let (Some((first_at, last)), Some(total)) = (parsed.bytes, parsed.total) else {
+                    return Err(az_other(
+                        "the response's Content-Range does not give both the range and the \
+                         blob's size, so the blob cannot be read completely",
+                    ));
+                };
+                if first_at != 0 {
+                    return Err(az_other(format!(
+                        "the response range starts at byte {first_at}, not 0"
+                    )));
+                }
+                let first_body_len = last
+                    .checked_add(1)
+                    .ok_or_else(|| az_other("the Content-Range end overflows"))?;
+                if content_length.is_some_and(|length| length != first_body_len) {
+                    return Err(az_other(
+                        "the Content-Length disagrees with the Content-Range",
+                    ));
+                }
+                if total > first_body_len {
+                    let body = self
+                        .receive_large_blob(
+                            &blob,
+                            key,
+                            resp,
+                            LargeBlob {
+                                total,
+                                first_body_len,
+                            },
+                            concurrency,
+                            first_len,
+                        )
+                        .await?;
+                    debug!(
+                        "AzureBlob::get success: key='{}', {} bytes",
+                        key,
+                        body.len()
+                    );
+                    return Ok(body);
+                }
+                total
+            }
+            // No `Content-Range`. A reply SHORTER than the range asked for is the whole blob
+            // (a range of a larger blob always carries the full range), and a LONGER one is a
+            // service that ignored the range and sent the whole blob. A reply exactly as long
+            // as the range cannot be told from the first partition of a larger blob whose
+            // `Content-Range` was stripped: taking it for the whole blob would silently
+            // truncate it, so it is refused.
+            None => match content_length {
+                Some(length) if length == first_requested => {
+                    return Err(az_other(format!(
+                        "the response to a request for the first {first_requested} bytes carries \
+                         no Content-Range and is exactly that long: it cannot be told from a \
+                         truncated read of a larger blob"
+                    )));
+                }
+                Some(length) => length,
+                None => {
+                    return Err(az_other(
+                        "the response has neither Content-Range nor Content-Length, so the \
+                         blob cannot be read completely",
+                    ));
+                }
+            },
+        };
+
+        // The whole blob is in this one response.
+        let body = collect_body(resp.body, Some(whole_blob_len)).await?;
         debug!(
             "AzureBlob::get success: key='{}', {} bytes",
             key,
             body.len()
         );
         Ok(body)
+    }
+
+    /// The large-blob half of [`Self::get_with_sdk_concurrency_sized`]: the first response (the
+    /// first `blob_sizes.first_body_len` bytes of a `blob_sizes.total`-byte blob) into the front
+    /// of one buffer, the rest in ranged reads of `partition` bytes, `concurrency` at a time,
+    /// into the remainder, all driven by this one future.
+    async fn receive_large_blob(
+        &self,
+        blob: &BlobClient,
+        key: &str,
+        first: azure_storage_blob::models::BlobClientDownloadResult,
+        blob_sizes: LargeBlob,
+        concurrency: Option<usize>,
+        partition: usize,
+    ) -> Result<Bytes> {
+        let LargeBlob {
+            total,
+            first_body_len,
+        } = blob_sizes;
+        let total_usize = usize::try_from(total)
+            .map_err(|_| az_other("the blob is larger than this platform's memory"))?;
+        let head_len = usize::try_from(first_body_len)
+            .map_err(|_| az_other("the first range does not fit in memory"))?;
+        let mut buffer = crate::read_buffer::try_zeroed_vec(total_usize).ok_or_else(|| {
+            az_other(format!(
+                "cannot allocate {total} bytes for the blob the service reports"
+            ))
+        })?;
+
+        // The remaining ranges are pinned to the version the first response came from. Without
+        // a strong ETag nothing can pin them, and unpinned responses are never combined: read
+        // the whole blob again as one request.
+        let Some(etag) = usable_etag(first.properties.etag.as_ref()) else {
+            drop(first);
+            debug!(
+                "AzureBlob::get key='{}': the first response has no strong ETag; reading the \
+                 {} bytes as one request",
+                key, total
+            );
+            self.get_into(key, &mut buffer, &ReceiveProgress::new())
+                .await?;
+            return Ok(Bytes::from(buffer));
+        };
+
+        let (head, tail) = buffer
+            .split_at_mut_checked(head_len)
+            .ok_or_else(|| az_other("the first range is longer than the blob"))?;
+        let concurrency = concurrency.filter(|c| *c > 0).unwrap_or_else(|| {
+            // The SDK's own default for a managed download.
+            std::thread::available_parallelism()
+                .map(NonZeroUsize::get)
+                .unwrap_or(1)
+                .clamp(8, 96)
+        });
+
+        let first_progress = ReceiveProgress::new();
+        let mut first_span = SpanMark::new(&first_progress);
+        let first_part = receive_into(first.body, head, &mut first_span, self.credential_mode);
+        let rest =
+            self.receive_tail_parts(blob, tail, first_body_len, partition, concurrency, &etag);
+        futures::try_join!(first_part, rest)?;
+        // `Bytes::from(Vec)` takes the allocation over: no copy.
+        Ok(Bytes::from(buffer))
+    }
+
+    /// Read `tail` (the blob's bytes from `tail_start` on) in ranged requests of `partition`
+    /// bytes, at most `concurrency` at a time, each straight into its own slice of `tail`, every
+    /// request carrying `If-Match: etag`. The requests are futures of this call: the first error
+    /// returns at once and drops the others, and so does dropping this future.
+    async fn receive_tail_parts(
+        &self,
+        blob: &BlobClient,
+        tail: &mut [u8],
+        tail_start: u64,
+        partition: usize,
+        concurrency: usize,
+        etag: &str,
+    ) -> Result<()> {
+        let mut parts = tail
+            .chunks_mut(partition.max(1))
+            .scan(tail_start, |offset, slice| {
+                let at = *offset;
+                *offset = offset.saturating_add(u64::try_from(slice.len()).unwrap_or(u64::MAX));
+                Some((at, slice))
+            });
+        let mut in_flight = FuturesUnordered::new();
+        loop {
+            while in_flight.len() < concurrency {
+                let Some((at, slice)) = parts.next() else {
+                    break;
+                };
+                in_flight.push(self.receive_tail_part(blob, at, slice, etag));
+            }
+            match in_flight.next().await {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Err(e),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// One tail part: bytes `at..at + part.len()`, pinned by `If-Match`, exactly that long.
+    async fn receive_tail_part(
+        &self,
+        blob: &BlobClient,
+        at: u64,
+        part: &mut [u8],
+        etag: &str,
+    ) -> Result<()> {
+        let wanted = part.len();
+        let progress = ReceiveProgress::new();
+        let mut span = SpanMark::new(&progress);
+        let received = self
+            .fetch_range_into(blob, at, part, &mut span, Some(etag))
+            .await
+            .map_err(|e| attach_azure_classification(e, true))?;
+        if received != wanted {
+            return Err(az_length_mismatch(
+                len_u64(wanted)?,
+                Some(len_u64(received)?),
+                "a ranged part of the blob came back short",
+            ));
+        }
+        Ok(())
     }
 
     /// Stat: read size, etag, last-modified from typed response headers.
@@ -2002,15 +2373,41 @@ mod tests {
     }
 
     #[test]
-    fn the_blob_length_comes_from_content_range_else_content_length() {
+    fn a_range_reply_length_comes_from_a_consistent_content_range() {
+        // A window in the middle, with and without a Content-Length.
         assert_eq!(
-            total_len_from_headers(Some("bytes 0-1048575/9437184"), Some(1048576)),
-            Some(9437184)
+            range_response_body_len(Some("bytes 100-199/1000"), Some(100), 100).unwrap(),
+            100
         );
-        assert_eq!(total_len_from_headers(Some("bytes */0"), None), Some(0));
-        assert_eq!(total_len_from_headers(None, Some(77)), Some(77));
-        assert_eq!(total_len_from_headers(Some("bytes 0-9/*"), Some(10)), None);
-        assert_eq!(total_len_from_headers(None, None), None);
+        assert_eq!(
+            range_response_body_len(Some("bytes 100-199/*"), None, 100).unwrap(),
+            100
+        );
+        // The range must start where the window does.
+        assert!(range_response_body_len(Some("bytes 4-7/100"), None, 0).is_err());
+        // A Content-Length that disagrees is refused.
+        assert!(range_response_body_len(Some("bytes 0-9/100"), Some(11), 0).is_err());
+        // No Content-Range: a whole-blob reply to a range at 0 is read by its Content-Length ...
+        assert_eq!(range_response_body_len(None, Some(77), 0).unwrap(), 77);
+        assert!(range_response_body_len(None, None, 0).is_err());
+        // ... but never for a range that starts later.
+        assert!(range_response_body_len(None, Some(77), 5).is_err());
+        // `bytes */n` carries no range.
+        assert!(range_response_body_len(Some("bytes */100"), None, 0).is_err());
+    }
+
+    /// The length of a range is computed with checked arithmetic: a header the server controls
+    /// must never overflow `u64` (a panic with overflow checks, a wrapped length without them).
+    #[test]
+    fn a_hostile_content_range_never_overflows_the_length() {
+        assert!(range_response_body_len(Some("bytes 0-18446744073709551615/*"), None, 0).is_err());
+        assert!(range_response_body_len(
+            Some("bytes 18446744073709551614-18446744073709551615/*"),
+            None,
+            u64::MAX - 1
+        )
+        .is_ok());
+        assert!(range_response_body_len(Some("bytes 5-4/*"), None, 5).is_err());
     }
 
     // Issue #242 review: list_account_containers handed a bearer-token credential to every
