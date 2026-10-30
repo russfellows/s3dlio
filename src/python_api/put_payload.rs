@@ -550,8 +550,8 @@ pub(crate) fn export_stats() -> ExportStats {
         quiesce_timeouts: QUIESCE_TIMEOUTS.load(Ordering::Relaxed),
         queued: QUEUE.get().map_or(0, |q| q.count.load(Ordering::Acquire)),
         internal_errors: BARRIER_INTERNAL_ERRORS.load(Ordering::Relaxed),
-        shutdown_attach_waits: GATE.waits.load(Ordering::Relaxed),
-        shutdown_attach_wait_timeouts: GATE.wait_timeouts.load(Ordering::Relaxed),
+        shutdown_attach_waits: gate().waits.load(Ordering::Relaxed),
+        shutdown_attach_wait_timeouts: gate().wait_timeouts.load(Ordering::Relaxed),
         releaser_attaches: QUEUE
             .get()
             .map_or(0, |q| q.attaches.load(Ordering::Relaxed)),
@@ -742,7 +742,15 @@ struct ReleaseQueue {
 }
 
 /// The process-wide gate, closed once by the atexit callback; see [`begin_shutdown`].
-static GATE: AttachGate = AttachGate::new();
+///
+/// Fork-aware (#297): the in-flight count belongs to threads of the process that made it, and the
+/// gate's lock may have been held by one of them at a fork. A fork child starts with a fresh,
+/// open gate (the inherited one is leaked, never used).
+static GATE_CELL: crate::fork_guard::ForkCell<AttachGate> = crate::fork_guard::ForkCell::new();
+
+fn gate() -> &'static AttachGate {
+    GATE_CELL.get_or_init(AttachGate::new)
+}
 
 /// Gate for the releaser thread's autonomous attachments to the interpreter.
 ///
@@ -956,12 +964,13 @@ impl ReleaseQueue {
 
 /// The process-wide queue and its releaser thread (started on the first export that had to be
 /// handed off).
-static QUEUE: crate::fork_guard::ForkCell<&'static ReleaseQueue> = crate::fork_guard::ForkCell::new();
+static QUEUE: crate::fork_guard::ForkCell<&'static ReleaseQueue> =
+    crate::fork_guard::ForkCell::new();
 
 fn global_queue() -> &'static ReleaseQueue {
-    *QUEUE.get_or_init(|| {
+    QUEUE.get_or_init(|| {
         // After shutdown no releaser thread is started (it could only attach to a dying interpreter).
-        ReleaseQueue::start(EXPORT_RELEASE_GRACE, &GATE, !GATE.is_closed())
+        ReleaseQueue::start(EXPORT_RELEASE_GRACE, gate(), !gate().is_closed())
     })
 }
 
@@ -985,7 +994,9 @@ pub(crate) fn exports_pending() -> bool {
 /// good. After this the releaser never attaches again. This replaces relying on pyo3's
 /// `Py_IsFinalizing` check, which only exists when built for Python 3.13 or newer.
 pub(crate) fn begin_shutdown(py: Python<'_>) {
-    py.detach(|| GATE.close_and_wait(RELEASER_ATTACH_DRAIN_TIMEOUT));
+    // Silent: a child that never used s3dlio must not warn merely because it exits.
+    let gate = GATE_CELL.get_or_init_silent(AttachGate::new);
+    py.detach(|| gate.close_and_wait(RELEASER_ATTACH_DRAIN_TIMEOUT));
     drain_pending_exports(py);
 }
 

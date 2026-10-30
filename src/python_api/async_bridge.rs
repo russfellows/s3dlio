@@ -209,7 +209,16 @@ impl Drop for DeliveryTicket {
 }
 
 /// Process-wide tracker for deliveries made through [`S3dlioRuntime`].
-static DELIVERIES: DeliveryTracker = DeliveryTracker::new();
+///
+/// Fork-aware (#297): the count belongs to the threads and tasks of the process that made it,
+/// and its mutex may have been held by one of them at a fork. A fork child starts with a fresh,
+/// open tracker (the inherited one is leaked, never used).
+static DELIVERIES_CELL: crate::fork_guard::ForkCell<DeliveryTracker> =
+    crate::fork_guard::ForkCell::new();
+
+fn deliveries() -> &'static DeliveryTracker {
+    DELIVERIES_CELL.get_or_init(DeliveryTracker::new)
+}
 
 tokio::task_local! {
     static TASK_LOCALS: OnceCell<TaskLocals>;
@@ -235,7 +244,7 @@ impl Runtime for S3dlioRuntime {
     where
         F: FnOnce() + Send + 'static,
     {
-        spawn_gated(&DELIVERIES, f)
+        spawn_gated(deliveries(), f)
     }
 }
 
@@ -319,7 +328,6 @@ where
     // finished (see `body_finished_hook`). Absent from the shipped extension.
     #[cfg(test)]
     let fut = body_finished_hook::observe(fut);
-    crate::fork_guard::check_py()?;
     generic::future_into_py::<S3dlioRuntime, _, T>(py, fut)
 }
 
@@ -365,15 +373,17 @@ pub(crate) mod body_finished_hook {
 #[pyfunction]
 fn drain_async_deliveries_at_exit(py: Python<'_>) {
     let timeout = crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT;
-    DELIVERIES.close();
-    let drained = py.detach(|| DELIVERIES.wait_idle(timeout));
+    // Silent: a child that never used s3dlio must not warn merely because it exits.
+    let tracker = DELIVERIES_CELL.get_or_init_silent(DeliveryTracker::new);
+    tracker.close();
+    let drained = py.detach(|| tracker.wait_idle(timeout));
     // Close the buffer-export releaser's attach gate, wait (GIL detached) for any attach scope it
     // is already in, release what is queued and stop releasing for good (issue #238): nothing
     // may attach to the interpreter once it starts finalizing.
     super::put_payload::begin_shutdown(py);
     if !drained {
         tracing::warn!(
-            in_flight = DELIVERIES.in_flight(),
+            in_flight = tracker.in_flight(),
             timeout = ?timeout,
             "s3dlio: async result deliveries still in flight at interpreter exit; \
              giving up the wait (issue #192 drain timed out)"
@@ -642,18 +652,18 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let finished_in_task = Arc::clone(&finished);
 
-        let before = DELIVERIES.in_flight();
+        let before = deliveries().in_flight();
         let handle = <S3dlioRuntime as Runtime>::spawn_blocking(move || {
             let _ = started_tx.send(());
             let _ = release_rx.recv();
             finished_in_task.store(true, Ordering::SeqCst);
         });
-        assert_eq!(DELIVERIES.in_flight(), before + 1, "counted at enqueue");
+        assert_eq!(deliveries().in_flight(), before + 1, "counted at enqueue");
 
         started_rx
             .recv_timeout(Duration::from_secs(30))
             .expect("closure started");
-        assert_eq!(DELIVERIES.in_flight(), before + 1, "held while running");
+        assert_eq!(deliveries().in_flight(), before + 1, "held while running");
         assert!(!finished.load(Ordering::SeqCst));
 
         release_tx.send(()).expect("release");
@@ -661,7 +671,7 @@ mod tests {
             .block_on(handle)
             .expect("join delivery");
         assert!(finished.load(Ordering::SeqCst));
-        assert!(DELIVERIES.wait_idle(Duration::from_secs(10)));
-        assert_eq!(DELIVERIES.in_flight(), before);
+        assert!(deliveries().wait_idle(Duration::from_secs(10)));
+        assert_eq!(deliveries().in_flight(), before);
     }
 }

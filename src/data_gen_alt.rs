@@ -54,7 +54,34 @@ pub fn optimal_chunk_size(total_size: usize) -> usize {
 /// Single-call generation returning `bytes::Bytes` (zero-copy for UMA).
 #[inline]
 pub fn generate_data_with_config(config: GeneratorConfig) -> bytes::Bytes {
-    generate_data(config).into_bytes()
+    // dgen-data's one-shot generator uses rayon's GLOBAL pool; run it inside s3dlio's own,
+    // fork-aware pool instead (#297).
+    crate::s3_client::with_rayon_pool(|| generate_data(config)).into_bytes()
+}
+
+/// First epoch (+1) in which this process lineage created a dgen-data streaming generator
+/// (0 = none yet). dgen-data keeps its own process-global rayon pool, built by the first
+/// `DataGenerator::new` and NOT fork-aware (a private `OnceLock` in the crate); a streaming
+/// generator that runs its parallel path in a fork child of a process that built that pool waits
+/// for ever on threads that do not exist there. s3dlio cannot rebuild a pool it does not own.
+static DGEN_POOL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The config for a new dgen-data streaming generator. In a fork child whose ancestor already
+/// built dgen-data's pool the generator is limited to ONE thread (its sequential path never
+/// touches the dead pool): correct and non-hanging, but slower. The real fix is a fork-aware
+/// pool in dgen-data (reported in #297).
+pub(crate) fn fork_safe_config(mut config: GeneratorConfig) -> GeneratorConfig {
+    use std::sync::atomic::Ordering;
+    let epoch = crate::fork_guard::epoch();
+    match DGEN_POOL_EPOCH.compare_exchange(0, epoch + 1, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(first) if first - 1 < epoch => {
+            crate::fork_guard::warn_abandoned();
+            config.max_threads = Some(1);
+        }
+        Err(_) => {}
+    }
+    config
 }
 
 /// Generate `size` bytes with controlled dedup/compress, returning `bytes::Bytes`.
@@ -103,13 +130,13 @@ impl ObjectGenAlt {
 
     /// Create a new streaming generator for one object.
     pub fn new_with_seed(total_size: usize, dedup: usize, compress: usize, seed: u64) -> Self {
-        let config = GeneratorConfig {
+        let config = fork_safe_config(GeneratorConfig {
             size: total_size,
             dedup_factor: dedup.max(1),
             compress_factor: compress.max(1),
             seed: Some(seed),
             ..Default::default()
-        };
+        });
         Self {
             inner: DataGenerator::new(config),
         }

@@ -194,33 +194,35 @@ pub fn fill_controlled_data(buf: &mut [u8], dedup: usize, compress: usize) {
         .unwrap_or_default()
         .as_nanos() as u64;
 
-    // FILL IN PLACE using the global Rayon pool (respects install() context!)
-    buf.par_chunks_mut(block_size)
-        .enumerate()
-        .for_each(|(i, chunk)| {
-            let unique_block_idx = i % unique_blocks;
-            let seed = (unique_block_idx as u64).wrapping_add(call_entropy);
-            let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+    // FILL IN PLACE inside s3dlio's own rayon pool (never rayon's global pool, #297).
+    crate::s3_client::with_rayon_pool(|| {
+        buf.par_chunks_mut(block_size)
+            .enumerate()
+            .for_each(|(i, chunk)| {
+                let unique_block_idx = i % unique_blocks;
+                let seed = (unique_block_idx as u64).wrapping_add(call_entropy);
+                let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
 
-            let src = &*A_BASE_BLOCK;
-            let len = chunk.len();
-            chunk.copy_from_slice(&src[..len]);
+                let src = &*A_BASE_BLOCK;
+                let len = chunk.len();
+                chunk.copy_from_slice(&src[..len]);
 
-            let const_len = const_lens[unique_block_idx].min(len);
-            chunk[..const_len].fill(0);
+                let const_len = const_lens[unique_block_idx].min(len);
+                chunk[..const_len].fill(0);
 
-            let region_start = const_len;
-            let region_len = len - region_start;
-            let modify_len = region_len.min(MOD_SIZE);
+                let region_start = const_len;
+                let region_len = len - region_start;
+                let modify_len = region_len.min(MOD_SIZE);
 
-            if modify_len > 0 {
-                rng.fill(&mut chunk[region_start..region_start + modify_len]);
-                let second_offset = HALF_BLK.max(region_start);
-                if second_offset + modify_len <= len {
-                    rng.fill(&mut chunk[second_offset..second_offset + modify_len]);
+                if modify_len > 0 {
+                    rng.fill(&mut chunk[region_start..region_start + modify_len]);
+                    let second_offset = HALF_BLK.max(region_start);
+                    if second_offset + modify_len <= len {
+                        rng.fill(&mut chunk[second_offset..second_offset + modify_len]);
+                    }
                 }
-            }
-        });
+            });
+    });
 }
 
 // =============================================================================

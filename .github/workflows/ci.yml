@@ -169,6 +169,15 @@ jobs:
           python -m pytest -q -rs python/tests/test_get_into_file_direct_295.py \
             python/tests/test_caller_buffer_get_into.py python/tests/test_conftest_fail_on_skip_295.py
 
+      # Fork safety (#297): parent states x child entry points, inherited objects, drop/exit,
+      # the warning, fork while parent threads run s3dlio calls, nested fork, a multiprocessing
+      # fork Pool, DataLoader-style workers, fork+exec, and a mock S3 server proving the child
+      # opens its own connection while the parent's survives. Each child has a hang limit.
+      - name: Test (Python - fork safety)
+        run: |
+          pip install pytest
+          python -m pytest -q -rs python/tests/test_fork_297.py
+
   # Rust-only integration tests that do not depend on the Python version. They
   # run once per OS, in parallel with the `test` matrix, instead of six times
   # inside it (2 OS x 3 Python versions).
@@ -219,6 +228,18 @@ jobs:
             echo "cargo fetch failed (attempt $i); retrying..."
             sleep $((i * 10))
           done
+
+      # Fork safety (#297): tokio must not be built with its `parking_lot` feature (a fork child
+      # follows dangling pointers in parking_lot's global table of parked threads and aborts),
+      # and dashmap must stay the only user of parking_lot_core. Checked on the RESOLVED graph
+      # for every feature set we ship, because a dependency can switch the feature back on.
+      - name: Guard (tokio parking_lot feature)
+        run: scripts/check_fork_safety_deps.sh
+
+      # The fork-safety unit tests (ForkCell rebuild in a child, claim takeover, panic in init,
+      # recursion, the no-drop rule) and the process-global state in a fork child.
+      - name: Test (Rust - fork safety)
+        run: cargo test --release --lib --offline fork
 
       # delete_batch bucket/server grouping (#179).  The integration test runs
       # against an in-process mock S3 endpoint (no network, no credentials).

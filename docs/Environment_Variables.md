@@ -202,6 +202,11 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 | `S3DLIO_RT_THREADS` | `max(4, cores)`, scaled by concurrency hint up to `cores * 4` | Number of Tokio runtime worker threads.  May be further bounded by `configure_tokio_threads()` for MPI-aware per-process budgets.  Note: the historical "capped at 32" docstring referred to the pre-v0.9.92 ceiling that was removed when the auto-scaling formula was rewritten.  **Sanity clamp (new in v0.9.112):** values below `RT_THREADS_LIMIT/4` (where `RT_THREADS_LIMIT` is set by `configure_thread_pools`, auto-called at import time to the MPI-aware per-process budget) are treated as downstream miscomputation and clamped up to `RT_THREADS_LIMIT` — building a 1-worker Tokio runtime silently serializes all concurrent multipart uploads (~10× throughput loss), and the DLIO unet3d datagen bottleneck was traced to exactly this pattern (DLIO's `ObjStoreLibStorage.__init__` computes `S3DLIO_RT_THREADS = write_threads * 1.5`, and with Hydra's default `write_threads=1` that resolves to `1`).  Set `S3DLIO_RT_THREADS_UNSAFE=1` to bypass the clamp.  A stderr warning is printed the first time the clamp fires so operators can spot the miscomputation. |
 | `S3DLIO_RT_THREADS_UNSAFE` | `0` | **New in v0.9.112.** Bypass the `S3DLIO_RT_THREADS` sanity clamp.  Set to `1` (or `true`, `yes`, `on`, `enable`) when you genuinely want a small worker count — e.g. running s3dlio's own single-threaded test suite, or a fault-injection scenario.  Under normal use leave unset. |
 
+### Fork safety (#297)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_FORK_WARN` | on | A process that was forked after s3dlio had been used prints ONE line on stderr the first time it abandons inherited state (runtime, thread pools, connections) and builds fresh ones. Set to `0` (or `false`, `no`, `off`) to silence it. Read when the line would be printed, so a worker can set it in `os.environ` before its first s3dlio call. It has no other effect: the child behaves the same either way. |
+
 ### Connection Timeouts and Retries
 | Variable | Default | Description |
 |----------|---------|-------------|

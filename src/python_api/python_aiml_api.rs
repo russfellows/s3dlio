@@ -37,6 +37,7 @@ use crate::data_loader::{
     s3_bytes::S3BytesDataset,
     DataLoader,
 };
+use crate::fork_guard::Guarded;
 use crate::object_store::store_for_uri_with_helper_rows;
 #[cfg(feature = "extension-module")]
 use crate::python_api::put_payload::{put_payload, quiesce_blocking, PayloadUse};
@@ -60,7 +61,18 @@ use crate::python_api::python_core_api::py_err;
 #[pyclass]
 #[derive(Clone)]
 pub struct PyS3Dataset {
-    inner: S3BytesDataset,
+    /// Never dropped in a fork child (#297): see [`PyDataset`].
+    inner: std::mem::ManuallyDrop<S3BytesDataset>,
+    stamp: crate::fork_guard::ForkStamp,
+}
+
+impl Drop for PyS3Dataset {
+    fn drop(&mut self) {
+        if !self.stamp.is_inherited() {
+            // SAFETY: dropped exactly once, here, and never used afterwards.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.inner) };
+        }
+    }
 }
 
 #[pymethods]
@@ -73,18 +85,35 @@ impl PyS3Dataset {
         let ds = S3BytesDataset::from_prefix_with_opts(uri, &o)
             //.map_err(|e| PyRuntimeError::new_err(e))?;
             .map_err(py_err)?;
-        Ok(Self { inner: ds })
+        Ok(Self {
+            inner: std::mem::ManuallyDrop::new(ds),
+            stamp: crate::fork_guard::ForkStamp::new(),
+        })
     }
     /// Optional: expose keys for debugging
-    fn keys(&self) -> Vec<String> {
-        self.inner.keys().clone()
+    fn keys(&self) -> PyResult<Vec<String>> {
+        self.stamp.check()?;
+        Ok(self.inner.keys().clone())
     }
 }
 
 // Generic dataset that works with all URI schemes
 #[pyclass]
 pub struct PyDataset {
-    inner: Arc<dyn Dataset<Item = Bytes>>,
+    /// A dataset owns store clients and connection pools of the process that created it. In a
+    /// fork child it is refused (`stamp`) and never dropped (`ManuallyDrop`, see the `Drop`
+    /// impl) (#297).
+    inner: std::mem::ManuallyDrop<Arc<dyn Dataset<Item = Bytes>>>,
+    stamp: crate::fork_guard::ForkStamp,
+}
+
+impl Drop for PyDataset {
+    fn drop(&mut self) {
+        if !self.stamp.is_inherited() {
+            // SAFETY: dropped exactly once, here, and never used afterwards.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.inner) };
+        }
+    }
 }
 
 #[pymethods]
@@ -95,7 +124,8 @@ impl PyDataset {
         let o = opts_from_dict(opts);
         let dataset = dataset_for_uri_with_options(uri, &o).map_err(py_err)?;
         Ok(Self {
-            inner: Arc::from(dataset),
+            inner: std::mem::ManuallyDrop::new(Arc::from(dataset)),
+            stamp: crate::fork_guard::ForkStamp::new(),
         })
     }
 
@@ -106,12 +136,14 @@ impl PyDataset {
     /// answer should raise, not lie with 0 — design doc
     /// docs/DESIGN_TIER4_FFI_HARDENING.md item 2).
     fn __len__(&self) -> PyResult<usize> {
+        self.stamp.check()?;
         require_known_length(self.inner.len()).map_err(PyTypeError::new_err)
     }
 
     /// Get an item by index (for map-style datasets)
     /// Returns a PyBytesView for zero-copy access
     fn get_item<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Py<PyAny>> {
+        self.stamp.check()?;
         let inner = Arc::clone(&self.inner);
         let bound_result = future_into_py(py, async move {
             let data = inner.get(index).await.map_err(py_err)?;
@@ -126,6 +158,7 @@ impl PyDataset {
 
     /// Return list of keys if supported (for map-style datasets)
     fn keys(&self) -> PyResult<Vec<String>> {
+        self.stamp.check()?;
         self.inner
             .keys()
             .ok_or_else(|| PyRuntimeError::new_err("keys() not supported for this dataset type"))
@@ -136,6 +169,7 @@ impl PyDataset {
     /// Built by the dataset from the root it parsed, so Python never rebuilds a URI
     /// from the dataset URI and a listed key.
     fn uris(&self) -> PyResult<Vec<String>> {
+        self.stamp.check()?;
         self.inner
             .uris()
             .ok_or_else(|| PyRuntimeError::new_err("uris() not supported for this dataset type"))
@@ -179,15 +213,18 @@ impl PyDataset {
     fn from_uris(uris: Vec<String>, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         let ds = crate::api::dataset_from_uris(uris).map_err(py_err)?;
         Ok(Self {
-            inner: Arc::from(ds),
+            inner: std::mem::ManuallyDrop::new(Arc::from(ds)),
+            stamp: crate::fork_guard::ForkStamp::new(),
         })
     }
 }
 
 impl Clone for PyDataset {
+    /// A clone keeps the stamp of its source: a copy of an inherited dataset stays inherited.
     fn clone(&self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
+            inner: std::mem::ManuallyDrop::new(Arc::clone(&self.inner)),
+            stamp: self.stamp,
         }
     }
 }
@@ -236,6 +273,7 @@ impl PyBytesAsyncDataLoader {
         // Fail loudly rather than silently yielding zero items -- see
         // docs/DESIGN_TIER4_FFI_HARDENING.md item 2. There is currently no
         // Python-exposed streaming path for unknown-length datasets.
+        dataset.stamp.check()?;
         require_known_length(dataset.inner.len()).map_err(PyTypeError::new_err)?;
 
         // Activate process-wide HEAD-skip latch if requested.
@@ -362,7 +400,8 @@ impl PyBytesAsyncDataLoader {
         Py::new(
             slf.py(),
             PyBytesDataLoaderSyncIter {
-                rx: parking_lot::Mutex::new(rx),
+                rx: std::sync::Mutex::new(rx),
+                stamp: crate::fork_guard::ForkStamp::new(),
             },
         )
     }
@@ -405,6 +444,7 @@ impl PyBytesAsyncDataLoader {
         // Fail loudly rather than silently yielding zero items -- see
         // docs/DESIGN_TIER4_FFI_HARDENING.md item 2. There is currently no
         // Python-exposed streaming path for unknown-length datasets.
+        dataset.stamp.check()?;
         require_known_length(dataset.inner.len()).map_err(PyTypeError::new_err)?;
 
         // Activate process-wide HEAD-skip latch if requested.
@@ -520,7 +560,8 @@ impl PyBytesAsyncDataLoader {
         Py::new(
             slf.py(),
             PyObjectDataLoaderSyncIter {
-                rx: parking_lot::Mutex::new(rx),
+                rx: std::sync::Mutex::new(rx),
+                stamp: crate::fork_guard::ForkStamp::new(),
             },
         )
     }
@@ -673,7 +714,8 @@ unsafe fn fill_read_only_bytes_buffer(
 /// run freely during that wait.
 #[pyclass]
 pub struct PyObjectDataLoaderSyncIter {
-    rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Result<(String, Bytes), DatasetError>>>,
+    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<(String, Bytes), DatasetError>>>,
+    stamp: crate::fork_guard::ForkStamp,
 }
 
 #[pymethods]
@@ -683,6 +725,7 @@ impl PyObjectDataLoaderSyncIter {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyObjectItem>> {
+        self.stamp.check()?;
         // Release GIL while the channel is empty (Tokio GETs in flight).
         let result = py.detach(|| blocking_recv_locked(&self.rx));
 
@@ -725,13 +768,17 @@ impl PyObjectDataLoaderSyncIter {
     /// `RuntimeError`, aborting the batch.
     #[pyo3(signature = (n))]
     fn collect_batch(&self, py: Python<'_>, n: usize) -> PyResult<Vec<Py<PyObjectItem>>> {
+        self.stamp.check()?;
         if n == 0 {
             return Ok(Vec::new());
         }
 
         // Release GIL for the entire drain loop — no Python objects created here.
         let raw: Vec<Result<(String, Bytes), DatasetError>> = py.detach(|| {
-            let mut rx = self.rx.lock();
+            let mut rx = self
+                .rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut buf = Vec::with_capacity(n);
             for _ in 0..n {
                 match rx.blocking_recv() {
@@ -765,7 +812,8 @@ impl PyObjectDataLoaderSyncIter {
 /// object's bytes (when using the default S3 bytes format).
 #[pyclass]
 pub struct PyBytesDataLoaderSyncIter {
-    rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Result<Bytes, DatasetError>>>,
+    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<Bytes, DatasetError>>>,
+    stamp: crate::fork_guard::ForkStamp,
 }
 
 #[pymethods]
@@ -775,6 +823,7 @@ impl PyBytesDataLoaderSyncIter {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.stamp.check()?;
         // Release the GIL while the Tokio channel is empty (network I/O in flight).
         // When the next item arrives the GIL is re-acquired automatically and `py`
         // is valid again — no Python::attach / Python::with_gil needed.
@@ -792,6 +841,7 @@ impl PyBytesDataLoaderSyncIter {
 #[allow(clippy::type_complexity)]
 pub struct PyBytesAsyncDataLoaderIter {
     rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Bytes>, DatasetError>>>>,
+    stamp: crate::fork_guard::ForkStamp,
 }
 
 impl PyBytesAsyncDataLoaderIter {
@@ -799,6 +849,7 @@ impl PyBytesAsyncDataLoaderIter {
         // Fail loudly rather than silently yielding zero items -- see
         // docs/DESIGN_TIER4_FFI_HARDENING.md item 2. There is currently no
         // Python-exposed streaming path for unknown-length datasets.
+        dataset.stamp.check()?;
         require_known_length(dataset.inner.len()).map_err(PyTypeError::new_err)?;
 
         let (tx, rx) = mpsc::channel::<Result<Vec<Bytes>, DatasetError>>(opts.prefetch.max(1));
@@ -884,6 +935,7 @@ impl PyBytesAsyncDataLoaderIter {
             py,
             Self {
                 rx: Arc::new(Mutex::new(rx)),
+                stamp: crate::fork_guard::ForkStamp::new(),
             },
         )
     }
@@ -892,6 +944,7 @@ impl PyBytesAsyncDataLoaderIter {
 #[pymethods]
 impl PyBytesAsyncDataLoaderIter {
     fn __anext__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        slf.stamp.check()?;
         let rx = Arc::clone(&slf.rx);
         let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
@@ -920,6 +973,7 @@ impl PyBytesAsyncDataLoaderIter {
 #[allow(clippy::type_complexity)]
 pub struct PyS3AsyncDataLoader {
     rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Bytes>, DatasetError>>>>,
+    stamp: crate::fork_guard::ForkStamp,
 }
 
 // AsyncDataLoader function
@@ -951,6 +1005,7 @@ impl PyS3AsyncDataLoader {
 
         Ok(Self {
             rx: Arc::new(Mutex::new(rx)),
+            stamp: crate::fork_guard::ForkStamp::new(),
         })
     }
 
@@ -959,6 +1014,7 @@ impl PyS3AsyncDataLoader {
     }
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        self.stamp.check()?;
         let rx = self.rx.clone();
         let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
@@ -1520,6 +1576,7 @@ impl PyAsyncDataLoader {
 #[allow(clippy::type_complexity)]
 pub struct PyAsyncDataLoaderIter {
     rx: Arc<Mutex<mpsc::Receiver<Result<Vec<i32>, DatasetError>>>>,
+    stamp: crate::fork_guard::ForkStamp,
 }
 
 /// This is the actual Async Data Loader
@@ -1548,6 +1605,7 @@ impl PyAsyncDataLoaderIter {
             py,
             Self {
                 rx: Arc::new(Mutex::new(rx)),
+                stamp: crate::fork_guard::ForkStamp::new(),
             },
         )
     }
@@ -1556,6 +1614,7 @@ impl PyAsyncDataLoaderIter {
 #[pymethods]
 impl PyAsyncDataLoaderIter {
     fn __anext__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        slf.stamp.check()?;
         let rx = slf.rx.clone();
         let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
@@ -1632,11 +1691,19 @@ where
     result
 }
 
+/// What every checkpoint object shares: the store and the runtime it runs on. It belongs to the
+/// process that created it ([`Guarded`]): a fork child cannot use it, and drops it by leaking.
+#[cfg(feature = "extension-module")]
+#[derive(Clone)]
+struct CheckpointHandle {
+    store: Arc<Mutex<CheckpointStore>>,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
 #[cfg(feature = "extension-module")]
 #[pyclass]
 pub struct PyCheckpointStore {
-    inner: Arc<Mutex<CheckpointStore>>,
-    runtime: crate::fork_guard::EpochRuntime,
+    handle: Guarded<CheckpointHandle>,
 }
 
 #[cfg(feature = "extension-module")]
@@ -1672,14 +1739,16 @@ impl PyCheckpointStore {
         let store = CheckpointStore::open_with_config(&uri, config)
             .map_err(|e| py_err(e.context("Failed to open checkpoint store")))?;
 
-        let runtime = crate::fork_guard::EpochRuntime::new(
+        let runtime = Arc::new(
             build_checkpoint_runtime()
                 .map_err(|e| py_err(format!("Failed to create runtime: {}", e)))?,
         );
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(store)),
-            runtime,
+            handle: Guarded::new(CheckpointHandle {
+                store: Arc::new(Mutex::new(store)),
+                runtime,
+            }),
         })
     }
 
@@ -1703,12 +1772,13 @@ impl PyCheckpointStore {
             serde_json::Value::Null
         });
 
-        let inner = self.inner.clone();
+        let h = self.handle.get()?;
+        let inner = h.store.clone();
 
         // `data` is read in place (any buffer-protocol object), not copied: see
         // `with_blocking_payload`.
         with_blocking_payload(py, data, |data| {
-            self.runtime
+            h.runtime
                 .block_on(async {
                     let store = inner.lock().await;
                     store.save(step, epoch, &framework, data, user_meta).await
@@ -1720,10 +1790,11 @@ impl PyCheckpointStore {
     /// Load the latest checkpoint
     #[pyo3(text_signature = "(self)")]
     fn load_latest(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        let inner = self.inner.clone();
+        let h = self.handle.get()?;
+        let inner = h.store.clone();
 
         py.detach(|| {
-            self.runtime.block_on(async {
+            h.runtime.block_on(async {
                 let store = inner.lock().await;
                 store.load_latest().await
             })
@@ -1738,11 +1809,12 @@ impl PyCheckpointStore {
     /// List available checkpoints
     #[pyo3(text_signature = "(self)")]
     fn list_checkpoints(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
-        let inner = self.inner.clone();
+        let h = self.handle.get()?;
+        let inner = h.store.clone();
 
         let infos = py
             .detach(|| {
-                self.runtime.block_on(async {
+                h.runtime.block_on(async {
                     let store = inner.lock().await;
                     store.list_checkpoints().await
                 })
@@ -1758,10 +1830,11 @@ impl PyCheckpointStore {
     /// Delete a checkpoint
     #[pyo3(text_signature = "(self, step)")]
     fn delete_checkpoint(&self, py: Python<'_>, step: u64) -> PyResult<bool> {
-        let inner = self.inner.clone();
+        let h = self.handle.get()?;
+        let inner = h.store.clone();
 
         py.detach(|| {
-            self.runtime.block_on(async {
+            h.runtime.block_on(async {
                 let store = inner.lock().await;
                 store.delete_checkpoint(step).await
             })
@@ -1773,8 +1846,7 @@ impl PyCheckpointStore {
     #[pyo3(text_signature = "(self, world_size, rank)")]
     fn writer(&self, world_size: u32, rank: u32) -> PyResult<PyCheckpointWriter> {
         Ok(PyCheckpointWriter {
-            store: self.inner.clone(),
-            runtime: self.runtime.clone(),
+            handle: Guarded::new(self.handle.get()?.clone()),
             world_size,
             rank,
         })
@@ -1784,8 +1856,7 @@ impl PyCheckpointStore {
     #[pyo3(text_signature = "(self)")]
     fn reader(&self) -> PyResult<PyCheckpointReader> {
         Ok(PyCheckpointReader {
-            store: self.inner.clone(),
-            runtime: self.runtime.clone(),
+            handle: Guarded::new(self.handle.get()?.clone()),
         })
     }
 }
@@ -1910,14 +1981,16 @@ async fn read_shard_checked(
 #[cfg(feature = "extension-module")]
 #[pyclass]
 pub struct PyCheckpointStream {
-    store: Arc<Mutex<CheckpointStore>>,
-    runtime: crate::fork_guard::EpochRuntime,
+    handle: Guarded<CheckpointHandle>,
     step: u64,
     epoch: u64,
     framework: String,
     world_size: u32,
     rank: u32,
-    writer: Option<Box<dyn crate::object_store::ObjectWriter + Send>>,
+    /// Guarded separately from `handle`: the open shard writer owns a connection (and a
+    /// multipart upload) of the process that created it, and dropping it in a fork child would
+    /// abort the PARENT's upload.
+    writer: Option<Guarded<Box<dyn crate::object_store::ObjectWriter + Send>>>,
     key: Option<String>,
     finalized: bool,
 }
@@ -1933,13 +2006,14 @@ impl PyCheckpointStream {
             return Err(PyRuntimeError::new_err("Stream has been finalized"));
         }
 
-        let store = self.store.clone();
+        let h = self.handle.get()?;
+        let store = h.store.clone();
         let world_size = self.world_size;
         let rank = self.rank;
         let step = self.step;
         let _epoch = self.epoch; // May be used in future for enhanced metadata
         let _framework = self.framework.clone(); // May be used in future for enhanced metadata
-        let runtime = self.runtime.clone();
+        let runtime = h.runtime.clone();
         let writer_slot = &mut self.writer;
         let key_slot = &mut self.key;
 
@@ -1964,12 +2038,13 @@ impl PyCheckpointStream {
                         ckpt_writer.get_shard_writer(&layout).await
                     })
                     .map_err(|e| py_err(e.context("Failed to create writer")))?;
-                *writer_slot = Some(writer);
+                *writer_slot = Some(Guarded::new(writer));
                 *key_slot = Some(key);
             }
 
             match writer_slot.as_mut() {
                 Some(writer) => {
+                    let writer = writer.get_mut()?;
                     runtime
                         .block_on(async { writer.write_chunk(&chunk).await })
                         .map_err(|e| py_err(e.context("Write failed")))?;
@@ -1982,8 +2057,11 @@ impl PyCheckpointStream {
 
     /// Get the number of bytes written so far
     #[pyo3(text_signature = "(self)")]
-    fn bytes_written(&self) -> u64 {
-        self.writer.as_ref().map_or(0, |w| w.bytes_written())
+    fn bytes_written(&self) -> PyResult<u64> {
+        match self.writer.as_ref() {
+            Some(w) => Ok(w.get()?.bytes_written()),
+            None => Ok(0),
+        }
     }
 
     /// Finalize the stream and return shard metadata
@@ -1993,8 +2071,12 @@ impl PyCheckpointStream {
             return Err(PyRuntimeError::new_err("Stream already finalized"));
         }
 
+        let h = self.handle.get()?;
         if let (Some(writer), Some(key)) = (self.writer.take(), self.key.take()) {
-            let store = self.store.clone();
+            // `into_inner` refuses (and leaks the writer) in a fork child: dropping it there
+            // would abort the PARENT's multipart upload.
+            let writer = writer.into_inner()?;
+            let store = h.store.clone();
             let world_size = self.world_size;
             let rank = self.rank;
             let step = self.step;
@@ -2002,7 +2084,7 @@ impl PyCheckpointStream {
 
             let shard_meta = py
                 .detach(|| {
-                    self.runtime.block_on(async {
+                    h.runtime.block_on(async {
                         // Finalize (upload) WITHOUT the store lock, so concurrent streams on
                         // one store are not serialised for the whole upload.
                         let checksum = writer.checksum();
@@ -2039,8 +2121,10 @@ impl PyCheckpointStream {
     /// Cancel the stream and clean up
     #[pyo3(text_signature = "(self)")]
     fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
+        let h = self.handle.get()?;
         if let Some(writer) = self.writer.take() {
-            py.detach(|| self.runtime.block_on(async { writer.cancel().await }))
+            let writer = writer.into_inner()?;
+            py.detach(|| h.runtime.block_on(async { writer.cancel().await }))
                 .map_err(|e| py_err(e.context("Cancel failed")))?;
         }
 
@@ -2053,8 +2137,7 @@ impl PyCheckpointStream {
 #[cfg(feature = "extension-module")]
 #[pyclass]
 pub struct PyCheckpointWriter {
-    store: Arc<Mutex<CheckpointStore>>,
-    runtime: crate::fork_guard::EpochRuntime,
+    handle: Guarded<CheckpointHandle>,
     world_size: u32,
     rank: u32,
 }
@@ -2072,14 +2155,15 @@ impl PyCheckpointWriter {
         framework: String,
         data: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let store = self.store.clone();
+        let h = self.handle.get()?;
+        let store = h.store.clone();
         let world_size = self.world_size;
         let rank = self.rank;
 
         // `data` is read in place (any buffer-protocol object), not copied: see
         // `with_blocking_payload`.
         with_blocking_payload(py, data, |data| {
-            self.runtime
+            h.runtime
                 .block_on(async {
                     let store_guard = store.lock().await;
                     let writer = store_guard.writer(world_size, rank);
@@ -2108,15 +2192,14 @@ impl PyCheckpointWriter {
         epoch: u64,
         framework: String,
     ) -> PyResult<PyCheckpointStream> {
-        let store = self.store.clone();
+        let h = self.handle.get()?;
         let world_size = self.world_size;
         let rank = self.rank;
 
         // Note: We'll need to handle the async creation in a different way
         // For now, return a PyCheckpointStream that handles lazy initialization
         Ok(PyCheckpointStream {
-            store,
-            runtime: self.runtime.clone(),
+            handle: Guarded::new(h.clone()),
             step,
             epoch,
             framework,
@@ -2158,12 +2241,13 @@ impl PyCheckpointWriter {
             shards.push(shard_meta_from_dict(dict)?);
         }
 
-        let store = self.store.clone();
+        let h = self.handle.get()?;
+        let store = h.store.clone();
         let world_size = self.world_size;
         let rank = self.rank;
 
         py.detach(|| {
-            self.runtime.block_on(async {
+            h.runtime.block_on(async {
                 use crate::checkpoint::KeyLayout;
                 let layout = KeyLayout::new(store.lock().await.uri.clone(), step);
                 let store_guard = store.lock().await;
@@ -2180,8 +2264,7 @@ impl PyCheckpointWriter {
 #[cfg(feature = "extension-module")]
 #[pyclass]
 pub struct PyCheckpointReader {
-    store: Arc<Mutex<CheckpointStore>>,
-    runtime: crate::fork_guard::EpochRuntime,
+    handle: Guarded<CheckpointHandle>,
 }
 
 #[cfg(feature = "extension-module")]
@@ -2190,10 +2273,11 @@ impl PyCheckpointReader {
     /// Load latest manifest
     #[pyo3(text_signature = "(self)")]
     fn load_latest_manifest(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        let store = self.store.clone();
+        let h = self.handle.get()?;
+        let store = h.store.clone();
 
         py.detach(|| {
-            self.runtime.block_on(async {
+            h.runtime.block_on(async {
                 let store_guard = store.lock().await;
                 let reader = store_guard.reader();
                 reader.load_latest_manifest().await
@@ -2245,11 +2329,12 @@ impl PyCheckpointReader {
         let (key, checksum) =
             target.ok_or_else(|| PyRuntimeError::new_err(format!("Rank {} not found", rank)))?;
 
-        let store = self.store.clone();
+        let h = self.handle.get()?;
+        let store = h.store.clone();
 
         let data = py
             .detach(|| {
-                self.runtime.block_on(async {
+                h.runtime.block_on(async {
                     let store_guard = store.lock().await;
                     let reader = store_guard.reader();
                     read_shard_checked(&reader, &key, checksum.as_deref()).await
@@ -2601,7 +2686,8 @@ impl PyParquetItem {
 /// bytes — enough for the Python consumer to cache by `(file_uri, rg_idx)`.
 #[pyclass]
 pub struct ParquetStreamIter {
-    rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Result<(usize, Bytes), DatasetError>>>,
+    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<(usize, Bytes), DatasetError>>>,
+    stamp: crate::fork_guard::ForkStamp,
     /// global_rg_idx → (file_uri_idx, rg_idx_in_file)
     rg_info: Arc<Vec<(usize, usize)>>,
     file_uris: Arc<Vec<String>>,
@@ -2614,6 +2700,7 @@ impl ParquetStreamIter {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.stamp.check()?;
         // Release the GIL while waiting — other Python threads continue freely.
         let result = py.detach(|| blocking_recv_locked(&self.rx));
 
@@ -2648,15 +2735,27 @@ impl ParquetStreamIter {
 ///   consumer: Python pops items, caches by (file_uri, rg_idx), serves on demand
 #[pyclass]
 pub struct PyParquetStreamLoader {
-    dataset: Arc<crate::data_loader::ParquetRowGroupDataset>,
+    /// Never dropped in a fork child (#297): see [`PyDataset`].
+    dataset: std::mem::ManuallyDrop<Arc<crate::data_loader::ParquetRowGroupDataset>>,
+    stamp: crate::fork_guard::ForkStamp,
     /// How many row-group GETs to keep in flight simultaneously.
     /// Also the bounded channel capacity (= always 1 full "batch" ahead minimum).
     concurrency: usize,
 }
 
+impl Drop for PyParquetStreamLoader {
+    fn drop(&mut self) {
+        if !self.stamp.is_inherited() {
+            // SAFETY: dropped exactly once, here, and never used afterwards.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.dataset) };
+        }
+    }
+}
+
 #[pymethods]
 impl PyParquetStreamLoader {
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<ParquetStreamIter>> {
+        slf.stamp.check()?;
         let concurrency = slf.concurrency;
         let dataset = Arc::clone(&slf.dataset);
         let total = dataset.len().unwrap_or(0);
@@ -2767,7 +2866,8 @@ impl PyParquetStreamLoader {
         Py::new(
             slf.py(),
             ParquetStreamIter {
-                rx: parking_lot::Mutex::new(rx),
+                rx: std::sync::Mutex::new(rx),
+                stamp: crate::fork_guard::ForkStamp::new(),
                 rg_info,
                 file_uris,
             },
@@ -3145,7 +3245,6 @@ pub fn create_async_loader(
     uri: &str,
     opts: Option<Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    crate::fork_guard::check_py()?;
     // Check for parquet format before falling through to the generic path.
     if let Some(ref d) = opts {
         let format_str = d
@@ -3219,7 +3318,8 @@ pub fn create_async_loader(
             return Py::new(
                 py,
                 PyParquetStreamLoader {
-                    dataset: Arc::new(pq_dataset),
+                    dataset: std::mem::ManuallyDrop::new(Arc::new(pq_dataset)),
+                    stamp: crate::fork_guard::ForkStamp::new(),
                     concurrency,
                 },
             )?

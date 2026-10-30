@@ -1,6 +1,56 @@
 # s3dlio Changelog
 
-## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267)
+## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267); fork safety (#297)
+
+### Fixed — fork safety (#297)
+
+A child made by `fork()` (`os.fork`, `multiprocessing` with the fork start method, PyTorch `DataLoader(num_workers>0)`,
+which forks by default) hung on its first s3dlio call whenever the parent had used s3dlio: `fork` copies only the
+calling thread, so the child owned the parent's Tokio runtimes, rayon pool and connection pools without any of the
+threads that make them work. The same hang hit `generate_data*` and `generate_npz_bytes` even when the parent never did
+any I/O (the rayon pool was built at import), and deleting an inherited `PyCheckpointStore` (or exiting with one) hung
+in `Runtime::drop`.
+
+- **Every s3dlio entry point now works in a fork child.** The child detects the fork (a `pthread_atfork` child handler
+  that only increments an atomic: async-signal-safe, same house style as the #294 op-log handlers) and rebuilds its
+  process-global state lazily, on first use: the global Tokio runtime, the decode/async-API runtime, the rayon pool,
+  the store cache, the S3 / Azure / GCS clients and credentials, the `direct://` bounce pool, the put-payload release
+  queue, the async delivery tracker and attach gate, and the global metrics collector. Nothing inherited is ever
+  used, locked or dropped in the child (the parent's runtimes and pools are leaked in the child, never joined), so
+  the child never reuses the parent's connections, TLS sessions or HTTP/2 streams, and the parent is unaffected.
+- **One warning line on stderr per forked process**, the first time inherited state is abandoned:
+  `s3dlio: this process was forked after s3dlio had already been used; ...`. Silence it with `S3DLIO_FORK_WARN=0`.
+  A child whose parent never used s3dlio prints nothing. `spawn` and `forkserver` never inherit anything and never print it.
+- **Objects created before the fork raise a catchable `RuntimeError` in the child**, never a `PanicException`, a hang
+  or a crash: `PyCheckpointStore` / `PyCheckpointWriter` / `PyCheckpointReader` / `PyCheckpointStream`, object writers
+  (`create_*_writer`), `MultipartUploadWriter`, `MultiEndpointStore`, datasets and loaders and their iterators,
+  `ParquetStream*`, and `Generator`. They own a runtime and/or connections of the parent that cannot be rebuilt
+  transparently. The message is "this s3dlio object was created before fork() ...; create it in the child process".
+  Create the object in the child instead. `del`, garbage collection and interpreter exit of an inherited object are safe: its state is
+  leaked, not dropped (dropping a runtime joins threads that do not exist; dropping a multipart writer would abort the
+  PARENT's upload).
+- **No thread pool is built at import any more.** The rayon pool s3dlio used to build with `build_global` at import is
+  now s3dlio's own pool (not rayon's global one), built on the first parallel call, and every parallel iterator in
+  s3dlio (`generate_data`, `generate_data_with_threads`, `generate_into_buffer`, `generate_npz_bytes`, the in-place
+  fill, one-shot generation in `data_gen_alt`) runs inside it. `configure_tokio_threads(n)` still sets the sizes; it
+  builds nothing.
+- **tokio's `parking_lot` feature is removed** (`tokio` is now built without `full`), and the `parking_lot` dependency
+  is gone; the sync loader iterators use `std::sync::Mutex`. A thread parked in parking_lot leaves an entry in a
+  process-global table that points into its stack; a fork child's own parking_lot use then follows dangling
+  pointers: with the feature on, 10 to 37% of children aborted (SIGABRT) in the investigation. A CI guard
+  (`scripts/check_fork_safety_deps.sh`) fails if the feature returns or if any crate other than `dashmap` uses
+  `parking_lot_core`. Throughput of the tokio change is in `docs/investigation/` (release build, before/after).
+- **Known limits.** (1) A parent thread that holds pyo3's own reference-pool mutex at the instant of the fork can hang the
+  child's first Python call; it affects every PyO3 extension and only pyo3 can fix it (idle parent threads, as with a
+  DataLoader, are practically never affected). (2) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware
+  rayon pool: a streaming `Generator`/`ObjectGen` created in a child whose ancestor already created one is limited to
+  one thread (correct, slower) until dgen-data is fork-aware. (3) The remaining `dashmap` users (the parquet index and
+  file-metadata caches, the redirect certificate store, the store cache) park only on contended shard locks held for a
+  hash operation. (4) Rust callers that fork must not use a store, writer or generator created before the fork.
+- Tests: `python/tests/test_fork_297.py` (parent states x child entry points, inherited objects, drop/exit, warnings,
+  fork while parent threads run s3dlio calls, nested fork, `multiprocessing` fork Pool, DataLoader, exec, a mock S3
+  server proving the child opens its own connection), the `fork_guard` unit tests (rebuild in the child, claim takeover,
+  a panic in `init` releases the claim, recursive init is detected, the no-drop rule) and `src/fork_tests.rs`.
 
 ### Fixed — Op-log can be restarted after `finalize_op_log()` (#294)
 

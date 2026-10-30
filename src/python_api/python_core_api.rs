@@ -251,8 +251,6 @@ fn get_or_create_store(
     uri: &str,
     logger: Option<crate::s3_logger::Logger>,
 ) -> anyhow::Result<Arc<dyn ObjectStore>> {
-    // A fork child that inherited s3dlio state (policy `error`): refuse, never hang (#297).
-    crate::fork_guard::check()?;
     // Routing errors propagate BEFORE the cache is consulted or populated.
     let key = StoreKey::from_uri(uri)?;
 
@@ -313,7 +311,6 @@ where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    crate::fork_guard::check_py()?;
     run_on_global_rt(fut).map_err(py_err)
 }
 
@@ -912,7 +909,6 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// the new session's op_log_stats(); the call itself is unaffected.
 #[pyfunction]
 pub fn init_op_log(py: Python<'_>, path: &str) -> PyResult<()> {
-    crate::fork_guard::check_py()?;
     // A re-init may wait for the previous session to drain (#294): release the GIL
     // meanwhile, as finalize_op_log does.
     py.detach(|| init_op_logger(path)).map_err(py_err)
@@ -3696,6 +3692,19 @@ fn lock_ignoring_poison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard
 pub struct PyObjectWriter {
     inner: std::sync::Mutex<Option<Box<dyn ObjectWriter>>>,
     stats: std::sync::Mutex<WriterStats>,
+    /// The process that created the writer. In a fork child the writer is refused and never
+    /// dropped (a multipart writer's drop would abort the PARENT's upload) (#297).
+    stamp: crate::fork_guard::ForkStamp,
+}
+
+impl Drop for PyObjectWriter {
+    fn drop(&mut self) {
+        let writer = match self.inner.get_mut() {
+            Ok(slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        self.stamp.leak_on_drop(writer);
+    }
 }
 
 impl PyObjectWriter {
@@ -3704,6 +3713,7 @@ impl PyObjectWriter {
         Self {
             inner: std::sync::Mutex::new(Some(writer)),
             stats: std::sync::Mutex::new(stats),
+            stamp: crate::fork_guard::ForkStamp::new(),
         }
     }
 
@@ -3737,6 +3747,7 @@ impl PyObjectWriter {
     /// call without the GIL: an exported buffer the caller promised not to modify, or an
     /// immutable `bytes`.
     fn write_detached(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        self.stamp.check()?;
         py.detach(|| {
             let mut guard = lock_ignoring_poison(&self.inner);
             self.write_locked(&mut guard, data)
@@ -3770,6 +3781,7 @@ impl PyObjectWriter {
     ///
     /// Calls on one writer from several threads run one after another.
     fn write_chunk(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.stamp.check()?;
         // Strict: bytes-like or `__bytes__()` only (never an int or an arbitrary iterable).
         let held = hold_for_call(py, data)?;
         let result = self.write_detached(py, held.as_slice());
@@ -3813,6 +3825,7 @@ impl PyObjectWriter {
 
     /// Finalize the writer and complete the upload
     fn finalize(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        self.stamp.check()?;
         py.detach(|| {
             let mut guard = lock_ignoring_poison(&self.inner);
             let writer = guard
@@ -3984,7 +3997,9 @@ fn endpoint_payload(
 /// Python wrapper for MultiEndpointStore
 #[pyclass(name = "MultiEndpointStore")]
 struct PyMultiEndpointStore {
-    store: Arc<MultiEndpointStore>,
+    /// Owns clients and connection pools of the creating process: refused in a fork child and
+    /// leaked, never dropped, there (#297).
+    store: crate::fork_guard::Guarded<Arc<MultiEndpointStore>>,
 }
 
 #[pymethods]
@@ -3992,7 +4007,7 @@ impl PyMultiEndpointStore {
     /// Get an object from the multi-endpoint store (zero-copy via BytesView)
     fn get<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let data = store
@@ -4014,7 +4029,7 @@ impl PyMultiEndpointStore {
         length: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let data = store
@@ -4049,7 +4064,7 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         guarded_put(py, payload.latch, move || async move {
             store
@@ -4071,7 +4086,7 @@ impl PyMultiEndpointStore {
         recursive: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let objects = store
@@ -4086,7 +4101,7 @@ impl PyMultiEndpointStore {
     /// Delete an object
     fn delete<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             store
@@ -4112,7 +4127,7 @@ impl PyMultiEndpointStore {
         recursive: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let objects = store
@@ -4135,7 +4150,7 @@ impl PyMultiEndpointStore {
         uri: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let data = store
@@ -4165,7 +4180,7 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         guarded_put(py, payload.latch, move || async move {
             store
@@ -4188,7 +4203,7 @@ impl PyMultiEndpointStore {
         uri: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             store
@@ -4220,7 +4235,7 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         guarded_put(py, payload.latch, move || async move {
             store
@@ -4234,7 +4249,7 @@ impl PyMultiEndpointStore {
 
     /// Get per-endpoint statistics
     fn get_endpoint_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let stats = self.store.get_all_stats();
+        let stats = self.store.get()?.get_all_stats();
         let list = PyList::empty(py);
 
         for (uri, stat) in stats {
@@ -4253,7 +4268,7 @@ impl PyMultiEndpointStore {
 
     /// Get total aggregated statistics across all endpoints
     fn get_total_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let total = self.store.get_total_stats();
+        let total = self.store.get()?.get_total_stats();
         let dict = PyDict::new(py);
 
         dict.set_item("total_requests", total.total_requests)?;
@@ -4266,16 +4281,16 @@ impl PyMultiEndpointStore {
     }
 
     /// Get the number of configured endpoints
-    fn endpoint_count(&self) -> usize {
-        self.store.endpoint_count()
+    fn endpoint_count(&self) -> PyResult<usize> {
+        Ok(self.store.get()?.endpoint_count())
     }
 
     /// Get the load balancing strategy
-    fn strategy(&self) -> String {
-        match self.store.strategy() {
+    fn strategy(&self) -> PyResult<String> {
+        Ok(match self.store.get()?.strategy() {
             LoadBalanceStrategy::RoundRobin => "round_robin".to_string(),
             LoadBalanceStrategy::LeastConnections => "least_connections".to_string(),
-        }
+        })
     }
 }
 
@@ -4317,7 +4332,7 @@ fn create_multi_endpoint_store(
         .map_err(|e| py_err(e.context("Failed to create multi-endpoint store")))?;
 
     Ok(PyMultiEndpointStore {
-        store: Arc::new(store),
+        store: crate::fork_guard::Guarded::new(Arc::new(store)),
     })
 }
 
@@ -4422,7 +4437,7 @@ fn create_multi_endpoint_store_from_env(strategy: Option<&str>) -> PyResult<PyMu
         py_err(e.context("Failed to create multi-endpoint store from S3_ENDPOINT_URIS"))
     })?;
     Ok(PyMultiEndpointStore {
-        store: Arc::new(store),
+        store: crate::fork_guard::Guarded::new(Arc::new(store)),
     })
 }
 

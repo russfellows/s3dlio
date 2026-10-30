@@ -2035,10 +2035,8 @@ but never on a file an ancestor process was still writing at the fork, however o
 the child starts and finishes sessions of its own (a `RuntimeError`: initialising it
 would truncate a live log; a log the ancestor had already finalized is not protected
 and may be initialised). Stores
-created before the fork stay silent in the child (one line on stderr says why). Do not use s3dlio I/O in a forked child whose parent has already used s3dlio I/O: the
-parent's runtime threads are not copied by `fork`, and the child's first call can hang
-(this predates the op-log changes). Use the `spawn` or `forkserver` start method, or fork
-before the first s3dlio call. If the
+created before the fork stay silent in the child (one line on stderr says why; see
+"Fork safety" below for everything else a forked child can do). If the
 active file was renamed or deleted behind the session's back (log rotation), a request
 for the old name is a `RuntimeError` saying the session is writing a file that was
 renamed or deleted (it keeps writing the open file); a request that is a directory,
@@ -2125,6 +2123,65 @@ exact number of queue-full drops included). In the default mode the first
 queue-full drop also prints one stderr note per session; later drops are only
 counted. To avoid queue-full drops set `S3DLIO_OPLOG_LOSSLESS=1` (callers wait
 instead of dropping) and/or raise `S3DLIO_OPLOG_BUF`.
+
+### Fork safety (`os.fork`, `multiprocessing`, `DataLoader` workers)
+
+`fork()` copies only the calling thread. Before the fix for issue #297 a forked child that called s3dlio after
+its parent had used it waited for ever on runtime threads that do not exist (issue #297). Now a
+child **works**: it notices the fork and builds its own runtimes, thread pools, store cache and
+clients on first use, and prints ONE line on stderr the first time it abandons inherited state:
+
+```
+s3dlio: this process was forked after s3dlio had already been used; the inherited runtime, ...
+```
+
+Set `S3DLIO_FORK_WARN=0` to silence it. A child whose parent never used s3dlio prints nothing.
+
+What works in a child, whatever the parent did: every function (`get`, `put_bytes`, `list`, `stat`,
+`get_many`, `get_async`, `get_into_async`, ..., `init_op_log`, `generate_data`,
+`generate_data_with_threads`, `generate_into_buffer`, `generate_npz_bytes`), and every object the
+**child itself creates** (`PyCheckpointStore`, writers, `MultiEndpointStore`, datasets, loaders,
+`Generator`). The child never reuses a connection of the parent, and the parent is not affected by
+what the child does.
+
+What does **not** work: an object **created in the parent** that owns a runtime and/or
+connections, used in the child. It raises a catchable `RuntimeError` ("created before fork();
+create it in the child process"), it never hangs and never raises `PanicException`:
+
+```python
+store = s3dlio.PyCheckpointStore("s3://bucket/ckpt")      # parent
+pid = os.fork()
+if pid == 0:
+    store.save(...)                                        # RuntimeError: created before fork()
+    store = s3dlio.PyCheckpointStore("s3://bucket/ckpt")   # create it in the child instead
+```
+
+This covers the checkpoint objects, `create_*_writer` / `MultipartUploadWriter`,
+`MultiEndpointStore`, datasets, loaders and their iterators, parquet stream objects and `Generator`.
+Deleting such an object, garbage collection and interpreter exit in the child are safe: its state
+is leaked, never dropped (dropping would join threads that do not exist, or abort the parent's
+multipart upload).
+
+Practical advice:
+
+- PyTorch `DataLoader(num_workers>0)` and `multiprocessing.Pool` (fork) work. Create s3dlio
+  objects inside the worker (the dataset's `__getitem__` or `worker_init_fn`), not in the main process.
+- `spawn` and `forkserver` remain the most robust start methods (they never inherit anything, so
+  they never print the line above); Python 3.14 makes `forkserver` the default on Linux.
+- Each forked process builds its own pools. On a many-core machine set `S3DLIO_RT_THREADS`
+  (and `configure_tokio_threads(n)`) so N workers do not each start one thread per core.
+- A process that execs after fork (`subprocess`, `os.execv`) is a new program: nothing applies.
+
+Known limits (fork cannot be made fully safe from a library):
+
+- If another parent thread holds **PyO3's internal reference-pool mutex** at the instant of the
+  fork, the child's first Python call can wait for it for ever. Every PyO3 extension has this
+  window; only PyO3 can close it. It is tiny (nanoseconds) and practically only seen when parent
+  threads hammer s3dlio calls while a fork happens; idle parent threads (the `DataLoader` pattern)
+  are not affected.
+- A streaming `Generator` created in a child whose ancestor already created one runs with one
+  thread (dgen-data's pool is not fork-aware): correct, slower.
+- Fork from inside a thread-local destructor is not protected.
 
 ### Python Convenience Helpers
 

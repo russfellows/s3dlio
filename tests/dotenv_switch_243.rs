@@ -74,7 +74,7 @@ fn probe_child() {
         }
         "pool" => {
             s3dlio::s3_client::configure_thread_pools(0);
-            format!("rayon={}", rayon::current_num_threads())
+            format!("rayon={}", s3dlio::s3_client::rayon_pool_threads())
         }
         "unsigned" => format!("unsigned={}", s3dlio::s3_client::unsigned_payload_enabled()),
         "logger" => {
