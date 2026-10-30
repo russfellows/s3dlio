@@ -251,6 +251,8 @@ fn get_or_create_store(
     uri: &str,
     logger: Option<crate::s3_logger::Logger>,
 ) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    // A fork child that inherited s3dlio state (policy `error`): refuse, never hang (#297).
+    crate::fork_guard::check()?;
     // Routing errors propagate BEFORE the cache is consulted or populated.
     let key = StoreKey::from_uri(uri)?;
 
@@ -910,6 +912,7 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// the new session's op_log_stats(); the call itself is unaffected.
 #[pyfunction]
 pub fn init_op_log(py: Python<'_>, path: &str) -> PyResult<()> {
+    crate::fork_guard::check_py()?;
     // A re-init may wait for the previous session to drain (#294): release the GIL
     // meanwhile, as finalize_op_log does.
     py.detach(|| init_op_logger(path)).map_err(py_err)

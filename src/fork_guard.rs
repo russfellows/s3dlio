@@ -35,6 +35,7 @@ static USED: AtomicBool = AtomicBool::new(false);
 /// Set by the child handler when [`USED`] was set at the fork: this process holds inherited
 /// s3dlio state that cannot work.
 static INHERITED_USED: AtomicBool = AtomicBool::new(false);
+static WARNED_EPOCH: AtomicU64 = AtomicU64::new(0);
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static POLICY: AtomicU8 = AtomicU8::new(Policy::Rebuild as u8);
 
@@ -46,13 +47,16 @@ pub enum Policy {
     Rebuild = 0,
     /// Refuse every call that needs process-global state with a clear error.
     Error = 1,
+    /// The literal "exit with an error" (prototype only, to measure it): print the message and
+    /// `_exit(75)` the child on its first call.
+    Exit = 2,
 }
 
 pub(crate) fn policy() -> Policy {
-    if POLICY.load(Ordering::Relaxed) == Policy::Error as u8 {
-        Policy::Error
-    } else {
-        Policy::Rebuild
+    match POLICY.load(Ordering::Relaxed) {
+        x if x == Policy::Error as u8 => Policy::Error,
+        x if x == Policy::Exit as u8 => Policy::Exit,
+        _ => Policy::Rebuild,
     }
 }
 
@@ -60,6 +64,7 @@ pub(crate) fn policy() -> Policy {
 fn policy_from_env() -> Policy {
     match std::env::var("S3DLIO_FORK_POLICY").ok().as_deref() {
         Some("error") | Some("fail") => Policy::Error,
+        Some("exit") => Policy::Exit,
         _ => Policy::Rebuild,
     }
 }
@@ -69,8 +74,17 @@ connections do not exist in the forked child. Create the child with the 'spawn' 
 start method (multiprocessing.set_start_method('spawn'); DataLoader(multiprocessing_context='spawn')), \
 or fork before the first s3dlio call, or set S3DLIO_FORK_POLICY=rebuild";
 
+fn exit_if_needed() {
+    if policy() == Policy::Exit && INHERITED_USED.load(Ordering::Acquire) {
+        eprintln!("s3dlio: {MSG}; exiting the child process (status 75)");
+        // SAFETY: `_exit` never returns and skips every destructor and atexit handler.
+        unsafe { libc::_exit(75) };
+    }
+}
+
 /// `Err` in a fork child that inherited s3dlio state while the policy is `Error`.
 pub(crate) fn check() -> anyhow::Result<()> {
+    exit_if_needed();
     if policy() == Policy::Error && INHERITED_USED.load(Ordering::Acquire) {
         anyhow::bail!(MSG);
     }
@@ -80,6 +94,7 @@ pub(crate) fn check() -> anyhow::Result<()> {
 /// [`check`] as a Python exception (`RuntimeError`).
 #[cfg(feature = "extension-module")]
 pub(crate) fn check_py() -> pyo3::PyResult<()> {
+    exit_if_needed();
     if policy() == Policy::Error && INHERITED_USED.load(Ordering::Acquire) {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(MSG));
     }
@@ -150,6 +165,7 @@ impl<T: 'static> ForkCell<T> {
             return v;
         }
         register();
+        exit_if_needed();
         if policy() == Policy::Error && INHERITED_USED.load(Ordering::Acquire) {
             // Defence in depth: an entry point that did not call `check` must still never hang.
             panic!("{MSG}");
@@ -182,6 +198,16 @@ impl<T: 'static> ForkCell<T> {
             }
             // Re-read the epoch AFTER the claim (a fork may have landed while waiting).
             let epoch = EPOCH.load(Ordering::Acquire);
+            if !self.slot.load(Ordering::Acquire).is_null()
+                && WARNED_EPOCH.swap(epoch, Ordering::AcqRel) != epoch
+                && std::env::var_os("S3DLIO_FORK_WARN").is_none_or(|v| v != "0")
+            {
+                eprintln!(
+                    "s3dlio: this process was forked after s3dlio had already been used; the \
+                     inherited runtime and connections are abandoned and fresh ones are built \
+                     (set S3DLIO_FORK_WARN=0 to silence, or use the spawn start method)"
+                );
+            }
             let value = init();
             let slot = Box::into_raw(Box::new(Slot { epoch, value }));
             USED.store(true, Ordering::Release);
@@ -197,5 +223,71 @@ impl<T: 'static> ForkCell<T> {
 impl<T: 'static> Default for ForkCell<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The fork epoch of this process (see [`ForkCell`]); objects that own a runtime or a client
+/// record it at creation and refuse to work in a later one.
+pub fn epoch() -> u64 {
+    EPOCH.load(Ordering::Acquire)
+}
+
+/// A per-OBJECT runtime (the checkpoint store owns one). It cannot be rebuilt transparently:
+/// the object also owns store clients whose connections belong to the parent. After a fork the
+/// object refuses to run (a clear panic message, never a hang); create the object in the child.
+#[derive(Clone)]
+pub struct EpochRuntime {
+    rt: std::sync::Arc<tokio::runtime::Runtime>,
+    epoch: u64,
+}
+
+impl EpochRuntime {
+    pub fn new(rt: tokio::runtime::Runtime) -> Self {
+        register();
+        USED.store(true, Ordering::Release);
+        Self {
+            rt: std::sync::Arc::new(rt),
+            epoch: epoch(),
+        }
+    }
+}
+
+impl std::ops::Deref for EpochRuntime {
+    type Target = tokio::runtime::Runtime;
+    fn deref(&self) -> &tokio::runtime::Runtime {
+        if self.epoch != epoch() {
+            panic!(
+                "this s3dlio object (it owns a runtime and connections) was created before \
+                 fork() and cannot be used in the forked child: create it in the child process"
+            );
+        }
+        &self.rt
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A fork child never sees the value its parent built: it builds its own (RED before the
+    /// fix: the child got the parent's value, whose thread does not exist there).
+    #[test]
+    fn a_fork_child_rebuilds_instead_of_inheriting() {
+        static CELL: ForkCell<u64> = ForkCell::new();
+        register();
+        let parent_value = *CELL.get_or_init(|| 1);
+        assert_eq!(CELL.get(), Some(&1));
+        // SAFETY: the child only does atomic loads, one allocation and `_exit`.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let inherited = CELL.get().is_some(); // must be None: the epoch moved
+            let rebuilt = *CELL.get_or_init(|| 2);
+            let ok = !inherited && parent_value == 1 && rebuilt == 2;
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status}");
+        assert_eq!(CELL.get(), Some(&1), "the parent keeps its own value");
     }
 }

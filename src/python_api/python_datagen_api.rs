@@ -66,7 +66,7 @@ fn generate_data(
             block_size: None,
             seed: None,
         };
-        dgen_generate_data(config)
+        crate::s3_client::rayon_pool().install(|| dgen_generate_data(config))
     });
 
     // Convert to Bytes (zero-copy for UMA via Bytes::from(vec)) and wrap

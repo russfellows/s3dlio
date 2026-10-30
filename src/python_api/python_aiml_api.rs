@@ -1636,7 +1636,7 @@ where
 #[pyclass]
 pub struct PyCheckpointStore {
     inner: Arc<Mutex<CheckpointStore>>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: crate::fork_guard::EpochRuntime,
 }
 
 #[cfg(feature = "extension-module")]
@@ -1672,7 +1672,7 @@ impl PyCheckpointStore {
         let store = CheckpointStore::open_with_config(&uri, config)
             .map_err(|e| py_err(e.context("Failed to open checkpoint store")))?;
 
-        let runtime = Arc::new(
+        let runtime = crate::fork_guard::EpochRuntime::new(
             build_checkpoint_runtime()
                 .map_err(|e| py_err(format!("Failed to create runtime: {}", e)))?,
         );
@@ -1911,7 +1911,7 @@ async fn read_shard_checked(
 #[pyclass]
 pub struct PyCheckpointStream {
     store: Arc<Mutex<CheckpointStore>>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: crate::fork_guard::EpochRuntime,
     step: u64,
     epoch: u64,
     framework: String,
@@ -2054,7 +2054,7 @@ impl PyCheckpointStream {
 #[pyclass]
 pub struct PyCheckpointWriter {
     store: Arc<Mutex<CheckpointStore>>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: crate::fork_guard::EpochRuntime,
     world_size: u32,
     rank: u32,
 }
@@ -2181,7 +2181,7 @@ impl PyCheckpointWriter {
 #[pyclass]
 pub struct PyCheckpointReader {
     store: Arc<Mutex<CheckpointStore>>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: crate::fork_guard::EpochRuntime,
 }
 
 #[cfg(feature = "extension-module")]
@@ -3145,6 +3145,7 @@ pub fn create_async_loader(
     uri: &str,
     opts: Option<Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
+    crate::fork_guard::check_py()?;
     // Check for parquet format before falling through to the generic path.
     if let Some(ref d) = opts {
         let format_str = d

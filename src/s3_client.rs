@@ -120,6 +120,22 @@ static RT_HANDLE: crate::fork_guard::ForkCell<Handle> = crate::fork_guard::ForkC
 static CLIENT: crate::fork_guard::ForkCell<OnceCell<Client>> = crate::fork_guard::ForkCell::new();
 /// Worker threads of the pyo3 (decode / async-API) runtime, set by configure_thread_pools.
 pub(crate) static DECODE_THREADS: AtomicUsize = AtomicUsize::new(0);
+static RAYON_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// s3dlio's own rayon pool (what `ThreadPoolBuilder::build_global` made at import): rebuilt in
+/// a fork child, because the global pool's worker threads do not exist there and any parallel
+/// iterator would wait for them for ever (#297). Run parallel work as `rayon_pool().install(..)`.
+pub(crate) fn rayon_pool() -> &'static rayon::ThreadPool {
+    static POOL: crate::fork_guard::ForkCell<rayon::ThreadPool> = crate::fork_guard::ForkCell::new();
+    POOL.get_or_init(|| {
+        let n = RAYON_THREADS.load(Ordering::Relaxed);
+        let mut b = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("s3dlio-rayon-{i}"));
+        if n > 0 {
+            b = b.num_threads(n);
+        }
+        b.build().expect("failed to build the s3dlio rayon pool")
+    })
+}
 
 /// Concurrency hint set by [`configure_for_concurrency`].
 /// Zero means "not set" — `get_runtime_threads` uses the CPU-based default.
@@ -193,6 +209,7 @@ pub fn configure_thread_pools(threads: usize) {
 
     // Global s3dlio Tokio runtime (blocking/sync + Python callers).
     RT_THREADS_LIMIT.store(threads, Ordering::Relaxed);
+    RAYON_THREADS.store(threads, Ordering::Relaxed);
 
     // pyo3-async-runtimes Tokio runtime (create_async_loader / Arrow decode
     // streaming pipeline) -- only present in Python extension builds.
