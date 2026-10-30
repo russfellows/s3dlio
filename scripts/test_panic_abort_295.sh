@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 # Regression test for #295 / #267: the file stores must not rely on catching a panic.
 #
 # Builds examples/abort_localset_295.rs with the `abort-test` profile (panic = "abort", see

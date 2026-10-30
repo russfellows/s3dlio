@@ -878,6 +878,10 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 ///       there and the child may start its OWN session, but not on the
 ///       file an ancestor is still writing (RuntimeError: it would truncate a
 ///       live log); a log the parent had already finalized may be initialised.
+///       This covers the op-log only: a forked child must not use s3dlio I/O
+///       once the parent has (the parent's runtime threads are not copied by
+///       fork, so the child's first call can hang); use the "spawn" or
+///       "forkserver" start method, or fork before the first s3dlio call.
 ///     - Call after finalize_op_log(): starts a NEW session. If the previous
 ///       session's writer is still draining (finalize running on another
 ///       thread), it waits for that first. The file is created like a first
@@ -894,6 +898,9 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// they are constructed: those created before init_op_log() are never logged;
 /// those created before finalize_op_log() stop recording when it runs, and stay
 /// silent after a later init_op_log() (they never write into the new session).
+/// A call still running when finalize_op_log() runs writes no row, even if a
+/// new session has started by the time it completes, and is not counted in
+/// the new session's op_log_stats(); the call itself is unaffected.
 #[pyfunction]
 pub fn init_op_log(py: Python<'_>, path: &str) -> PyResult<()> {
     // A re-init may wait for the previous session to drain (#294): release the GIL

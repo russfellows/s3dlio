@@ -8,7 +8,7 @@
 // the number of destination positions filled (also on an error), a HEAD row the size (0 for
 // an absent file), and the inner store writes no row of its own.
 //
-// One process, one op-log (it is process-global and cannot be re-initialised).
+// The op-log is process-global: the tests in this binary share one session.
 
 #[allow(dead_code)] // shared test helpers; each test binary uses a subset
 mod common;

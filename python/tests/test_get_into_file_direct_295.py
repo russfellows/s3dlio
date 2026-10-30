@@ -1,3 +1,7 @@
+# python/tests/test_get_into_file_direct_295.py
+#
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 """get_into_async / head_async / object_capabilities for file:// and direct:// (#295, #267).
 
 Runs against the INSTALLED wheel, in process, with no network and no environment variable

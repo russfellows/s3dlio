@@ -30,7 +30,7 @@
 //!
 //! # The rule
 //!
-//! [`blocking_io`] (crate-internal) calls `block_in_place` ONLY when ALL of these hold:
+//! `blocking_io` (crate-internal) calls `block_in_place` ONLY when ALL of these hold:
 //!
 //! 1. the current thread carries the worker marker ([`mark_tokio_worker_thread`]);
 //! 2. the current runtime is a multi-thread runtime;
@@ -135,7 +135,7 @@ static HANDOFFS: AtomicU64 = AtomicU64::new(0);
 /// larger `on_thread_start` closure of your own (the builder keeps one callback only).
 /// s3dlio's own runtimes already do this.
 ///
-/// `on_thread_start` also runs for the runtime\'s `spawn_blocking` threads. That is harmless
+/// `on_thread_start` also runs for the runtime's `spawn_blocking` threads. That is harmless
 /// except for a `spawn_blocking` closure that drives a `LocalSet` itself: see the module
 /// documentation and [`inline_blocking_io`].
 ///

@@ -1,3 +1,7 @@
+# tests/test_oplog_lifecycle_permutations_294.py
+#
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 """Op-log lifecycle PERMUTATION matrix for s3dlio issue #294 (round 2).
 
 Systematic coverage of starting and stopping op-logging from single-threaded,

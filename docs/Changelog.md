@@ -2,267 +2,197 @@
 
 ## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267)
 
-### Fixed
+### Fixed — Op-log can be restarted after `finalize_op_log()` (#294)
 
-- **Op-log can be restarted after `finalize_op_log()` (#294).** `init_op_log(path)` /
-  `init_op_logger(path)` after a finalize used to fail with "op-log was already finalized and
-  cannot be restarted; a process supports only one op-log session" (even with a different file),
-  which broke repeated unit tests and Jupyter use. The lifecycle is now `Uninitialized` ->
-  `Active` -> `Finalized` -> `Active` -> ...: one session at a time, any number in a process.
-  This supersedes the "One op-log session per process (#170)" behaviour listed under 0.10.0.
-  - A re-init starts a new session: new file (create-and-truncate, like a first init: a
-    different path leaves the finished log untouched, the same path replaces it), a fresh
-    `Logger`, `op_log_stats()` restarting at zero (it is the new session's, never a sum) and a
-    clock offset of 0; the process client ID carries over.
-  - A re-init never lets two writers overlap: if the previous session's writer is still
-    draining (a finalize on another thread), init waits for that drain before opening the new
-    file. If another thread initialises meanwhile, the call is the Active no-op.
-  - A failed init after a finalize leaves the op-log Finalized so a corrected call can succeed.
-  - **Init while a session is Active** (round 2, decided by the maintainer): the same file (any
-    spelling: `x`, `./x`, absolute, `file:///abs/x`, `dir/../x`, a symlink or hard link to it;
-    decided by `(device, inode)` on Unix, canonical paths elsewhere) is a no-op and nothing is
-    truncated; ANY OTHER file is now an error (`ErrorKind::ResourceBusy`, `RuntimeError` in
-    Python) naming the file being written and the requested path and saying to finalize first;
-    the requested path is not created. BEHAVIOUR CHANGE: this used to be a silent no-op for any
-    path, which let a caller believe it was logging to the new file. Of N concurrent inits with
-    different files exactly one wins and the others get the error.
-  - **Fork safety:** a child created by `fork` (`os.fork`, `multiprocessing` fork) inherited the
-    parent's Active session without its writer thread: a lossless `log()` on a full queue and
-    `finalize_op_log()` blocked forever, and the child could deadlock on the lifecycle lock if
-    another parent thread held it during the fork. The child now sees the op-log as not
-    initialised (`pthread_atfork`; the lock is held across the fork), may start its own session,
-    and is refused (`ResourceBusy`) if it initialises a file the parent was still writing (see
-    round 4: finished logs are not protected).
-  - The permutation matrix: `tests/test_oplog_lifecycle_permutations_294.py` (single thread,
-    16 threads racing init/finalize, workers running during 50 cycles, asyncio, fork/spawn,
-    exit; lossy and lossless) and `tests/oplog_lifecycle_{same_file_spellings,
-    concurrent_init_same_file,concurrent_init_different_files,cycles_no_leaks}.rs`.
-  - **Round 3 (second adversarial review):**
-    - *Fork guard hole closed (S2).* The parent's file was remembered only until the child
-      started a session of its own, so `child: init(c); finalize; init(parent file)` truncated
-      the parent's live log (a grandchild forgot its grandparent's file too). The files of
-      every ancestor session are now kept in a process-lifetime, append-only set (linked from
-      the atfork child handler with a node allocated in `prepare`, so the handler does not
-      allocate) and refused on every init (round 4 narrowed this to sessions that were Active at
-      the fork). The new file is opened WITHOUT truncation, its
-      identity read from the open descriptor, vetted, and only then truncated, so a refused
-      request never touches the file. The message now says whether the ancestor was still
-      writing the file or had finished it (N5; both are refused: truncating a finished log
-      destroys data too).
-    - *Session identity from the open file (N6a):* `(device, inode)` comes from `fstat` of the
-      created descriptor, not from a path lookup afterwards. Documented limitation (N6b):
-      filesystems without stable inodes (FUSE without `use_ino`, CIFS `noserverino`, overlayfs
-      without `xino`) can make a same-path init while Active fail with `ResourceBusy`.
-    - *Accurate messages (N7):* a session whose file was renamed or deleted says so (and, on
-      Linux, what the file is now called) instead of "already active and writing '<old name>'";
-      a request that is a directory, a device, a FIFO or a dangling symlink is described as
-      such; the requested path is shown resolved (`chdir` between two inits of a relative path
-      names both files).
-    - *Fork handlers hardened (N8):* registration is an atomic claim that records the process
-      id (a `Once` could stay RUNNING in a child forked during the first init and hang its
-      init); handlers use `try_with` (a fork from a thread-local destructor no longer aborts);
-      the client-id mutex is held across the fork too (lock order: lifecycle, then client id;
-      `GLOBAL_CLIENT_ID` is now a plain `static Mutex`); the child's note says the process was
-      forked, not that the op-log was finalized; the `Forked` state is gone (the child is
-      `Uninitialized` plus the inherited set), so non-Unix builds have no dead code. Documented:
-      a hung `File::create` under the lifecycle lock also blocks `fork()`.
-    - *CI (B1):* the Python job now runs `tests/test_oplog_store_cache.py` and
-      `tests/test_oplog_lifecycle_permutations_294.py` (skipped without the `zstd` CLI, which
-      CI installs); the permutation file's scenarios use real paths so messages compare exactly.
-    - *Tests:* `tests/oplog_lifecycle_fork_{child_logger_closed,holds_lock,inherited_files,
-      from_tls_destructor}.rs`, `tests/oplog_lifecycle_active_file_gone_or_odd.rs`, unit tests
-      for the registration protocol and for the identify-then-vet-then-truncate open, and
-      Python `test_16e`-`test_16i`, `test_18`-`test_20` and the opt-in bind-mount
-      `test_21` (`S3DLIO_TEST_BIND_MOUNT_DIR`, see `docs/Environment_Variables.md`).
-  - **Round 4 (third adversarial review):**
-    - *Inode reuse refused a NEW path (B1) and S1.* Round 3 also refused the files of
-      FINALIZED ancestor sessions, compared by `(device, inode)`. A finalized session's
-      descriptor is closed, so once its file was deleted the inode number was reused at once
-      (ext4): `parent: init a; finalize; rm a; fork; child: init NEW b0` failed with
-      `ResourceBusy`, the message said "nothing was created", and b0 was left behind as an empty
-      file. Only the last session was recorded either way (S1). Now only sessions that were
-      ACTIVE at the fork (or finalized with the writer still draining: its file is still being written) are protected: the hazard is truncating a log an ancestor is still
-      WRITING, an Active session's descriptor stays open in every descendant (so its inode can
-      never be reused and the identity is exact), and a finished log has no writer to corrupt
-      (its owner may replace it by initialising the same path too; so may a child). The refusal
-      message and docs say exactly that. A new file is created with `O_CREAT|O_EXCL` and is
-      never vetted (it cannot be an ancestor's live file); only an existing file is opened
-      without truncation, vetted and then truncated, so a refusal never leaves a new file.
-    - *N2:* the double-registration early return in `prepare` is now tested (handlers
-      registered twice, then a fork with an Active session: no deadlock). *N3:* the
-      `/proc/self/fd` identity check in `current_name` is tested (a reused descriptor number
-      is not trusted). *N4:* the registration wait yields 64 times, then sleeps 50 us growing
-      to 1 ms instead of spinning. *N1 (unchanged, documented):* a `fork()` from a thread-local
-      destructor is unprotected.
-  - Stores, readers and writers captured in an earlier session keep that session's closed
-    logger: they keep working but never write into a later session's file. The Python
-    module-level calls look the op-log up on every call, so they need no change.
-  - Tests: `tests/oplog_lifecycle_reinit_{after_finalize,same_path,waits_for_drain,old_store}.rs`
-    (replacing `oplog_lifecycle_reinit_rejected.rs`) and `tests/test_oplog_lifecycle.py`.
+`init_op_log(path)` / `init_op_logger(path)` after a finalize used to fail with "op-log was already finalized and
+cannot be restarted; a process supports only one op-log session" (even with a different file), which broke repeated
+unit tests and Jupyter use. The lifecycle is now `Uninitialized` -> `Active` -> `Finalized` -> `Active` -> ...: one
+session at a time, any number in a process. This supersedes the "One op-log session per process (#170)" behaviour
+listed under 0.10.0.
+
+- **Init after a finalize** starts a new session: the file is created and truncated like a first init (a different
+  path leaves the finished log untouched, the same path replaces it), with a fresh `Logger`, `op_log_stats()`
+  restarting at zero (the new session's counts, never a sum) and a clock offset of 0. The process client ID carries
+  over.
+- **Two writers never overlap.** If the previous session's writer is still draining (a finalize on another thread),
+  init waits for the drain before it opens the new file. If another thread initialises meanwhile, the call is the
+  Active no-op below.
+- **A failed init** after a finalize leaves the op-log Finalized, so a corrected call can succeed.
+- **Init while a session is Active.**
+  - The same file is a no-op and nothing is truncated. That covers any spelling: `x`, `./x`, an absolute path,
+    `file:///abs/x`, `dir/../x`, or a symlink or hard link to it. Unix compares `(device, inode)` of the open file;
+    other platforms compare canonical paths.
+  - Any other file is an error: `ErrorKind::ResourceBusy` in Rust, `RuntimeError` in Python. The message names the
+    file being written and the requested path, and says to finalize first. The requested path is not created.
+  - Of N concurrent inits with different files, exactly one wins and the others get the error.
+  - BEHAVIOUR CHANGE: init with a different file used to be a silent no-op, which let a caller believe it was
+    logging to the new file.
+- **Fork safety** (Unix, `pthread_atfork`). A child created by `fork` (`os.fork`, `multiprocessing` with the fork
+  start method) used to inherit the parent's Active session without its writer thread: a lossless `log()` on a full
+  queue, and `finalize_op_log()`, blocked forever, and the child could deadlock on the lifecycle lock if another parent
+  thread held it during the fork. Now:
+  - The child sees the op-log as not initialised and may start a session of its own. The lifecycle and client-ID
+    locks are held across the fork, so the child never inherits them locked.
+  - An init in the child of a file that an ancestor was still writing at the fork is refused with `ResourceBusy`, so
+    a child cannot truncate a live log. That includes a session that was finalized but still draining. This holds for
+    every later session of the child and its descendants too.
+  - A log that was already finished at the fork is not protected (it has no writer), so a child may replace it, as
+    the parent could.
+  - A fork from inside a thread-local destructor is not protected.
+- **Existing files are never truncated before they are vetted.** A new file is created with `O_CREAT|O_EXCL`; an
+  existing file is opened without truncation, identified from the open descriptor, vetted, and only then truncated.
+  A refused init therefore leaves the requested path exactly as it was.
+- **Error messages** say when the active session's file was renamed or deleted (and, on Linux, what it is called now),
+  describe a request that is a directory, a device, a FIFO or a dangling symlink as such, and show the requested path
+  resolved (a `chdir` between two inits of a relative path names both files).
+- **Earlier sessions' handles.** Stores, readers and writers created during an earlier session keep that session's
+  closed logger: they keep working but never write into a later session's file. The Python module-level calls look
+  the op-log up on every call, so they need no change.
+- **In-flight calls across a finalize.** A call that is still running when its session is finalized writes no row
+  (the logger is closed), even if a new session has started by the time it completes, and it is not counted in the
+  new session's `op_log_stats()`; the call itself is unaffected.
+- **Limitations.** On filesystems without stable inode numbers (FUSE without `use_ino`, CIFS with `noserverino`,
+  overlayfs without `xino`), an init of the same path while Active can fail with `ResourceBusy`. A `File::create` that
+  hangs (for example on a dead network mount) holds the lifecycle lock, so it also blocks `fork()` in that process.
+- **Tests:** the Python permutation matrix `tests/test_oplog_lifecycle_permutations_294.py` (single thread, 16 threads
+  racing init and finalize, workers running through 50 cycles, asyncio, fork and spawn, exit, lossy and lossless; the
+  opt-in bind-mount case uses `S3DLIO_TEST_BIND_MOUNT_DIR`, see `docs/Environment_Variables.md`),
+  `tests/test_oplog_lifecycle.py`, and the Rust binaries `tests/oplog_lifecycle_reinit_*.rs`,
+  `tests/oplog_lifecycle_fork_*.rs`, `tests/oplog_lifecycle_concurrent_init_*.rs`,
+  `tests/oplog_lifecycle_same_file_spellings.rs`, `tests/oplog_lifecycle_cycles_no_leaks.rs` and
+  `tests/oplog_lifecycle_active_file_gone_or_odd.rs` (replacing `oplog_lifecycle_reinit_rejected.rs`). CI's Python job
+  now also runs `tests/test_oplog_store_cache.py` and the permutation matrix.
+
 ### Added — Caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267)
 
-The caller-buffer GET and the typed HEAD that v0.10.0 added for S3, Azure and GCS (#264) now also work
-on the local file stores. `s3dlio.get_into_async("file:///path", buf, expected_len=n)`,
-`s3dlio.get_into_async("direct:///path", ...)` and `s3dlio.head_async(...)` no longer raise
-`UnsupportedOperationError`, and `object_capabilities` reports `get_into: True, head: True` for both
-schemes (in every build, including `arrow-backend`: the local file stores do not depend on a backend). The
-Rust methods are `ObjectStore::get_into` and `ObjectStore::head` on `FileSystemObjectStore` and
-`ConfigurableFileSystemObjectStore` (so also on every store `store_for_uri*` and `direct_io_store_for_uri*`
-build for these schemes, with or without the op-log wrapper).
+The caller-buffer GET and the typed HEAD that v0.10.0 added for S3, Azure and GCS (#264) now also work on the local
+file stores. `s3dlio.get_into_async("file:///path", buf, expected_len=n)`, `s3dlio.get_into_async("direct:///path", ...)`
+and `s3dlio.head_async(...)` no longer raise `UnsupportedOperationError`, and `object_capabilities` reports
+`get_into: True, head: True` for both schemes in every build, including `arrow-backend` (the local file stores do not
+depend on a backend). The Rust methods are `ObjectStore::get_into` and `ObjectStore::head` on `FileSystemObjectStore` and
+`ConfigurableFileSystemObjectStore`, so also on every store that `store_for_uri*` and `direct_io_store_for_uri*` build for
+these schemes, with or without the op-log wrapper.
 
-**Added**
-- `get_into` for `file://`: `pread` straight into the caller's buffer, in chunks of at most 16 MiB. No other
-  buffer of the object's size is allocated.
-- `get_into` for `direct://` (and for any store configured with `direct_io`, whatever the URI scheme, like its
-  `get`): a destination whose address is a multiple of the store alignment is read with O_DIRECT straight into
-  it, no copy. An unaligned address, and the sub-alignment tail of an aligned destination whose length is not a
-  multiple of the alignment, go through the existing shared bounce pool (`read_direct_into`, formerly the
-  test-only `read_all_direct_into`): the kernel fills an aligned bounce buffer and the bytes are copied once into
-  the destination. That copy is the documented O_DIRECT exception of Rule #1 and is bounded by the pool's buffers.
-  A file below the store's minimum direct size, and a filesystem that refuses O_DIRECT (counted in
-  `direct_io_counters().get_fallbacks`), are read with ordinary positional reads, still straight into the buffer.
-  The refusal path is tested against a real refusing filesystem (ramfs) by the opt-in
-  `tests/direct_get_into_no_odirect_fs_295.rs` (set `S3DLIO_TEST_NO_ODIRECT_DIR`; see `docs/Environment_Variables.md`).
-- `head` for both schemes, from `stat`: `HeadMetadata { size, etag: Some("file-<size>-<mtime seconds>"), version_id: None }`
-  (the identity `stat` reports), `Ok(None)` for a missing file or a path below a regular file, an error for a
-  directory or any non-regular file and for a refusal (`Forbidden`).
-- The #264 contract: `dst.len()` is the expected length, and the file's size is checked BEFORE anything is read, so a
-  file of another size is `LengthMismatch { expected, actual: Some(file size) }` with nothing written (and the size is
-  re-checked after the read, so a file that changed under it is an error too); a missing file is `NotFound`, an
-  unreadable one `Forbidden`, a directory `Other`; nothing is ever written past the destination; progress counts the
-  distinct destination positions filled, recorded after each copy (`SpanMark::record_copy`); the op-log writes exactly
-  one GET row (bytes = progress, also on an error) and one HEAD row.
-- Cancellation: `dst` is a borrowed `&mut [u8]`, so it is never given to `spawn_blocking`. Every read runs inside the
-  poll of the returned future (`block_in_place` on a marked worker of a multi-thread runtime, inline everywhere else; see
-  "Runtime support"), one chunk at a time with a yield between chunks: dropping the future or aborting its task stops it at
-  a chunk boundary with no writer left. In Python the read runs on the runtime without the GIL.
-- A file that is modified WHILE it is read is an error, never `Ok` with mixed data. The open file's `mtime` and
-  `ctime` (nanoseconds) are recorded when it is opened and compared after the last chunk: a different size is
-  `LengthMismatch` (with the size it has now); the same size but a changed `mtime` or `ctime` (an overwrite in place,
-  truncate-then-regrow, a replacement by `rename`, a deletion, or a `chmod`/`chown`/hard link, which also move
-  `ctime`) is `VersionChanged` ("the object changed after the read pinned its version"; in Python a `RuntimeError`
-  whose message says "version changed"). The check is conservative about metadata changes and cannot see a change
-  that leaves both timestamps as they were: on Linux a write always moves `ctime`, but the kernel clock that stamps
-  it is coarse (one tick, 1-10 ms on ext4, finer with multigrain timestamps on recent kernels), so a write in the
-  SAME tick as the last change before the read opened the file, made while the read runs, goes unseen; filesystems with
-  one- or two-second timestamps (some network and legacy filesystems) widen that window; a write through a shared
-  `mmap` updates the timestamps only when the kernel writes the page back. A retry after `VersionChanged` or
-  `LengthMismatch` is always safe.
-- `examples/get_into_local_bench.rs`: `get_into` against the allocating `get` (see Performance).
+- **`get_into` for `file://`:** `pread` straight into the caller's buffer, in chunks of at most 16 MiB. No other buffer
+  of the object's size is allocated.
+- **`get_into` for `direct://`** (and for any store configured with `direct_io`, whatever the URI scheme, like its
+  `get`):
+  - A destination whose address is a multiple of the store alignment is read with O_DIRECT straight into it, with no
+    copy. If its length is not a multiple of the alignment, only the last, sub-alignment piece goes through the
+    bounce pool.
+  - An unaligned destination address goes through the existing shared bounce pool (`read_direct_into`, formerly the
+    test-only `read_all_direct_into`): the kernel fills an aligned bounce buffer and the bytes are copied once into
+    the destination. That copy is the documented O_DIRECT exception of Rule #1 and is bounded by the pool's buffers.
+    A Python `bytearray` is only 16-byte aligned, so on `direct://` it always takes this path; see "Local files" in
+    the Python API guide for page-aligned buffers.
+  - `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, `_PAIRS_PER_NODE` and `_WHEN_BUSY` apply. `S3DLIO_DIRECT_IO_GET_MODE` does not:
+    its `direct` mode means one fresh aligned buffer of the object's size, which a caller-buffer GET must never
+    allocate.
+  - A file below the store's minimum direct size, and a filesystem that refuses O_DIRECT, are read with ordinary
+    positional reads, still straight into the buffer. A refusal is counted in `direct_io_counters().get_fallbacks` and
+    logged at WARN once per process (DEBUG afterwards). A refusal on a later chunk clears `O_DIRECT` on the same open
+    descriptor (`fcntl(F_SETFL)`), so the rest of the read cannot come from a different file.
+- **`head` for both schemes**, from `stat`: `HeadMetadata { size, etag: Some("file-<size>-<mtime seconds>"),
+  version_id: None }`. A missing file, or a path below a regular file, is `Ok(None)`; a directory or any other
+  non-regular file is an error, and so is a refusal (`Forbidden`).
+- **The #264 contract.** `dst.len()` is the expected length, and the file's size is checked BEFORE anything is read:
+  a file of another size is `LengthMismatch { expected, actual: Some(file size) }` with nothing written. A missing file
+  is `NotFound`, an unreadable one `Forbidden`, a directory `Other`. Nothing is ever written past the destination.
+  Progress counts the distinct destination positions filled. The op-log writes exactly one GET row (bytes = progress,
+  also on an error; `error = cancelled` for a dropped call) and one HEAD row.
+- **A file that changes while it is read is an error, never `Ok` with mixed data.** The size, `mtime` and `ctime`
+  (nanoseconds) are recorded when the file is opened and compared after the last chunk. A different size is
+  `LengthMismatch` with the size the file has now; a read that hits the end of the file says so. The same size with a
+  changed `mtime` or `ctime` is `VersionChanged` ("the object changed after the read pinned its version"; in Python a
+  `RuntimeError` whose message says "version changed"). That covers an overwrite in place, truncate-then-regrow, a
+  replacement by `rename`, a deletion, and a `chmod`, `chown` or new hard link (which also move `ctime`). A retry is
+  always safe. Limits:
+  - A write in the same kernel clock tick as the last change before the open, made while the read runs, goes unseen
+    (one tick is 1-10 ms on ext4, finer with multigrain timestamps on recent kernels).
+  - Filesystems with one- or two-second timestamps widen that window. NFS, Lustre, GPFS, BeeGFS, CephFS and SMB serve
+    cached attributes, so a write by another node can go unseen for seconds (best effort there).
+  - A write through a shared `mmap` updates the timestamps only when the kernel writes the page back.
+  - The `head` etag has one-second granularity (a pre-existing format, unchanged).
+- **Cancellation.** `dst` is a borrowed `&mut [u8]`, so it is never handed to `spawn_blocking`. Every read runs inside
+  the poll of the returned future, one chunk at a time with a yield between chunks, so dropping the future or aborting
+  its task stops it at a chunk boundary with no reader left touching the buffer. In Python the read runs on the
+  runtime without the GIL.
+- **`examples/get_into_local_bench.rs`:** `get_into` against the allocating `get` (see Performance).
 
-**Hardened after review (same release)**
-- No panic in any polling context, and no panic machinery. `block_in_place` panics ("can call blocking only when
-  running on the multi-threaded runtime") inside a tokio `LocalSet` that a non-worker thread drives on a multi-thread
-  runtime (`rt.block_on(local.run_until(..))`, `LocalSet::block_on`, `spawn_local` inside either), which used to take
-  `file://` and `direct://` `get_into` and the `direct://` writer down. The first fix probed `block_in_place` under
-  `catch_unwind` with a process-wide chained panic hook; the second review found that this aborts the process under
-  `panic = "abort"`, that every panic hook an application installs later sees one false panic per probe, and that a
-  genuine panic of tokio's could be swallowed. The probe, the hook and `catch_unwind` are gone. The shared helper
-  (`runtime_support::blocking_io`) decides from thread-local state and tokio's public API alone: it calls
-  `block_in_place` only on a thread carrying the worker marker, on a multi-thread runtime, outside an
-  `inline_blocking_io()` scope, and runs the closure inline everywhere else; a panic in the closure propagates
-  unchanged. See "Runtime support" below.
-- A mid-read fall back from O_DIRECT (the kernel answers EINVAL for a later chunk) now clears `O_DIRECT` on the SAME open
-  file descriptor (`fcntl(F_SETFL)`) instead of reopening the path, so a rename-replace between two chunks can no
-  longer feed the rest of the read from another file. Progress is not double counted for the chunk that is read twice.
-- A filesystem that refuses O_DIRECT is logged at WARN once per process and at DEBUG afterwards (it used to log a WARN for
-  every call); `direct_io_counters().get_fallbacks` still counts every call.
-- A read that hits the end of the file says so (`<path> ended during the read, after N bytes had been read; its size
-  is now M bytes ...`); a file that was truncated and refilled to its old size is `VersionChanged` rather than the old
-  "expected N bytes, got N". The `std::thread::scope` helper thread that an unaligned `direct://` read starts for each 16 MiB
-  chunk costs 54 us (median of 2000): 64 chunks per GiB is 3.5 ms against 254 ms for a 1 GiB bounce read
-  (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=4`, 4.03 GiB/s), 1.4%, so it was left as is.
-- `get_into` on `direct://` always sends an unaligned destination through the shared bounce pool
-  (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, `_PAIRS_PER_NODE`, `_WHEN_BUSY` apply) and does NOT honour
-  `S3DLIO_DIRECT_IO_GET_MODE`: `direct` mode of the allocating `get` means one fresh aligned buffer of the OBJECT'S size,
-  which a bounded, caller-buffer GET must never allocate. A Python `bytearray` is only 16-byte aligned, so on `direct://` it
-  always takes the bounce copy; see "Local files" in the Python API guide for page-aligned buffers.
-- Tests added: file changes during the read (grow, shrink, truncate-and-regrow, in-place overwrite, rename-replace,
-  unlink, chmod, concurrent reader) in both schemes, aligned and unaligned destinations
-  (`tests/get_into_mid_read_295.rs`, deterministic: the future is polled by hand once, the file changed, the future polled
-  to the end); a mid-read EINVAL, the page-cache hint (`mincore`), the file identity and the fallback log
-  (`src/file_get_into_tests.rs`); 4 MiB bounce buffers over a size sweep at 16 MiB +- 1 and unaligned addresses
-  (`tests/direct_get_into_small_bounce_295.rs`); 24 concurrent unaligned reads through a one-pair pool in both busy policies on a
-  one-worker multi-thread and a current-thread runtime, in child processes under a timeout
-  (`tests/direct_get_into_tiny_pool_295.rs`); op-log rows of a failed, a dropped and an unpolled `get_into`
-  (`tests/oplog_file_get_into_midread_295.rs`: a failed read is one GET row with the bytes filled so far, a dropped one is one
-  row with `error = cancelled` and the count at the drop, an unpolled one no row: the same as the network stores); an
-  unreadable zero-byte file is `Ok` without being opened. The Python test helper `aligned_view` could return a view cut
-  short at some page offsets (flaky) and is fixed and tested over 400 random allocations.
+### Added — `s3dlio::runtime_support` (Rust)
 
-**Runtime support (public, Rust).** New module `s3dlio::runtime_support`:
-- `mark_tokio_worker_thread()`: pass it to `tokio::runtime::Builder::on_thread_start` of a multi-thread runtime you
-  build yourself to get the worker hand-off for `file://` / `direct://` reads and writes. s3dlio's own multi-thread
-  runtimes (the global runtime, the Python decode and checkpoint runtimes, the CLI) already do. Without it the file
-  stores work in every context but run each read chunk (at most 16 MiB) inline on the polling worker: a
-  neighbouring task can wait up to one chunk, and a single reader is about twice as fast. Measured with
-  `examples/runtime_handoff_bench.rs` (release, 96-core Linux, 4 workers, 1 GiB warm file on ext4): single reader
-  3.3 GiB/s with the hand-off against 7.4 GiB/s inline; with 4 readers saturating the 4 workers a neighbour's
-  1 ms timer fires late by p99 1.8 ms / max 2.1 ms with the hand-off against p99 9.8 ms / max 10.8 ms inline (on tmpfs
-  max 2.0 against 14.9 ms; the reviewer's heavier saturation: about 3 ms against 60 ms). The hand-off costs about 2.6 ms per
-  16 MiB chunk on this box; s3dlio's own runtimes keep it because neighbour latency matters more than one reader's peak.
-- `inline_blocking_io()`: a guard that keeps the file stores inline on this thread while it lives. Needed in exactly
-  one case: a `spawn_blocking` closure, on a runtime whose threads carry the marker, that drives a `LocalSet` itself
-  and runs s3dlio file I/O in it (tokio gives the library no way to tell that thread from a worker, and `block_in_place`
-  panics there). Why the marker is set at thread start rather than by the park hooks, and why that is robust:
-  see the module documentation (tokio's workers are blocking-pool threads and a worker's core moves between them
-  on every `block_in_place`; the park hooks fire only on a worker's own park path, so replacement workers would lose
-  the marker exactly when the pool is saturated).
-- BEHAVIOUR CHANGE for embedders: a multi-thread runtime that is NOT marked used to get `block_in_place` for the
-  `file://` writer's borrowed-slice writes; it now runs ALL of these inline on the polling worker (never a panic):
-  `direct://` and `file://` `get_into` reads (open, each chunk of at most 16 MiB, finish), `file://` borrowed-slice
-  writes, and the `direct://` writer's O_DIRECT write chunks, the per-chunk fsync with `sync_writes`, `sync_all()`,
-  and finalize (`sync_file`, the buffered tail append and its fsync). That is every caller of
-  `runtime_support::blocking_io` (`file_get_into.rs`, `file_store.rs`, `file_store_direct.rs`). The remedy is one line:
-  `.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)` on your multi-thread runtime builder.
-- The marker follows the THREAD, not the runtime. A marked `spawn_blocking` thread of runtime A that drives a
-  `LocalSet` on ANY runtime (even an unmarked runtime B: `b.block_on(local.run_until(read))`) reaches
-  `block_in_place` on a thread that is not a worker and tokio panics there; wrap that closure in
-  `inline_blocking_io()`. A unit test pins both halves (panics without the scope, works with it).
-- Production wiring is guarded: s3dlio's own multi-thread runtimes are all built from
-  `runtime_support::marked_multi_thread_builder()` (hidden, not semver-stable); a source scan test fails on any other
-  `new_multi_thread` in `src/`, and tests build the global, decode (extension-module), checkpoint (extension-module) and
-  CLI runtimes and check that their workers are marked (the global runtime also through a real `file://` `get_into`).
-- CI/test harness: `python/tests/conftest.py` now also turns module-level skips (`pytest.importorskip` at collection)
-  into failures when `S3DLIO_REQUIRE_ODIRECT_TESTS` / `S3DLIO_FAIL_ON_SKIP` is set, and leaves `xfail` tests alone
-  (`python/tests/test_conftest_fail_on_skip_295.py` runs a child pytest and is part of the CI step);
-  `scripts/test_panic_abort_295.sh` finds the binary through `cargo metadata` (`CARGO_TARGET_DIR` / `build.target-dir`)
-  and passes `--offline` only with `S3DLIO_CARGO_OFFLINE=1`.
-- Test probes `would_hand_off` / `handoff_count` are `pub` + `#[doc(hidden)]` because the integration tests need them;
-  they are not semver-stable.
-- Measured trade-off of the hand-off for s3dlio's own runtimes, from Python (1 GiB `get_into_async`, warm page cache,
-  single reader; 3 repetitions, noisy, 2-socket box): `file://` 3.8-6.9 GiB/s with the hand-off against 5.6-7.7 inline;
-  `direct://` 4.4-4.8 against 4.9-5.5. A neighbour's stall is about 2 ms with the hand-off against about 10 ms inline
-  (4 readers on 4 workers). Both are far above the allocating `get` (1.5-2.0 GiB/s), so the hand-off costs a single
-  reader up to about 1.5x but keeps neighbouring tasks responsive.
-- Other `block_in_place` call sites that are NOT changed here and have the same LocalSet limitation
-  (`python_core_api.rs` store-builder wait, `s3_client.rs` `run_on_global_rt`, `s3_utils.rs` `stat_object_uri`): follow-up.
-- macOS: the new `get_into` code compiles without `libc::O_DIRECT` (it is Linux only; elsewhere `direct://` reads are
+The local file stores' blocking system calls run inside the future's poll (above). On a tokio multi-thread runtime they
+call `tokio::task::block_in_place` first, so the worker hands its queue to another thread; but `block_in_place` panics
+inside a `LocalSet` driven by a thread that is not a runtime worker (`rt.block_on(local.run_until(..))`,
+`LocalSet::block_on`, `spawn_local` inside either). Under `panic = "abort"` that panic is a process abort. Tokio offers no
+way to detect that context, so the hand-off is now an explicit opt-in per thread:
+
+- `mark_tokio_worker_thread()`: pass it to `Builder::on_thread_start` of a multi-thread runtime you build yourself.
+  The file stores then call `block_in_place` on that runtime's threads. s3dlio's own multi-thread runtimes (the global
+  runtime, the Python decode and checkpoint runtimes, the CLI) are marked.
+- Everywhere else (an unmarked runtime, a current-thread runtime, a `LocalSet`, no runtime at all) the blocking step
+  runs inline on the calling thread. It never panics, and no panic hook or `catch_unwind` is involved; a panic in
+  the I/O itself propagates unchanged.
+- `inline_blocking_io()`: a guard that keeps the file stores inline on this thread while it lives. It is needed in
+  one case only: a `spawn_blocking` closure, on a marked runtime, that drives a `LocalSet` itself and runs s3dlio file
+  I/O in it. The marker follows the thread, and tokio gives no way to tell that thread from a worker.
+- BEHAVIOUR CHANGE for embedders: on a multi-thread runtime that is NOT marked, every blocking step of the file
+  stores now runs inline on the polling worker. That covers `get_into` reads (open, each chunk of at most 16 MiB,
+  finish), `file://` borrowed-slice writes (which used to get `block_in_place`), and the `direct://` writer's O_DIRECT
+  write chunks, per-chunk fsync (`sync_writes`), `sync_all()` and finalize. A neighbouring task on the same worker can
+  wait up to one chunk. The remedy is one line:
+  `.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)`.
+- The trade-off, measured with `examples/runtime_handoff_bench.rs` (release, 96-core Linux box, 4 workers, 1 GiB file
+  in the warm page cache on ext4): a single reader runs at 3.3 GiB/s with the hand-off against 7.4 GiB/s inline. With 4
+  readers saturating the 4 workers, a neighbour's 1 ms timer fires late by p99 1.8 ms / max 2.1 ms with the hand-off
+  against p99 9.8 ms / max 10.8 ms inline. From Python (1 GiB `get_into_async`, warm): `file://` 3.8-6.9 GiB/s with the
+  hand-off against 5.6-7.7 inline, `direct://` 4.4-4.8 against 4.9-5.5. s3dlio's own runtimes keep the hand-off
+  because neighbour latency matters more than one reader's peak.
+- `marked_multi_thread_builder()`, `would_hand_off()` and `handoff_count()` are `pub` but `#[doc(hidden)]` for the
+  crate's own runtimes and tests; they are not semver-stable. A source-scan test fails on any other
+  `new_multi_thread` in `src/`.
+- Not changed here, with the same `LocalSet` limitation: the `block_in_place` calls in the `python_core_api.rs`
+  store-builder wait, `s3_client.rs` `run_on_global_rt` and `s3_utils.rs` `stat_object_uri` (follow-up).
+
+### Changed (BEHAVIOUR CHANGE)
+
+- `object_capabilities("file://...")` and `("direct://...")` were `get_into: False, head: False`; they are now
+  `True, True`, and `get_into_async` / `head_async` on those URIs read instead of raising `UnsupportedOperationError`
+  synchronously. Code that used that error to choose a fallback for local files no longer needs it. The Python error
+  mapping is as for the other schemes: `ObjectNotFoundError`, `LengthMismatchError`; a directory or a permission error
+  is a `RuntimeError`. `MultiEndpointStore` does not implement `get_into` / `head` for any scheme (unchanged).
+- See also the two BEHAVIOUR CHANGE entries above: init of a different file while Active is an error (#294), and
+  unmarked embedder runtimes run file-store I/O inline.
+
+### Tests and CI (#295, #267)
+
+- Rust: `tests/get_into_local_295.rs`, `tests/get_into_local_alloc_295.rs`, `tests/direct_get_into_295.rs`,
+  `tests/get_into_mid_read_295.rs` (the file changes between two hand-polled chunks: grow, shrink,
+  truncate-and-regrow, in-place overwrite, rename-replace, unlink, chmod), `tests/direct_get_into_small_bounce_295.rs`
+  (a size sweep around 16 MiB with 4 MiB bounce buffers), `tests/direct_get_into_tiny_pool_295.rs` (24 concurrent reads
+  through a one-pair pool, both busy policies), `tests/get_into_runtime_contexts_295.rs` (every runtime context, marked
+  and unmarked), `tests/get_into_panic_hook_295.rs`, `tests/oplog_file_get_into_295.rs` and
+  `tests/oplog_file_get_into_midread_295.rs` (op-log rows of successful, failed, dropped and unpolled calls), and unit
+  tests in `src/file_get_into_tests.rs` and `src/runtime_support.rs`.
+- Opt-in: `tests/direct_get_into_no_odirect_fs_295.rs` reads from a real filesystem that refuses O_DIRECT (ramfs) when
+  `S3DLIO_TEST_NO_ODIRECT_DIR` is set; `scripts/test_panic_abort_295.sh` builds `examples/abort_localset_295.rs` with
+  the `abort-test` profile (`panic = "abort"`) and requires exit 0.
+- Python: `python/tests/test_get_into_file_direct_295.py`. `python/tests/conftest.py` turns skips (including
+  module-level `pytest.importorskip`) into failures when `S3DLIO_REQUIRE_ODIRECT_TESTS` or `S3DLIO_FAIL_ON_SKIP` is set,
+  and leaves `xfail` alone (`python/tests/test_conftest_fail_on_skip_295.py`). The helper `aligned_view` no longer
+  returns a short view at some page offsets.
+- CI runs every `tests/*_295.rs` binary, the `panic = "abort"` script and both Python files with
+  `S3DLIO_REQUIRE_ODIRECT_TESTS=1`. `the_page_cache_hint_is_applied_and_takes_effect` uses a real-filesystem scratch
+  directory (`S3DLIO_TEST_DIR`, else `target/tmp`) and skips on tmpfs/ramfs; it used to fail with `TMPDIR=/dev/shm`.
+- macOS: the new `get_into` code compiles without `libc::O_DIRECT` (Linux only; elsewhere `direct://` reads are
   buffered like the fallback). The crate as a whole still does not build on macOS (`file_store_direct.rs` uses
   `libc::O_DIRECT` throughout, as before this change).
-- Test and CI: `tests/get_into_panic_hook_295.rs` (an application hook installed after the first read sees zero calls),
-  `tests/get_into_runtime_contexts_295.rs` (every context, marked and unmarked runtimes, `file://` put included),
-  unit tests in `runtime_support` (the rule table, panics propagate on a worker and inline, the hand-off observed
-  with a one-worker runtime), and `scripts/test_panic_abort_295.sh` (builds `examples/abort_localset_295.rs` with the
-  `abort-test` profile, `panic = "abort"`, and requires exit 0). CI now runs every `tests/*_295.rs` binary, the
-  `panic=abort` script and both Python test files; `S3DLIO_REQUIRE_ODIRECT_TESTS=1` (see `docs/Environment_Variables.md`)
-  turns any skip in them into a failure. `the_page_cache_hint_is_applied_and_takes_effect` now uses a real-filesystem
-  scratch directory (`S3DLIO_TEST_DIR`, else `target/tmp`), skips on tmpfs/ramfs (where `DONTNEED` cannot drop anything) and
-  skips when the freshly read file is not fully cached (memory pressure); it used to fail with `TMPDIR=/dev/shm`.
-- Documented limits of the same-size overwrite detection: NFS, Lustre, GPFS, BeeGFS, CephFS and SMB serve cached
-  attributes and coarse or lagging timestamps, so a write by another node can go unseen for seconds (best effort there);
-  the `head` etag has second granularity (a pre-existing format, unchanged).
 
-**Changed (BEHAVIOUR CHANGE).** `object_capabilities("file://...")` and `("direct://...")` were `get_into: False, head: False`;
-they are now `True, True`, and `get_into_async` / `head_async` on those URIs read instead of raising
-`UnsupportedOperationError` synchronously. Code that used the `UnsupportedOperationError` to choose a fallback for
-local files no longer needs it. The Python mapping is as for the other schemes: `ObjectNotFoundError`,
-`LengthMismatchError`; a directory or a permission error is a `RuntimeError`. `MultiEndpointStore` does not
-implement `get_into` / `head` for any scheme (unchanged).
+### Performance (#295)
 
-**Performance** (Rust, release build, local NVMe ext4, 96-core box, median of 7 calls after a warm-up;
-`examples/get_into_local_bench.rs`; GiB/s, higher is better). `file://` is page-cache warm unless marked cold
-(every call after `echo 3 > /proc/sys/vm/drop_caches`).
+Rust, release build, local NVMe ext4, 96-core box, median of 7 calls after a warm-up (`examples/get_into_local_bench.rs`;
+GiB/s, higher is better). `file://` is page-cache warm unless marked cold (every call after
+`echo 3 > /proc/sys/vm/drop_caches`).
 
 | scheme / state | size | `get` (allocates) | `get_into` reused buffer | `get_into` fresh buffer |
 |---|---|---|---|---|
@@ -273,8 +203,8 @@ implement `get_into` / `head` for any scheme (unchanged).
 | `direct://` aligned | 1 GiB | 2.92 | 4.94 | 2.72 |
 | `direct://` unaligned (bounce) | 1 GiB | 2.92 | 3.15 (reused) | n/a |
 
-Reading into a buffer you already own is 3.7x (`file://`, warm) and 1.7x (`direct://`, aligned) faster than `get`
-for large objects, because the destination's pages are already mapped: the allocating call spends most of its time
+Reading into a buffer you already own is 3.7x (`file://`, warm) and 1.7x (`direct://`, aligned) faster than `get` for
+large objects, because the destination's pages are already mapped: the allocating call spends most of its time
 faulting fresh pages in. Into a freshly allocated buffer `get_into` runs at about the speed of `get` (within 10% in
 these runs: it does the same work, plus faulting the pages in). The bounce copy costs about 35% against a reused
 aligned destination, and a reused unaligned destination is still about 8% faster than `get`.

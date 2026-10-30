@@ -712,7 +712,7 @@ impl ObjectStore for FileSystemObjectStore {
     }
 
     /// Caller-buffer GET: `pread` straight into `dst` (#295, #267); see
-    /// [`crate::file_get_into`] for the contract, the zero-copy and the cancellation story.
+    /// `crate::file_get_into` for the contract, the zero-copy and the cancellation story.
     async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
         if !uri.starts_with("file://") {
             bail!("FileSystemObjectStore expected file:// URI");

@@ -2009,7 +2009,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     /// Caller-buffer GET (#295, #267), for `file://` and `direct://` URIs alike, read the way
     /// this store's `get` reads: with O_DIRECT when `direct_io` is set (an aligned destination
     /// straight into the caller's buffer, an unaligned one through the bounce pool), with
-    /// positional buffered reads otherwise. See [`crate::file_get_into`].
+    /// positional buffered reads otherwise. See `crate::file_get_into`.
     async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
         if !Self::is_valid_file_uri(uri) {
             bail!("FileSystemObjectStore expected file:// or direct:// URI");
