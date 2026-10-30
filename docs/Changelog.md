@@ -231,6 +231,10 @@ a thread with `pthread_exit`, 3.11 and 3.12 still do.
 - **Not covered:** a thread parked at exit keeps whatever Rust state it holds above the call (it never runs
   its destructors); that is the same as 3.13.8+. Other extensions (NumPy C code, torch) that release the GIL are not
   changed by this fix. Do not build s3dlio with `panic = "abort"` for release: the guard needs unwinding.
+- **Known separate problem (not #298, not fixed here):** on CPython 3.14 a daemon thread's event loop with `get_async`
+  calls in flight at exit usually crashes (`Fatal Python error: PyInterpreterState_Delete: remaining threads`),
+  identically with PyO3 0.27.2 and 0.29.3. Sync calls, `get_into_async`, `put_bytes_async` and a pending `get_async` are
+  clean on 3.14. The test marks that one case `xfail` on 3.14.
 - **Tests:** `python/tests/test_exit_daemon_threads_298.py` runs each scenario in a fresh subprocess with a timeout:
   sync `get`, `put_bytes`, `list`, `stat`, `get_many`, `get_range`, a streaming writer, a call blocked on an unresponsive
   endpoint, async calls (including `get_into_async` and a never-completing one) on a daemon thread's event loop, op-log
