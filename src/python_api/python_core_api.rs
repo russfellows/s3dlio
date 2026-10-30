@@ -894,8 +894,9 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// ...) look the op-log up on every call: a call made while logging is active is
 /// recorded once, and a call made before init_op_log() or after
 /// finalize_op_log() is not, whichever call first used a given scheme. An
-/// *_async call is checked when it is made, not when the event loop first runs it. Datasets and
-/// loaders over s3:// are objects you construct: they capture the logger at construction. Objects
+/// *_async call is checked when it is made, not when the event loop first runs it. Datasets,
+/// loaders and MultiEndpointStore objects are objects you construct: they capture the logger at
+/// construction. Objects
 /// you construct yourself (stores, readers, writers) capture the logger when
 /// they are constructed: those created before init_op_log() are never logged;
 /// those created before finalize_op_log() stop recording when it runs, and stay
@@ -4003,6 +4004,10 @@ fn endpoint_payload(
 #[pyclass(name = "MultiEndpointStore")]
 struct PyMultiEndpointStore {
     store: Arc<MultiEndpointStore>,
+    /// The op-log logger of the session that was Active when the store was CONSTRUCTED (`None`:
+    /// the op-log was off). Every call writes its rows to this logger, never to the session that is
+    /// Active when the call is made or runs (issue #294: stores capture the logger at construction).
+    logger: Option<crate::s3_logger::Logger>,
 }
 
 #[pymethods]
@@ -4011,8 +4016,8 @@ impl PyMultiEndpointStore {
     fn get<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         future_into_py(
             py,
@@ -4038,8 +4043,8 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         future_into_py(
             py,
@@ -4078,8 +4083,8 @@ impl PyMultiEndpointStore {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         guarded_put(py, payload.latch, move || {
             crate::s3_logger::scope_call_logger(logger, async move {
@@ -4104,8 +4109,8 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         future_into_py(
             py,
@@ -4124,8 +4129,8 @@ impl PyMultiEndpointStore {
     fn delete<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         future_into_py(
             py,
@@ -4155,8 +4160,8 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         future_into_py(
             py,
@@ -4183,8 +4188,8 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         future_into_py(
             py,
@@ -4218,8 +4223,8 @@ impl PyMultiEndpointStore {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         guarded_put(py, payload.latch, move || {
             crate::s3_logger::scope_call_logger(logger, async move {
@@ -4245,8 +4250,8 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         future_into_py(
             py,
@@ -4282,8 +4287,8 @@ impl PyMultiEndpointStore {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
         let store = self.store.clone();
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = global_logger();
+        // The logger captured when the store was constructed (#294).
+        let logger = self.logger.clone();
 
         guarded_put(py, payload.latch, move || {
             crate::s3_logger::scope_call_logger(logger, async move {
@@ -4383,6 +4388,7 @@ fn create_multi_endpoint_store(
 
     Ok(PyMultiEndpointStore {
         store: Arc::new(store),
+        logger: global_logger(),
     })
 }
 
@@ -4488,6 +4494,7 @@ fn create_multi_endpoint_store_from_env(strategy: Option<&str>) -> PyResult<PyMu
     })?;
     Ok(PyMultiEndpointStore {
         store: Arc::new(store),
+        logger: global_logger(),
     })
 }
 

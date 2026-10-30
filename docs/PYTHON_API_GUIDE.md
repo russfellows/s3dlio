@@ -2055,8 +2055,8 @@ once, a call made before `init_op_log` or after `finalize_op_log` is not,
 whichever call first used the scheme.
 An `*_async` call is checked when it is made, not when the event loop first runs it: an
 awaitable created in one session never writes into a later one. Datasets and loaders over
-`s3://` (`create_dataset`, `create_async_loader`, ...) follow the rule for objects you
-construct: they capture the logger when they are constructed and use it for every fetch,
+`s3://` (`create_dataset`, `create_async_loader`, ...) and `MultiEndpointStore` objects
+(`create_multi_endpoint_store*`) follow the rule for objects you construct: they capture the logger when they are constructed and use it for every fetch,
 so one built before `init_op_log` is never logged and one built in session 1 never writes
 into session 2. The synchronous `get_many` on `s3://` takes the logger once, at entry.
 Objects you construct yourself (stores, readers, writers) capture the logger at construction: those created before

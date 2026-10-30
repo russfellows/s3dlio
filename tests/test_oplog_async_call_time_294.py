@@ -9,7 +9,7 @@ The contract:
 * an awaitable created while op-log session 1 is active never writes a row into a later
   session 2 (after ``finalize_op_log()`` + ``init_op_log()``), and an awaitable created while no
   session is active is never logged, however late the runtime first polls it;
-* objects you construct (datasets, loaders) capture the logger when they are CONSTRUCTED and
+* objects you construct (datasets, loaders, MultiEndpointStore) capture the logger when they are CONSTRUCTED and
   use it for every fetch: one built in session 1 and used after ``finalize_op_log()`` +
   ``init_op_log(other)`` writes nothing into session 2, and one built before ``init_op_log``
   is never logged;
@@ -209,16 +209,10 @@ def s3env(m):
     return env
 
 
-MEP = 's3dlio.create_multi_endpoint_store(["s3://bkt/mep/"])'
 S3_ENTRIES = {
     "get_many_async": 'lambda n: s3dlio.get_many_async(["s3://bkt/" + n])',
     "get_many_stats_async": 'lambda n: s3dlio.get_many_stats_async(["s3://bkt/" + n])',
     "put_async": 'lambda n: s3dlio.put_async("s3://bkt/", 1, template=n + "-{}", size=16)',
-    "multi_endpoint_get": f'lambda n: {MEP}.get("s3://bkt/mep/" + n)',
-    "multi_endpoint_put": f'lambda n: {MEP}.put("s3://bkt/mep/" + n, b"xxxx")',
-    "multi_endpoint_get_from_endpoint": f'lambda n: {MEP}.get_from_endpoint(0, "s3://bkt/mep/" + n)',
-    "multi_endpoint_put_to_endpoint": f'lambda n: {MEP}.put_to_endpoint(0, "s3://bkt/mep/" + n, b"xxxx")',
-    "multi_endpoint_put_all_endpoints": f'lambda n: {MEP}.put_all_endpoints("s3://bkt/mep/" + n, b"xxxx")',
 }
 
 
@@ -232,9 +226,13 @@ def test_s3_async_call_is_bound_to_the_session_active_when_it_was_made(
 
 
 # ----------------------------------------------------------------------------
-# 3. Constructed objects: datasets and loaders capture the logger at CONSTRUCTION
+# 3. Constructed objects: datasets, loaders and MultiEndpointStores capture the logger at CONSTRUCTION
 # ----------------------------------------------------------------------------
 # `build(uri)` constructs the object, `use(obj)` is an async function that fetches through it.
+MEP_BUILD = (
+    'lambda uri: (s3dlio.create_multi_endpoint_store(["s3://bkt/mep/"]), "OLDTOK" if "old" in uri else "NEWTOK")'
+)
+
 OBJECTS = {
     "dataset_get_item": (
         "lambda uri: s3dlio.create_dataset(uri)",
@@ -244,6 +242,34 @@ OBJECTS = {
     "async_loader": (
         "lambda uri: s3dlio.create_async_loader(uri)",
         "drain",
+        False,
+    ),
+    # A MultiEndpointStore is a store: it captures the logger at construction and uses it for every call
+    # (its bucket-form s3:// endpoints write the rows). `build` returns (store, token) so the control
+    # store, built in session 2, touches the NEW key.
+    "multi_endpoint_get": (
+        MEP_BUILD,
+        'lambda o: o[0].get("s3://bkt/mep/" + o[1])',
+        False,
+    ),
+    "multi_endpoint_put": (
+        MEP_BUILD,
+        'lambda o: o[0].put("s3://bkt/mep/" + o[1], b"xxxx")',
+        False,
+    ),
+    "multi_endpoint_get_from_endpoint": (
+        MEP_BUILD,
+        'lambda o: o[0].get_from_endpoint(0, "s3://bkt/mep/" + o[1])',
+        False,
+    ),
+    "multi_endpoint_put_to_endpoint": (
+        MEP_BUILD,
+        'lambda o: o[0].put_to_endpoint(0, "s3://bkt/mep/" + o[1], b"xxxx")',
+        False,
+    ),
+    "multi_endpoint_put_all_endpoints": (
+        MEP_BUILD,
+        'lambda o: o[0].put_all_endpoints("s3://bkt/mep/" + o[1], b"xxxx")',
         False,
     ),
     # (PyS3AsyncDataLoader is a deprecated shim whose __aiter__ returns a loader that is not an async
