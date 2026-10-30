@@ -316,9 +316,36 @@ writer and never creates or truncates `path`:
   file and a hard link to it are all the same file. On Unix the session records
   the `(device, inode)` of its file right after creating it and a request is
   `stat`-ed (following symlinks) and compared; elsewhere the canonical paths are
-  compared. A request that does not exist is, by definition, another file. (A file
-  deleted or replaced behind the session's back is a different file: the session
-  keeps writing the unlinked inode.)
+  compared. A request that does not exist is, by definition, another file. The
+  identity is read from the OPEN file (`fstat` of the descriptor the session
+  writes), never by looking the path up again after creation.
+- **A file renamed, deleted or replaced behind the session's back** (log rotation, a
+  cleanup job) is a different file from then on: the session keeps writing the open
+  inode, and a request for the old name is an error (the name is not created), whose
+  message says so instead of the contradictory "already active and writing '<old
+  name>'": `... the op-log is already active; its session is writing a file that was
+  originally '/data/a.tsv.zst' but has since been renamed or deleted; the open file
+  is now named '/data/a.tsv.zst.1' ...`. On Linux the current name comes from
+  `/proc/self/fd/<n>` (an unlinked file shows `(deleted)`); `(a different file now
+  has that name)` is added when another file sits at the old path.
+- **Requests that cannot be an op-log file at all** while a session is Active (a
+  directory, `/dev/null` or another device, a FIFO, a socket, a dangling symlink)
+  are errors that say what the request is (`... it is a directory, and the op-log
+  is already active ...`); nothing is created (a dangling symlink's target is not
+  created either).
+- **A relative path means a different file after `chdir`.** The error names both the
+  file being written (`'x' (resolved to '/d1/x')`) and the requested one (`'x'
+  (resolves to '/d2/x')`); going back to the first directory makes it the same file
+  again (a no-op).
+- **Limitation (identity is authoritative):** a filesystem that does not give a file
+  a stable `(device, inode)` can report a DIFFERENT identity for the same path: FUSE
+  without `use_ino`, CIFS/SMB with `noserverino`, overlayfs without `xino` (and some
+  network filesystems after a server-side change). A same-path `init_op_log` while
+  Active then fails with `ResourceBusy` instead of being a no-op. The semantics are
+  deliberately not relaxed (a rotated file that was replaced under the same name
+  must stay an error); finalize first, or call `init_op_log` once. A bind mount of
+  the file's directory has the same `(device, inode)` and is the same file (opt-in
+  test `test_21_bind_mount...`, see `docs/Environment_Variables.md`).
 - **Another file: error.** `ErrorKind::ResourceBusy`, which Python's `py_err`
   maps (like every `io::Error`) to **`RuntimeError`**. The message names the file
   being written (as given, and resolved when spelled differently) and the
@@ -345,18 +372,13 @@ writer and never creates or truncates `path`:
   the default lossy mode); an operation overlapping `finalize`/`init` is in the
   file, in `rejected_closed`, or in neither (it ran while no session was Active).
   Never in two files.
-- `os.fork()` (and `multiprocessing` with the `fork` start method): the writer
-  thread is not copied into the child, so an inherited session could never write or
-  finish (lossless mode would block on a full queue, finalize would wait forever).
-  The child therefore sees the op-log as **not initialised**: `is_op_log_active()`
-  is `False`, `op_log_stats()` is `None`, `finalize_op_log()` is a no-op, stores the
-  child inherited record nothing, and the child may start its own session on a
-  different file; initialising the parent's file in the child is refused
-  (`ResourceBusy`) because it would truncate the parent's log. The parent is not
-  affected. The lifecycle lock is held across the fork (`pthread_atfork`) so a child
-  cannot inherit it locked. With the `spawn` and `forkserver` start methods the child
-  starts clean. Forking a process that has already used s3dlio I/O is a separate
-  matter: the runtime threads are not copied either.
+- `os.fork()` (and `multiprocessing` with the `fork` start method): see "Fork
+  safety" below. In short: the child sees the op-log as **not initialised**
+  (`is_op_log_active()` is `False`, `op_log_stats()` is `None`, `finalize_op_log()`
+  is a no-op), may start its own session on another file, and can never initialise a
+  file that an ancestor process wrote. With the `spawn` and `forkserver` start
+  methods the child starts clean. Forking a process that has already used s3dlio I/O
+  is a separate matter: the runtime threads are not copied either.
 - **Interpreter exit** with a session Active (no `finalize_op_log()`): the process
   exits normally; queued rows and the zstd frame end are lost, as documented above.
   Daemon threads that are inside an s3dlio I/O call at exit can abort the
@@ -384,6 +406,58 @@ framing); see "What the format tests establish" below for what is checked.
 After finalize (until the next init), `set_clock_offset` / `get_clock_offset`
 return an error of kind `Unsupported` saying the op-log was finalized (before any
 init the kind is `NotFound`, "Logger not initialized").
+
+### Fork safety (#294, round 3)
+
+The writer thread exists only in the process that started the session, so a
+`fork` child that kept the parent's session could never write or finish it: a
+lossless `log()` on a full queue and `finalize` would block for ever, and the child
+could inherit the lifecycle lock held by a parent thread that does not exist in
+it. s3dlio registers `pthread_atfork` handlers on the first `init_op_logger` (Unix):
+
+- **prepare (parent, before the fork):** takes the lifecycle lock, then the
+  client-id lock (always in that order), and holds them until `fork` returns, so no
+  other thread owns either at the instant of the fork. It also allocates the one
+  record the child may need, so the child handler never allocates. A failed
+  `fork()` (for example `EAGAIN` under `RLIMIT_NPROC`) still runs the parent
+  handler, which releases the locks.
+- **child:** closes the gate of the inherited session (every clone of its `Logger`,
+  including those inside stores created before the fork, rejects entries at once as
+  `LogOutcome::Closed`, never blocking), leaks the logger (never dropped or waited
+  for) and leaves the op-log `Uninitialized`. The first rejected entry prints one
+  line saying the process was FORKED and that the parent's session belongs to the
+  parent (not the "finalized" note). Reads and writes through such stores still work;
+  they are just not recorded.
+- **Inherited files, for the life of the process.** The child records the file of
+  the session it inherited (Active or Finalized) in a process-lifetime, append-only
+  set. `init_op_logger` refuses every file in that set with `ResourceBusy`, whatever
+  the child does in between: it may finalize and re-init its own files as often as
+  it likes, a grandchild inherits the child's set plus the child's live file, and
+  none of them can truncate an ancestor's log. Refused whether the ancestor was
+  still writing the file (`... which was still writing it when this process was
+  forked`) or had already finalized it (`... which had already finished that log
+  (finalized it) ... initialising it here would destroy that finished log`):
+  truncating a finished log destroys data just the same. The check compares the
+  `(device, inode)` of the file as opened (before it is truncated), so every
+  spelling, symlink or hard link to it is refused, and a refused request leaves the
+  file untouched. Unrelated files are unaffected.
+- **Registration is not a `Once`.** A fork that lands while another thread is inside
+  the very first registration would leave a `Once` RUNNING in the child for ever (its
+  registering thread does not exist there) and the child's first init would hang.
+  The claim records the claiming process id instead: a child that finds a claim by
+  another pid takes it over and registers itself; another thread of the same process
+  waits for the claimant, so no session starts before the handlers exist. (A child
+  may end up with the handlers registered twice; they are idempotent.)
+- **A `fork()` from a thread-local destructor** runs after the handlers' own
+  thread-local is destroyed. The handlers use `try_with` and do nothing in that case
+  (that fork is unprotected) instead of panicking, which would abort the process.
+- **A `File::create` that hangs blocks `fork()` in the process.** The lifecycle lock
+  is held while a session's file is opened (a dead NFS server, a FIFO with no
+  reader), and `prepare` needs that lock, so `fork()` waits until the open returns.
+  Open op-log destinations on healthy local storage.
+- Non-Unix targets have no `fork`; the handlers and the inherited set compile away
+  (checked by compiling the crate with the Unix code configured out; a real Windows
+  target could not be built on the development host, which has no MinGW toolchain).
 
 ### Detecting lost records
 

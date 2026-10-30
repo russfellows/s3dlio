@@ -15,21 +15,40 @@ Behaviour pinned here (decided for #294):
   written and the requested path, saying to finalize first; nothing is created.
 * init after finalize: a new session (waits for the old writer to drain).
 * a forked child never shares the parent's session (it sees the op-log as not
-  initialised) and cannot hang on it or corrupt the parent's file.
+  initialised) and cannot hang on it or corrupt the parent's file; it can never
+  truncate the file of ANY ancestor, however its own sessions come and go.
+
+Round 3 adds: fork while the parent is Finalized, fork racing a finalize, a failed
+fork, pre-fork awaitables used in the child, an active file that was renamed or
+deleted, odd requests (directory, /dev/null, FIFO, dangling symlink), a changed
+working directory between two ``init`` calls with a relative path, and an opt-in
+bind-mount test (``S3DLIO_TEST_BIND_MOUNT_DIR``, see docs/Environment_Variables.md).
+
+Run with ``uv run -q --no-project --isolated --python 3.12 --with <wheel> --with pytest
+python -m pytest tests/test_oplog_lifecycle_permutations_294.py`` (about 70 s; the
+zstd command-line tool must be installed).
 
 Multi-threaded scenarios run in the default (lossy) mode and with
 ``S3DLIO_OPLOG_LOSSLESS=1``.
 """
 
+import os
+import shutil
 import textwrap
 
 import pytest
 from test_oplog_lifecycle import HEADER, assert_ok, read_rows, run_scenario
 
+# The scenarios verify op-log files with the zstd command-line tool (CI installs it).
+pytestmark = pytest.mark.skipif(
+    shutil.which("zstd") is None,
+    reason="the zstd command-line tool is not installed (e.g. `apt-get install zstd`)",
+)
+
 PRE = f'''
 import faulthandler, threading, subprocess, shutil, time, random, asyncio, json, signal
 faulthandler.dump_traceback_later(int(os.environ["SCEN_WATCHDOG"]), exit=True)
-T = sys.argv[1]
+T = os.path.realpath(sys.argv[1])             # messages show resolved paths
 HEADER = {HEADER!r}
 ZSTD = shutil.which("zstd")
 
@@ -55,6 +74,50 @@ def rows(p):
         assert len(c) == 13 and c[0] == str(i), (p, i, line)
         res.append((c[2], c[7]))
     return res
+
+
+def wait_child(pid, limit=60):
+    """Exit status of a forked child; a child that does not exit within `limit` s HUNG."""
+    end = time.time() + limit
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return status
+        if time.time() > end:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            raise AssertionError("forked child HUNG (no exit within %d s)" % limit)
+        time.sleep(0.01)
+
+
+def child_run(fn, limit=60):
+    """fork; run fn() in the child (exit 0 if it returns, 3 with a traceback if it
+    raises); return the child's exit code."""
+    pid = os.fork()
+    if pid == 0:
+        code = 0
+        try:
+            fn()
+        except BaseException:
+            import traceback
+            traceback.print_exc()
+            code = 3
+        os._exit(code)
+    status = wait_child(pid, limit)
+    assert os.WIFEXITED(status), status
+    return os.WEXITSTATUS(status)
+
+
+def refuses(path, *needles):
+    """init_op_log(path) must raise RuntimeError whose text contains every needle."""
+    try:
+        s3dlio.init_op_log(path)
+    except RuntimeError as e:
+        m = str(e)
+        for n in needles:
+            assert n in m, (n, m)
+        return m
+    raise AssertionError(path + " must be refused")
 
 
 def run_threads(fn, n, limit=90):
@@ -84,13 +147,18 @@ def mode(request):
     return request.param
 
 
-def run(body, tmp_path, mode="lossy", timeout=180, cwd=None, extra_env=None):
+def run(body, tmp_path, mode="lossy", timeout=180, cwd=None, extra_env=None, argv=None):
     env = dict(extra_env or {})
     env["SCEN_WATCHDOG"] = str(timeout - 20)
     if mode == "lossless":
         env["S3DLIO_OPLOG_LOSSLESS"] = "1"
     proc = run_scenario(
-        PRE + textwrap.dedent(body), str(tmp_path), timeout=timeout, cwd=cwd, env=env
+        PRE + textwrap.dedent(body),
+        str(tmp_path),
+        *(argv or []),
+        timeout=timeout,
+        cwd=cwd,
+        env=env,
     )
     assert_ok(proc)
     return proc
@@ -968,3 +1036,333 @@ def test_17_exit_with_a_reinitialised_session_active_does_not_hang(
     )
     assert (tmp_path / "b.tsv.zst").exists()
     assert ops(tmp_path / "a.tsv.zst") == ["GET"]
+
+
+# --------------------------------------------------------------------------
+# Round 3: fork permutations (S2, S3, N5, N8)
+# --------------------------------------------------------------------------
+
+
+def test_16e_a_child_never_truncates_any_ancestors_file(tmp_path, mode):
+    """S2: the child's own sessions coming and going must not make the parent's file
+    (or a grandparent's) initialisable; unrelated files stay fine."""
+    run(
+        """
+        a, c, d, e, f = [T + "/" + n for n in ("a.tsv.zst", "c.tsv.zst", "d.tsv.zst",
+                                               "e.tsv.zst", "f.bin")]
+        with open(f, "wb") as fh:                  # no s3dlio I/O before the forks
+            fh.write(b"x")
+        s3dlio.init_op_log(a)
+
+        def grandchild():
+            refuses(a, "PARENT")                   # the grandparent's live file
+            refuses(c, "PARENT")                   # the parent's live file
+            s3dlio.init_op_log(d)                  # unrelated: fine
+            s3dlio.stat(u(f))
+            s3dlio.finalize_op_log()
+            refuses(a, "PARENT")                   # still protected after its own session
+            refuses(c, "PARENT")
+            s3dlio.init_op_log(e)
+            s3dlio.finalize_op_log()
+
+        def child():
+            refuses(a, "PARENT", "still writing", a)
+            s3dlio.init_op_log(c)
+            s3dlio.finalize_op_log()
+            refuses(a, "PARENT")                   # THE S2 REPRO: used to truncate a
+            s3dlio.init_op_log(c)                  # its own file is fair game again
+            assert child_run(grandchild) == 0
+            s3dlio.get(u(f))                       # the child's session on c is unaffected
+            s3dlio.finalize_op_log()
+            refuses(a, "PARENT")
+
+        assert child_run(child) == 0
+        s3dlio.get(u(f))                           # the parent's session is unaffected
+        s3dlio.finalize_op_log()
+        assert rows(a) == [("GET", f)], rows(a)
+        assert rows(c) == [("GET", f)], rows(c)
+        assert rows(d) == [("HEAD", f)], rows(d)
+        assert rows(e) == []
+        """,
+        tmp_path,
+        mode,
+        extra_env={"S3DLIO_OPLOG_BUF": "64"},
+    )
+
+
+def test_16f_fork_while_the_parent_is_finalized(tmp_path, mode):
+    """N5: the parent had FINISHED its log: the child sees no session, may not
+    truncate that log, and the message must not claim it is still being written."""
+    run(
+        """
+        a, c, f = T + "/a.tsv.zst", T + "/c.tsv.zst", T + "/f.bin"
+        s3dlio.init_op_log(a)
+        s3dlio.finalize_op_log()
+        before = open(a, "rb").read()
+
+        def child():
+            assert s3dlio.is_op_log_active() is False
+            assert s3dlio.op_log_stats() is None, "a Finalized parent's stats are not the child's"
+            s3dlio.finalize_op_log()
+            m = refuses(a, "PARENT", "finished", a)
+            assert "still writing" not in m, m
+            s3dlio.init_op_log(c)
+            s3dlio.finalize_op_log()
+            m = refuses(a, "PARENT", "finished")
+            assert "still writing" not in m, m
+
+        assert child_run(child) == 0
+        assert open(a, "rb").read() == before, "the parent's finished log must be untouched"
+        assert rows(a) == [] and rows(c) == []
+        """,
+        tmp_path,
+        mode,
+    )
+
+
+def test_16g_fork_while_another_thread_is_finalizing(tmp_path, mode):
+    """The fork lands anywhere in a finalize/drain running on another thread: the
+    child never hangs and the parent's log is complete."""
+    run(
+        """
+        a, c, f = T + "/a.tsv.zst", T + "/c.tsv.zst", T + "/f.bin"
+        with open(f, "wb") as fh:
+            fh.write(b"x")
+        for rep in range(25):
+            s3dlio.init_op_log(a)
+            for _ in range(200):
+                s3dlio.get(u(f))                   # queued rows to drain (before any fork)
+            t = threading.Thread(target=s3dlio.finalize_op_log)
+            t.start()
+            pid = os.fork()
+            if pid == 0:
+                code = 0
+                try:
+                    s3dlio.is_op_log_active()
+                    s3dlio.op_log_stats()
+                    s3dlio.finalize_op_log()       # nothing to wait for in the child
+                    refuses(a, "PARENT")
+                    s3dlio.init_op_log(c)
+                    s3dlio.finalize_op_log()
+                except BaseException:
+                    import traceback
+                    traceback.print_exc()
+                    code = 3
+                os._exit(code)
+            status = wait_child(pid)
+            assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, (rep, status)
+            t.join(60)
+            assert not t.is_alive(), "DEADLOCK: finalize thread"
+            assert len(rows(a)) == 200, rep
+        """,
+        tmp_path,
+        mode,
+        extra_env={"S3DLIO_OPLOG_BUF": "4096"},
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is exempt from RLIMIT_NPROC")
+def test_16h_a_failed_fork_leaves_the_lock_usable(tmp_path, mode):
+    """RLIMIT_NPROC=1 makes fork() fail (EAGAIN) AFTER the prepare handler took the
+    lifecycle and client-id locks: the parent handler must release them, for this
+    thread and for other threads."""
+    run(
+        """
+        import errno, resource
+        a = T + "/a.tsv.zst"
+        s3dlio.init_op_log(a)
+        soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        resource.setrlimit(resource.RLIMIT_NPROC, (1, hard))
+        try:
+            try:
+                pid = os.fork()
+            except OSError as e:
+                assert e.errno == errno.EAGAIN, e
+            else:
+                if pid == 0:
+                    os._exit(0)
+                raise AssertionError("fork must fail with RLIMIT_NPROC=1")
+        finally:
+            resource.setrlimit(resource.RLIMIT_NPROC, (soft, hard))
+        assert s3dlio.op_log_stats() is not None   # same thread: lock was released
+        assert s3dlio.is_op_log_active() is True
+        res = run_threads(lambda i: (s3dlio.op_log_stats() is not None, s3dlio.is_op_log_active()), 4)
+        assert [r[0] for r in res] == ["ok"] * 4, res
+        assert all(r[1] == (True, True) for r in res), res
+        s3dlio.finalize_op_log()
+        assert rows(a) == []
+        # and a fork that works still works afterwards
+        s3dlio.init_op_log(a)
+        assert child_run(lambda: None) == 0
+        s3dlio.finalize_op_log()
+        """,
+        tmp_path,
+        mode,
+    )
+
+
+def test_16i_child_calls_with_a_one_entry_queue_never_hang(tmp_path):
+    """S3 (Python side). Python has no object that holds the parent's logger across a
+    fork (each module-level call snapshots ``global_logger()`` when it STARTS, and an
+    in-flight call's thread does not exist in the child), so the pre-fork-clone case is
+    covered in Rust: tests/oplog_lifecycle_fork_child_logger_closed.rs. What Python
+    can show: with a ONE-entry queue and lossless mode, sync and async calls in the
+    child never block (the second logged entry would block for ever on a session whose
+    writer thread does not exist), nothing reaches the parent's file."""
+    run(
+        """
+        a, f = T + "/a.tsv.zst", T + "/f.bin"
+        with open(f, "wb") as fh:
+            fh.write(b"x" * 100)
+        s3dlio.init_op_log(a)
+
+        def child():
+            for _ in range(50):
+                assert bytes(s3dlio.get(u(f))) == b"x" * 100
+            async def main():
+                return await asyncio.gather(*[s3dlio.get_async(u(f)) for _ in range(20)])
+            assert all(bytes(x) == b"x" * 100 for x in asyncio.run(main()))
+            assert s3dlio.op_log_stats() is None
+
+        assert child_run(child, limit=60) == 0
+        s3dlio.get(u(f))
+        s3dlio.finalize_op_log()
+        assert rows(a) == [("GET", f)], rows(a)   # nothing the child did reached the parent's file
+        """,
+        tmp_path,
+        "lossless",
+        timeout=150,
+        extra_env={"S3DLIO_OPLOG_BUF": "1"},
+    )
+
+
+# --------------------------------------------------------------------------
+# Round 3: what an active session says about odd files (N7) and a changed cwd
+# --------------------------------------------------------------------------
+
+
+def test_18_chdir_between_two_inits_of_the_same_relative_path(tmp_path, mode):
+    """A relative path means a different file after chdir: an error naming BOTH
+    resolved files; going back makes it the same file again (a no-op)."""
+    run(
+        """
+        d1, d2 = T + "/d1", T + "/d2"
+        os.mkdir(d1)
+        os.mkdir(d2)
+        os.chdir(d1)
+        s3dlio.init_op_log("x")
+        os.chdir(d2)
+        refuses("x", d1 + "/x", d2 + "/x", "finalize")
+        assert os.listdir(d2) == [], "nothing may be created in the new directory"
+        os.chdir(d1)
+        s3dlio.init_op_log("x")                    # the same file again: no-op
+        assert s3dlio.is_op_log_active() is True
+        s3dlio.finalize_op_log()
+        rows(d1 + "/x")
+        """,
+        tmp_path,
+        mode,
+    )
+
+
+def test_19_renamed_or_deleted_active_file_is_reported_accurately(tmp_path, mode):
+    run(
+        """
+        a, b = T + "/a.tsv.zst", T + "/b.tsv.zst"
+        f = T + "/f.bin"
+        s3dlio.put_bytes(u(f), b"x")
+        s3dlio.init_op_log(a)
+        m = refuses(T + "/other.tsv.zst", "already active and writing", a)
+        assert "renamed or deleted" not in m, m                # the ordinary message is unchanged
+        os.rename(a, a + ".1")                      # log rotation behind its back
+        m = refuses(a, "renamed or deleted", a + ".1")
+        assert not os.path.exists(a), "an error: the old name must not be re-created"
+        s3dlio.get(u(f))                            # the session keeps writing the open file
+        s3dlio.finalize_op_log()
+        assert rows(a + ".1") == [("GET", f)]
+        # unlinked while active
+        s3dlio.init_op_log(b)
+        os.unlink(b)
+        refuses(b, "renamed or deleted", "(deleted)")
+        assert not os.path.exists(b)
+        s3dlio.finalize_op_log()                    # finalize copes with a vanished name
+        assert not os.path.exists(b)
+        s3dlio.init_op_log(a)                       # and a new session on the old name works
+        s3dlio.finalize_op_log()
+        assert rows(a) == []
+        """,
+        tmp_path,
+        mode,
+    )
+
+
+def test_20_odd_requests_while_active_are_described_and_create_nothing(tmp_path, mode):
+    run(
+        """
+        a = T + "/a.tsv.zst"
+        s3dlio.init_op_log(a)
+        os.mkdir(T + "/adir")
+        refuses(T + "/adir", "is a directory", "finalize")
+        refuses("/dev/null", "character device", "finalize")
+        os.mkfifo(T + "/afifo")
+        refuses(T + "/afifo", "named pipe", "finalize")
+        os.symlink(T + "/no_such_target", T + "/dangling")
+        refuses(T + "/dangling", "symbolic link", "does not exist", "finalize")
+        assert not os.path.exists(T + "/no_such_target")
+        assert os.listdir(T + "/adir") == []
+        assert sorted(os.listdir(T)) == ["a.tsv.zst", "adir", "afifo", "dangling"]
+        s3dlio.finalize_op_log()
+        rows(a)
+        """,
+        tmp_path,
+        mode,
+    )
+
+
+BIND_DIR = os.environ.get("S3DLIO_TEST_BIND_MOUNT_DIR")
+
+
+@pytest.mark.skipif(
+    not BIND_DIR,
+    reason="opt-in: set S3DLIO_TEST_BIND_MOUNT_DIR (see docs/Environment_Variables.md)",
+)
+def test_21_bind_mount_of_the_active_file_is_the_same_file(tmp_path, mode):
+    """Opt-in (needs root to set up): $S3DLIO_TEST_BIND_MOUNT_DIR/orig is bind-mounted
+    at $S3DLIO_TEST_BIND_MOUNT_DIR/bound. The same file through the mount point has
+    the same (device, inode): a no-op, no truncation; another file through it errors."""
+    orig, bound = os.path.join(BIND_DIR, "orig"), os.path.join(BIND_DIR, "bound")
+    with open("/proc/self/mountinfo") as fh:
+        mounts = [line.split()[4] for line in fh]
+    assert os.path.realpath(bound) in mounts, (
+        "S3DLIO_TEST_BIND_MOUNT_DIR/bound is not a mount point; run: "
+        f"sudo mount --bind {orig} {bound}"
+    )
+    name = f"oplog294_{os.getpid()}.tsv.zst"
+    try:
+        run(
+            """
+            orig, bound, name = sys.argv[2:5]
+            f = T + "/f.bin"
+            s3dlio.put_bytes(u(f), b"x")
+            s3dlio.init_op_log(orig + "/" + name)
+            s3dlio.get(u(f))
+            s3dlio.init_op_log(bound + "/" + name)     # same file through the bind mount: no-op
+            s3dlio.get(u(f))
+            assert s3dlio.op_log_stats()["accepted"] == 2, s3dlio.op_log_stats()
+            refuses(bound + "/other_" + name, "already active", orig + "/" + name)
+            assert not os.path.exists(orig + "/other_" + name)
+            s3dlio.finalize_op_log()
+            assert rows(orig + "/" + name) == [("GET", f), ("GET", f)]
+            assert rows(bound + "/" + name) == [("GET", f), ("GET", f)]
+            """,
+            tmp_path,
+            mode,
+            argv=[orig, bound, name],
+        )
+    finally:
+        for d in (orig, bound):
+            for victim in (name, "other_" + name):
+                try:
+                    os.unlink(os.path.join(d, victim))
+                except FileNotFoundError:
+                    pass

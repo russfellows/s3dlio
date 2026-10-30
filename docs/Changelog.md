@@ -36,6 +36,42 @@
     16 threads racing init/finalize, workers running during 50 cycles, asyncio, fork/spawn,
     exit; lossy and lossless) and `tests/oplog_lifecycle_{same_file_spellings,
     concurrent_init_same_file,concurrent_init_different_files,cycles_no_leaks}.rs`.
+  - **Round 3 (second adversarial review):**
+    - *Fork guard hole closed (S2).* The parent's file was remembered only until the child
+      started a session of its own, so `child: init(c); finalize; init(parent file)` truncated
+      the parent's live log (a grandchild forgot its grandparent's file too). The files of
+      every ancestor session are now kept in a process-lifetime, append-only set (linked from
+      the atfork child handler with a node allocated in `prepare`, so the handler does not
+      allocate) and refused on every init. The new file is opened WITHOUT truncation, its
+      identity read from the open descriptor, vetted, and only then truncated, so a refused
+      request never touches the file. The message now says whether the ancestor was still
+      writing the file or had finished it (N5; both are refused: truncating a finished log
+      destroys data too).
+    - *Session identity from the open file (N6a):* `(device, inode)` comes from `fstat` of the
+      created descriptor, not from a path lookup afterwards. Documented limitation (N6b):
+      filesystems without stable inodes (FUSE without `use_ino`, CIFS `noserverino`, overlayfs
+      without `xino`) can make a same-path init while Active fail with `ResourceBusy`.
+    - *Accurate messages (N7):* a session whose file was renamed or deleted says so (and, on
+      Linux, what the file is now called) instead of "already active and writing '<old name>'";
+      a request that is a directory, a device, a FIFO or a dangling symlink is described as
+      such; the requested path is shown resolved (`chdir` between two inits of a relative path
+      names both files).
+    - *Fork handlers hardened (N8):* registration is an atomic claim that records the process
+      id (a `Once` could stay RUNNING in a child forked during the first init and hang its
+      init); handlers use `try_with` (a fork from a thread-local destructor no longer aborts);
+      the client-id mutex is held across the fork too (lock order: lifecycle, then client id;
+      `GLOBAL_CLIENT_ID` is now a plain `static Mutex`); the child's note says the process was
+      forked, not that the op-log was finalized; the `Forked` state is gone (the child is
+      `Uninitialized` plus the inherited set), so non-Unix builds have no dead code. Documented:
+      a hung `File::create` under the lifecycle lock also blocks `fork()`.
+    - *CI (B1):* the Python job now runs `tests/test_oplog_store_cache.py` and
+      `tests/test_oplog_lifecycle_permutations_294.py` (skipped without the `zstd` CLI, which
+      CI installs); the permutation file's scenarios use real paths so messages compare exactly.
+    - *Tests:* `tests/oplog_lifecycle_fork_{child_logger_closed,holds_lock,inherited_files,
+      from_tls_destructor}.rs`, `tests/oplog_lifecycle_active_file_gone_or_odd.rs`, unit tests
+      for the registration protocol and for the identify-then-vet-then-truncate open, and
+      Python `test_16e`-`test_16i`, `test_18`-`test_20` and the opt-in bind-mount
+      `test_21` (`S3DLIO_TEST_BIND_MOUNT_DIR`, see `docs/Environment_Variables.md`).
   - Stores, readers and writers captured in an earlier session keep that session's closed
     logger: they keep working but never write into a later session's file. The Python
     module-level calls look the op-log up on every call, so they need no change.

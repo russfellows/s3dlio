@@ -8,7 +8,6 @@
 //! Creates a zstd-compressed, tab-separated log file with a format
 //! identical to the 'warp-replay' tool.
 
-use once_cell::sync::OnceCell;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -32,16 +31,16 @@ use zstd::stream::write::Encoder;
 /// and a re-init waits for that drain before it opens the next file, so two
 /// writers never overlap. It also keeps that session's stats readable.
 ///
-/// `Forked` is what a CHILD process (created by `fork`) sees of a session that
-/// was Active or Finalized in its parent: the writer thread does not exist in the
-/// child, so the inherited session can never write or finish. The child treats
-/// the op-log as not initialised (it can start its own session), but remembers
-/// the parent's file so that it cannot truncate it by initialising the same path.
+/// A CHILD process (created by `fork`) never keeps a session of its parent: the
+/// writer thread does not exist in the child, so the inherited session can never
+/// write or finish. The child's atfork handler (see `fork_safety`) turns the
+/// state into `Uninitialized` and records the parent's file in a process-lifetime
+/// set of INHERITED files, which `init_op_logger` refuses (it would truncate a
+/// log that belongs to another process).
 enum OpLogState {
     Uninitialized,
     Active(Session),
     Finalized(Session),
-    Forked(SessionFile),
 }
 
 /// One op-log session: its logger and the file it writes.
@@ -50,46 +49,90 @@ struct Session {
     file: SessionFile,
 }
 
+/// `(device, inode)` of an open file.
+#[cfg(unix)]
+type FileId = Option<(u64, u64)>;
+
+/// What `fstat` of the descriptor of a file just opened for a session says. The
+/// identity is read from the SAME open file that the session then writes, never
+/// by looking the path up again (a path can be replaced in between).
+struct CreatedFile {
+    /// `(device, inode)`; `None` if `fstat` failed (then paths are compared).
+    #[cfg(unix)]
+    id: FileId,
+    /// The descriptor number, valid while the session is Active (used only to ask
+    /// `/proc/self/fd` what the system now calls the file).
+    #[cfg(unix)]
+    fd: i32,
+}
+
+impl CreatedFile {
+    fn of(file: &File) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::io::AsRawFd;
+            CreatedFile {
+                id: file.metadata().ok().map(|m| (m.dev(), m.ino())),
+                fd: file.as_raw_fd(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            CreatedFile {}
+        }
+    }
+}
+
 /// The identity of the file a session writes, so that a later `init_op_logger`
 /// can tell "the same file" from "another file" whatever the spelling (`x`,
 /// `./x`, `/abs/x`, `file:///abs/x`, `dir/../x`, a symlink or hard link to it).
 ///
-/// On Unix the identity is the `(device, inode)` pair read right after the file
-/// was created, and a request is compared by `stat`-ing it (which follows
+/// On Unix the identity is the `(device, inode)` pair of the OPEN file (`fstat`
+/// of the descriptor, so there is no window in which the path could have been
+/// swapped), and a request is compared by `stat`-ing it (which follows
 /// symlinks): that is exact for every spelling and link, with no string
 /// processing to get wrong. A request that does not exist (or cannot be
-/// `stat`ed) cannot be the active file. Elsewhere (and if the `stat` failed) the
+/// `stat`ed) cannot be the active file. Elsewhere (and if the `fstat` failed) the
 /// canonical paths are compared. The check runs under the lifecycle lock, but a
 /// file removed or replaced behind the session's back is a different file, by
-/// design: the session writes the unlinked inode.
+/// design: the session writes the unlinked inode, and a request for the old
+/// name is an error that says so (see `renamed_or_deleted_note`).
+///
+/// Limitation, by design: identity is authoritative, so a filesystem that does
+/// not give a file a stable inode number (FUSE without `use_ino`, CIFS/SMB
+/// `noserverino`, overlayfs without `xino`) can report a DIFFERENT identity for
+/// the same path and make a same-path `init` while Active fail with
+/// `ResourceBusy` instead of being a no-op. The remedy is to `finalize` first.
 struct SessionFile {
     /// What the caller passed to `init` (for messages).
     given: String,
     /// The canonical absolute path, resolved right after creation (for messages
     /// and for the non-Unix comparison).
     canonical: PathBuf,
-    /// `(device, inode)` of the created file.
+    /// `(device, inode)` of the open file, from `fstat` of its descriptor.
     #[cfg(unix)]
-    id: Option<(u64, u64)>,
+    id: FileId,
+    /// The descriptor number while the session is Active (see `CreatedFile`).
+    #[cfg(unix)]
+    fd: i32,
 }
 
 impl SessionFile {
-    /// Record the identity of `local` (the resolved path of a file that was just
-    /// created); `given` is the text the caller passed to `init`.
-    fn of_created(given: &str, local: &str) -> Self {
+    /// The identity of the file just opened (`created`, from its descriptor) for a
+    /// session; `local` is its resolved path and `given` the text passed to `init`.
+    fn of_created(given: &str, local: &str, created: &CreatedFile) -> Self {
         let canonical = std::fs::canonicalize(local).unwrap_or_else(|_| PathBuf::from(local));
-        #[cfg(unix)]
-        let id = {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(&canonical)
-                .ok()
-                .map(|m| (m.dev(), m.ino()))
-        };
+        #[cfg(not(unix))]
+        let _ = created;
         SessionFile {
             given: given.to_string(),
             canonical,
             #[cfg(unix)]
-            id,
+            id: created.id,
+            #[cfg(unix)]
+            fd: created.fd,
         }
     }
 
@@ -107,6 +150,17 @@ impl SessionFile {
             .unwrap_or(false)
     }
 
+    /// True if `opened` (a file just opened, resolved path `local`) is this file.
+    #[cfg(unix)]
+    fn is_same_as_opened(&self, opened: &CreatedFile, local: &str) -> bool {
+        match (self.id, opened.id) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => std::fs::canonicalize(local)
+                .map(|c| c == self.canonical)
+                .unwrap_or(false),
+        }
+    }
+
     /// The file as the user would recognise it: as given, plus the resolved path
     /// when that is spelled differently.
     fn describe(&self) -> String {
@@ -116,6 +170,113 @@ impl SessionFile {
         } else {
             format!("'{}' (resolved to '{canonical}')", self.given)
         }
+    }
+
+    /// For an ACTIVE session whose file no longer has the name it was created
+    /// under: a clause saying so. `None` while the path still names the file
+    /// (and on platforms where this cannot be told). "Already active and writing
+    /// '/x/a'" would read as a contradiction when '/x/a' no longer is that file.
+    fn renamed_or_deleted_note(&self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let id = self.id?;
+            let replaced = match std::fs::metadata(&self.canonical) {
+                Ok(m) if (m.dev(), m.ino()) == id => return None,
+                Ok(_) => " (a different file now has that name)",
+                Err(_) => "",
+            };
+            let now = self
+                .current_name()
+                .map(|n| format!("; the open file is now named '{n}'"))
+                .unwrap_or_default();
+            Some(format!("has since been renamed or deleted{replaced}{now}"))
+        }
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// What the system now calls the open file (Linux: `/proc/self/fd/<fd>`; an
+    /// unlinked file shows with a ` (deleted)` suffix). Trusted only if that link
+    /// still leads to this session's inode (the descriptor is open while the
+    /// session is Active, but a failed writer may have closed it).
+    #[cfg(unix)]
+    fn current_name(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let link = format!("/proc/self/fd/{}", self.fd);
+            let id = self.id?;
+            let m = std::fs::metadata(&link).ok()?;
+            if (m.dev(), m.ino()) != id {
+                return None;
+            }
+            std::fs::read_link(&link)
+                .ok()
+                .map(|p| p.display().to_string())
+        }
+        #[cfg(not(target_os = "linux"))]
+        None
+    }
+}
+
+/// How a requested op-log path is spelled in messages: as given, plus the
+/// absolute path it denotes in the current directory when that differs (the
+/// working directory can change between two `init` calls with a relative path).
+fn show_request(requested: &str, local: &str) -> String {
+    match std::path::absolute(local) {
+        Ok(abs) if abs.as_os_str() != requested => {
+            format!("'{requested}' (resolves to '{}')", abs.display())
+        }
+        _ => format!("'{requested}'"),
+    }
+}
+
+/// Why `local` cannot be an op-log file at all (a directory, a device such as
+/// /dev/null, a FIFO or other special file, a dangling symlink, an unreadable
+/// path); `None` for a regular file and for a path that does not exist yet.
+fn request_problem(local: &str) -> Option<String> {
+    match std::fs::metadata(local) {
+        Ok(m) => {
+            let ft = m.file_type();
+            if ft.is_dir() {
+                return Some("is a directory".to_string());
+            }
+            if ft.is_file() {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if ft.is_fifo() {
+                    return Some("is a named pipe (FIFO)".to_string());
+                }
+                if ft.is_char_device() {
+                    return Some("is a character device (such as /dev/null)".to_string());
+                }
+                if ft.is_block_device() {
+                    return Some("is a block device".to_string());
+                }
+                if ft.is_socket() {
+                    return Some("is a socket".to_string());
+                }
+            }
+            Some("is not a regular file".to_string())
+        }
+        Err(e) => match std::fs::symlink_metadata(local) {
+            Ok(link)
+                if link.file_type().is_symlink() && e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let target = std::fs::read_link(local)
+                    .map(|t| format!(" to '{}'", t.display()))
+                    .unwrap_or_default();
+                Some(format!(
+                    "is a symbolic link{target} whose target does not exist"
+                ))
+            }
+            Ok(_) => Some(format!("cannot be examined ({e})")),
+            Err(_) => None,
+        },
     }
 }
 
@@ -127,96 +288,203 @@ fn check_request_against_active(active: &SessionFile, requested: &str) -> std::i
     if active.is_same_file(local) {
         return Ok(());
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::ResourceBusy,
-        format!(
-            "cannot start an op-log session for '{requested}': the op-log is already \
-             active and writing {}. Call finalize_op_log() first, then start the new \
-             session (nothing was created or changed)",
-            active.describe()
-        ),
-    ))
-}
-
-/// A child of `fork` asked to start a session on the file its parent's session
-/// writes: refused (initialising it would truncate the parent's log).
-fn check_request_against_parent(parent: &SessionFile, requested: &str) -> std::io::Result<()> {
-    let local = resolve_local_oplog_path(requested)?;
-    if parent.is_same_file(local) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::ResourceBusy,
-            format!(
-                "cannot start an op-log session for '{requested}': that is the op-log file \
-                 of the PARENT process, which this process was forked from and which is \
-                 still writing it. Use a different file in the child (nothing was created \
-                 or changed)"
-            ),
-        ));
+    let mut msg = format!(
+        "cannot start an op-log session for {}: ",
+        show_request(requested, local)
+    );
+    if let Some(problem) = request_problem(local) {
+        msg.push_str(&format!("it {problem}, and "));
     }
-    Ok(())
+    match active.renamed_or_deleted_note() {
+        None => msg.push_str(&format!(
+            "the op-log is already active and writing {}",
+            active.describe()
+        )),
+        Some(note) => msg.push_str(&format!(
+            "the op-log is already active; its session is writing a file that was \
+             originally {} but {note}",
+            active.describe()
+        )),
+    }
+    msg.push_str(
+        ". Call finalize_op_log() first, then start the new session (nothing was \
+         created or changed)",
+    );
+    Err(std::io::Error::new(std::io::ErrorKind::ResourceBusy, msg))
 }
 
 /// Fork safety (issue #294): the writer thread exists only in the process that
 /// started the session, so after `fork` the child would block forever on the
 /// inherited session (a lossless `log()` on a full queue, `finalize`'s wait for
-/// the writer), and could deadlock on the lifecycle lock if another parent thread
-/// held it at the instant of the fork. `pthread_atfork` handlers fix both: the
-/// parent's `prepare` takes the lifecycle lock for the duration of the fork, and
-/// the child's handler abandons any inherited session (closing its gate, so every
-/// logger clone, including those inside stores, rejects entries at once) and
-/// turns the state into `Forked`. They do nothing but atomics, moves and
-/// forgetting, so they are safe to run between `fork` and `exec` too.
+/// the writer), and could deadlock on the lifecycle lock (or the client-id lock)
+/// if another parent thread held it at the instant of the fork. `pthread_atfork`
+/// handlers fix both:
+///
+/// - the parent's `prepare` takes the lifecycle lock, then the client-id lock
+///   (always in that order), for the duration of the fork, and also allocates the
+///   one node the child may need (so the child handler never allocates);
+/// - the child handler abandons any inherited session (closing its gate, so every
+///   logger clone, including those inside stores, rejects entries at once),
+///   leaves the state `Uninitialized`, and links the session's file into the
+///   process-lifetime, append-only set of INHERITED files;
+/// - `init_op_logger` refuses an inherited file for ever: a child, its own later
+///   sessions, and its descendants must never truncate a log that belongs to an
+///   ancestor, whether that ancestor was still writing it or had finished it
+///   (truncating a finished log destroys data just the same).
+///
+/// The handlers do nothing but atomics, moves, linking a pre-allocated node and
+/// forgetting, so they are safe to run between `fork` and `exec` too. They reach
+/// their thread-local with `try_with`: a `fork` from a thread-local destructor
+/// (after the handlers' own thread-local is gone) must not panic, which would
+/// abort the process; it simply proceeds unprotected.
+///
+/// A `File::create` that hangs under the lifecycle lock (a dead NFS server, a
+/// FIFO without a reader) therefore also blocks `fork()` in this process for as
+/// long as it hangs; see `docs/supplemental/OPERATION_LOGGING.md`.
 #[cfg(unix)]
 mod fork_safety {
-    use super::{lock_state, OpLogState, GATE_CLOSED};
+    use super::{
+        lock_state, CreatedFile, OpLogState, Session, SessionFile, GATE_CLOSED, GLOBAL_CLIENT_ID,
+    };
     use std::cell::RefCell;
-    use std::sync::atomic::Ordering;
-    use std::sync::{MutexGuard, Once};
+    use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+    use std::sync::{MutexGuard, PoisonError};
 
-    thread_local! {
-        /// The lifecycle lock, held by the forking thread from `prepare` until
-        /// `parent` / `child` run (those run on the same thread).
-        static HELD: RefCell<Option<MutexGuard<'static, OpLogState>>> = const { RefCell::new(None) };
+    /// A file written by a session of an ANCESTOR process. Nodes are leaked on
+    /// purpose and never removed: the set only grows, for the life of the process.
+    struct Inherited {
+        file: SessionFile,
+        /// Whether that ancestor's session was still Active when this process was
+        /// forked (otherwise it had finished and was Finalized).
+        was_active: bool,
+        next: Option<&'static Inherited>,
     }
 
-    extern "C" fn prepare() {
-        let guard = lock_state();
-        HELD.with(|held| *held.borrow_mut() = Some(guard));
-    }
-
-    extern "C" fn parent() {
-        HELD.with(|held| drop(held.borrow_mut().take()));
-    }
-
-    extern "C" fn child() {
-        let Some(mut state) = HELD.with(|held| held.borrow_mut().take()) else {
-            return;
-        };
-        let file = match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
-            OpLogState::Uninitialized => None,
-            OpLogState::Forked(file) => Some(file),
-            OpLogState::Active(session) | OpLogState::Finalized(session) => {
-                // No writer exists here: reject everything from now on. The
-                // logger is leaked on purpose (never dropped or waited for).
-                session
-                    .logger
-                    .shared
-                    .gate
-                    .fetch_or(GATE_CLOSED, Ordering::AcqRel);
-                let super::Session { logger, file } = session;
-                std::mem::forget(logger);
-                Some(file)
-            }
-        };
-        if let Some(file) = file {
-            *state = OpLogState::Forked(file);
+    impl Inherited {
+        fn blank() -> Box<Inherited> {
+            // Empty `String`/`PathBuf` own no heap memory, so this node costs one
+            // allocation (done in `prepare`, in the parent) and replacing `file`
+            // later frees nothing.
+            Box::new(Inherited {
+                file: SessionFile {
+                    given: String::new(),
+                    canonical: std::path::PathBuf::new(),
+                    id: None,
+                    fd: -1,
+                },
+                was_active: false,
+                next: None,
+            })
         }
     }
 
-    /// Register the handlers once per process (first `init_op_logger`).
+    /// Head of the inherited-file list. Pushed only by the child handler (one
+    /// thread, lifecycle lock held); read by `refuse_if_inherited`.
+    static INHERITED: AtomicPtr<Inherited> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// What the forking thread holds between `prepare` and `parent` / `child`.
+    /// Fields drop in declaration order: the client-id lock before the lifecycle lock.
+    struct Held {
+        _client: MutexGuard<'static, String>,
+        state: MutexGuard<'static, OpLogState>,
+        /// Allocated in `prepare` iff a session exists, for the child to link.
+        spare: Option<Box<Inherited>>,
+    }
+
+    thread_local! {
+        static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+    }
+
+    extern "C" fn prepare() {
+        let _ = HELD.try_with(|cell| {
+            let Ok(mut held) = cell.try_borrow_mut() else {
+                return;
+            };
+            if held.is_some() {
+                // The handlers were registered twice (see `register_with`): this
+                // thread already holds the locks.
+                return;
+            }
+            let state = lock_state();
+            let spare = match &*state {
+                OpLogState::Uninitialized => None,
+                OpLogState::Active(_) | OpLogState::Finalized(_) => Some(Inherited::blank()),
+            };
+            let client = GLOBAL_CLIENT_ID
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *held = Some(Held {
+                _client: client,
+                state,
+                spare,
+            });
+        });
+    }
+
+    extern "C" fn parent() {
+        let _ = HELD.try_with(|cell| {
+            if let Ok(mut held) = cell.try_borrow_mut() {
+                drop(held.take());
+            }
+        });
+    }
+
+    extern "C" fn child() {
+        let held = HELD
+            .try_with(|cell| cell.try_borrow_mut().ok().and_then(|mut h| h.take()))
+            .ok()
+            .flatten();
+        let Some(Held {
+            _client,
+            mut state,
+            spare,
+        }) = held
+        else {
+            return;
+        };
+        let (session, was_active) = match std::mem::replace(&mut *state, OpLogState::Uninitialized)
+        {
+            OpLogState::Uninitialized => return,
+            OpLogState::Active(session) => (session, true),
+            OpLogState::Finalized(session) => (session, false),
+        };
+        let Session { logger, file } = session;
+        // No writer exists here: reject everything from now on. The logger is
+        // leaked on purpose (never dropped or waited for).
+        logger.shared.gate.fetch_or(GATE_CLOSED, Ordering::AcqRel);
+        logger.shared.forked.store(true, Ordering::Relaxed);
+        std::mem::forget(logger);
+        // `spare` is Some whenever a session existed under the lock `prepare` took;
+        // the fallback allocation is unreachable but keeps the record correct.
+        let mut node = spare.unwrap_or_else(Inherited::blank);
+        node.file = file;
+        node.was_active = was_active;
+        // SAFETY: every pointer in the list comes from `Box::into_raw` below and is
+        // never freed.
+        node.next = unsafe { INHERITED.load(Ordering::Acquire).as_ref() };
+        INHERITED.store(Box::into_raw(node), Ordering::Release);
+    }
+
+    /// Registration states: 0 = not registered; `u64::MAX` = registered; any other
+    /// value = being registered by the process whose id is that value minus one.
+    static REGISTRATION: AtomicU64 = AtomicU64::new(0);
+
+    /// Register the handlers once per process, before the first session can start
+    /// (called at the top of every `init_op_logger`).
+    ///
+    /// Not a `Once`: a fork that happens while another thread is inside the very
+    /// first registration would leave a `Once` RUNNING in the child for ever (the
+    /// registering thread does not exist there), and the child's first `init`
+    /// would hang. Instead the claim records the claiming PROCESS id: a caller in
+    /// another process that finds a claim by a different pid is a fork child of
+    /// the claimant, takes the claim over and registers itself. A second caller
+    /// in the SAME process waits (yielding) for the claimant to finish, so every
+    /// `init` proceeds only after the handlers exist. Handlers may therefore be
+    /// registered twice in a child (when the fork landed after the claimant's
+    /// `pthread_atfork` returned but before it marked completion); `prepare`,
+    /// `parent` and `child` are idempotent for that reason.
     pub(super) fn register() {
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
+        register_with(&REGISTRATION, std::process::id(), || {
             // SAFETY: the handlers are `extern "C" fn()`, live for the whole
             // process and only touch this module's state.
             let rc = unsafe { libc::pthread_atfork(Some(prepare), Some(parent), Some(child)) };
@@ -227,16 +495,86 @@ mod fork_safety {
             }
         });
     }
+
+    /// The registration protocol of [`register`], with the state, the process id
+    /// and the installation given explicitly (so it can be tested).
+    pub(super) fn register_with(cell: &AtomicU64, pid: u32, install: impl Fn()) {
+        const DONE: u64 = u64::MAX;
+        let mine = u64::from(pid) + 1;
+        loop {
+            match cell.load(Ordering::Acquire) {
+                DONE => return,
+                0 => {
+                    if cell
+                        .compare_exchange(0, mine, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        install();
+                        cell.store(DONE, Ordering::Release);
+                        return;
+                    }
+                }
+                claimed if claimed == mine => std::thread::yield_now(),
+                stale => {
+                    // Claimed by another process: we are its fork child and the
+                    // claimant thread does not exist here. Take the claim over.
+                    let _ = cell.compare_exchange(stale, 0, Ordering::AcqRel, Ordering::Acquire);
+                }
+            }
+        }
+    }
+
+    /// Refuse to open a file that an ancestor process wrote (see the module
+    /// documentation). `opened` is the file just opened for the new session
+    /// (NOT yet truncated), `local` its path, `given` the text the caller passed.
+    pub(super) fn refuse_if_inherited(
+        given: &str,
+        local: &str,
+        opened: &CreatedFile,
+    ) -> std::io::Result<()> {
+        // SAFETY: see `child`: nodes are leaked and immutable once linked.
+        let mut cur = unsafe { INHERITED.load(Ordering::Acquire).as_ref() };
+        while let Some(node) = cur {
+            if node.file.is_same_as_opened(opened, local) {
+                let how = if node.was_active {
+                    "which was still writing it when this process was forked"
+                } else {
+                    "which had already finished that log (finalized it) when this process \
+                     was forked; initialising it here would destroy that finished log"
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    format!(
+                        "cannot start an op-log session for {}: that is the op-log file of a \
+                         PARENT process (an ancestor this process was forked from), {how}. Use \
+                         a different file in this process (nothing was created or changed)",
+                        super::show_request(given, local)
+                    ),
+                ));
+            }
+            cur = node.next;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(unix))]
 mod fork_safety {
     pub(super) fn register() {}
+    pub(super) fn refuse_if_inherited(
+        _given: &str,
+        _local: &str,
+        _opened: &super::CreatedFile,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // Global variables
 static OP_LOG_STATE: Mutex<OpLogState> = Mutex::new(OpLogState::Uninitialized);
-static GLOBAL_CLIENT_ID: OnceCell<Mutex<String>> = OnceCell::new();
+/// The process client ID. A plain `Mutex` (not lazily initialised), so the fork
+/// handlers can always hold it across `fork` (see `fork_safety`).
+static GLOBAL_CLIENT_ID: Mutex<String> = Mutex::new(String::new());
 
 /// Top bit of `Shared::gate`: set once finalize has begun. The low bits count
 /// `Logger::try_log` calls currently between "gate entered" and "outcome decided".
@@ -318,9 +656,14 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
 
 /// Create the file for a new session (create-and-truncate) and start its writer.
 fn new_session(path: &str) -> std::io::Result<OpLogState> {
-    let logger = Logger::new(path)?;
     let local = resolve_local_oplog_path(path)?;
-    let file = SessionFile::of_created(path, local);
+    // The file is opened WITHOUT truncation, its identity is read from the open
+    // descriptor, an inherited (ancestor's) file is refused, and only then is it
+    // truncated: a refused request never destroys anything.
+    let (logger, created) = Logger::new_checked(path, |created| {
+        fork_safety::refuse_if_inherited(path, local, created)
+    })?;
+    let file = SessionFile::of_created(path, local, &created);
     Ok(OpLogState::Active(Session { logger, file }))
 }
 
@@ -358,12 +701,29 @@ fn new_session(path: &str) -> std::io::Result<OpLogState> {
 ///   Active (a no-op for the same file, an error for another).
 /// - After a `fork` (in the child): the inherited session is not usable (its
 ///   writer thread does not exist in the child), so the op-log is treated as
-///   not initialised and the child may start its own session, except on the
-///   parent's file, which is refused (`ResourceBusy`) rather than truncated.
+///   not initialised and the child may start its own session. The file of every
+///   ancestor's session (the parent's, and the grandparent's, and so on) is
+///   refused for the life of the child process (`ResourceBusy`), whatever the
+///   child does in between (it may finalize and re-init as often as it likes): a
+///   child must never truncate a log that belongs to an ancestor, whether the
+///   ancestor was still writing it or had already finalized it (truncating a
+///   finished log destroys data just the same). The message says which. The
+///   fork itself is protected by `pthread_atfork` handlers registered by the
+///   first call to this function.
 ///
 /// Concurrent calls: the lifecycle lock is held while a file is created, so with
 /// the same file exactly one call creates it and the rest are no-ops; with
-/// different files exactly one wins and every other call gets the error.
+/// different files exactly one wins and every other call gets the error. The
+/// same lock makes `fork()` wait: a `File::create` that hangs (a dead NFS
+/// server, a FIFO with no reader) also blocks `fork` in this process until it
+/// returns.
+///
+/// Identity caveat: two paths are the same file if they have the same
+/// `(device, inode)` (Unix). On a filesystem without stable inode numbers (FUSE
+/// without `use_ino`, CIFS `noserverino`, overlayfs without `xino`) the same path
+/// can look like another file and fail with `ResourceBusy` while Active;
+/// finalize first. Identity stays authoritative (a rotated file that was moved
+/// away and recreated under the same name is a different file: an error).
 ///
 /// Stores capture the logger at construction (`store_for_uri_with_logger(uri,
 /// global_logger())`): stores created before init are unlogged, and stores
@@ -384,11 +744,6 @@ pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
                 }
                 OpLogState::Finalized(previous) if !previous.logger.is_drained() => {
                     previous.logger.clone()
-                }
-                OpLogState::Forked(parent) => {
-                    check_request_against_parent(parent, path)?;
-                    *state = new_session(path)?;
-                    break;
                 }
                 OpLogState::Uninitialized | OpLogState::Finalized(_) => {
                     // Nothing is writing (never started, or the previous writer has
@@ -426,7 +781,7 @@ pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
 pub fn global_logger() -> Option<Logger> {
     match &*lock_state() {
         OpLogState::Active(session) => Some(session.logger.clone()),
-        OpLogState::Uninitialized | OpLogState::Finalized(_) | OpLogState::Forked(_) => None,
+        OpLogState::Uninitialized | OpLogState::Finalized(_) => None,
     }
 }
 
@@ -735,7 +1090,7 @@ pub fn op_log_stats() -> Option<OpLogStats> {
         OpLogState::Active(session) | OpLogState::Finalized(session) => {
             Some(session.logger.stats())
         }
-        OpLogState::Uninitialized | OpLogState::Forked(_) => None,
+        OpLogState::Uninitialized => None,
     }
 }
 
@@ -783,7 +1138,7 @@ pub fn get_clock_offset() -> std::io::Result<i64> {
 fn with_active_logger<T>(what: &str, f: impl FnOnce(&Logger) -> T) -> std::io::Result<T> {
     match &*lock_state() {
         OpLogState::Active(session) => Ok(f(&session.logger)),
-        OpLogState::Uninitialized | OpLogState::Forked(_) => Err(std::io::Error::new(
+        OpLogState::Uninitialized => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("{what}: Logger not initialized - call init_op_logger() first"),
         )),
@@ -815,29 +1170,19 @@ fn with_active_logger<T>(what: &str, f: impl FnOnce(&Logger) -> T) -> std::io::R
 /// s3dlio::set_client_id("agent-1")?;
 /// ```
 pub fn set_client_id(client_id: &str) -> std::io::Result<()> {
-    // Initialize global client_id storage if not already done
-    let _ = GLOBAL_CLIENT_ID.get_or_init(|| Mutex::new(String::new()));
-
-    if let Some(global_id) = GLOBAL_CLIENT_ID.get() {
-        if let Ok(mut id) = global_id.lock() {
+    match GLOBAL_CLIENT_ID.lock() {
+        Ok(mut id) => {
             *id = client_id.to_string();
             Ok(())
-        } else {
-            Err(std::io::Error::other("Failed to acquire client_id lock"))
         }
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Failed to initialize client_id storage",
-        ))
+        Err(_) => Err(std::io::Error::other("Failed to acquire client_id lock")),
     }
 }
 
 /// Get the current global client ID.
 pub fn get_client_id() -> String {
     GLOBAL_CLIENT_ID
-        .get()
-        .and_then(|m| m.lock().ok())
+        .lock()
         .map(|id| id.clone())
         .unwrap_or_default()
 }
@@ -863,11 +1208,6 @@ pub fn finalize_op_logger() {
         let mut state = lock_state();
         match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
             OpLogState::Uninitialized => return,
-            // A forked child has nothing to drain (see `OpLogState::Forked`).
-            OpLogState::Forked(file) => {
-                *state = OpLogState::Forked(file);
-                return;
-            }
             OpLogState::Active(session) | OpLogState::Finalized(session) => {
                 let logger = session.logger.clone();
                 *state = OpLogState::Finalized(session);
@@ -1138,6 +1478,9 @@ struct Shared {
     /// Fixed per logger when it is built.
     lossless: bool,
     closed_noted: AtomicBool,
+    /// Set by the fork child handler: this logger was inherited from a parent
+    /// process, so entries are rejected because of the fork, not a finalize.
+    forked: AtomicBool,
     writer_failure_noted: AtomicBool,
     /// Set by the first dropped entry, which prints the session's one queue-full
     /// note; later drops are only counted (`dropped_full`) and reported at finalize.
@@ -1395,10 +1738,19 @@ impl Shared {
     fn reject_closed(&self) -> LogOutcome {
         self.rejected_closed.fetch_add(1, Ordering::Relaxed);
         if !self.closed_noted.swap(true, Ordering::Relaxed) {
-            stderr_note(
-                "op-log finalized: entries from stores created before finalize are no \
-                 longer recorded",
-            );
+            if self.forked.load(Ordering::Relaxed) {
+                stderr_note(
+                    "op-log: this process was forked from one with an op-log session; \
+                     entries from stores created before the fork are not recorded here \
+                     (that session belongs to the parent; call init_op_log() in this \
+                     process to start one of its own)",
+                );
+            } else {
+                stderr_note(
+                    "op-log finalized: entries from stores created before finalize are no \
+                     longer recorded",
+                );
+            }
         }
         LogOutcome::Closed
     }
@@ -1541,18 +1893,41 @@ impl Logger {
     /// lossless mode, buffer size and compression level come from the
     /// `S3DLIO_OPLOG_*` environment variables, read once here.
     pub fn new(log_file_path: &str) -> std::io::Result<Self> {
+        Self::new_checked(log_file_path, |_| Ok(())).map(|(logger, _)| logger)
+    }
+
+    /// [`Logger::new`] that also reports the identity of the file it opened and
+    /// lets the caller veto it (`vet`) AFTER the file is open but BEFORE it is
+    /// truncated.
+    fn new_checked(
+        log_file_path: &str,
+        vet: impl FnOnce(&CreatedFile) -> std::io::Result<()>,
+    ) -> std::io::Result<(Self, CreatedFile)> {
         // The S3DLIO_OPLOG_* settings below, and the writer thread, come after the
         // `.env` policy (#243).
         crate::dotenv::apply();
         let lossless = std::env::var("S3DLIO_OPLOG_LOSSLESS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        Self::open(log_file_path, oplog_channel_capacity(), lossless)
+        Self::open_checked(log_file_path, oplog_channel_capacity(), lossless, vet)
     }
 
     /// [`Logger::new`] with the queue capacity and lossless mode given explicitly
     /// (the environment is not consulted for these two).
+    #[cfg(test)]
     fn open(log_file_path: &str, cap: usize, lossless: bool) -> std::io::Result<Self> {
+        Self::open_checked(log_file_path, cap, lossless, |_| Ok(())).map(|(logger, _)| logger)
+    }
+
+    /// Open (create) the file, read its identity from the descriptor, let `vet`
+    /// refuse it, then truncate it (like `File::create`, but a refused file is
+    /// left exactly as it was), and start the writer.
+    fn open_checked(
+        log_file_path: &str,
+        cap: usize,
+        lossless: bool,
+        vet: impl FnOnce(&CreatedFile) -> std::io::Result<()>,
+    ) -> std::io::Result<(Self, CreatedFile)> {
         let local_path = resolve_local_oplog_path(log_file_path)?;
 
         // Tunable buffer sizes via (env) variables:
@@ -1562,10 +1937,9 @@ impl Logger {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1); // bias to fast
 
-        // Prepare compressed writer.
         // Include the path in the error: a bare "No such file or directory
         // (os error 2)" gives the user nothing to act on (issue #168).
-        let file = File::create(local_path).map_err(|e| {
+        let create_error = |e: std::io::Error| {
             let shown = if local_path == log_file_path {
                 format!("'{local_path}'")
             } else {
@@ -1575,12 +1949,27 @@ impl Logger {
                 e.kind(),
                 format!("failed to create op-log file {shown}: {e}"),
             )
-        })?;
+        };
+        // O_CREAT without O_TRUNC: the vet below must see the file untouched.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(local_path)
+            .map_err(create_error)?;
+        let created = CreatedFile::of(&file);
+        vet(&created)?;
+        // `File::create` semantics: an existing regular file is emptied. (A
+        // device or FIFO has no length to reset.)
+        if file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            file.set_len(0).map_err(create_error)?;
+        }
 
         // Old, we didn't set a buffer capacity
         //let writer = BufWriter::new(file);
         let writer = BufWriter::with_capacity(wbuf, file);
-        Self::start(writer, cap, lossless, level, WRITER_THREAD_NAME)
+        let logger = Self::start(writer, cap, lossless, level, WRITER_THREAD_NAME)?;
+        Ok((logger, created))
     }
 
     /// Write the header to `sink`, then start the background writer thread that
@@ -1652,6 +2041,7 @@ impl Logger {
                 clock_offset_nanos: clock_offset,
                 lossless,
                 closed_noted: AtomicBool::new(false),
+                forked: AtomicBool::new(false),
                 writer_failure_noted: AtomicBool::new(false),
                 full_noted: AtomicBool::new(false),
                 accepted: AtomicU64::new(0),
@@ -5430,5 +5820,146 @@ mod oplog_unsafe_field_tests {
                 );
             },
         );
+    }
+}
+
+/// Fork-handler registration protocol (issue #294, round 3, N8a). The
+/// protocol is driven with an explicit state cell, process id and install
+/// function, so the "fork landed in the middle of the first registration" case
+/// can be built exactly, without racing real threads against `fork`.
+#[cfg(all(test, unix))]
+mod fork_registration_tests {
+    use super::fork_safety::register_with;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const DONE: u64 = u64::MAX;
+
+    #[test]
+    fn first_caller_installs_once_later_callers_do_nothing() {
+        let cell = AtomicU64::new(0);
+        let installs = AtomicUsize::new(0);
+        for _ in 0..5 {
+            register_with(&cell, 100, || {
+                installs.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert_eq!(installs.load(Ordering::SeqCst), 1);
+        assert_eq!(cell.load(Ordering::SeqCst), DONE);
+    }
+
+    /// The hang the `Once` had: a fork child inherits a registration CLAIMED by
+    /// a thread that does not exist in the child. It must take the claim over
+    /// and register, not wait for ever.
+    #[test]
+    fn a_claim_inherited_from_another_process_is_taken_over() {
+        let parent_pid = 4242u32;
+        let cell = AtomicU64::new(u64::from(parent_pid) + 1); // claimed, never finished
+        let installs = AtomicUsize::new(0);
+        let start = Instant::now();
+        register_with(&cell, 7777, || {
+            installs.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(start.elapsed() < Duration::from_secs(5), "must not wait");
+        assert_eq!(installs.load(Ordering::SeqCst), 1);
+        assert_eq!(cell.load(Ordering::SeqCst), DONE);
+    }
+
+    /// A second thread of the SAME process must not return (and go on to start a
+    /// session) before the claimant has finished installing the handlers.
+    #[test]
+    fn a_second_thread_waits_for_the_claimant_to_finish() {
+        let pid = 31337u32;
+        let cell = Arc::new(AtomicU64::new(u64::from(pid) + 1)); // claimed by us
+        let installs = Arc::new(AtomicUsize::new(0));
+        let waiter = {
+            let (cell, installs) = (cell.clone(), installs.clone());
+            std::thread::spawn(move || {
+                register_with(&cell, pid, || {
+                    installs.fetch_add(1, Ordering::SeqCst);
+                });
+                cell.load(Ordering::SeqCst)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !waiter.is_finished(),
+            "returned before the claimant finished"
+        );
+        cell.store(DONE, Ordering::Release); // the claimant finishes
+        assert_eq!(waiter.join().unwrap(), DONE);
+        assert_eq!(installs.load(Ordering::SeqCst), 0, "must not install twice");
+    }
+
+    #[test]
+    fn many_racing_threads_install_exactly_once_and_all_see_it_done() {
+        let cell = Arc::new(AtomicU64::new(0));
+        let installs = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let (cell, installs) = (cell.clone(), installs.clone());
+                std::thread::spawn(move || {
+                    register_with(&cell, 555, || {
+                        std::thread::sleep(Duration::from_millis(50));
+                        installs.fetch_add(1, Ordering::SeqCst);
+                    });
+                    // Every return is AFTER the install finished.
+                    installs.load(Ordering::SeqCst)
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), 1);
+        }
+        assert_eq!(installs.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// The file a session opens is vetted and identified from its OPEN descriptor
+/// (issue #294, round 3, N6a), and a vetoed file is left untouched.
+#[cfg(all(test, unix))]
+mod created_file_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn vetoed_existing_file_is_not_truncated_and_identity_comes_from_the_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.tsv.zst");
+        std::fs::write(&path, b"precious").unwrap();
+        let p = path.to_str().unwrap();
+        let want = {
+            let m = std::fs::metadata(&path).unwrap();
+            (m.dev(), m.ino())
+        };
+
+        // Vetoed: the vet sees the identity of the open (untouched) file.
+        let err = Logger::new_checked(p, |created| {
+            assert_eq!(created.id, Some(want));
+            assert_eq!(
+                std::fs::read(p).unwrap(),
+                b"precious",
+                "vet runs BEFORE truncation"
+            );
+            Err(std::io::Error::other("veto"))
+        })
+        .err()
+        .expect("vetoed");
+        assert_eq!(err.to_string(), "veto");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"precious",
+            "a vetoed file is untouched"
+        );
+
+        // Accepted: truncated like File::create, same inode.
+        let (logger, created) = Logger::new_checked(p, |_| Ok(())).unwrap();
+        assert_eq!(created.id, Some(want));
+        logger.shutdown();
+        let raw = std::fs::read(&path).unwrap();
+        assert!(raw.len() > 8, "replaced by the op-log");
+        let text = zstd::decode_all(raw.as_slice()).expect("complete zstd stream");
+        assert!(text.starts_with(b"idx\tthread\t"));
     }
 }

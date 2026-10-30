@@ -1972,7 +1972,17 @@ session carries on. Of several threads calling `init_op_log` at once exactly one
 creates the file (same file: every call returns; different files: the rest raise). After
 `os.fork()` the child does not share the parent's session (its writer thread is not
 copied): `is_op_log_active()` is `False` in the child, which can start its own session,
-but not on the parent's file. A re-init waits
+but never on a file an ancestor process wrote, however often the child starts and
+finishes sessions of its own (the `RuntimeError` says whether the parent was still
+writing the file or had finished it; initialising it would truncate the log). Stores
+created before the fork stay silent in the child (one line on stderr says why). If the
+active file was renamed or deleted behind the session's back (log rotation), a request
+for the old name is a `RuntimeError` saying the session is writing a file that was
+renamed or deleted (it keeps writing the open file); a request that is a directory,
+`/dev/null`, a FIFO or a dangling symlink is described as such. Files are compared by
+`(device, inode)`: on a filesystem without stable inode numbers (FUSE without `use_ino`,
+CIFS `noserverino`, overlayfs without `xino`) the same path can look like another file
+and raise while active; finalize first. A re-init waits
 for the previous session's writer to finish (with the GIL released), then creates
 its file exactly as a first init does: the same path replaces the old log, a
 different path leaves it untouched. `finalize_op_log` is safe to repeat. The
