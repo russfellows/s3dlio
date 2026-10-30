@@ -3,7 +3,8 @@
 Runs against the INSTALLED wheel, in process, with no network and no environment variable
 (``S3DLIO_TEST_DIR`` optionally names a directory on a real filesystem for the scratch files;
 the default is the system temp directory).  direct:// tests are skipped when the scratch
-filesystem refuses O_DIRECT.
+filesystem refuses O_DIRECT, unless S3DLIO_REQUIRE_ODIRECT_TESTS=1 (CI), which makes such a skip
+a failure (see conftest.py).
 
 Run (the in-repo convention):
 

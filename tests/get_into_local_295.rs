@@ -359,7 +359,7 @@ async fn forbidden(s: &Subject, dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
-        eprintln!("SKIPPED: root ignores file permissions");
+        odirect::skip("root ignores file permissions");
         return;
     }
     let path = write(dir, "secret", &pattern(64));
@@ -635,7 +635,7 @@ async fn an_unreadable_empty_file_is_ok_without_being_opened() {
     use std::os::unix::fs::PermissionsExt;
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
-        eprintln!("SKIPPED: running as root, a mode-000 file is readable");
+        odirect::skip("running as root, a mode-000 file is readable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();

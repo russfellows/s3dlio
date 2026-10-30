@@ -18,6 +18,17 @@
 //   overwrite, truncate-and-regrow, a rename-replace, an unlink, a chmod) is `VersionChanged`.
 //   Limits: a write in the same kernel timestamp tick as the last change before the open, made
 //   while the read runs, and a shared-`mmap` write that is not yet written back, are not seen.
+//   On NETWORK and CLUSTER filesystems (NFS, Lustre, GPFS, BeeGFS, CephFS, SMB) the timestamps
+//   are those the client has cached: attribute caching (`actimeo`, `lookupcache`, the
+//   revalidation interval) and server/client clock or mtime lag mean a write by ANOTHER client
+//   can be missed for seconds, and many of them stamp with 1 s or coarser granularity. Same-size
+//   overwrites by another node are therefore detected only on a best-effort basis there; the
+//   size check (`LengthMismatch`) is as good as the client's cached size. Use a
+//   version-pinning store (an object store) or an external lock/handshake when another node may
+//   rewrite a file that is being read.
+//   `head`'s etag (`stat_etag`) is `file-<size>-<mtime in whole seconds>`: second granularity,
+//   so two same-size rewrites within one second share an etag. That format predates #295 and is
+//   unchanged; the open-file check above uses nanoseconds and is not affected.
 // * A missing file is `NotFound`, an unreadable one `Forbidden`, a directory (or any other
 //   non-regular file) `Other`. A HEAD of a missing file is `Ok(None)`.
 // * Progress reports the DISTINCT destination positions filled, recorded after each copy.
@@ -41,9 +52,8 @@
 //
 // `dst` is a borrowed `&mut [u8]`, so it is never handed to `spawn_blocking` (the future could
 // be dropped while a thread still wrote into it). Every read runs INSIDE the poll of the
-// returned future, through [`blocking_io`] (`block_in_place` on a multi-thread runtime, inline in a `LocalSet`,
-// inline
-// otherwise), one bounded chunk at a time ([`GET_INTO_CHUNK_BYTES`]), with a yield between
+// returned future, through [`blocking_io`] (`block_in_place` on a marked worker of a multi-thread runtime, inline
+// everywhere else, see `runtime_support`), one bounded chunk at a time ([`GET_INTO_CHUNK_BYTES`]), with a yield between
 // chunks. A running read is therefore never separated from its future: when the future is
 // dropped (or its task aborted) it is dropped at a chunk boundary, with no writer left.
 
@@ -51,6 +61,7 @@ use crate::data_loader::options::PageCacheMode;
 use crate::object_error::{attach_object_error, ObjectError, ObjectErrorKind};
 use crate::object_store::HeadMetadata;
 use crate::receive_progress::{ReceiveProgress, SpanMark};
+use crate::runtime_support::blocking_io;
 use anyhow::Result;
 use std::fs::File;
 use std::io;
@@ -60,68 +71,6 @@ use std::time::SystemTime;
 /// The most bytes one read call asks for. Bounds how long a read runs without yielding to the
 /// runtime (the granularity of cancellation), and the size of one pass through the bounce pool.
 pub(crate) const GET_INTO_CHUNK_BYTES: usize = 16 * 1024 * 1024;
-
-thread_local! {
-    /// Set only while [`blocking_io`] is probing `block_in_place`: the panic hook installed by
-    /// [`install_quiet_probe_hook`] stays silent for a panic raised on THIS thread in that window.
-    static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Chain a panic hook in front of the current one that swallows the message of the panic the
-/// `block_in_place` probe in [`blocking_io`] provokes on purpose (and nothing else: it is silent
-/// only on a thread that is inside the probe window, before the closure has started). Installed
-/// once per process, the first time a read runs on a multi-thread runtime.
-fn install_quiet_probe_hook() {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    INSTALLED.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if !PROBING.with(|p| p.get()) {
-                previous(info);
-            }
-        }));
-    });
-}
-
-/// Run blocking file I/O from async code without stalling a runtime worker.
-///
-/// * On a multi-thread runtime the worker hands its queue to another thread first
-///   (`block_in_place`), so the I/O does not stall the tasks queued behind it.
-/// * Everywhere else (a current-thread runtime, no runtime) the closure runs inline.
-/// * `block_in_place` itself PANICS when it is called from a tokio `LocalSet` that is driven by
-///   a thread that is not a runtime worker (`rt.block_on(local.run_until(..))`,
-///   `LocalSet::block_on`, `spawn_local` inside either): "can call blocking only when running
-///   on the multi-threaded runtime". Tokio (1.52) exposes no way to ask whether that is the
-///   case, so the call is made under `catch_unwind` with the closure held back in an `Option`:
-///   the panic is raised before the closure is started, so it is still there, and it simply
-///   runs inline. While probing, a one-time chained panic hook (see
-///   [`install_quiet_probe_hook`]) keeps that expected panic from printing a message; a panic
-///   raised BY the closure is not hidden (the flag is cleared before it starts) and is
-///   propagated unchanged.
-pub(crate) fn blocking_io<R>(f: impl FnOnce() -> R) -> R {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            install_quiet_probe_hook();
-            let mut pending = Some(f);
-            PROBING.with(|p| p.set(true));
-            let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::task::block_in_place(|| {
-                    PROBING.with(|p| p.set(false));
-                    (pending.take().expect("the closure runs once"))()
-                })
-            }));
-            PROBING.with(|p| p.set(false));
-            match probed {
-                Ok(r) => r,
-                // Refused before the closure started: run it here.
-                Err(_) if pending.is_some() => (pending.take().expect("checked"))(),
-                // The closure itself panicked: not ours to swallow.
-                Err(payload) => std::panic::resume_unwind(payload),
-            }
-        }
-        _ => f(),
-    }
-}
 
 /// O_DIRECT parameters of a store that reads with direct I/O.
 #[derive(Debug, Clone, Copy)]
@@ -367,6 +316,15 @@ fn inject_einval(offset: usize, after: bool) -> bool {
     })
 }
 
+/// The `open(2)` flag for direct I/O. Linux only: other Unixes have no `O_DIRECT` (macOS uses
+/// `fcntl(F_NOCACHE)`, which has different alignment rules), so there [`open_direct`] reports
+/// the same refusal a filesystem without O_DIRECT gives and the read is done buffered, exactly
+/// like the fallback. (The rest of the crate\'s `direct://` write path still assumes Linux.)
+#[cfg(target_os = "linux")]
+const O_DIRECT_FLAG: libc::c_int = libc::O_DIRECT;
+#[cfg(all(unix, not(target_os = "linux")))]
+const O_DIRECT_FLAG: libc::c_int = 0;
+
 #[cfg(unix)]
 fn open_direct(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -374,9 +332,12 @@ fn open_direct(path: &Path) -> io::Result<File> {
     if REFUSE_DIRECT_OPEN.with(|r| r.get()) {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
+    if O_DIRECT_FLAG == 0 {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECT)
+        .custom_flags(O_DIRECT_FLAG)
         .open(path)
 }
 
@@ -540,8 +501,8 @@ impl<'a> Reader<'a> {
         let cleared = unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             flags >= 0
-                && libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_DIRECT) >= 0
-                && libc::fcntl(fd, libc::F_GETFL) & libc::O_DIRECT == 0
+                && libc::fcntl(fd, libc::F_SETFL, flags & !O_DIRECT_FLAG) >= 0
+                && libc::fcntl(fd, libc::F_GETFL) & O_DIRECT_FLAG == 0
         };
         if !cleared {
             return Err(io_failure(

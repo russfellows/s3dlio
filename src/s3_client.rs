@@ -198,6 +198,7 @@ pub fn configure_thread_pools(threads: usize) {
         builder.worker_threads(threads);
         builder.enable_all();
         builder.thread_name("s3dlio-decode");
+        builder.on_thread_start(crate::runtime_support::mark_tokio_worker_thread);
         pyo3_async_runtimes::tokio::init(builder);
     }
 
@@ -272,6 +273,7 @@ pub(crate) fn global_rt_handle() -> &'static Handle {
                     .enable_time()
                     .worker_threads(threads)
                     .thread_name("s3dlio-rt-worker")
+                    .on_thread_start(crate::runtime_support::mark_tokio_worker_thread)
                     .build()
                     .expect("failed to build global tokio runtime");
 

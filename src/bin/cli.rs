@@ -778,6 +778,7 @@ fn run() -> Result<()> {
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)
         .build()
         .context("failed to build the Tokio runtime")?
         .block_on(async_main())

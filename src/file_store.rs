@@ -174,17 +174,13 @@ pub(crate) fn write_all_std(file: &std::fs::File, data: &[u8]) -> std::io::Resul
 /// Write a BORROWED slice completely to `file` without copying it (Rule #1).
 ///
 /// A borrowed `&[u8]` cannot be moved into `spawn_blocking` without a copy, so the write runs on
-/// the calling task's thread: on the multi-thread runtime `block_in_place` hands the worker's
-/// other tasks to a fresh thread first (the same off-loading `spawn_blocking` gives); a
-/// current-thread runtime has no other thread to hand them to (and `block_in_place` would panic
-/// there), so the write simply runs inline. Owned data should use `spawn_blocking` instead.
+/// the calling task's thread: on a marked worker of a multi-thread runtime `block_in_place`
+/// hands the worker's other tasks to a fresh thread first (the same off-loading
+/// `spawn_blocking` gives); everywhere else (a current-thread runtime, a `LocalSet`, a thread
+/// without the worker marker) the write runs inline, because `block_in_place` would panic or
+/// do nothing there (see [`crate::runtime_support`]). Owned data should use `spawn_blocking`.
 pub(crate) fn write_borrowed_blocking(file: &std::fs::File, data: &[u8]) -> std::io::Result<()> {
-    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-            tokio::task::block_in_place(|| write_all_std(file, data))
-        }
-        _ => write_all_std(file, data),
-    }
+    crate::runtime_support::blocking_io(|| write_all_std(file, data))
 }
 
 /// Streaming writer for filesystem operations

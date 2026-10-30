@@ -34,8 +34,8 @@ build for these schemes, with or without the op-log wrapper).
   distinct destination positions filled, recorded after each copy (`SpanMark::record_copy`); the op-log writes exactly
   one GET row (bytes = progress, also on an error) and one HEAD row.
 - Cancellation: `dst` is a borrowed `&mut [u8]`, so it is never given to `spawn_blocking`. Every read runs inside the
-  poll of the returned future (`block_in_place` on a multi-thread runtime, inline on a current-thread one or inside
-  a `LocalSet`), one chunk at a time with a yield between chunks: dropping the future or aborting its task stops it at
+  poll of the returned future (`block_in_place` on a marked worker of a multi-thread runtime, inline everywhere else; see
+  "Runtime support"), one chunk at a time with a yield between chunks: dropping the future or aborting its task stops it at
   a chunk boundary with no writer left. In Python the read runs on the runtime without the GIL.
 - A file that is modified WHILE it is read is an error, never `Ok` with mixed data. The open file's `mtime` and
   `ctime` (nanoseconds) are recorded when it is opened and compared after the last chunk: a different size is
@@ -52,14 +52,17 @@ build for these schemes, with or without the op-log wrapper).
 - `examples/get_into_local_bench.rs`: `get_into` against the allocating `get` (see Performance).
 
 **Hardened after review (same release)**
-- No panic in any polling context. `block_in_place` panics ("can call blocking only when running on the
-  multi-threaded runtime") inside a tokio `LocalSet` that a non-worker thread drives on a multi-thread runtime
-  (`rt.block_on(local.run_until(..))`, `LocalSet::block_on`, `spawn_local` inside either), which used to take
-  `file://` and `direct://` `get_into` and the `direct://` writer down. tokio 1.52 has no way to ask whether that is the case,
-  so the shared helper (`file_get_into::blocking_io`) probes `block_in_place` under `catch_unwind` with the closure held
-  back (the panic is raised before the closure starts) and runs it inline when refused. A one-time chained panic hook
-  keeps that probe from printing a message; it is silent only on a thread inside the probe window, and a panic raised
-  by the closure itself is neither hidden nor altered. Tested in 13 contexts (`tests/get_into_runtime_contexts_295.rs`).
+- No panic in any polling context, and no panic machinery. `block_in_place` panics ("can call blocking only when
+  running on the multi-threaded runtime") inside a tokio `LocalSet` that a non-worker thread drives on a multi-thread
+  runtime (`rt.block_on(local.run_until(..))`, `LocalSet::block_on`, `spawn_local` inside either), which used to take
+  `file://` and `direct://` `get_into` and the `direct://` writer down. The first fix probed `block_in_place` under
+  `catch_unwind` with a process-wide chained panic hook; the second review found that this aborts the process under
+  `panic = "abort"`, that every panic hook an application installs later sees one false panic per probe, and that a
+  genuine panic of tokio's could be swallowed. The probe, the hook and `catch_unwind` are gone. The shared helper
+  (`runtime_support::blocking_io`) decides from thread-local state and tokio's public API alone: it calls
+  `block_in_place` only on a thread carrying the worker marker, on a multi-thread runtime, outside an
+  `inline_blocking_io()` scope, and runs the closure inline everywhere else; a panic in the closure propagates
+  unchanged. See "Runtime support" below.
 - A mid-read fall back from O_DIRECT (the kernel answers EINVAL for a later chunk) now clears `O_DIRECT` on the SAME open
   file descriptor (`fcntl(F_SETFL)`) instead of reopening the path, so a rename-replace between two chunks can no
   longer feed the rest of the read from another file. Progress is not double counted for the chunk that is read twice.
@@ -87,6 +90,45 @@ build for these schemes, with or without the op-log wrapper).
   row with `error = cancelled` and the count at the drop, an unpolled one no row: the same as the network stores); an
   unreadable zero-byte file is `Ok` without being opened. The Python test helper `aligned_view` could return a view cut
   short at some page offsets (flaky) and is fixed and tested over 400 random allocations.
+
+**Runtime support (public, Rust).** New module `s3dlio::runtime_support`:
+- `mark_tokio_worker_thread()`: pass it to `tokio::runtime::Builder::on_thread_start` of a multi-thread runtime you
+  build yourself to get the worker hand-off for `file://` / `direct://` reads and writes. s3dlio's own multi-thread
+  runtimes (the global runtime, the Python decode and checkpoint runtimes, the CLI) already do. Without it the file
+  stores work in every context but run each read chunk (at most 16 MiB) inline on the polling worker: a
+  neighbouring task can wait up to one chunk, and a single reader is about twice as fast. Measured with
+  `examples/runtime_handoff_bench.rs` (release, 96-core Linux, 4 workers, 1 GiB warm file on ext4): single reader
+  3.3 GiB/s with the hand-off against 7.4 GiB/s inline; with 4 readers saturating the 4 workers a neighbour's
+  1 ms timer fires late by p99 1.8 ms / max 2.1 ms with the hand-off against p99 9.8 ms / max 10.8 ms inline (on tmpfs
+  max 2.0 against 14.9 ms; the reviewer's heavier saturation: about 3 ms against 60 ms). The hand-off costs about 2.6 ms per
+  16 MiB chunk on this box; s3dlio's own runtimes keep it because neighbour latency matters more than one reader's peak.
+- `inline_blocking_io()`: a guard that keeps the file stores inline on this thread while it lives. Needed in exactly
+  one case: a `spawn_blocking` closure, on a runtime whose threads carry the marker, that drives a `LocalSet` itself
+  and runs s3dlio file I/O in it (tokio gives the library no way to tell that thread from a worker, and `block_in_place`
+  panics there). Why the marker is set at thread start rather than by the park hooks, and why that is robust:
+  see the module documentation (tokio's workers are blocking-pool threads and a worker's core moves between them
+  on every `block_in_place`; the park hooks fire only on a worker's own park path, so replacement workers would lose
+  the marker exactly when the pool is saturated).
+- BEHAVIOUR CHANGE for embedders: a multi-thread runtime that is NOT marked used to get `block_in_place` for the
+  `file://` writer's borrowed-slice writes (and for the new reads); it now runs them inline (never a panic).
+  Add the one-line `on_thread_start` to keep the hand-off.
+- Other `block_in_place` call sites that are NOT changed here and have the same LocalSet limitation
+  (`python_core_api.rs` store-builder wait, `s3_client.rs` `run_on_global_rt`, `s3_utils.rs` `stat_object_uri`): follow-up.
+- macOS: the new `get_into` code compiles without `libc::O_DIRECT` (it is Linux only; elsewhere `direct://` reads are
+  buffered like the fallback). The crate as a whole still does not build on macOS (`file_store_direct.rs` uses
+  `libc::O_DIRECT` throughout, as before this change).
+- Test and CI: `tests/get_into_panic_hook_295.rs` (an application hook installed after the first read sees zero calls),
+  `tests/get_into_runtime_contexts_295.rs` (every context, marked and unmarked runtimes, `file://` put included),
+  unit tests in `runtime_support` (the rule table, panics propagate on a worker and inline, the hand-off observed
+  with a one-worker runtime), and `scripts/test_panic_abort_295.sh` (builds `examples/abort_localset_295.rs` with the
+  `abort-test` profile, `panic = "abort"`, and requires exit 0). CI now runs every `tests/*_295.rs` binary, the
+  `panic=abort` script and both Python test files; `S3DLIO_REQUIRE_ODIRECT_TESTS=1` (see `docs/Environment_Variables.md`)
+  turns any skip in them into a failure. `the_page_cache_hint_is_applied_and_takes_effect` now uses a real-filesystem
+  scratch directory (`S3DLIO_TEST_DIR`, else `target/tmp`), skips on tmpfs/ramfs (where `DONTNEED` cannot drop anything) and
+  skips when the freshly read file is not fully cached (memory pressure); it used to fail with `TMPDIR=/dev/shm`.
+- Documented limits of the same-size overwrite detection: NFS, Lustre, GPFS, BeeGFS, CephFS and SMB serve cached
+  attributes and coarse or lagging timestamps, so a write by another node can go unseen for seconds (best effort there);
+  the `head` etag has second granularity (a pre-existing format, unchanged).
 
 **Changed (BEHAVIOUR CHANGE).** `object_capabilities("file://...")` and `("direct://...")` were `get_into: False, head: False`;
 they are now `True, True`, and `get_into_async` / `head_async` on those URIs read instead of raising

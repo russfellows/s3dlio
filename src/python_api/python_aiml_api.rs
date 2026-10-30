@@ -1591,6 +1591,7 @@ fn build_checkpoint_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .worker_threads(crate::constants::effective_thread_budget())
         .enable_all()
         .thread_name("s3dlio-checkpoint")
+        .on_thread_start(crate::runtime_support::mark_tokio_worker_thread)
         .build()
 }
 

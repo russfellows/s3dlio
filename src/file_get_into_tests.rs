@@ -52,22 +52,45 @@ fn run_to_end<F: std::future::Future>(mut f: std::pin::Pin<&mut F>) -> F::Output
     panic!("the future did not finish");
 }
 
-/// A scratch directory whose filesystem accepts O_DIRECT, or `None` (skip, with a message).
-fn odirect_dir() -> Option<tempfile::TempDir> {
+/// Where scratch files go: `S3DLIO_TEST_DIR` (a real filesystem), else `target/tmp` of the
+/// checkout. Never the system temp dir, which is tmpfs on many machines (`TMPDIR=/dev/shm`).
+fn scratch_base() -> std::path::PathBuf {
     let base = std::env::var_os("S3DLIO_TEST_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp"));
+    std::fs::create_dir_all(&base).expect("create the scratch base directory");
+    base
+}
+
+/// A scratch directory whose filesystem accepts O_DIRECT, or `None` (skip, with a message; a
+/// failure when `S3DLIO_REQUIRE_ODIRECT_TESTS` is set).
+fn odirect_dir() -> Option<tempfile::TempDir> {
     let dir = tempfile::Builder::new()
         .prefix("get-into-unit-")
-        .tempdir_in(base)
+        .tempdir_in(scratch_base())
         .unwrap();
     let probe = dir.path().join("probe");
     std::fs::write(&probe, [0u8; PAGE]).unwrap();
     if open_direct(&probe).is_err() {
-        eprintln!("SKIPPED: the scratch filesystem refuses O_DIRECT; set S3DLIO_TEST_DIR");
+        crate::test_env::skip("the scratch filesystem refuses O_DIRECT; set S3DLIO_TEST_DIR");
         return None;
     }
     Some(dir)
+}
+
+/// Whether `path` is on a filesystem whose pages ARE its storage (tmpfs, ramfs): there
+/// `posix_fadvise(DONTNEED)` cannot drop anything, so a test of its effect is meaningless.
+fn on_memory_filesystem(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    const RAMFS_MAGIC: i64 = 0x8584_58f6;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path and `st` is a properly sized, writable struct.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(c.as_ptr(), &mut st) };
+    assert_eq!(rc, 0, "statfs {}", path.display());
+    let magic = st.f_type as i64;
+    magic == TMPFS_MAGIC || magic == RAMFS_MAGIC
 }
 
 fn backing(len: usize) -> AlignedBuf {
@@ -213,7 +236,18 @@ fn resident_pages(file: &File, offset: usize, len: usize) -> usize {
 /// file that are cached and not yet read are dropped, while a `Normal` hint leaves them alone.
 #[tokio::test(flavor = "current_thread")]
 async fn the_page_cache_hint_is_applied_and_takes_effect() {
-    let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("get-into-hint-")
+        .tempdir_in(scratch_base())
+        .unwrap();
+    if on_memory_filesystem(dir.path()) {
+        crate::test_env::skip(&format!(
+            "{} is on tmpfs/ramfs, where the page cache hint has no effect to observe; set \
+             S3DLIO_TEST_DIR to a directory on a disk filesystem",
+            dir.path().display()
+        ));
+        return;
+    }
     let len = 48 * MIB;
     let path = dir.path().join("hint.bin");
     std::fs::write(&path, pattern(len)).unwrap();
@@ -228,11 +262,17 @@ async fn the_page_cache_hint_is_applied_and_takes_effect() {
         std::fs::File::open(&path).unwrap().sync_all().unwrap();
         let _ = std::fs::read(&path).unwrap();
         let probe = File::open(&path).unwrap();
-        assert_eq!(
-            resident_pages(&probe, tail.0, tail.1),
-            tail_pages,
-            "precondition: the tail is cached"
-        );
+        let cached = resident_pages(&probe, tail.0, tail.1);
+        if cached != tail_pages {
+            // The kernel evicted part of a file it was just handed (memory pressure): there is
+            // nothing left to observe the hint on, so this run cannot judge it. A real
+            // implementation bug cannot cause this (the precondition is checked BEFORE the read).
+            crate::test_env::skip(&format!(
+                "only {cached} of {tail_pages} pages of the freshly read file are cached \
+                 (memory pressure on this machine)"
+            ));
+            return;
+        }
 
         HINTS_APPLIED.with(|h| h.borrow_mut().clear());
         let spec = LocalRead {

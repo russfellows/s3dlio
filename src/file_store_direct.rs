@@ -4,10 +4,10 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use crate::checksum::Crc32c;
-use crate::file_get_into::blocking_io;
 use crate::memory::{AlignedAllocError, AlignedBuf, BufferPool, BufferPoolConfig};
 use crate::object_store::WriterOptions;
 use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
+use crate::runtime_support::blocking_io;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -3090,11 +3090,13 @@ mod direct_io_chunking_tests {
                 .custom_flags(libc::O_DIRECT)
                 .open(d.path().join("probe"));
             if let Err(e) = probe {
-                eprintln!(
-                    "SKIPPED: {} does not support O_DIRECT ({e}); set S3DLIO_TEST_DIR to a \
+                let msg = format!(
+                    "{} does not support O_DIRECT ({e}); set S3DLIO_TEST_DIR to a \
                      directory on a real filesystem (not tmpfs)",
                     d.path().display()
                 );
+                // CI sets S3DLIO_REQUIRE_ODIRECT_TESTS=1: a skip is then a failure.
+                crate::test_env::skip(&msg);
                 return None;
             }
             Some(d)

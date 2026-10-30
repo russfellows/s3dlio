@@ -576,11 +576,21 @@ stores, with these local specifics:
   in the same kernel timestamp tick (1-10 ms on ext4) as the last change before the read opened the file goes unseen;
   filesystems with 1-2 s timestamps widen that window; a write through a shared `mmap` is stamped only at write-back.
   The check cannot protect against a writer that is still writing when the read ends successfully.
+  **Network and cluster filesystems (NFS, Lustre, GPFS, BeeGFS, CephFS, SMB):** the timestamps are the ones the
+  client has cached. Attribute caching (`actimeo`, the revalidation interval), server-to-client clock or mtime lag and
+  coarse timestamp granularity mean a same-size overwrite made by ANOTHER node can go unseen for seconds, so the
+  version check is best effort there (the size check is only as current as the client's cached size). If another
+  node may rewrite a file you are reading, coordinate with a lock or a handshake, or use an object store.
 - A missing file (or a path below a regular file) raises `ObjectNotFoundError`; `head_async` returns `None`.
   A directory raises `RuntimeError` from both. A file you may not read raises `RuntimeError` naming the
   permission error (`head_async`, which only needs `stat`, still succeeds).
 - `head_async` is a `stat`: `size`, `etag` = `file-<size>-<mtime seconds>` (the identity
-  `ObjectStore.stat` reports; it is not a content hash) and `version_id` = `None`.
+  `ObjectStore.stat` reports; it is not a content hash) and `version_id` = `None`. The etag has second
+  granularity (a historical format, unchanged): two same-size rewrites within one second share it. The
+  read-time version check above uses nanoseconds and is not affected.
+- Embedding in Rust? The file stores hand a runtime worker off around each read chunk only on threads marked with
+  `s3dlio::runtime_support::mark_tokio_worker_thread` (s3dlio's own runtimes, including everything the Python
+  module starts, are marked); see the Rust section of the changelog and the `runtime_support` rustdoc.
 - The read runs without the GIL, in chunks of at most 16 MiB. Cancelling the awaitable stops it at the next
   chunk boundary; as everywhere, the awaitable ends only after the last write into `dst`.
 

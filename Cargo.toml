@@ -262,3 +262,9 @@ opt-level = 3
 #
 # Development: path = "../google-cloud-rust/src/..."
 # Released:    git  = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2"
+
+# Test-only profile (#295): the dev profile with `panic = "abort"`, to prove the crate does not
+# rely on catching a panic (see scripts/test_panic_abort_295.sh). Not used by any release build.
+[profile.abort-test]
+inherits = "dev"
+panic = "abort"
