@@ -246,13 +246,8 @@ OBJECTS = {
         "drain",
         False,
     ),
-    # Its producer starts at construction: hold the runtime so the first fetch happens after the
-    # session switch.
-    "pooled_s3_loader": (
-        "lambda uri: s3dlio.PyS3AsyncDataLoader(uri)",
-        "drain",
-        True,
-    ),
+    # (PyS3AsyncDataLoader is a deprecated shim whose __aiter__ returns a loader that is not an async
+    # iterator, so it cannot be iterated; create_async_loader is the supported route to S3BytesDataset.)
 }
 
 OBJECT_BODY = '''
