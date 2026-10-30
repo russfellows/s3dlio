@@ -78,7 +78,6 @@ use crate::object_store::{
 // ---------------------------------------------------------------------------
 
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use std::sync::Arc;
 
 /// Cache key: uniquely identifies an ObjectStore configuration
@@ -202,7 +201,14 @@ impl StoreSlot {
 /// per key and the slot makes the build happen once.
 ///
 /// Performance: <100ns per lookup (DashMap sharded locking)
-static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<StoreSlot>>> = Lazy::new(DashMap::new);
+static STORE_CACHE_CELL: crate::fork_guard::ForkCell<DashMap<StoreKey, Arc<StoreSlot>>> =
+    crate::fork_guard::ForkCell::new();
+
+/// The store cache of THIS process: a fork child starts with an empty one (the inherited
+/// stores own connection pools whose tasks ran on the parent's runtime, #297).
+fn store_cache() -> &'static DashMap<StoreKey, Arc<StoreSlot>> {
+    STORE_CACHE_CELL.get_or_init(DashMap::new)
+}
 
 /// Test hook: the URI of every store `get_or_create_store` built (not served from the
 /// cache), in order.  Lets a test count the builds for one URI.
@@ -249,11 +255,11 @@ fn get_or_create_store(
     let key = StoreKey::from_uri(uri)?;
 
     // Fast path: the slot exists (cache hit >99% in typical workloads).
-    let existing = STORE_CACHE.get(&key).map(|slot| Arc::clone(slot.value()));
+    let existing = store_cache().get(&key).map(|slot| Arc::clone(slot.value()));
     let slot = match existing {
         Some(slot) => slot,
         None => Arc::clone(
-            STORE_CACHE
+            store_cache()
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(StoreSlot::new()))
                 .value(),
@@ -305,6 +311,7 @@ where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
+    crate::fork_guard::check_py()?;
     run_on_global_rt(fut).map_err(py_err)
 }
 
@@ -1318,7 +1325,7 @@ pub fn configure_s3(
     }
     // Clear the store cache so subsequent operations create fresh stores
     // with the updated configuration rather than reusing stale ones.
-    STORE_CACHE.clear();
+    store_cache().clear();
     Ok(())
 }
 
@@ -3713,7 +3720,7 @@ impl PyObjectWriter {
         data: &[u8],
     ) -> PyResult<()> {
         let writer = writer.as_mut().ok_or_else(Self::finalized_error)?;
-        let result = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+        let result = crate::s3_client::pyo3_runtime().block_on(async {
             writer
                 .write_chunk(data)
                 .await
@@ -4932,7 +4939,7 @@ mod issue173_store_creation_tests {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
         // Force the slow (creating) path of get_or_create_store.
-        STORE_CACHE.remove(&StoreKey::from_uri(HOST_FORM_URI).expect("valid URI"));
+        store_cache().remove(&StoreKey::from_uri(HOST_FORM_URI).expect("valid URI"));
     }
 
     /// The exact shape of the old `get`/`get_range`/`put_bytes` bodies:
@@ -5104,7 +5111,7 @@ mod issue171_store_cache_routing_tests {
     /// How many cache entries sit under the global-client key (route `None`).
     fn global_route_entries() -> usize {
         let want = StoreKey::from_uri(GLOBAL_BUCKET_URI).expect("valid URI");
-        STORE_CACHE.iter().filter(|e| *e.key() == want).count()
+        store_cache().iter().filter(|e| *e.key() == want).count()
     }
 
     #[test]

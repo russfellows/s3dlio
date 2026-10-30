@@ -27,6 +27,7 @@ pub mod checksum; // CRC-32C: the checksum every writer reports (#256)
 pub mod config;
 pub mod constants;
 pub mod data_formats;
+pub mod fork_guard; // #297 prototype: fork-aware process-global state
 pub mod dotenv; // `.env` handling: the one S3DLIO_LOAD_DOTENV switch (#243)
 pub mod download;
 pub mod memory;
@@ -295,6 +296,7 @@ pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     // does at import, and `s3dlio/torch.py` imports this module before `torch`; but
     // anything the host imported or started before `import s3dlio` is outside our reach.
     dotenv::apply();
+    fork_guard::register();
 
     // Auto-size every process-wide thread pool (global Tokio runtime,
     // pyo3-async-runtimes runtime, Rayon global pool) from MPI/distributed-

@@ -889,7 +889,7 @@ fn pool_for_current_node() -> Option<&'static NodePool> {
     if test_seam::pool_unavailable() {
         return None; // injected: as if the node's pool could not be created
     }
-    static POOLS: OnceLock<Vec<Slot>> = OnceLock::new();
+    static POOLS: crate::fork_guard::ForkCell<Vec<Slot>> = crate::fork_guard::ForkCell::new();
     let topo = topology();
     let pools = POOLS.get_or_init(|| (0..topo.nodes()).map(|_| Slot::new()).collect());
     let idx = current_cpu().map_or(0, |c| topo.node_of_cpu(c));

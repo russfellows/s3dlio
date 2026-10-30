@@ -247,7 +247,7 @@ impl PyBytesAsyncDataLoader {
         // Producer backs off automatically when Python consumer is slow.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, DatasetError>>(prefetch);
 
-        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        crate::s3_client::pyo3_runtime().spawn(async move {
             if let Some(len) = dataset.inner.len() {
                 // Task-level parallelism (issue #148 site 1.1): each fetch is
                 // spawned onto tokio's scheduler so requests can be polled
@@ -415,7 +415,7 @@ impl PyBytesAsyncDataLoader {
         let (tx, rx) =
             tokio::sync::mpsc::channel::<Result<(String, Bytes), DatasetError>>(prefetch);
 
-        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        crate::s3_client::pyo3_runtime().spawn(async move {
             if let Some(len) = dataset.inner.len() {
                 // Task-level parallelism (issue #148 site 1.1 — items()
                 // variant). See the __iter__ version above for the full
@@ -812,7 +812,7 @@ impl PyBytesAsyncDataLoaderIter {
         };
 
         // Spawn the producer task with concurrent batch fetching
-        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        crate::s3_client::pyo3_runtime().spawn(async move {
             let batch_size = opts.batch_size.max(1);
             let semaphore = Arc::new(Semaphore::new(num_workers));
 
@@ -939,7 +939,7 @@ impl PyS3AsyncDataLoader {
         // Use the SAME options for DataLoader and for channel capacity.
         let (tx, rx) = mpsc::channel::<Result<Vec<Bytes>, DatasetError>>(o.prefetch.max(1));
 
-        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        crate::s3_client::pyo3_runtime().spawn(async move {
             let loader = DataLoader::new(ds, o);
             let mut stream = loader.stream();
             while let Some(batch) = stream.next().await {
@@ -1534,7 +1534,7 @@ impl PyAsyncDataLoaderIter {
         //
         //Spawn the producer task using the runtime managed by
         // `pyo3_async_runtimes`; this ensures a reactor is active.
-        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        crate::s3_client::pyo3_runtime().spawn(async move {
             let loader = DataLoader::new(dataset, opts);
             let mut stream = loader.stream();
             while let Some(batch) = stream.next().await {
@@ -2677,7 +2677,7 @@ impl PyParquetStreamLoader {
             concurrency
         );
 
-        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        crate::s3_client::pyo3_runtime().spawn(async move {
             // Task-level parallelism (issue #148 site 1.1 — Parquet stream
             // variant). Same DropCancel + spawn-each + select! pattern as
             // the other two sites in this file; item type here is

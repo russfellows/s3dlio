@@ -228,7 +228,7 @@ impl Runtime for S3dlioRuntime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        pyo3_async_runtimes::tokio::get_runtime().spawn(fut)
+        crate::s3_client::pyo3_runtime().spawn(fut)
     }
 
     fn spawn_blocking<F>(f: F) -> Self::JoinHandle
@@ -256,7 +256,7 @@ fn spawn_gated<F>(tracker: &'static DeliveryTracker, f: F) -> tokio::task::JoinH
 where
     F: FnOnce() + Send + 'static,
 {
-    let runtime = pyo3_async_runtimes::tokio::get_runtime();
+    let runtime = crate::s3_client::pyo3_runtime();
     match tracker.enter() {
         Some(ticket) => runtime.spawn_blocking(move || {
             // Release buffer exports queued by a finished `put_bytes_async(borrow=True)` BEFORE
@@ -319,6 +319,7 @@ where
     // finished (see `body_finished_hook`). Absent from the shipped extension.
     #[cfg(test)]
     let fut = body_finished_hook::observe(fut);
+    crate::fork_guard::check_py()?;
     generic::future_into_py::<S3dlioRuntime, _, T>(py, fut)
 }
 
@@ -548,7 +549,7 @@ mod tests {
         });
         // `f` is dropped synchronously, before the handle is even awaited.
         assert!(dropped.load(Ordering::SeqCst), "closure must be dropped");
-        pyo3_async_runtimes::tokio::get_runtime()
+        crate::s3_client::pyo3_runtime()
             .block_on(handle)
             .expect("join no-op handle");
         assert!(!ran.load(Ordering::SeqCst), "closure must NOT run");
@@ -562,7 +563,7 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_in_task = Arc::clone(&ran);
         let handle = spawn_gated(t, move || ran_in_task.store(true, Ordering::SeqCst));
-        pyo3_async_runtimes::tokio::get_runtime()
+        crate::s3_client::pyo3_runtime()
             .block_on(handle)
             .expect("join delivery");
         assert!(ran.load(Ordering::SeqCst));
@@ -575,7 +576,7 @@ mod tests {
     fn panicking_delivery_releases_its_ticket_exactly_once() {
         let t = tracker();
         let handle = spawn_gated(t, || std::panic::panic_any("simulated delivery panic"));
-        let joined = pyo3_async_runtimes::tokio::get_runtime().block_on(handle);
+        let joined = crate::s3_client::pyo3_runtime().block_on(handle);
         assert!(joined.is_err_and(|e| e.is_panic()));
         assert_eq!(t.in_flight(), 0);
         assert!(t.wait_idle(Duration::from_millis(10)));
@@ -656,7 +657,7 @@ mod tests {
         assert!(!finished.load(Ordering::SeqCst));
 
         release_tx.send(()).expect("release");
-        pyo3_async_runtimes::tokio::get_runtime()
+        crate::s3_client::pyo3_runtime()
             .block_on(handle)
             .expect("join delivery");
         assert!(finished.load(Ordering::SeqCst));

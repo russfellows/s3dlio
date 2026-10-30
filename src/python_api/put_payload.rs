@@ -154,7 +154,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::constants::{
@@ -956,10 +956,10 @@ impl ReleaseQueue {
 
 /// The process-wide queue and its releaser thread (started on the first export that had to be
 /// handed off).
-static QUEUE: OnceLock<&'static ReleaseQueue> = OnceLock::new();
+static QUEUE: crate::fork_guard::ForkCell<&'static ReleaseQueue> = crate::fork_guard::ForkCell::new();
 
 fn global_queue() -> &'static ReleaseQueue {
-    QUEUE.get_or_init(|| {
+    *QUEUE.get_or_init(|| {
         // After shutdown no releaser thread is started (it could only attach to a dying interpreter).
         ReleaseQueue::start(EXPORT_RELEASE_GRACE, &GATE, !GATE.is_closed())
     })

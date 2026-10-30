@@ -116,8 +116,10 @@ pub fn set_s3_endpoint_override(url: &str) {
 // -----------------------------------------------------------------------------
 // Global runtime + S3 client (lazy, thread-safe)
 // -----------------------------------------------------------------------------
-static RT_HANDLE: once_cell::sync::OnceCell<Handle> = once_cell::sync::OnceCell::new();
-static CLIENT: OnceCell<Client> = OnceCell::const_new();
+static RT_HANDLE: crate::fork_guard::ForkCell<Handle> = crate::fork_guard::ForkCell::new();
+static CLIENT: crate::fork_guard::ForkCell<OnceCell<Client>> = crate::fork_guard::ForkCell::new();
+/// Worker threads of the pyo3 (decode / async-API) runtime, set by configure_thread_pools.
+pub(crate) static DECODE_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// Concurrency hint set by [`configure_for_concurrency`].
 /// Zero means "not set" — `get_runtime_threads` uses the CPU-based default.
@@ -196,6 +198,7 @@ pub fn configure_thread_pools(threads: usize) {
     // streaming pipeline) -- only present in Python extension builds.
     #[cfg(feature = "extension-module")]
     {
+        DECODE_THREADS.store(threads, Ordering::Relaxed);
         pyo3_async_runtimes::tokio::init(decode_runtime_builder(threads));
     }
 
@@ -219,6 +222,27 @@ pub(crate) fn decode_runtime_builder(threads: usize) -> TokioBuilder {
     builder.enable_all();
     builder.thread_name("s3dlio-decode");
     builder
+}
+
+/// The Tokio runtime behind the Python async entry points and the data loaders (what
+/// `pyo3_async_runtimes::tokio::get_runtime()` was). Owned here so that a fork child builds
+/// its own instead of using the parent's threadless copy (#297).
+#[cfg(feature = "extension-module")]
+pub(crate) fn pyo3_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: crate::fork_guard::ForkCell<tokio::runtime::Runtime> =
+        crate::fork_guard::ForkCell::new();
+    RT.get_or_init(|| {
+        let threads = DECODE_THREADS.load(Ordering::Relaxed);
+        let mut b = if threads > 0 {
+            decode_runtime_builder(threads)
+        } else {
+            let mut b = crate::runtime_support::marked_multi_thread_builder();
+            b.enable_all();
+            b.thread_name("s3dlio-decode");
+            b
+        };
+        b.build().expect("failed to build the s3dlio decode runtime")
+    })
 }
 
 /// Returns `true` when `S3DLIO_UNSIGNED_PAYLOAD=1` (or `true`/`yes`/`on`/`enable`).
@@ -437,6 +461,7 @@ where
     F: std::future::Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
+    crate::fork_guard::check()?;
     match tokio::runtime::Handle::try_current() {
         Ok(current) => {
             let spawn_and_wait = move || {
@@ -520,6 +545,7 @@ pub fn aws_s3_client() -> Result<Client> {
 /// Safe to call from any async context; initializes once without blocking.
 pub async fn aws_s3_client_async() -> Result<Client> {
     let client_ref = CLIENT
+        .get_or_init(OnceCell::new)
         .get_or_try_init(|| async {
             crate::dotenv::apply();
 
