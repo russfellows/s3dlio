@@ -45,6 +45,51 @@
 //! thread, and the marker is never set on the threads that usually drive one (the application's
 //! main thread, a `LocalSet`-per-thread runtime, a current-thread runtime).
 //!
+//! # The synchronous wrappers: `blocking_wait` (#173, #300)
+//!
+//! `run_on_global_rt` (and every sync wrapper built on it, such as `s3_utils::stat_object_uri`) and
+//! the Python store-cache lock wait for work that runs on ANOTHER runtime, so they use a second
+//! helper, `blocking_wait`, with a rule that is deliberately wider than the one above. The
+//! asymmetry: skipping the hand-off here is not only slower, it can HANG, because the awaited
+//! work may depend on the caller's own runtime making progress (an in-process mock server on a
+//! `#[tokio::main]` runtime, issue #173), so the hand-off is kept wherever it is valid. In order:
+//!
+//! 1. inside an [`inline_blocking_io`] scope: wait inline;
+//! 2. the thread carries the worker marker and the current runtime is multi-thread: hand off
+//!    (`block_in_place`), exactly as before;
+//! 3. not marked, current runtime multi-thread, inside a task (`tokio::task::try_id()` is `Some`)
+//!    and the thread bears tokio's DEFAULT worker thread name (measured once per process, it is
+//!    `"tokio-rt-worker"` in tokio 1.52): hand off. That is a real worker of an embedder's runtime
+//!    that did not opt in (`#[tokio::main]`, `#[tokio::test(flavor = "multi_thread")]`, axum);
+//! 4. anything else: wait inline. That is no runtime, a current-thread runtime, a `LocalSet`
+//!    driven by a thread of any other name (the main thread: `rt.block_on(local.run_until(..))`,
+//!    `LocalSet::block_on`, and its `spawn_local` tasks), `block_on`'s main future, a thread of
+//!    an unmarked runtime that has custom thread names. Safe because the awaited future runs on
+//!    the global runtime, which is never the caller's runtime here (its threads are marked).
+//!
+//! No panic is provoked and none is caught, so a `panic = "abort"` build behaves the same.
+//!
+//! Residuals, precisely:
+//!
+//! * (a) an unmarked runtime with CUSTOM worker thread names takes rule 4. It cannot panic, but a
+//!   worker is parked without a hand-off while the call waits, which can stall work that
+//!   depends on that runtime (an in-process server on it; every worker parked). Remedy, one
+//!   line: `Builder::on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)`, or use
+//!   the async API.
+//! * (b) a `spawn_blocking` thread that drives a `LocalSet` (`handle.block_on(local.run_until(..))`)
+//!   and calls a sync wrapper inside it PANICS when the thread is marked (rule 2) or has the
+//!   default name (rule 3, the default for every unmarked runtime): inside the LocalSet
+//!   `try_id()` is `Some` (the blocking task's, or the `spawn_local` task's id), the thread name
+//!   is the worker name, and tokio gives no public way to tell a blocking-pool thread from a
+//!   worker. This is no worse than before #300 (it panicked there too), and the same remedy as
+//!   the file stores applies: wrap the closure in [`inline_blocking_io`]. (A plain
+//!   `handle.block_on(future)` on such a thread is fine: tokio lets `block_in_place` run inline
+//!   there.) Measured by `tests/run_on_global_rt_contexts_300.rs` (rows "spawn_blocking +
+//!   Handle::block_on(LocalSet), no inline scope", reported as known limits).
+//! * `MultipartUploadSink::write_blocking`, `enqueue_part` and `finish_blocking` use
+//!   `Sender::blocking_send`, which panics in ANY tokio context: a separate bug (#301), not
+//!   fixed by this rule.
+//!
 //! # Which threads are marked
 //!
 //! Every multi-thread runtime that s3dlio builds (the global runtime, the Python decode and
@@ -114,6 +159,7 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 thread_local! {
     /// This thread belongs to a multi-thread runtime that was built with the worker marker.
@@ -235,6 +281,94 @@ pub(crate) fn blocking_io<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// The thread name tokio gives its worker AND blocking-pool threads when the builder is not given
+/// one (`"tokio-rt-worker"` in tokio 1.52, `"tokio-runtime-worker"` in older releases). It is
+/// measured, not hard-coded: once per process a throw-away one-worker runtime reports the name of
+/// its worker thread. `None` when the probe failed (rule 3 of [`blocking_wait`] is then off).
+fn default_tokio_thread_name() -> Option<&'static str> {
+    static NAME: OnceLock<Option<String>> = OnceLock::new();
+    NAME.get_or_init(|| {
+        // A separate thread: building and dropping a runtime is not allowed from async context.
+        std::thread::Builder::new()
+            .name("s3dlio-thread-name-probe".into())
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .build()
+                    .ok()?;
+                let (tx, rx) = std::sync::mpsc::channel();
+                rt.spawn(async move {
+                    let _ = tx.send(std::thread::current().name().map(str::to_owned));
+                });
+                let name = rx.recv().ok().flatten();
+                rt.shutdown_background();
+                name
+            })
+            .ok()?
+            .join()
+            .ok()?
+    })
+    .as_deref()
+}
+
+/// Rule 3 of [`blocking_wait`]: not marked, but inside a task and on a thread that carries tokio's
+/// default worker name.
+fn looks_like_default_tokio_worker() -> bool {
+    if tokio::task::try_id().is_none() {
+        return false;
+    }
+    match (default_tokio_thread_name(), std::thread::current().name()) {
+        (Some(default), Some(name)) => name == default,
+        _ => false,
+    }
+}
+
+/// True when [`blocking_wait`] would hand the worker off here and now (the decision rule in its
+/// documentation). Test instrumentation, not API: hidden, and NOT semver-stable.
+#[doc(hidden)]
+pub fn would_hand_off_wait() -> bool {
+    if INLINE_SCOPES.with(|d| d.get() != 0) {
+        return false; // rule 1
+    }
+    if !matches!(
+        tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        return false; // rule 4: no runtime, or a current-thread runtime
+    }
+    MARKED.with(|m| m.get()) // rule 2
+        || looks_like_default_tokio_worker() // rule 3
+}
+
+/// Wait for a result produced by ANOTHER runtime (the global runtime) or by another thread, from
+/// synchronous code that may be running on any thread: [`crate::s3_client::run_on_global_rt`]
+/// and the store-cache `lock_build`. The wait blocks the thread, so where the thread is a worker of
+/// a multi-thread runtime its core is handed off first (`tokio::task::block_in_place`), exactly as
+/// #173 requires, and everywhere else the closure just runs. The decision, in order:
+///
+/// 1. inside an [`inline_blocking_io`] scope: run inline;
+/// 2. the thread carries the worker marker and the current runtime is multi-thread: hand off;
+/// 3. not marked, current runtime is multi-thread, inside a task (`tokio::task::try_id()` is
+///    `Some`) AND the thread bears tokio's default worker thread name: hand off. On a real worker
+///    that is valid. A `LocalSet` that the main thread (or any thread with another name) drives,
+///    and its `spawn_local` tasks, fall through to rule 4;
+/// 4. anything else (no runtime, current-thread runtime, a `LocalSet` on a non-worker thread,
+///    `block_on`'s main future, a `spawn_blocking` thread, an unmarked runtime with custom
+///    thread names): run inline.
+///
+/// Rule 4 is safe because the awaited future runs on the GLOBAL runtime, whose threads are marked
+/// and which is never the caller's runtime here. Only thread-local state, the thread name and
+/// tokio's public API are read: no panic is provoked (no `catch_unwind`, no panic hook), so the
+/// behaviour is identical under `panic = "abort"`. See the module documentation for the residuals.
+pub(crate) fn blocking_wait<R>(f: impl FnOnce() -> R) -> R {
+    if would_hand_off_wait() {
+        HANDOFFS.fetch_add(1, Ordering::Relaxed);
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +460,73 @@ mod tests {
             mark_tokio_worker_thread();
             would_hand_off()
         }));
+    }
+
+    /// The rule of `blocking_wait`, one row per context (#300). Rows 3 and 4 are the point:
+    /// an UNMARKED worker with the default thread name hands off, a LocalSet on the main thread
+    /// and a custom-named worker do not.
+    #[test]
+    fn wait_rule_table() {
+        // Rule 2: marked worker.
+        let rt = marked_rt(2);
+        assert!(rt.block_on(async { tokio::spawn(async { would_hand_off_wait() }).await.unwrap() }));
+        // Rule 1: inline scope wins.
+        assert!(!rt.block_on(async {
+            tokio::spawn(async {
+                let _g = inline_blocking_io();
+                would_hand_off_wait()
+            })
+            .await
+            .unwrap()
+        }));
+        // The main thread of block_on is no worker (no task id).
+        assert!(!rt.block_on(async { would_hand_off_wait() }));
+        drop(rt);
+        // Rule 3: unmarked, default thread names, inside a task.
+        let rt = plain_rt(2);
+        assert!(rt.block_on(async { tokio::spawn(async { would_hand_off_wait() }).await.unwrap() }));
+        // Rule 4: LocalSet on the main thread, main future and spawn_local task.
+        let local = tokio::task::LocalSet::new();
+        assert!(!rt.block_on(local.run_until(async { would_hand_off_wait() })));
+        let local = tokio::task::LocalSet::new();
+        assert!(!rt.block_on(local.run_until(async {
+            tokio::task::spawn_local(async { would_hand_off_wait() })
+                .await
+                .unwrap()
+        })));
+        drop(rt);
+        // Rule 4: unmarked runtime with custom thread names (residual a) ...
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("embedder-worker")
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            !rt.block_on(async { tokio::spawn(async { would_hand_off_wait() }).await.unwrap() })
+        );
+        drop(rt);
+        // ... and Rule 2 again once it is marked (the remedy).
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("embedder-worker")
+            .enable_all()
+            .on_thread_start(mark_tokio_worker_thread)
+            .build()
+            .unwrap();
+        assert!(rt.block_on(async { tokio::spawn(async { would_hand_off_wait() }).await.unwrap() }));
+        drop(rt);
+        // No runtime and a current-thread runtime: never, whatever the thread is called.
+        assert!(!run_in_thread(would_hand_off_wait));
+        let ct = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(!run_in_thread(move || {
+            mark_tokio_worker_thread();
+            ct.block_on(async { tokio::spawn(async { would_hand_off_wait() }).await.unwrap() })
+        }));
+        // The measured default name is a worker name, not empty.
+        assert!(default_tokio_thread_name().is_some_and(|n| n.contains("worker")));
     }
 
     /// A panic raised by the closure propagates unchanged on a worker (with the hand-off) and

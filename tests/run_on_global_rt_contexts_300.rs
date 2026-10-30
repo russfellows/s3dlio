@@ -329,10 +329,12 @@ fn run_all(f: fn() -> u32, rounds: &[bool]) -> Vec<String> {
             if verdict == "OK" {
                 let _ = h.join();
             }
-            // The documented limit: tokio cannot tell a marked spawn_blocking thread that drives a
-            // LocalSet from a worker, so such a closure must use `inline_blocking_io()` (the rows
-            // with an inline scope). Reported, not asserted, for the marked round.
-            let known_limit = name.ends_with("no inline scope");
+            // The documented limit (b): tokio cannot tell a `spawn_blocking` thread that drives a
+            // LocalSet from a worker, so a thread that carries the marker or tokio's default
+            // worker name takes the hand-off and panics there. Such a closure must use
+            // `inline_blocking_io()` (the rows with an inline scope). Reported, not asserted.
+            let known_limit = name.ends_with("no inline scope")
+                || (marked && name.contains("custom thread names: spawn_blocking"));
             println!(
                 "MATRIX|{round}|{name}|{verdict}{}",
                 if known_limit && verdict != "OK" {
@@ -385,6 +387,7 @@ async fn start_fake_s3() -> u16 {
     tokio::spawn(async move {
         loop {
             let (mut s, _) = l.accept().await.unwrap();
+            SERVED.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
                 let _ = s.read(&mut buf).await;
@@ -426,6 +429,73 @@ fn stat_is_err() -> bool {
     s3dlio::s3_utils::stat_object_uri("s3://bucket/key").is_err()
 }
 
+/// Hits on the fake endpoint.
+static SERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Runs one hang scenario in a CHILD process: the global S3 client is built once per process and
+/// remembers its endpoint, so each scenario needs a process of its own (and a hang costs one
+/// child, killed after [`CHILD_TIMEOUT`], not the whole binary).
+const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn run_child(case: &str) {
+    let exe = std::env::current_exe().unwrap();
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "child_hang_case",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("S3DLIO_300_CHILD_CASE", case)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let t0 = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "{case}: child failed: {status}");
+            return;
+        }
+        if t0.elapsed() > CHILD_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{case}: HANG (child still running after {CHILD_TIMEOUT:?})");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Child side of [`run_child`]; a no-op unless started by it.
+#[test]
+fn child_hang_case() {
+    let Ok(case) = std::env::var("S3DLIO_300_CHILD_CASE") else {
+        return;
+    };
+    let workers: usize = case.parse().expect("worker count");
+    MARKED.store(false, Ordering::SeqCst);
+    let rt = mt(workers);
+    let errs = rt.block_on(async move {
+        let port = start_fake_s3().await;
+        point_endpoint_at(port);
+        let v: Vec<_> = (0..workers)
+            .map(|_| tokio::spawn(async { stat_is_err() }))
+            .collect();
+        let mut n = 0;
+        for j in v {
+            n += usize::from(j.await.unwrap());
+        }
+        n
+    });
+    assert_eq!(errs, workers, "every stat must return the 404 as an Err");
+    // The stats really reached the endpoint that lives on the caller's own runtime.
+    assert!(
+        SERVED.load(Ordering::SeqCst) >= workers,
+        "the fake endpoint served {} requests",
+        SERVED.load(Ordering::SeqCst)
+    );
+}
+
 /// The hang the first prototype introduced: an UNMARKED multi-thread runtime (a plain
 /// `#[tokio::main]`, `#[tokio::test(flavor = "multi_thread")]`) that serves the endpoint itself,
 /// with as many concurrent sync-wrapper callers as it has workers. Without a hand-off every worker
@@ -433,24 +503,8 @@ fn stat_is_err() -> bool {
 #[test]
 fn unmarked_runtime_serving_its_own_endpoint_does_not_hang() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    MARKED.store(false, Ordering::SeqCst);
-    for workers in [1usize, 2, 4] {
-        let errs = bounded(&format!("unmarked, {workers} worker(s)"), move || {
-            let rt = mt(workers);
-            rt.block_on(async move {
-                let port = start_fake_s3().await;
-                point_endpoint_at(port);
-                let v: Vec<_> = (0..workers)
-                    .map(|_| tokio::spawn(async { stat_is_err() }))
-                    .collect();
-                let mut n = 0;
-                for j in v {
-                    n += usize::from(j.await.unwrap());
-                }
-                n
-            })
-        });
-        assert_eq!(errs, workers, "every stat must return the 404 as an Err");
+    for workers in ["1", "2", "4"] {
+        run_child(workers);
     }
 }
 

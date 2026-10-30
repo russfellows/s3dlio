@@ -20,7 +20,7 @@ use std::{env, thread, time::Duration};
 #[cfg(feature = "extension-module")]
 use tokio::runtime::Builder as TokioBuilder;
 use tokio::runtime::Handle;
-use tokio::sync::{oneshot, OnceCell};
+use tokio::sync::OnceCell;
 use tracing::{debug, info}; // For logging
 
 // -----------------------------------------------------------------------------
@@ -409,72 +409,56 @@ fn get_runtime_threads() -> usize {
 /// is parked in `recv()`) or `block_in_place`.  The spawned task therefore
 /// never ran, regardless of the worker count.
 ///
-/// The fix, by calling context:
-/// * **No runtime on this thread** -- plain OS thread: spawn and wait, as
-///   before.
-/// * **Multi-thread runtime** (the global runtime always is one) -- wait
-///   inside [`tokio::task::block_in_place`].  That hands the worker's core,
-///   including its LIFO slot, to another worker *before* we block, and the
-///   spawn performed inside the closure goes through the injection queue, so
-///   `fut` is always runnable by some other worker.  This also keeps a
-///   foreign multi-thread runtime's capacity intact while we wait.
-///   `block_in_place` was chosen over "await the nested future directly"
-///   because this function is synchronous and returns `T`, not a future:
-///   the nested future cannot be awaited from here without changing the
-///   signature of ~40 sync callers.
-/// * **Current-thread runtime** -- `block_in_place` panics there, so it is
-///   not used.  The global runtime is always multi-thread and is a different
-///   runtime, so a plain blocking wait can only stall the caller's own
-///   (single-thread) runtime, never deadlock against the global one; `fut`
-///   still executes on the global runtime.  This is the pre-existing
-///   behaviour that e.g. `#[tokio::test]` callers rely on.
+/// The rule, by calling context (#173, #300). The wait is [`crate::runtime_support`]'s
+/// `blocking_wait`; in order:
+/// 1. inside an [`crate::runtime_support::inline_blocking_io`] scope: a plain blocking wait;
+/// 2. the thread carries the worker marker (the global runtime's workers, s3dlio's other
+///    runtimes, any runtime built with [`crate::runtime_support::mark_tokio_worker_thread`]) and
+///    the current runtime is multi-thread: the wait is inside [`tokio::task::block_in_place`].
+///    That hands the worker's core, including its LIFO slot, to another worker *before* we
+///    block, and the spawn performed inside the closure goes through the injection queue, so
+///    `fut` is always runnable by some other worker (#173);
+/// 3. not marked, multi-thread runtime, inside a task, and the thread bears tokio's default worker
+///    thread name: `block_in_place` as in 2. This keeps the hand-off for an embedder's own
+///    `#[tokio::main]` or `#[tokio::test(flavor = "multi_thread")]` runtime, where `fut` (or what
+///    it needs, such as an in-process server) may depend on that same runtime making progress;
+/// 4. everything else: a plain blocking wait. That is no runtime, a current-thread runtime, the
+///    main thread of `Runtime::block_on`, a `LocalSet` driven by a non-worker thread
+///    (`run_until`, `block_on`, `spawn_local`), `Handle::block_on`, a `spawn_blocking` thread, and
+///    an unmarked runtime whose threads have custom names. `block_in_place` is never called
+///    there: it panics inside a `LocalSet` that a non-worker thread drives (#300). `fut` runs on
+///    the global runtime, which is never the caller's runtime here, so the wait cannot deadlock
+///    it.
 ///
-/// Recorded limit: a thread that is a multi-thread runtime handle's
-/// `enter()` guard *inside* a current-thread `block_on` is not detectable
-/// from `Handle::runtime_flavor()` and would make `block_in_place` panic.
+/// Recorded limits (see `runtime_support` for the details and the remedies):
+/// (1) a worker of an unmarked runtime with CUSTOM thread names takes rule 4: no panic, but it is
+/// parked without a hand-off, which can stall work that depends on that runtime (call
+/// `Builder::on_thread_start(mark_tokio_worker_thread)`, or use the async API);
+/// (2) a `spawn_blocking` thread that drives a `LocalSet` with `spawn_local` tasks takes rule 2
+/// (marked runtime) or rule 3 (default thread name) and panics: wrap the closure in
+/// [`crate::runtime_support::inline_blocking_io`].
 pub fn run_on_global_rt<F, T>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::runtime::Handle::try_current() {
-        Ok(current) => {
-            let spawn_and_wait = move || {
-                let handle = global_rt_handle().clone();
-                let (tx, rx) = std::sync::mpsc::channel();
+    let spawn_and_wait = move || {
+        let handle = global_rt_handle().clone();
+        let (tx, rx) = std::sync::mpsc::channel();
 
-                handle.spawn(async move {
-                    let result = fut.await;
-                    let _ = tx.send(result);
-                });
+        handle.spawn(async move {
+            let result = fut.await;
+            let _ = tx.send(result);
+        });
 
-                rx.recv()
-                    .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
-            };
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
+    };
 
-            match current.runtime_flavor() {
-                tokio::runtime::RuntimeFlavor::MultiThread => {
-                    tokio::task::block_in_place(spawn_and_wait)
-                }
-                // Current-thread (or any future flavor): block_in_place is
-                // invalid here; see the doc comment above.
-                _ => spawn_and_wait(),
-            }
-        }
-        Err(_) => {
-            // Not in a runtime, use our original approach with oneshot
-            let handle = global_rt_handle().clone();
-            let (tx, rx) = oneshot::channel();
-
-            handle.spawn(async move {
-                let _ = tx.send(fut.await);
-            });
-
-            // Block this plain OS thread until the async result arrives.
-            rx.blocking_recv()
-                .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
-        }
-    }
+    // Hand the worker's core off ONLY where `runtime_support` knows that is valid (a marked
+    // worker of a multi-thread runtime, outside an `inline_blocking_io` scope); a plain
+    // blocking wait everywhere else. No runtime state is probed by provoking a panic.
+    crate::runtime_support::blocking_wait(spawn_and_wait)
 }
 
 /// Spawn a task on the global runtime without blocking (non-blocking spawn).

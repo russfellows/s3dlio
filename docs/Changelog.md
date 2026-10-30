@@ -1,6 +1,44 @@
 # s3dlio Changelog
 
-## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267)
+## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267); sync wrappers inside a tokio `LocalSet` (#300)
+
+### Fixed — sync wrappers inside a tokio `LocalSet` (#300)
+
+`run_on_global_rt` and every synchronous wrapper built on it (for example `s3_utils::stat_object_uri`) panicked with "can call blocking
+only when running on the multi-threaded runtime" when called inside a `tokio::task::LocalSet` that a non-worker thread
+drives, the usual `rt.block_on(local.run_until(..))` on the main thread (also `LocalSet::block_on` and `spawn_local`
+tasks), on a multi-thread runtime. Cause: they always called `tokio::task::block_in_place` on a multi-thread runtime,
+and tokio refuses that off a worker thread inside a `LocalSet`. They now work there, and under `panic = "abort"`.
+
+The wait for the global runtime hands the worker off with `block_in_place` where that is valid and waits plainly
+elsewhere, decided in this order (`runtime_support::blocking_wait`; no panic is provoked or caught):
+
+1. inside an `inline_blocking_io()` scope: plain wait;
+2. the thread carries the worker marker (all of s3dlio's runtimes, any runtime built with
+   `on_thread_start(mark_tokio_worker_thread)`) on a multi-thread runtime: hand off, exactly as before (#173);
+3. not marked, multi-thread runtime, inside a task and the thread has tokio's default worker thread name: hand off. This
+   keeps `#[tokio::main]` and `#[tokio::test(flavor = "multi_thread")]` runtimes working when the awaited work (for
+   example an in-process mock server) needs that same runtime;
+4. everything else: plain wait. That is no runtime, a current-thread runtime, a `LocalSet` driven by a thread with another
+   name (the main thread) and its `spawn_local` tasks, `block_on`'s main future, `Handle::block_on`, `spawn_blocking`
+   threads of runtimes that are not named like tokio's default. It is safe because the awaited future runs on the global
+   runtime, which is never the caller's runtime here.
+
+The Python store-cache lock (`lock_build`) uses the same helper.
+
+Known residuals:
+- A worker of an unmarked runtime with CUSTOM thread names (`Builder::thread_name`) takes rule 4: no panic, but the worker
+  is parked without a hand-off while the call waits, which can stall work that depends on that runtime. Remedy, one line:
+  `Builder::on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)`, or call the async API.
+- A `spawn_blocking` thread that drives a `LocalSet` itself and calls a sync wrapper inside it still panics (it panicked
+  before this fix too), because tokio gives no way to tell it from a worker: wrap the closure in
+  `runtime_support::inline_blocking_io()`.
+- `MultipartUploadSink::write_blocking`, `enqueue_part` and `finish_blocking` (`blocking_send`) panic in any tokio context.
+  That is a separate bug (#301), NOT fixed here.
+
+Tests: `tests/run_on_global_rt_contexts_300.rs` (a context matrix with 12 s row timeouts that stops at the first hang, a
+per-process hang test for an unmarked runtime that serves its own endpoint with 1, 2 and 4 workers, a latency test and
+hand-off accounting) and `scripts/test_panic_abort_300.sh` (a `panic = "abort"` build); both run in CI next to the #295 ones.
 
 ### Fixed — Op-log can be restarted after `finalize_op_log()` (#294)
 

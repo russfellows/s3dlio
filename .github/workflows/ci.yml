@@ -329,6 +329,14 @@ jobs:
       - name: Test (Rust - panic=abort LocalSet read/write, #295)
         run: scripts/test_panic_abort_295.sh
 
+      # #300: run_on_global_rt and the sync wrappers inside a tokio LocalSet (the context matrix,
+      # the unmarked-runtime hang case, hand-off accounting), then in a panic = "abort" build.
+      - name: Test (Rust - sync wrappers in every tokio context, #300)
+        run: cargo test --release --offline --test run_on_global_rt_contexts_300 -- --test-threads=1
+
+      - name: Test (Rust - panic=abort LocalSet run_on_global_rt, #300)
+        run: scripts/test_panic_abort_300.sh
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

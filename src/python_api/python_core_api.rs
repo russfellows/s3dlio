@@ -132,10 +132,11 @@ struct StoreSlot {
 }
 
 /// Take a slot's build lock. Uncontended, this is a plain `try_lock`. When another caller is
-/// building and this one is on a multi-thread Tokio runtime (the async entry points run on
-/// the pyo3 runtime), the wait is wrapped in `block_in_place` so the runtime can run other
-/// tasks on a replacement worker instead of losing this one for the whole cold start. Any
-/// other thread just waits. A poisoned lock (a build that panicked) guards no data and is
+/// building and this one is a worker of a multi-thread Tokio runtime (the async entry points run
+/// on the pyo3 runtime), the wait is wrapped in `block_in_place` so the runtime can run other
+/// tasks on a replacement worker instead of losing this one for the whole cold start. The
+/// choice is `runtime_support::blocking_wait`'s rule (#300): any other thread, including a
+/// `LocalSet` driven by a non-worker thread, just waits. A poisoned lock (a build that panicked) guards no data and is
 /// recovered.
 fn lock_build(build: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
     match build.try_lock() {
@@ -143,14 +144,7 @@ fn lock_build(build: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
         Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {}
     }
-    let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
-        .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-        .unwrap_or(false);
-    if on_multi_thread_runtime {
-        tokio::task::block_in_place(|| build.lock().unwrap_or_else(|e| e.into_inner()))
-    } else {
-        build.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    crate::runtime_support::blocking_wait(|| build.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 impl StoreSlot {

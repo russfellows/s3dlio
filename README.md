@@ -474,6 +474,14 @@ drives a `LocalSet` needs `inline_blocking_io()`; details in `s3dlio::runtime_su
 `tests/direct_get_into_no_odirect_fs_295.rs` needs a ramfs (`S3DLIO_TEST_NO_ODIRECT_DIR`); see
 [docs/Environment_Variables.md](docs/Environment_Variables.md). See the [Python API guide](docs/PYTHON_API_GUIDE.md#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100).
 
+**Sync wrappers inside a tokio `LocalSet` (#300):** `run_on_global_rt` and the blocking wrappers built on it (for example
+`s3_utils::stat_object_uri`) work from `rt.block_on(local.run_until(..))`, `LocalSet::block_on` and `spawn_local` tasks, with
+`panic = "abort"` too; they used to panic. They hand the worker off (`block_in_place`) on s3dlio's own runtimes and on an
+embedder's runtime whose workers have tokio's default thread name, and wait plainly elsewhere. If your runtime sets custom
+thread names, add `.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)` so a worker is never parked without
+a hand-off; a `spawn_blocking` closure that drives a `LocalSet` needs `inline_blocking_io()`. `MultipartUploadSink`'s blocking
+methods are a separate bug (#301), not covered. Details in `s3dlio::runtime_support` and `docs/Changelog.md`.
+
 **Writes borrow your buffer (v0.10.0):** async writes read your buffer in place until the `await` finishes; pass
 `borrow=False` for a copy.
 
