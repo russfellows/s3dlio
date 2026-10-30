@@ -41,10 +41,10 @@ in `Runtime::drop`.
   process-global table that points into its stack; a fork child's own parking_lot use then follows dangling
   pointers: with the feature on, 10 to 37% of children aborted (SIGABRT) in the investigation. A CI guard
   (`scripts/check_fork_safety_deps.sh`) fails if the feature returns or if any crate other than `dashmap` uses
-  `parking_lot_core`. Throughput of dropping the feature (release builds, same sources, interleaved runs on a busy
-  shared host): `get_into_local_bench` and a Python `get` loop moved by less than the run-to-run noise at 1 MiB and
-  below single-threaded, and not in the wrong direction at 4 KiB / 1 MiB with 8 to 32 threads (see the build report
-  numbers in the PR).
+  `parking_lot_core`. Throughput of dropping the feature (release builds, identical sources, 8 interleaved rounds on a
+  busy shared host, Python `get` on tmpfs, medians): 16 MiB +2 to +8% (1, 8 and 32 threads), 1 MiB +1% at 8 threads and
+  +73% at 32 threads, 4 KiB +10% at 8 threads and +87% at 32 threads; `get_into_local_bench` `file://` variants within
+  the noise (-1% to +22%, 3 rounds). No slowdown was measured.
 - **Known limits.** (1) A parent thread that holds pyo3's own reference-pool mutex at the instant of the fork can hang the
   child's first Python call; it affects every PyO3 extension and only pyo3 can fix it. Measured: 0 hangs in 500 forks of
   an idle parent (the DataLoader pattern), about 2% with four parent threads busy in s3dlio calls, 1 to 9% with eight
