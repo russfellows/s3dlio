@@ -113,6 +113,8 @@ impl PyDataset {
     /// Returns a PyBytesView for zero-copy access
     fn get_item<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Py<PyAny>> {
         let inner = Arc::clone(&self.inner);
+        // The dataset captured the op-log logger when it was constructed and scopes every fetch
+        // with it (#294), so the awaitable needs nothing here.
         let bound_result = future_into_py(py, async move {
             let data = inner.get(index).await.map_err(py_err)?;
             Python::attach(|py| {

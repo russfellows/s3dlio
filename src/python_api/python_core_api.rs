@@ -885,16 +885,19 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 ///       call leaves logging finalized, so a corrected call can succeed.
 ///
 /// The module-level functions (get, put_bytes, stat, list, delete, get_async,
-/// ...) look the op-log up on every call: a call made while logging is active is
-/// recorded once, and a call made before init_op_log() or after
-/// finalize_op_log() is not, whichever call first used a given scheme. Objects
-/// you construct yourself (stores, readers, writers) capture the logger when
-/// they are constructed: those created before init_op_log() are never logged;
-/// those created before finalize_op_log() stop recording when it runs, and stay
-/// silent after a later init_op_log() (they never write into the new session).
-/// A call still running when finalize_op_log() runs writes no row, even if a
-/// new session has started by the time it completes, and is not counted in
-/// the new session's op_log_stats(); the call itself is unaffected.
+/// ...) look the op-log up when the call is made: a call made while logging is
+/// active is recorded once, and a call made before init_op_log() or after
+/// finalize_op_log() is not, whichever call first used a given scheme. For an
+/// *_async call that moment is the call itself, not the first run of its
+/// awaitable on the event loop. Objects you construct yourself (stores such as
+/// MultiEndpointStore, readers, writers, and datasets and loaders over s3://)
+/// capture the logger when they are constructed: those created before
+/// init_op_log() are never logged; those created before finalize_op_log() stop
+/// recording when it runs, and stay silent after a later init_op_log() (they
+/// never write into the new session). A call still running when
+/// finalize_op_log() runs writes no row, even if a new session has started by
+/// the time it completes, and is not counted in the new session's
+/// op_log_stats(); the call itself is unaffected.
 #[pyfunction]
 pub fn init_op_log(py: Python<'_>, path: &str) -> PyResult<()> {
     // A re-init may wait for the previous session to drain (#294): release the GIL
@@ -1235,12 +1238,18 @@ pub(crate) fn put_async_py<'p>(
         .with_chunk_size(chunk_size);
 
     let prefix = prefix.to_string();
+    // The op-log session is bound NOW, when the call is made, not when the runtime first polls
+    // the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
         task::spawn_blocking(move || {
             if should_create_bucket {
                 create_put_bucket(&prefix).map_err(py_err)?;
             }
-            put_objects_with_random_data_and_type(&uris, sz, jobs, config).map_err(py_err)
+            crate::s3_utils::put_objects_with_random_data_and_type_logged(
+                &uris, sz, jobs, config, None, logger,
+            )
+            .map_err(py_err)
         })
         .await
         .map_err(py_err)??;
@@ -1693,9 +1702,11 @@ fn put_bytes_async<'py>(
     let payload = put_payload(py, data, usage)?;
     let latch = payload.latch;
     let data_owned = payload.bytes;
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
 
     guarded_put(py, latch, move || async move {
-        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri, logger).map_err(py_err)?;
         put_verified_with_retry(store.as_ref(), &uri, data_owned)
             .await
             .map_err(py_err)?;
@@ -2647,9 +2658,11 @@ pub fn mkdir(py: Python<'_>, uri: &str) -> PyResult<()> {
 #[pyfunction]
 fn mkdir_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
 
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri, logger).map_err(py_err)?;
         store.mkdir(&uri).await.map_err(py_err)?;
         // Python `None` (the Rust unit would reach Python as `()`, an empty tuple; issue #233).
         // `Option<()>` converts to `None` INSIDE the exit-safe delivery (issue #192). This body
@@ -2682,9 +2695,12 @@ pub fn get_many_stats_async<'p>(
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
         let (count, total) = task::spawn_blocking(move || {
-            let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
+            let res = crate::s3_utils::get_objects_parallel_logged(&uris, max_in_flight, logger)
+                .map_err(py_err)?;
             let bytes = res.iter().map(|(_, b)| b.len()).sum::<usize>();
             Ok::<(usize, usize), PyErr>((res.len(), bytes))
         })
@@ -2703,10 +2719,13 @@ pub(crate) fn get_many_async_py<'p>(
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
         // get_objects_parallel returns Vec<(String, Bytes)> - keep as Bytes for zero-copy
         let pairs: Vec<(String, Bytes)> = task::spawn_blocking(move || {
-            get_objects_parallel(&uris, max_in_flight).map_err(py_err)
+            crate::s3_utils::get_objects_parallel_logged(&uris, max_in_flight, logger)
+                .map_err(py_err)
         })
         .await
         .map_err(py_err)??;
@@ -2781,8 +2800,10 @@ pub fn get_range_py(
 #[pyo3(signature = (uri))]
 pub fn get_async_py<'p>(py: Python<'p>, uri: &str) -> PyResult<Bound<'p, PyAny>> {
     let uri_owned = uri.to_owned();
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri_owned, logger).map_err(py_err)?;
         let bytes = store.get(&uri_owned).await.map_err(py_err)?;
         Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
     })
@@ -2798,8 +2819,10 @@ pub fn get_range_async_py<'p>(
     length: Option<u64>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let uri_owned = uri.to_owned();
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri_owned, logger).map_err(py_err)?;
         let bytes = store
             .get_range(&uri_owned, offset, length)
             .await
@@ -3584,11 +3607,17 @@ pub fn put_many_async<'py>(
         latch,
     } = batch_payloads(py, items, usage)?;
 
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
+
     guarded_put(py, latch, move || async move {
-        let puts = owned_items.into_iter().map(|(uri, data)| async move {
-            let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
-            store.put(&uri, data).await.map_err(py_err)?;
-            Ok::<(), PyErr>(())
+        let puts = owned_items.into_iter().map(|(uri, data)| {
+            let logger = logger.clone();
+            async move {
+                let store = get_or_create_store(&uri, logger).map_err(py_err)?;
+                store.put(&uri, data).await.map_err(py_err)?;
+                Ok::<(), PyErr>(())
+            }
         });
         run_bounded_puts(puts.collect(), max_in_flight, py_err).await?;
         // Python `None`, converted inside the exit-safe delivery (issue #271; see `mkdir_async`).

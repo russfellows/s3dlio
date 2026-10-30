@@ -2074,8 +2074,14 @@ different path leaves it untouched. `finalize_op_log` is safe to repeat. The
 module-level functions (`get`, `put_bytes`, `stat`, `list`, `delete`, `get_async`,
 ...) check the op-log on every call: a call made while it is active is recorded
 once, a call made before `init_op_log` or after `finalize_op_log` is not,
-whichever call first used the scheme. Objects you construct yourself (stores,
-readers, writers) capture the logger at construction: those created before
+whichever call first used the scheme.
+An `*_async` call is checked when it is made, not when the event loop first runs it: an
+awaitable created in one session never writes into a later one. Datasets and loaders over
+`s3://` (`create_dataset`, `create_async_loader`, ...) and `MultiEndpointStore` objects
+(`create_multi_endpoint_store*`) follow the rule for objects you construct: they capture the logger when they are constructed and use it for every fetch,
+so one built before `init_op_log` is never logged and one built in session 1 never writes
+into session 2. The synchronous `get_many` on `s3://` takes the logger once, at entry.
+Objects you construct yourself (stores, readers, writers) capture the logger at construction: those created before
 `init_op_log` are never logged, and those created before `finalize_op_log` stop
 recording when it runs and stay silent after a later `init_op_log` (they never
 write into the new session). A call that is still running when `finalize_op_log` runs writes

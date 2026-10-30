@@ -817,6 +817,40 @@ pub fn global_logger() -> Option<Logger> {
     }
 }
 
+tokio::task_local! {
+    /// The logger a Python async call snapshotted when it was MADE (issue #294): `None` means
+    /// "the op-log was not active then". Set with [`scope_call_logger`] around the future that
+    /// does the work and read by [`call_logger`].
+    static CALL_LOGGER: Option<Logger>;
+}
+
+/// The logger the code running now must write its row to: the snapshot of the call it runs
+/// for when one was scoped with [`scope_call_logger`], otherwise [`global_logger`].
+///
+/// An awaitable created by a Python call must be bound to the op-log session that was active
+/// when the call was made, not to whichever is active when the runtime first polls it (issue
+/// #294): a call made in session 1 never writes into session 2 and a call made while the op-log
+/// is off is never logged. Code that cannot take the logger as a parameter (the S3 helper rows)
+/// reads it through this function.
+///
+/// The scope is a tokio task-local: it covers the scoped future and what it awaits ON THE SAME TASK. A
+/// `tokio::spawn` below a `Rows::Write` helper silently falls back to [`global_logger`], so such a
+/// spawn must be given the logger (see `get_objects_parallel_logged`).
+pub(crate) fn call_logger() -> Option<Logger> {
+    CALL_LOGGER
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| global_logger())
+}
+
+/// Run `fut` with `logger` as its [`call_logger`]. The scope covers `fut` and what it awaits on
+/// the same task; a task it `spawn`s does not inherit it and must be given the logger itself.
+pub(crate) fn scope_call_logger<F: std::future::Future>(
+    logger: Option<Logger>,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    CALL_LOGGER.scope(logger, fut)
+}
+
 /// Counts of what happened to the entries submitted to the process's op-log
 /// session, so a caller can detect most ways records are lost.
 ///
@@ -2406,7 +2440,7 @@ mod oplog_buffer_default_tests {
 /// process-global state (the `tracing` callsite registry, the current directory)
 /// untouched by the other tests in the suite.
 #[cfg(test)]
-mod fresh_process {
+pub(crate) mod fresh_process {
     const CHILD_ENV: &str = "S3DLIO_TEST_FRESH_PROCESS_CHILD";
     const CHILD_OK: &str = "fresh-process child finished";
 
@@ -2414,7 +2448,7 @@ mod fresh_process {
     /// the child flag, and assert that the child succeeded and ran its body (a
     /// filtered-out child cannot pass vacuously). In the child: run `body`.
     /// `module` is the caller's `module_path!()`.
-    pub(super) fn run(module: &str, name: &str, body: impl FnOnce()) {
+    pub(crate) fn run(module: &str, name: &str, body: impl FnOnce()) {
         if std::env::var_os(CHILD_ENV).is_some() {
             body();
             println!("{CHILD_OK}");

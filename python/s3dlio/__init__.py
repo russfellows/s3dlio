@@ -70,6 +70,9 @@ for _name in dir(_core):
 # counters (quiesce_timeouts, queued, internal_errors, shutdown_attach_waits, ...). Underscore names
 # are not re-exported by the loop above.
 _put_export_stats = _core._put_export_stats
+# Test-only hook (issue #294): occupies every async-runtime worker. It exists ONLY in a wheel built with the
+# `test-hooks` cargo feature (CI test wheel); a release wheel has no such symbol and this stays None.
+_hold_async_runtime = getattr(_core, "_hold_async_runtime", None)
 # Hidden test hooks of the barrier (used only by python/tests/test_put_release_barrier.py).
 _put_test_queue_export = _core._put_test_queue_export
 _put_test_retain_next_clone = _core._put_test_retain_next_clone

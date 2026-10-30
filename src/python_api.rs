@@ -13,6 +13,8 @@ mod python_advanced_api;
 mod python_aiml_api;
 mod python_core_api;
 mod python_datagen_api;
+#[cfg(feature = "test-hooks")]
+mod test_hooks;
 
 // Main module registration function
 pub fn register_all_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -26,6 +28,8 @@ pub fn register_all_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     python_aiml_api::register_aiml_functions(m)?;
     python_advanced_api::register_advanced_functions(m)?;
     python_datagen_api::register_datagen_functions(m)?;
+    #[cfg(feature = "test-hooks")]
+    test_hooks::register(m)?;
 
     Ok(())
 }

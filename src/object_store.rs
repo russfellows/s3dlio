@@ -7198,6 +7198,261 @@ mod helper_row_tests {
         assert_eq!(seen(&helper_key, "GET"), 1);
         assert_eq!(seen(&helper_key, "HEAD"), 1);
     }
+
+    /// #294: a `MultiEndpointStore` is a store, so it captures the op-log logger when it is
+    /// CONSTRUCTED and uses it for every operation (its bucket-form S3 endpoints write the GET/PUT
+    /// helper rows). One built in session 1 and used after finalize + init(other) writes nothing into
+    /// session 2; one built before any init is never logged; one built in session 2 is logged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_multi_endpoint_store_keeps_the_logger_it_was_built_with() {
+        use crate::multi_endpoint::{LoadBalanceStrategy, MultiEndpointStore};
+        use crate::s3_logger::finalize_op_logger;
+
+        let _guard = s3_object_store_tests::CRED_LOCK.lock().await;
+        for name in ["S3DLIO_OPLOG_BUF", "S3DLIO_OPLOG_LOSSLESS"] {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("S3DLIO_LOAD_DOTENV", "0");
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+        let (_, server) = ensure_mock_s3_server();
+
+        let key = |tag: &str| format!("mep/{}", unique_test_key(&format!("mepcap-{tag}")));
+        let (old_a, old_b, new_c) = (key("old-a"), key("old-b"), key("new-c"));
+        for k in [&old_a, &old_b, &new_c] {
+            server.put_object(BUCKET, k, MockObject::new(vec![9u8; 32]));
+        }
+        let build = || {
+            MultiEndpointStore::new(
+                vec![format!("s3://{BUCKET}/mep/")],
+                LoadBalanceStrategy::RoundRobin,
+                None,
+            )
+            .expect("multi-endpoint store")
+        };
+        let uri = |k: &str| format!("s3://{BUCKET}/{k}");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s1 = dir.path().join("s1.tsv.zst");
+        let s2 = dir.path().join("s2.tsv.zst");
+
+        let built_before_init = build(); // the op-log is off
+        crate::s3_logger::init_op_logger(s1.to_str().expect("utf-8 path")).expect("init s1");
+        let built_in_session_1 = build();
+        finalize_op_logger();
+        crate::s3_logger::init_op_logger(s2.to_str().expect("utf-8 path")).expect("init s2");
+
+        for (store, k) in [(&built_in_session_1, &old_a), (&built_before_init, &old_b)] {
+            store.get(&uri(k)).await.expect("old store get");
+            store
+                .put(&uri(k), bytes::Bytes::from_static(b"y"))
+                .await
+                .expect("old store put");
+            store
+                .get_from_endpoint(0, &uri(k))
+                .await
+                .expect("old get_from_endpoint");
+        }
+        let built_in_session_2 = build();
+        built_in_session_2
+            .get(&uri(&new_c))
+            .await
+            .expect("new store get");
+        built_in_session_2
+            .put(&uri(&new_c), bytes::Bytes::from_static(b"z"))
+            .await
+            .expect("new store put");
+
+        finalize_op_logger();
+        let rows = rows_of(&s2);
+        for old in [&old_a, &old_b] {
+            assert!(
+                !rows.iter().any(|(_, f)| f.contains(old.as_str())),
+                "a store built before session 2 wrote into session 2 ({old}): {rows:?}"
+            );
+        }
+        let of = |op: &str| {
+            rows.iter()
+                .filter(|(o, f)| o == op && f.contains(new_c.as_str()))
+                .count()
+        };
+        assert_eq!(of("GET"), 1, "the session-2 store logs its GET: {rows:?}");
+        assert_eq!(of("PUT"), 1, "the session-2 store logs its PUT: {rows:?}");
+        assert_eq!(rows.len(), 2, "nothing else is recorded: {rows:?}");
+        let rows1 = rows_of(&s1);
+        assert!(
+            rows1.is_empty(),
+            "session 1 got rows after finalize: {rows1:?}"
+        );
+    }
+
+    /// #294: the S3 helper rows (`get_object_uri_async`, `get_objects_parallel`, the put batch)
+    /// belong to the op-log session of the CALL that started them, not to the session that is
+    /// active when the work finally runs. A Python `*_async` call snapshots `global_logger()`
+    /// when it is made and hands the snapshot down; here the "call" is made in session 1 (or
+    /// while the op-log is off) and its work runs after a finalize + re-init, deterministically
+    /// (the snapshot is simply taken first). Nothing may reach session 2, and a call made in
+    /// session 2 (scoped or not) still writes its row, so the test cannot pass vacuously.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn helper_rows_follow_the_session_of_the_call_not_the_session_at_first_poll() {
+        use crate::s3_logger::{finalize_op_logger, global_logger, scope_call_logger};
+        use crate::s3_utils::{
+            get_object_uri_async, get_objects_parallel_logged,
+            put_objects_parallel_with_progress_logged,
+        };
+
+        let _guard = s3_object_store_tests::CRED_LOCK.lock().await;
+        for name in ["S3DLIO_OPLOG_BUF", "S3DLIO_OPLOG_LOSSLESS"] {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("S3DLIO_LOAD_DOTENV", "0");
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+        let (_, server) = ensure_mock_s3_server();
+
+        let keys: Vec<String> = [
+            "single",
+            "batch",
+            "nolog",
+            "ctl-scoped",
+            "ctl-plain",
+            "ctl-batch",
+        ]
+        .iter()
+        .map(|n| unique_test_key(&format!("calltime-{n}")))
+        .collect();
+        for key in &keys {
+            server.put_object(BUCKET, key, MockObject::new(vec![7u8; 64]));
+        }
+        let uri = |i: usize| format!("s3://{BUCKET}/{}", keys[i]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s1 = dir.path().join("s1.tsv.zst");
+        let s2 = dir.path().join("s2.tsv.zst");
+
+        // The calls are made here: one in session 1, one while the op-log is off (the second
+        // snapshot is taken after the first session is finalized).
+        crate::s3_logger::init_op_logger(s1.to_str().expect("utf-8 path")).expect("init s1");
+        let made_in_session_1 = global_logger();
+        assert!(made_in_session_1.is_some());
+        finalize_op_logger();
+        let made_while_off = global_logger();
+        assert!(made_while_off.is_none());
+
+        // Session 2 starts BEFORE any of those calls does its work.
+        crate::s3_logger::init_op_logger(s2.to_str().expect("utf-8 path")).expect("init s2");
+
+        // (a) single GET of a session-1 call: the closed session-1 logger takes (and refuses) it.
+        scope_call_logger(made_in_session_1.clone(), get_object_uri_async(&uri(0)))
+            .await
+            .expect("session-1 single get");
+        // (b) batch GET of a session-1 call (spawned tasks carry the snapshot themselves).
+        let batch = vec![uri(1)];
+        let logger = made_in_session_1.clone();
+        tokio::task::spawn_blocking(move || get_objects_parallel_logged(&batch, 2, logger))
+            .await
+            .expect("join")
+            .expect("session-1 batch get");
+        // (c) a call made while the op-log was off, run after init: still not logged.
+        scope_call_logger(made_while_off.clone(), get_object_uri_async(&uri(2)))
+            .await
+            .expect("off-call get");
+        let batch = vec![uri(2)];
+        tokio::task::spawn_blocking(move || get_objects_parallel_logged(&batch, 2, None))
+            .await
+            .expect("join")
+            .expect("off-call batch get");
+        // (d) a put batch of a session-1 call.
+        let put_uris = vec![format!(
+            "s3://{BUCKET}/{}",
+            unique_test_key("calltime-put-old")
+        )];
+        let logger = made_in_session_1.clone();
+        tokio::task::spawn_blocking(move || {
+            put_objects_parallel_with_progress_logged(
+                put_uris,
+                bytes::Bytes::from_static(b"x"),
+                2,
+                None,
+                logger,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("session-1 put batch");
+
+        // Controls: calls made in session 2 ARE logged, scoped or not.
+        scope_call_logger(global_logger(), get_object_uri_async(&uri(3)))
+            .await
+            .expect("session-2 scoped get");
+        get_object_uri_async(&uri(4))
+            .await
+            .expect("session-2 plain get");
+        let batch = vec![uri(5)];
+        let logger = global_logger();
+        tokio::task::spawn_blocking(move || get_objects_parallel_logged(&batch, 2, logger))
+            .await
+            .expect("join")
+            .expect("session-2 batch get");
+        let put_new = vec![format!(
+            "s3://{BUCKET}/{}",
+            unique_test_key("calltime-put-new")
+        )];
+        let logger = global_logger();
+        tokio::task::spawn_blocking(move || {
+            put_objects_parallel_with_progress_logged(
+                put_new,
+                bytes::Bytes::from_static(b"y"),
+                2,
+                None,
+                logger,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("session-2 put batch");
+
+        finalize_op_logger();
+        let rows = rows_of(&s2);
+        let mut got: Vec<(String, String)> = rows
+            .iter()
+            .map(|(op, file)| (op.clone(), file.clone()))
+            .collect();
+        got.sort();
+        for stray in [0usize, 1, 2] {
+            assert!(
+                !rows.iter().any(|(_, f)| f.contains(&keys[stray])),
+                "a call made before session 2 wrote into session 2 ({}): {rows:?}",
+                keys[stray]
+            );
+        }
+        assert!(
+            !rows.iter().any(|(_, f)| f.contains("calltime-put-old")),
+            "a put batch made in session 1 wrote into session 2: {rows:?}"
+        );
+        for ctl in [3usize, 4, 5] {
+            assert_eq!(
+                rows.iter()
+                    .filter(|(op, f)| op == "GET" && f.contains(&keys[ctl]))
+                    .count(),
+                1,
+                "the session-2 control {} must be logged exactly once: {rows:?}",
+                keys[ctl]
+            );
+        }
+        assert_eq!(
+            rows.iter()
+                .filter(|(op, f)| op == "PUT" && f.contains("calltime-put-new"))
+                .count(),
+            1,
+            "the session-2 put control must be logged exactly once: {rows:?}"
+        );
+        assert_eq!(rows.len(), 4, "nothing else is recorded: {rows:?}");
+        // Session 1 stayed empty: its calls finished after it was finalized.
+        let rows1 = rows_of(&s1);
+        assert!(
+            rows1.is_empty(),
+            "session 1 got rows after finalize: {rows1:?}"
+        );
+    }
 }
 
 /// A `gs://` URI that names a bucket but no object is refused before the client is built (no
