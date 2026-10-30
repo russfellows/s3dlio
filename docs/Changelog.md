@@ -27,12 +27,15 @@ elsewhere, decided in this order (`runtime_support::blocking_wait`; no panic is 
 The Python store-cache lock (`lock_build`) uses the same helper.
 
 Known residuals:
-- A worker of an unmarked runtime with CUSTOM thread names (`Builder::thread_name`) takes rule 4: no panic, but the worker
-  is parked without a hand-off while the call waits, which can stall work that depends on that runtime. Remedy, one line:
+- An unmarked runtime with CUSTOM thread names (`Builder::thread_name`) gets no hand-off (rule 4): no panic, but every
+  call parks a worker for its whole duration (latency), and it HANGS if the awaited work needs that same runtime (an
+  in-process server on it). Remedy, one line:
   `Builder::on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)`, or call the async API.
-- A `spawn_blocking` thread that drives a `LocalSet` itself and calls a sync wrapper inside it still panics (it panicked
-  before this fix too), because tokio gives no way to tell it from a worker: wrap the closure in
-  `runtime_support::inline_blocking_io()`.
+- PANIC (it panicked before this fix too) on any thread that carries the default tokio worker name or the s3dlio
+  marker and drives a `LocalSet` with the call inside a task: a `spawn_blocking` thread running
+  `handle.block_on(local.run_until(..))` (even without `spawn_local`: the blocking task's id persists inside
+  `Handle::block_on`) and a thread hand-named like tokio's default. Tokio gives no way to tell them from a worker. Remedy:
+  wrap the closure in `runtime_support::inline_blocking_io()`.
 - `MultipartUploadSink::write_blocking`, `enqueue_part` and `finish_blocking` (`blocking_send`) panic in any tokio context.
   That is a separate bug (#301), NOT fixed here.
 

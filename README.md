@@ -479,7 +479,7 @@ drives a `LocalSet` needs `inline_blocking_io()`; details in `s3dlio::runtime_su
 `panic = "abort"` too; they used to panic. They hand the worker off (`block_in_place`) on s3dlio's own runtimes and on an
 embedder's runtime whose workers have tokio's default thread name, and wait plainly elsewhere. If your runtime sets custom
 thread names, add `.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)` so a worker is never parked without
-a hand-off; a `spawn_blocking` closure that drives a `LocalSet` needs `inline_blocking_io()`. `MultipartUploadSink`'s blocking
+a hand-off; a `spawn_blocking` closure (or a thread hand-named like tokio's default worker) that drives a `LocalSet` with the call inside needs `inline_blocking_io()`, else it panics; a runtime with custom thread names and no marker gets no hand-off (a hang if the awaited work needs that same runtime). `MultipartUploadSink`'s blocking
 methods are a separate bug (#301), not covered. Details in `s3dlio::runtime_support` and `docs/Changelog.md`.
 
 **Writes borrow your buffer (v0.10.0):** async writes read your buffer in place until the `await` finishes; pass

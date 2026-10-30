@@ -431,11 +431,14 @@ fn get_runtime_threads() -> usize {
 ///    it.
 ///
 /// Recorded limits (see `runtime_support` for the details and the remedies):
-/// (1) a worker of an unmarked runtime with CUSTOM thread names takes rule 4: no panic, but it is
-/// parked without a hand-off, which can stall work that depends on that runtime (call
-/// `Builder::on_thread_start(mark_tokio_worker_thread)`, or use the async API);
-/// (2) a `spawn_blocking` thread that drives a `LocalSet` with `spawn_local` tasks takes rule 2
-/// (marked runtime) or rule 3 (default thread name) and panics: wrap the closure in
+/// (a) a worker of an unmarked runtime with CUSTOM thread names takes rule 4: no panic, but it gets
+/// no hand-off (every call parks a worker for its whole duration, and it HANGS if the awaited work
+/// needs that same runtime, such as an in-process server); call
+/// `Builder::on_thread_start(mark_tokio_worker_thread)`, or use the async API;
+/// (b) PANIC on any thread that carries the default tokio worker name or the s3dlio marker and
+/// drives a `LocalSet` with the call inside a task: a `spawn_blocking` thread (even without
+/// `spawn_local`: the blocking task's id persists inside `Handle::block_on`) or a thread
+/// hand-named like tokio's default. Wrap the closure in
 /// [`crate::runtime_support::inline_blocking_io`].
 pub fn run_on_global_rt<F, T>(fut: F) -> Result<T>
 where

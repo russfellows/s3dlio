@@ -5,8 +5,13 @@
 //
 // #300: `s3_client::run_on_global_rt` (and every sync wrapper built on it) must work, and must
 // never panic or hang, in EVERY context a caller can be in. `block_in_place` panics when a tokio
-// `LocalSet` is driven by a thread that is not a runtime worker, so the call may only be used on
-// threads known to be workers (`runtime_support`'s marker).
+// `LocalSet` is driven by a thread that is not a runtime worker, so the worker hand-off is used
+// only where `runtime_support::blocking_wait` can tell that it is valid (the worker marker, or an
+// unmarked worker task on a thread with tokio's default worker name).
+//
+// The documented residual (b) rows (a thread that carries the marker or the default worker name
+// and drives a LocalSet with the call inside a task) are ASSERTED to panic: if one stops
+// panicking the test fails with "residual fixed? update the docs".
 //
 // Each context runs in its own thread under a wall-clock timeout, twice: on runtimes built with
 // the s3dlio worker marker and on plain runtimes. The scenario is `run_on_global_rt(async {Ok(42)})`
@@ -72,6 +77,35 @@ fn mt_named(workers: usize) -> tokio::runtime::Runtime {
     b.build().unwrap()
 }
 
+/// tokio's default worker thread name, measured here independently of the code under test.
+fn default_name() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        rt.spawn(async move {
+            let _ = tx.send(std::thread::current().name().unwrap().to_owned());
+        });
+        let n = rx.recv().unwrap();
+        rt.shutdown_background();
+        n
+    })
+    .clone()
+}
+
+/// Run `g` on a plain std thread with exactly this name; a panic in it propagates.
+fn on_named_thread(name: String, g: impl FnOnce() -> u32 + Send + 'static) -> u32 {
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(g)
+        .unwrap()
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p))
+}
+
 fn ct() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -131,6 +165,60 @@ fn contexts() -> Vec<Ctx> {
                     })
                     .await
                     .unwrap()
+                })
+            },
+        ),
+        (
+            "std thread named like the default worker: LocalSet::run_until, call in the MAIN future",
+            |f| {
+                on_named_thread(default_name(), move || {
+                    let rt = mt(2);
+                    let l = tokio::task::LocalSet::new();
+                    rt.block_on(l.run_until(async move { f() }))
+                })
+            },
+        ),
+        (
+            "std thread named like the default worker: LocalSet + spawn_local (known limit)",
+            |f| {
+                on_named_thread(default_name(), move || {
+                    let rt = mt(2);
+                    let l = tokio::task::LocalSet::new();
+                    rt.block_on(l.run_until(async move {
+                        tokio::task::spawn_local(async move { f() }).await.unwrap()
+                    }))
+                })
+            },
+        ),
+        (
+            "current-thread runtime on a thread named like the default worker: spawn_local",
+            |f| {
+                on_named_thread(default_name(), move || {
+                    let rt = ct();
+                    let l = tokio::task::LocalSet::new();
+                    rt.block_on(l.run_until(async move {
+                        tokio::task::spawn_local(async move { f() }).await.unwrap()
+                    }))
+                })
+            },
+        ),
+        (
+            "current-thread runtime on a thread named like the default worker: spawned task",
+            |f| {
+                on_named_thread(default_name(), move || {
+                    ct().block_on(async move { tokio::spawn(async move { f() }).await.unwrap() })
+                })
+            },
+        ),
+        (
+            "thread name merely CONTAINING the default name: LocalSet + spawn_local",
+            |f| {
+                on_named_thread(format!("my-{}-1", default_name()), move || {
+                    let rt = mt(2);
+                    let l = tokio::task::LocalSet::new();
+                    rt.block_on(l.run_until(async move {
+                        tokio::task::spawn_local(async move { f() }).await.unwrap()
+                    }))
                 })
             },
         ),
@@ -334,19 +422,24 @@ fn run_all(f: fn() -> u32, rounds: &[bool]) -> Vec<String> {
             // worker name takes the hand-off and panics there. Such a closure must use
             // `inline_blocking_io()` (the rows with an inline scope). Reported, not asserted.
             let known_limit = name.ends_with("no inline scope")
+                || name.contains("(known limit)")
                 || (marked && name.contains("custom thread names: spawn_blocking"));
             println!(
                 "MATRIX|{round}|{name}|{verdict}{}",
-                if known_limit && verdict != "OK" {
-                    " (known limit)"
-                } else {
-                    ""
-                }
+                if known_limit { " (known limit)" } else { "" }
             );
-            if verdict != "OK" && !known_limit {
+            if known_limit {
+                // Asserted, not just reported: the docs promise exactly this panic.
+                if !verdict.starts_with("PANIC") {
+                    failures.push(format!(
+                        "[{round}] {name}: expected the documented PANIC, got {verdict} \
+                         (residual fixed? update the docs)"
+                    ));
+                }
+            } else if verdict != "OK" {
                 failures.push(format!("[{round}] {name}: {verdict}"));
             }
-            if verdict == "HANG" && !known_limit {
+            if verdict == "HANG" {
                 // The global runtime is wedged now: every later row would burn its whole timeout.
                 failures.push("stopped at the first hang (global runtime wedged)".into());
                 return if report { Vec::new() } else { failures };
@@ -623,6 +716,46 @@ fn handoff_accounting() {
         })),
         0,
         "inline_blocking_io scope"
+    );
+    // The name check is strict (equality, not `contains`): a name that merely contains the default
+    // takes rule 4, for a worker thread and for a LocalSet on a hand-named thread.
+    assert_eq!(
+        delta(false, || {
+            let mut b = tokio::runtime::Builder::new_multi_thread();
+            b.worker_threads(2)
+                .enable_all()
+                .thread_name(format!("my-{}-1", default_name()));
+            b.build()
+                .unwrap()
+                .block_on(async { tokio::spawn(async { call() }).await.unwrap() })
+        }),
+        0,
+        "worker whose name only contains the default name"
+    );
+    assert_eq!(
+        delta(false, || on_named_thread(
+            format!("my-{}-1", default_name()),
+            || {
+                let l = tokio::task::LocalSet::new();
+                mt(2).block_on(
+                    l.run_until(async {
+                        tokio::task::spawn_local(async { call() }).await.unwrap()
+                    }),
+                )
+            }
+        )),
+        0,
+        "LocalSet + spawn_local on a thread whose name only contains the default name"
+    );
+    // The try_id guard: a LocalSet MAIN future on a thread hand-named like the default worker has
+    // no task id, so it waits plainly (no hand-off, and no panic).
+    assert_eq!(
+        delta(false, || on_named_thread(default_name(), || {
+            let l = tokio::task::LocalSet::new();
+            mt(2).block_on(l.run_until(async { call() }))
+        })),
+        0,
+        "LocalSet main future on a default-named std thread"
     );
     // No runtime, current-thread runtime: none.
     assert_eq!(delta(true, call), 0, "no runtime");
