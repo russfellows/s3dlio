@@ -876,7 +876,8 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 ///     - In a child process created by os.fork() the parent's session does not
 ///       exist (its writer thread is not copied): is_op_log_active() is False
 ///       there and the child may start its OWN session, but not on the
-///       parent's file (RuntimeError: it would truncate the parent's log).
+///       file an ancestor is still writing (RuntimeError: it would truncate a
+///       live log); a log the parent had already finalized may be initialised.
 ///     - Call after finalize_op_log(): starts a NEW session. If the previous
 ///       session's writer is still draining (finalize running on another
 ///       thread), it waits for that first. The file is created like a first

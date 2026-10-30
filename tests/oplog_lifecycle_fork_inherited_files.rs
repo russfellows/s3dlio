@@ -12,9 +12,11 @@
 // parent's live log, and a grandchild forgot its grandparent's file. The set of
 // inherited files is now process-lifetime and append-only.
 //
-// Also pinned here: the refusal message is accurate whether the ancestor was
-// still writing the file or had already finalized it (N5); a child may still use
-// every unrelated file; and the parent's files are byte-identical at the end.
+// Round 4 (B1, S1): only files an ancestor was still WRITING at the fork are
+// protected. A FINISHED log has no writer to corrupt (and the parent may replace
+// its own finished log), so a child may initialise it; refusing it was wrong
+// once the finished session's inode number was reused. A child may use every
+// unrelated file.
 //
 // One scenario per file: the op-log is process-global.
 
@@ -105,7 +107,7 @@ fn a_forked_process_never_truncates_any_ancestors_op_log() {
     }
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n);
-    let (a, c, d, e, g) = (p("a"), p("c"), p("d"), p("e"), p("g"));
+    let (a, b, c, d, e, g) = (p("a"), p("b"), p("c"), p("d"), p("e"), p("g"));
 
     init_op_logger(a.to_str().unwrap()).unwrap();
     let logger = global_logger().unwrap();
@@ -165,37 +167,52 @@ fn a_forked_process_never_truncates_any_ancestors_op_log() {
     finalize_op_logger();
     assert_eq!(tags(&a), vec!["parent-1", "parent-2"]);
 
-    // --- Child of a FINALIZED parent (N5): refused, with an accurate message. -
-    let before = std::fs::read(&a).unwrap();
-    let a3 = a.clone();
+    // --- Children of a FINALIZED parent (round 4: B1, S1). -------------------
+    // A finished log has no writer to corrupt, and the parent may replace its own
+    // finished log by re-initialising it, so a child may too (not refused). Only
+    // files an ancestor was still WRITING at the fork are protected.
     let g3 = g.clone();
+    let a3 = a.clone();
     let status = in_child(move || {
         if op_log_stats().is_some() {
             return Err("stats must be None in the child of a finalized parent".into());
         }
-        // The parent had FINISHED this log: it must not be described as still being written.
-        match init_op_logger(a3.to_str().unwrap()) {
-            Ok(()) => return Err("must be refused".into()),
-            Err(e) => {
-                let m = e.to_string();
-                if m.contains("still writing") || !m.contains("PARENT") || !m.contains("finished") {
-                    return Err(format!("inaccurate message for a finalized parent: {m}"));
-                }
-            }
-        }
         init_op_logger(g3.to_str().unwrap()).map_err(|e| e.to_string())?;
         finalize_op_logger();
-        must_refuse(&a3, &["PARENT", "finished"])?;
+        // The parent's finished log is NOT protected: this replaces it.
+        init_op_logger(a3.to_str().unwrap()).map_err(|e| format!("finished log refused: {e}"))?;
+        finalize_op_logger();
         Ok(())
     });
     assert_eq!(status, 0, "finalized-parent scenario failed");
     assert_eq!(
-        std::fs::read(&a).unwrap(),
-        before,
-        "the parent's finished log must be byte-identical"
+        tags(&a),
+        Vec::<String>::new(),
+        "the child replaced the finished log"
     );
     assert_eq!(tags(&g), Vec::<String>::new());
+
+    // --- S1: the parent finalized a, then is Active on b when it forks. ------
+    init_op_logger(b.to_str().unwrap()).unwrap();
+    assert_eq!(
+        logger_now().try_log(entry("parent-b")),
+        LogOutcome::Accepted
+    );
+    let (a4, b4) = (a.clone(), b.clone());
+    let status = in_child(move || {
+        init_op_logger(a4.to_str().unwrap()).map_err(|e| format!("finished a refused: {e}"))?;
+        finalize_op_logger();
+        must_refuse(&b4, &["PARENT", "still writing"])?;
+        Ok(())
+    });
+    assert_eq!(status, 0, "S1 scenario failed");
+    finalize_op_logger();
+    assert_eq!(tags(&b), vec!["parent-b"]);
     assert_eq!(tags(&c), Vec::<String>::new());
     assert_eq!(tags(&e), Vec::<String>::new());
     assert!(!d.exists() || tags(&d).is_empty());
+}
+
+fn logger_now() -> s3dlio::s3_logger::Logger {
+    global_logger().expect("an Active session")
 }

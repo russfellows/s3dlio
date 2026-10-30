@@ -31,7 +31,8 @@
     `finalize_op_log()` blocked forever, and the child could deadlock on the lifecycle lock if
     another parent thread held it during the fork. The child now sees the op-log as not
     initialised (`pthread_atfork`; the lock is held across the fork), may start its own session,
-    and is refused (`ResourceBusy`) if it initialises the parent's file, which would truncate it.
+    and is refused (`ResourceBusy`) if it initialises a file the parent was still writing (see
+    round 4: finished logs are not protected).
   - The permutation matrix: `tests/test_oplog_lifecycle_permutations_294.py` (single thread,
     16 threads racing init/finalize, workers running during 50 cycles, asyncio, fork/spawn,
     exit; lossy and lossless) and `tests/oplog_lifecycle_{same_file_spellings,
@@ -42,7 +43,8 @@
       the parent's live log (a grandchild forgot its grandparent's file too). The files of
       every ancestor session are now kept in a process-lifetime, append-only set (linked from
       the atfork child handler with a node allocated in `prepare`, so the handler does not
-      allocate) and refused on every init. The new file is opened WITHOUT truncation, its
+      allocate) and refused on every init (round 4 narrowed this to sessions that were Active at
+      the fork). The new file is opened WITHOUT truncation, its
       identity read from the open descriptor, vetted, and only then truncated, so a refused
       request never touches the file. The message now says whether the ancestor was still
       writing the file or had finished it (N5; both are refused: truncating a finished log
@@ -72,6 +74,26 @@
       for the registration protocol and for the identify-then-vet-then-truncate open, and
       Python `test_16e`-`test_16i`, `test_18`-`test_20` and the opt-in bind-mount
       `test_21` (`S3DLIO_TEST_BIND_MOUNT_DIR`, see `docs/Environment_Variables.md`).
+  - **Round 4 (third adversarial review):**
+    - *Inode reuse refused a NEW path (B1) and S1.* Round 3 also refused the files of
+      FINALIZED ancestor sessions, compared by `(device, inode)`. A finalized session's
+      descriptor is closed, so once its file was deleted the inode number was reused at once
+      (ext4): `parent: init a; finalize; rm a; fork; child: init NEW b0` failed with
+      `ResourceBusy`, the message said "nothing was created", and b0 was left behind as an empty
+      file. Only the last session was recorded either way (S1). Now only sessions that were
+      ACTIVE at the fork (or finalized with the writer still draining: its file is still being written) are protected: the hazard is truncating a log an ancestor is still
+      WRITING, an Active session's descriptor stays open in every descendant (so its inode can
+      never be reused and the identity is exact), and a finished log has no writer to corrupt
+      (its owner may replace it by initialising the same path too; so may a child). The refusal
+      message and docs say exactly that. A new file is created with `O_CREAT|O_EXCL` and is
+      never vetted (it cannot be an ancestor's live file); only an existing file is opened
+      without truncation, vetted and then truncated, so a refusal never leaves a new file.
+    - *N2:* the double-registration early return in `prepare` is now tested (handlers
+      registered twice, then a fork with an Active session: no deadlock). *N3:* the
+      `/proc/self/fd` identity check in `current_name` is tested (a reused descriptor number
+      is not trusted). *N4:* the registration wait yields 64 times, then sleeps 50 us growing
+      to 1 ms instead of spinning. *N1 (unchanged, documented):* a `fork()` from a thread-local
+      destructor is unprotected.
   - Stores, readers and writers captured in an earlier session keep that session's closed
     logger: they keep working but never write into a later session's file. The Python
     module-level calls look the op-log up on every call, so they need no change.

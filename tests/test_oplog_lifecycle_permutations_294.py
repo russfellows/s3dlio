@@ -16,7 +16,8 @@ Behaviour pinned here (decided for #294):
 * init after finalize: a new session (waits for the old writer to drain).
 * a forked child never shares the parent's session (it sees the op-log as not
   initialised) and cannot hang on it or corrupt the parent's file; it can never
-  truncate the file of ANY ancestor, however its own sessions come and go.
+  truncate a file an ANCESTOR was still writing at the fork, however its own
+  sessions come and go (a log an ancestor had already finalized is not protected).
 
 Round 3 adds: fork while the parent is Finalized, fork racing a finalize, a failed
 fork, pre-fork awaitables used in the child, an active file that was renamed or
@@ -1090,30 +1091,48 @@ def test_16e_a_child_never_truncates_any_ancestors_file(tmp_path, mode):
     )
 
 
-def test_16f_fork_while_the_parent_is_finalized(tmp_path, mode):
-    """N5: the parent had FINISHED its log: the child sees no session, may not
-    truncate that log, and the message must not claim it is still being written."""
+def test_16f_a_finalized_ancestors_log_is_not_protected(tmp_path, mode):
+    """Round 4 (B1, S1): only a log an ancestor is still WRITING at the fork is
+    protected. A finished log has no writer to corrupt (its owner may replace it),
+    so a child may initialise it; a NEW path is never refused, even when the
+    filesystem reuses the inode number of a deleted finished log."""
     run(
         """
-        a, c, f = T + "/a.tsv.zst", T + "/c.tsv.zst", T + "/f.bin"
+        a, b, c, n = [T + "/" + x for x in ("a.tsv.zst", "b.tsv.zst", "c.tsv.zst", "n.tsv.zst")]
         s3dlio.init_op_log(a)
         s3dlio.finalize_op_log()
-        before = open(a, "rb").read()
 
-        def child():
+        def child_finalized():                     # forked while the parent is Finalized
             assert s3dlio.is_op_log_active() is False
             assert s3dlio.op_log_stats() is None, "a Finalized parent's stats are not the child's"
             s3dlio.finalize_op_log()
-            m = refuses(a, "PARENT", "finished", a)
-            assert "still writing" not in m, m
+            s3dlio.init_op_log(a)                  # the finished log: allowed (replaced)
+            s3dlio.finalize_op_log()
             s3dlio.init_op_log(c)
             s3dlio.finalize_op_log()
-            m = refuses(a, "PARENT", "finished")
-            assert "still writing" not in m, m
 
-        assert child_run(child) == 0
-        assert open(a, "rb").read() == before, "the parent's finished log must be untouched"
+        assert child_run(child_finalized) == 0
         assert rows(a) == [] and rows(c) == []
+
+        os.remove(a)                               # B1: free the inode number...
+        def child_new_path():
+            s3dlio.init_op_log(n)                  # ...a NEW path must work, not "ResourceBusy"
+            s3dlio.finalize_op_log()
+            assert rows(n) == []
+
+        assert child_run(child_new_path) == 0
+
+        s3dlio.init_op_log(b)                      # S1: finalized a, then Active on b
+        def child_active_b():
+            s3dlio.init_op_log(a)                  # finished (re-created): allowed
+            s3dlio.finalize_op_log()
+            before = open(b, "rb").read()
+            refuses(b, "PARENT", "still writing", b)
+            assert open(b, "rb").read() == before, "a refused request must not touch the file"
+
+        assert child_run(child_active_b) == 0
+        s3dlio.finalize_op_log()
+        assert rows(b) == []
         """,
         tmp_path,
         mode,
@@ -1122,7 +1141,9 @@ def test_16f_fork_while_the_parent_is_finalized(tmp_path, mode):
 
 def test_16g_fork_while_another_thread_is_finalizing(tmp_path, mode):
     """The fork lands anywhere in a finalize/drain running on another thread: the
-    child never hangs and the parent's log is complete."""
+    child never hangs and never truncates a log whose writer is still draining
+    (once the writer has finished the log is just a finished log: the child may
+    replace it, and the parent's log is then a valid empty one, never a mix)."""
     run(
         """
         a, c, f = T + "/a.tsv.zst", T + "/c.tsv.zst", T + "/f.bin"
@@ -1141,7 +1162,12 @@ def test_16g_fork_while_another_thread_is_finalizing(tmp_path, mode):
                     s3dlio.is_op_log_active()
                     s3dlio.op_log_stats()
                     s3dlio.finalize_op_log()       # nothing to wait for in the child
-                    refuses(a, "PARENT")
+                    try:
+                        s3dlio.init_op_log(a)      # drained at the fork: allowed; else refused
+                        code = 5
+                        s3dlio.finalize_op_log()
+                    except RuntimeError as e:
+                        assert "PARENT" in str(e) and "still writing" in str(e), str(e)
                     s3dlio.init_op_log(c)
                     s3dlio.finalize_op_log()
                 except BaseException:
@@ -1150,10 +1176,16 @@ def test_16g_fork_while_another_thread_is_finalizing(tmp_path, mode):
                     code = 3
                 os._exit(code)
             status = wait_child(pid)
-            assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, (rep, status)
+            assert os.WIFEXITED(status) and os.WEXITSTATUS(status) in (0, 5), (rep, status)
             t.join(60)
             assert not t.is_alive(), "DEADLOCK: finalize thread"
-            assert len(rows(a)) == 200, rep
+            if os.WEXITSTATUS(status) == 5:
+                # The parent's writer had already finished at the fork, so the child may
+                # replace that finished log: a valid, empty log.
+                assert rows(a) == [], rep
+            else:
+                # Still draining at the fork: the child was refused, the log is whole.
+                assert len(rows(a)) == 200, rep
         """,
         tmp_path,
         mode,

@@ -376,7 +376,8 @@ writer and never creates or truncates `path`:
   safety" below. In short: the child sees the op-log as **not initialised**
   (`is_op_log_active()` is `False`, `op_log_stats()` is `None`, `finalize_op_log()`
   is a no-op), may start its own session on another file, and can never initialise a
-  file that an ancestor process wrote. With the `spawn` and `forkserver` start
+  file that an ancestor process is still writing (a log the ancestor had already
+  finalized is not protected). With the `spawn` and `forkserver` start
   methods the child starts clean. Forking a process that has already used s3dlio I/O
   is a separate matter: the runtime threads are not copied either.
 - **Interpreter exit** with a session Active (no `finalize_op_log()`): the process
@@ -429,18 +430,26 @@ it. s3dlio registers `pthread_atfork` handlers on the first `init_op_logger` (Un
   parent (not the "finalized" note). Reads and writes through such stores still work;
   they are just not recorded.
 - **Inherited files, for the life of the process.** The child records the file of
-  the session it inherited (Active or Finalized) in a process-lifetime, append-only
-  set. `init_op_logger` refuses every file in that set with `ResourceBusy`, whatever
+  the session it inherited, if a writer may still be writing it (the session was ACTIVE at the fork, or finalized with its writer still draining), in a
+  process-lifetime, append-only set. `init_op_logger` refuses every file in that set with `ResourceBusy`, whatever
   the child does in between: it may finalize and re-init its own files as often as
   it likes, a grandchild inherits the child's set plus the child's live file, and
-  none of them can truncate an ancestor's log. Refused whether the ancestor was
-  still writing the file (`... which was still writing it when this process was
-  forked`) or had already finalized it (`... which had already finished that log
-  (finalized it) ... initialising it here would destroy that finished log`):
-  truncating a finished log destroys data just the same. The check compares the
-  `(device, inode)` of the file as opened (before it is truncated), so every
+  none of them can truncate a log an ancestor is still writing (`... which was
+  still writing it when this process was forked`). Why only Active sessions: the
+  hazard is truncating a log with a live writer. An Active session's descriptor is
+  inherited and, with the leaked logger, stays open in every descendant, so its
+  inode number cannot be reused while the descendant lives and the `(device,
+  inode)` identity is exact. A log the ancestor had already FINALIZED has no writer
+  to corrupt, and its owner may replace it by initialising the same path again, so a
+  child may too (protecting it was also wrong: its descriptor is closed, so after
+  the file is deleted the inode number is reused and an unrelated new path was
+  refused). Only the last session of each ancestor can be Active, so a finished
+  log of an earlier session is never protected either. The check compares the
+  `(device, inode)` of an EXISTING file as opened (before it is truncated), so every
   spelling, symlink or hard link to it is refused, and a refused request leaves the
-  file untouched. Unrelated files are unaffected.
+  file untouched. A file that does not exist is created with `O_CREAT|O_EXCL` and
+  never refused (a new inode cannot be an ancestor's live file), so a refusal never
+  leaves a new file behind. Unrelated files are unaffected.
 - **Registration is not a `Once`.** A fork that lands while another thread is inside
   the very first registration would leave a `Once` RUNNING in the child for ever (its
   registering thread does not exist there) and the child's first init would hang.
@@ -450,7 +459,8 @@ it. s3dlio registers `pthread_atfork` handlers on the first `init_op_logger` (Un
   may end up with the handlers registered twice; they are idempotent.)
 - **A `fork()` from a thread-local destructor** runs after the handlers' own
   thread-local is destroyed. The handlers use `try_with` and do nothing in that case
-  (that fork is unprotected) instead of panicking, which would abort the process.
+  (that fork is unprotected: the child keeps the inherited session, which cannot make progress,
+  and its file is not recorded) instead of panicking, which would abort the process.
 - **A `File::create` that hangs blocks `fork()` in the process.** The lifecycle lock
   is held while a session's file is opened (a dead NFS server, a FIFO with no
   reader), and `prepare` needs that lock, so `fork()` waits until the open returns.

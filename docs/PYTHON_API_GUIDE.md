@@ -1972,9 +1972,10 @@ session carries on. Of several threads calling `init_op_log` at once exactly one
 creates the file (same file: every call returns; different files: the rest raise). After
 `os.fork()` the child does not share the parent's session (its writer thread is not
 copied): `is_op_log_active()` is `False` in the child, which can start its own session,
-but never on a file an ancestor process wrote, however often the child starts and
-finishes sessions of its own (the `RuntimeError` says whether the parent was still
-writing the file or had finished it; initialising it would truncate the log). Stores
+but never on a file an ancestor process was still writing at the fork, however often
+the child starts and finishes sessions of its own (a `RuntimeError`: initialising it
+would truncate a live log; a log the ancestor had already finalized is not protected
+and may be initialised). Stores
 created before the fork stay silent in the child (one line on stderr says why). If the
 active file was renamed or deleted behind the session's back (log rotation), a request
 for the old name is a `RuntimeError` saying the session is writing a file that was
