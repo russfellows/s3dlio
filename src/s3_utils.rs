@@ -1984,23 +1984,6 @@ pub(crate) fn list_object_uris_with_prefix_stream(
     )
 }
 
-/*
- * Old ?
- *
-/// Sync wrapper that is safe even if a Tokio runtime is already running.
-pub fn stat_object_uri(uri: &str) -> Result<ObjectStat> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(stat_object_uri_async(uri)))
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()?
-            .block_on(stat_object_uri_async(uri))
-    }
-}
-*/
-
 /// Sync wrapper that is safe uses helper, we don't use the one above now?
 pub fn stat_object_uri(uri: &str) -> anyhow::Result<ObjectStat> {
     let uri = uri.to_string();
