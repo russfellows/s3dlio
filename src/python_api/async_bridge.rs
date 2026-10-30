@@ -100,16 +100,16 @@
 //! * This is a targeted shutdown fix for the observed crash, not a guarantee
 //!   covering every teardown pattern.
 
-use std::cell::OnceCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use pyo3::conversion::IntoPyObjectExt;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3::IntoPyObject;
-use pyo3_async_runtimes::generic::{self, ContextExt, Runtime};
-use pyo3_async_runtimes::TaskLocals;
+use pyo3_async_runtimes::generic::Runtime;
 
 /// Count of result deliveries that have been handed to the blocking pool and
 /// have not yet fully returned.
@@ -220,10 +220,6 @@ fn deliveries() -> &'static DeliveryTracker {
     DELIVERIES_CELL.get_or_init(DeliveryTracker::new)
 }
 
-tokio::task_local! {
-    static TASK_LOCALS: OnceCell<TaskLocals>;
-}
-
 /// `pyo3_async_runtimes` runtime adapter over the shared pyo3-async-runtimes
 /// tokio runtime (the one `s3_client::configure_thread_pools` sizes), with
 /// delivery accounting on its blocking path.
@@ -299,26 +295,141 @@ where
     }
 }
 
-impl ContextExt for S3dlioRuntime {
-    fn scope<F, R>(locals: TaskLocals, fut: F) -> Pin<Box<dyn Future<Output = R> + Send>>
-    where
-        F: Future<Output = R> + Send + 'static,
-    {
-        let cell = OnceCell::new();
-        // A fresh cell is empty, so this `set` cannot fail.
-        let _ = cell.set(locals);
-        Box::pin(TASK_LOCALS.scope(cell, fut))
+/// A Python reference that is NEVER dropped by pyo3's off-GIL path.
+///
+/// Dropping a `Py<..>` on a thread without the GIL makes pyo3 push the pointer onto its global
+/// reference pool, a `Mutex` that is locked by every such drop. A parent thread that holds that
+/// mutex at a `fork()` leaves it locked for ever in the child, and the child's first Python call
+/// waits for it (#297). Every Python reference that lives in a task or closure of this module is
+/// therefore wrapped here: it is consumed with the GIL held ([`GilRef::into_bound`]), and if it is
+/// dropped anywhere else (a task dropped at runtime shutdown, a delivery refused by the closed
+/// gate) it is queued for a GIL holder to decref ([`super::put_payload::defer_decref`]).
+struct GilRef(Option<Py<PyAny>>);
+
+impl GilRef {
+    fn new(obj: Py<PyAny>) -> Self {
+        Self(Some(obj))
     }
 
-    fn get_task_locals() -> Option<TaskLocals> {
-        TASK_LOCALS
-            .try_with(|cell| cell.get().cloned())
-            .unwrap_or_default()
+    /// Take the reference; the `py` token proves the GIL is held.
+    fn into_bound(mut self, py: Python<'_>) -> Bound<'_, PyAny> {
+        self.0
+            .take()
+            .expect("a GilRef is consumed once")
+            .into_bound(py)
     }
 }
 
-/// Drop-in replacement for `pyo3_async_runtimes::tokio::future_into_py` whose
-/// result deliveries are visible to the exit drain (see the module docs).
+impl Drop for GilRef {
+    fn drop(&mut self) {
+        if let Some(obj) = self.0.take() {
+            super::put_payload::ASYNC_GILREF_DEFERRED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::put_payload::defer_decref(obj.into_ptr());
+        }
+    }
+}
+
+/// `add_done_callback` target: a cancelled Python future cancels the Rust future.
+#[pyclass]
+struct DoneCallback {
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[pymethods]
+impl DoneCallback {
+    fn __call__(&mut self, fut: &Bound<'_, PyAny>) -> PyResult<()> {
+        if future_cancelled(fut).unwrap_or(false) {
+            if let Some(tx) = self.cancel_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Runs on the event loop thread: completes the future unless it was cancelled meanwhile.
+#[pyclass]
+struct CheckedCompletor;
+
+#[pymethods]
+impl CheckedCompletor {
+    fn __call__(
+        &self,
+        future: &Bound<'_, PyAny>,
+        complete: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if future_cancelled(future)? {
+            return Ok(());
+        }
+        complete.call1((value,))?;
+        Ok(())
+    }
+}
+
+fn future_cancelled(future: &Bound<'_, PyAny>) -> PyResult<bool> {
+    future
+        .getattr(pyo3::intern!(future.py(), "cancelled"))?
+        .call0()?
+        .is_truthy()
+}
+
+/// Hand the outcome to the event loop thread (`loop.call_soon_threadsafe`).
+fn set_result(
+    event_loop: &Bound<'_, PyAny>,
+    future: &Bound<'_, PyAny>,
+    result: PyResult<Py<PyAny>>,
+) -> PyResult<()> {
+    let py = event_loop.py();
+    let none = py.None().into_bound(py);
+    let (complete, val) = match result {
+        Ok(val) => (
+            future.getattr(pyo3::intern!(py, "set_result"))?,
+            val.into_bound(py),
+        ),
+        Err(err) => (
+            future.getattr(pyo3::intern!(py, "set_exception"))?,
+            err.into_bound_py_any(py)?,
+        ),
+    };
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(pyo3::intern!(py, "context"), &none)?;
+    event_loop.call_method(
+        pyo3::intern!(py, "call_soon_threadsafe"),
+        (CheckedCompletor, future, complete, val),
+        Some(&kwargs),
+    )?;
+    Ok(())
+}
+
+fn panic_message(any: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = any.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = any.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "unknown error"
+    }
+}
+
+/// What the Rust side of an awaitable ended with.
+enum BridgeOutcome<T> {
+    Value(PyResult<T>),
+    /// The Python future was cancelled first: nothing to deliver.
+    Cancelled,
+    Panicked(String),
+}
+
+/// Replacement for `pyo3_async_runtimes::tokio::future_into_py` whose result deliveries are
+/// visible to the exit drain (see the module docs) and which never drops a Python reference
+/// without the GIL (#297).
+///
+/// The upstream function keeps a spare `Py` of the awaitable (for the panic path) in the task
+/// that spawns the delivery; that task ends on a Tokio worker, which drops the reference without
+/// the GIL on EVERY call. Here the awaitable and the event loop each have exactly one owner at
+/// any time (the task, then the delivery closure) and both are consumed under the GIL; a Rust
+/// panic is caught inside the task and delivered the same way, so no second reference is needed.
 pub(crate) fn future_into_py<F, T>(py: Python<'_>, fut: F) -> PyResult<Bound<'_, PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
@@ -328,7 +439,71 @@ where
     // finished (see `body_finished_hook`). Absent from the shipped extension.
     #[cfg(test)]
     let fut = body_finished_hook::observe(fut);
-    generic::future_into_py::<S3dlioRuntime, _, T>(py, fut)
+
+    let event_loop = pyo3_async_runtimes::get_running_loop(py)?;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let py_fut = event_loop.call_method0(pyo3::intern!(py, "create_future"))?;
+    py_fut.call_method1(
+        pyo3::intern!(py, "add_done_callback"),
+        (DoneCallback {
+            cancel_tx: Some(cancel_tx),
+        },),
+    )?;
+    let loop_ref = GilRef::new(event_loop.unbind());
+    let fut_ref = GilRef::new(py_fut.clone().unbind());
+
+    S3dlioRuntime::spawn(async move {
+        use futures::FutureExt;
+        let body = async move {
+            tokio::pin!(fut);
+            let mut cancel_rx = Some(cancel_rx);
+            std::future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(v) = fut.as_mut().poll(cx) {
+                    return std::task::Poll::Ready(BridgeOutcome::Value(v));
+                }
+                if let Some(rx) = cancel_rx.as_mut() {
+                    match Pin::new(rx).poll(cx) {
+                        std::task::Poll::Ready(Ok(())) => {
+                            return std::task::Poll::Ready(BridgeOutcome::Cancelled)
+                        }
+                        // The callback was dropped without a cancellation: keep waiting.
+                        std::task::Poll::Ready(Err(_)) => cancel_rx = None,
+                        std::task::Poll::Pending => {}
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await
+        };
+        let outcome = match std::panic::AssertUnwindSafe(body).catch_unwind().await {
+            Ok(o) => o,
+            Err(payload) => BridgeOutcome::Panicked(format!(
+                "rust future panicked: {}",
+                panic_message(&*payload)
+            )),
+        };
+        // Not on this worker: the delivery needs the GIL (see the module docs).
+        S3dlioRuntime::spawn_blocking(move || {
+            Python::attach(move |py| {
+                let event_loop = loop_ref.into_bound(py);
+                let future = fut_ref.into_bound(py);
+                let result = match outcome {
+                    BridgeOutcome::Cancelled => return,
+                    BridgeOutcome::Value(r) => r.and_then(|v| v.into_py_any(py)),
+                    BridgeOutcome::Panicked(msg) => {
+                        Err(pyo3_async_runtimes::err::RustPanic::new_err(msg))
+                    }
+                };
+                if future_cancelled(&future).unwrap_or(false) {
+                    return;
+                }
+                if let Err(e) = set_result(&event_loop, &future, result) {
+                    e.print_and_set_sys_last_vars(py);
+                }
+            });
+        });
+    });
+    Ok(py_fut)
 }
 
 /// Test-only observation of "the future body handed to [`future_into_py`] has returned".

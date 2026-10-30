@@ -94,8 +94,15 @@
 //!   ([`EXPORT_RELEASE_GRACE`]) that normally lets the callers above get there first, so it
 //!   finds nothing to do and never contends for the GIL on the hot path.
 //!
-//! Exact `bytes` are held as a `Py<PyBytes>`: dropping it off the GIL defers the decref
-//! (pyo3's reference pool), also without blocking.
+//! Exact `bytes` are held by [`PyBytesOwner`] as a raw owned reference that is NEVER dropped as a
+//! `Py` off the GIL: the last clone of the `Bytes` dies on whatever thread the store finishes
+//! with it (a Tokio worker, a thread inside `py.detach`), and the owner queues the reference on
+//! the release queue for a thread that holds the GIL (the `put_bytes` / checkpoint-save caller
+//! drains it, else the releaser thread). A `Py` dropped without the GIL would instead be
+//! registered in pyo3's process-global reference pool, a mutex that a parent thread can hold at
+//! a `fork()`, leaving the child's first Python call waiting for ever (#297). Rule for all of
+//! s3dlio: no `Py<..>` is ever dropped without the GIL; CI builds a wheel with
+//! `--cfg pyo3_disable_reference_pool`, where such a drop aborts, to enforce it.
 //!
 //! # Interpreter shutdown
 //!
@@ -543,7 +550,19 @@ pub(crate) struct ExportStats {
     pub(crate) releaser_attaches: usize,
     /// Test hook: times the releaser parked at the armed point.
     pub(crate) test_releaser_parked: u64,
+    /// Owned Python references queued for a GIL holder instead of being dropped without the GIL
+    /// (#297): one per exact-`bytes` payload whose last clone died, plus `async_gilref_deferred`.
+    pub(crate) deferred_decrefs: u64,
+    /// Async-bridge references that were NOT consumed under the GIL and fell back to the queue
+    /// (a task dropped at runtime shutdown, a delivery refused by the closed gate). Zero in normal
+    /// operation: the tests assert it stays zero.
+    pub(crate) async_gilref_deferred: u64,
 }
+
+/// See [`ExportStats::deferred_decrefs`].
+static DEFERRED_DECREFS: AtomicU64 = AtomicU64::new(0);
+/// See [`ExportStats::async_gilref_deferred`].
+pub(crate) static ASYNC_GILREF_DEFERRED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn export_stats() -> ExportStats {
     ExportStats {
@@ -556,6 +575,8 @@ pub(crate) fn export_stats() -> ExportStats {
             .get()
             .map_or(0, |q| q.attaches.load(Ordering::Relaxed)),
         test_releaser_parked: TEST_RELEASER_PARKED.load(Ordering::SeqCst),
+        deferred_decrefs: DEFERRED_DECREFS.load(Ordering::Relaxed),
+        async_gilref_deferred: ASYNC_GILREF_DEFERRED.load(Ordering::Relaxed),
     }
 }
 
@@ -725,9 +746,33 @@ impl RawExport {
     }
 }
 
+/// What waits in the [`ReleaseQueue`] for a thread that holds the GIL: a buffer export to
+/// release, or one owned reference to a Python object (an exact `bytes` payload) to decref.
+/// The second exists so that NO `Py<..>` of s3dlio is ever dropped without the GIL: pyo3 would
+/// push such a drop onto its global reference pool (a mutex that another thread may hold at a
+/// `fork()`, which wedges the child's first Python call, #297).
+enum Deferred {
+    Export(RawExport),
+    Decref(std::ptr::NonNull<ffi::PyObject>),
+}
+
+// SAFETY: `RawExport` is `Send` (see above); the pointer is an OWNED reference that is only
+// released by a thread holding the GIL.
+unsafe impl Send for Deferred {}
+
+impl Deferred {
+    fn release(self, py: Python<'_>) {
+        match self {
+            Deferred::Export(e) => e.release(py),
+            // SAFETY: `py` proves the GIL is held; the pointer is an owned reference.
+            Deferred::Decref(p) => unsafe { ffi::Py_DECREF(p.as_ptr()) },
+        }
+    }
+}
+
 /// Queue of exports waiting for a thread that holds the GIL to release them.
 struct ReleaseQueue {
-    pending: Mutex<Vec<RawExport>>,
+    pending: Mutex<Vec<Deferred>>,
     wake: Condvar,
     count: AtomicUsize,
     /// The autonomous attach gate (closed at interpreter exit): the releaser enters it before
@@ -862,13 +907,22 @@ fn park_releaser_for_test() {
 }
 
 impl ReleaseQueue {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<RawExport>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Deferred>> {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn push(&self, export: RawExport) {
+        self.push_item(Deferred::Export(export));
+    }
+
+    /// Queue one owned reference to a Python object for a GIL holder to decref.
+    fn push_decref(&self, obj: std::ptr::NonNull<ffi::PyObject>) {
+        self.push_item(Deferred::Decref(obj));
+    }
+
+    fn push_item(&self, item: Deferred) {
         let mut pending = self.lock();
-        pending.push(export);
+        pending.push(item);
         self.count.store(pending.len(), Ordering::Release);
         drop(pending);
         self.wake.notify_one();
@@ -882,7 +936,7 @@ impl ReleaseQueue {
             return;
         }
         thread_local! {
-            static SCRATCH: RefCell<Vec<RawExport>> = const { RefCell::new(Vec::new()) };
+            static SCRATCH: RefCell<Vec<Deferred>> = const { RefCell::new(Vec::new()) };
         }
         let mut batch = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
         {
@@ -890,8 +944,8 @@ impl ReleaseQueue {
             std::mem::swap(&mut *pending, &mut batch);
             self.count.store(0, Ordering::Release);
         }
-        for export in batch.drain(..) {
-            export.release(py);
+        for item in batch.drain(..) {
+            item.release(py);
         }
         SCRATCH.with(|s| *s.borrow_mut() = batch);
     }
@@ -1313,14 +1367,51 @@ pub(crate) fn acquire_writable(
 
 /// Exact `bytes` (or the `bytes` Python made for a gather / `__bytes__`) as the owner of a `Bytes`.
 struct PyBytesOwner {
-    _keep: Py<PyBytes>,
+    keep: std::mem::ManuallyDrop<Py<PyBytes>>,
     ptr: *const u8,
     len: usize,
 }
 
-// SAFETY: `bytes` objects are immutable and `_keep` pins the allocation; dropping a `Py`
-// off the GIL defers the decref (pyo3 reference pool), it never waits for the GIL.
+// SAFETY: `bytes` objects are immutable and `keep` pins the allocation; the reference is only
+// released through the release queue (below), by a thread that holds the GIL.
 unsafe impl Send for PyBytesOwner {}
+
+impl PyBytesOwner {
+    fn new(keep: Py<PyBytes>, ptr: *const u8, len: usize) -> Self {
+        Self {
+            keep: std::mem::ManuallyDrop::new(keep),
+            ptr,
+            len,
+        }
+    }
+}
+
+impl Drop for PyBytesOwner {
+    /// The last clone of the `Bytes` dies wherever the store finishes with it: a Tokio worker, a
+    /// thread inside `py.detach`. None of them may drop a `Py` (pyo3 would register the decref in
+    /// its global reference pool, whose mutex a fork can leave locked for ever in the child, #297),
+    /// so the reference is queued for a thread that holds the GIL, like a buffer export.
+    fn drop(&mut self) {
+        // SAFETY: dropped exactly once, here.
+        let keep = unsafe { std::mem::ManuallyDrop::take(&mut self.keep) };
+        let raw = keep.into_ptr();
+        defer_decref(raw);
+    }
+}
+
+/// Queue one OWNED reference to a Python object for a thread that holds the GIL to decref (the
+/// release queue's releaser thread, or whoever drains it). Never touches Python itself, so it is
+/// safe on any thread, with or without the GIL, and never takes pyo3's reference-pool mutex.
+pub(crate) fn defer_decref(raw: *mut ffi::PyObject) {
+    // SAFETY: always safe to call.
+    if unsafe { ffi::Py_IsInitialized() } == 0 {
+        return; // the interpreter is gone: nothing to release into
+    }
+    if let Some(raw) = std::ptr::NonNull::new(raw) {
+        DEFERRED_DECREFS.fetch_add(1, Ordering::Relaxed);
+        global_queue().push_decref(raw);
+    }
+}
 
 impl AsRef<[u8]> for PyBytesOwner {
     fn as_ref(&self) -> &[u8] {
@@ -1334,11 +1425,11 @@ fn bytes_from_pybytes(b: &Bound<'_, PyBytes>) -> Bytes {
     if slice.is_empty() {
         return Bytes::new();
     }
-    Bytes::from_owner(PyBytesOwner {
-        ptr: slice.as_ptr(),
-        len: slice.len(),
-        _keep: b.clone().unbind(),
-    })
+    Bytes::from_owner(PyBytesOwner::new(
+        b.clone().unbind(),
+        slice.as_ptr(),
+        slice.len(),
+    ))
 }
 
 /// One copy of `src` for `put_bytes_async` (default): with the GIL held below
@@ -1530,11 +1621,11 @@ fn immutable_export_bytes(data: &Bound<'_, PyAny>, export: &RawExport) -> Option
     if ptr < start || ptr.checked_add(len)? > end {
         return None;
     }
-    Some(Bytes::from_owner(PyBytesOwner {
-        ptr: ptr as *const u8,
+    Some(Bytes::from_owner(PyBytesOwner::new(
+        base.unbind(),
+        ptr as *const u8,
         len,
-        _keep: base.unbind(),
-    }))
+    )))
 }
 
 fn payload_parts(py: Python<'_>, data: &Bound<'_, PyAny>, usage: PayloadUse) -> PyResult<Parts> {
@@ -1853,7 +1944,7 @@ mod tests {
             for mode in BOTH {
                 let got = put_payload_from_py(py, b.as_any(), mode).unwrap();
                 assert_eq!(got.as_ptr(), src, "bytes was copied ({mode:?})");
-                // dropping off the GIL defers the decref instead of blocking
+                // dropped off the GIL: the owner queues the decref, it never blocks
                 py.detach(move || drop(got));
             }
         });

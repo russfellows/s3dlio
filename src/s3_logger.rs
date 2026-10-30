@@ -811,6 +811,9 @@ pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
 /// clone, but its entries are rejected (`LogOutcome::Closed`) once finalize runs,
 /// and stay rejected after a later re-init: it never writes into a newer session.
 pub fn global_logger() -> Option<Logger> {
+    // Taken by every store lookup, so the fork handlers must exist before the first fork even
+    // if no session is ever started (an atomic load once registered; #297).
+    fork_safety::register();
     match &*lock_state() {
         OpLogState::Active(session) => Some(session.logger.clone()),
         OpLogState::Uninitialized | OpLogState::Finalized(_) => None,

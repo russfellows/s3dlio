@@ -33,8 +33,9 @@ in `Runtime::drop`.
   now s3dlio's own pool (not rayon's global one), built on the first parallel call, and every parallel iterator in
   s3dlio (`generate_data`, `generate_data_with_threads`, `generate_into_buffer`, `generate_npz_bytes`, the in-place
   fill, one-shot generation in `data_gen_alt`) runs inside it. `configure_tokio_threads(n)` still sets the sizes; it
-  builds nothing. BEHAVIOUR CHANGE: s3dlio no longer configures rayon's global pool (an application that uses rayon
-  itself gets rayon's defaults, `RAYON_NUM_THREADS`); `s3dlio::s3_client::rayon_pool_threads()` reports the size of
+  builds nothing. BEHAVIOUR CHANGE: s3dlio no longer pre-sizes rayon's GLOBAL pool at import. A Rust caller of
+  `configure_thread_pools(n)` who relied on that and uses rayon itself now gets rayon's defaults (`RAYON_NUM_THREADS`), and
+  `ThreadPoolBuilder::build_global()` after the import now succeeds (it used to return `Err`: the pool already existed); `s3dlio::s3_client::rayon_pool_threads()` reports the size of
   s3dlio's own pool.
 - **tokio's `parking_lot` feature is removed** (`tokio` is now built without `full`), and the `parking_lot` dependency
   is gone; the sync loader iterators use `std::sync::Mutex`. A thread parked in parking_lot leaves an entry in a
@@ -44,19 +45,28 @@ in `Runtime::drop`.
   `parking_lot_core`. Throughput of dropping the feature (release builds, identical sources, 8 interleaved rounds on a
   busy shared host, Python `get` on tmpfs, medians): 16 MiB +2 to +8% (1, 8 and 32 threads), 1 MiB +1% at 8 threads and
   +73% at 32 threads, 4 KiB +10% at 8 threads and +87% at 32 threads; `get_into_local_bench` `file://` variants within
-  the noise (-1% to +22%, 3 rounds). No slowdown was measured.
-- **Known limits.** (1) A parent thread that holds pyo3's own reference-pool mutex at the instant of the fork can hang the
-  child's first Python call; it affects every PyO3 extension and only pyo3 can fix it. Measured: 0 hangs in 500 forks of
-  an idle parent (the DataLoader pattern), about 2% with four parent threads busy in s3dlio calls, 1 to 9% with eight
-  threads in a tight loop (all 55 examined with gdb were this mutex; no crash in 3000 children). A parent with busy s3dlio
-  threads should prefer `spawn`/`forkserver`. (2) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware
+  the noise (-1% to +22%, 3 rounds). No slowdown was measured. The explanation (tokio's inject queue and park/unpark mutexes under 32-way contention are cheaper as std futex mutexes than through parking_lot's hash table) is INFERRED, not profiled.
+- **No Python reference is ever dropped without the GIL, and the op-log lock is fork-safe.** The first release candidate
+  still hung 1 to 9% of children when the parent had busy threads: not a pyo3 limit but s3dlio's own off-GIL drops.
+  pyo3 registers a `Py<..>` dropped on a thread without the GIL in a process-global mutex, and a parent thread holding it
+  at the fork left the child's first Python call waiting for ever. The sources (found by instrumenting pyo3,
+  3295 samples) were (a) the `bytes` of an exact-`bytes` put dying on a Tokio worker or inside `py.detach`
+  (`put_bytes`, async puts, checkpoint saves) and (b) pyo3-async-runtimes dropping a spare reference per awaitable on a
+  Tokio worker. (a) now queues the reference for a thread that holds the GIL; (b) is replaced by an s3dlio-owned
+  `future_into_py` whose references are consumed under the GIL. Independently, `global_logger()` (taken on every store
+  lookup) locks the op-log state, and the #294 fork handlers that hold that lock across a fork were registered only
+  by `init_op_logger`: a parent that never used the op-log left it locked in the child. They are now registered by
+  `global_logger()` too. CI builds a wheel with `--cfg pyo3_disable_reference_pool` (an off-GIL drop aborts) and runs the
+  fork, async-exit and put-release tests with it; released wheels keep the default pool.
+- **The lock rule.** Every process-global lock of s3dlio lives in a `ForkCell`, except `OP_LOG_STATE` (and the client-id
+  lock), which the #294 atfork handlers hold across the fork.
+- **Known limits (none observed as a hang).** (1) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware
   rayon pool: a streaming `Generator`/`ObjectGen` created in a child whose ancestor already created one is limited to
-  one thread (correct, slower) until dgen-data is fork-aware. (3) The remaining `dashmap` users (the parquet index and
-  file-metadata caches, the redirect certificate store, the store cache) park only on contended shard locks held for a
-  hash operation. (4) Rust callers that fork must not use a store, writer or generator created before the fork.
-  (5) std's process-wide environment lock: the child's rebuild reads settings with `std::env::var`, so a parent thread
-  that was inside `std::env::set_var` at the fork (s3dlio does that in `configure_s3` and when it applies a `.env` file)
-  leaves the lock held in the child. The warning line itself reads `S3DLIO_FORK_WARN` with `getenv`, so it cannot hang.
+  one thread (correct, slower) until dgen-data is fork-aware. (2) `OnceLock`/`Lazy` initialisation that is in progress on
+  another parent thread at the fork (a one-time, microseconds-wide window at first use), dashmap's parking_lot table and
+  tracing's callsite registry (third party). (3) Rust callers that fork must not use a store, writer or generator
+  created before the fork. (4) std's environment lock: only `configure_s3` calls `set_var`, with the GIL held, which the
+  forking thread holds; the warning line reads `S3DLIO_FORK_WARN` with `getenv`.
 - Tests: `python/tests/test_fork_297.py` (parent states x child entry points, inherited objects, drop/exit, warnings,
   fork while parent threads run s3dlio calls, nested fork, `multiprocessing` fork Pool, DataLoader, exec, a mock S3
   server proving the child opens its own connection, a mock multipart upload the child must not abort),

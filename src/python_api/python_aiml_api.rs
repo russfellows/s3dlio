@@ -1674,6 +1674,7 @@ where
     let payload = put_payload(py, data, PayloadUse::Blocking)?;
     let bytes = payload.bytes;
     let result = py.detach(move || run(bytes));
+    super::put_payload::drain_pending_exports(py); // #297: a queued `bytes` reference
     if let Some(latch) = &payload.latch {
         if quiesce_blocking(py, latch).is_err() {
             let outcome = match &result {

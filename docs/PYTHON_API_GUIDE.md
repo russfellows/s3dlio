@@ -2172,20 +2172,17 @@ Practical advice:
   (and `configure_tokio_threads(n)`) so N workers do not each start one thread per core.
 - A process that execs after fork (`subprocess`, `os.execv`) is a new program: nothing applies.
 
-Known limits (fork cannot be made fully safe from a library):
+Known limits (none observed as a hang):
 
-- If another parent thread holds **PyO3's internal reference-pool mutex** at the instant of the
-  fork, the child's first Python call can wait for it for ever. Every PyO3 extension has this
-  window; only PyO3 can close it (the lock is private to PyO3, taken on every attach, and
-  held for a few instructions). Measured on a 96-core host, forking children back to back: 0 hangs
-  in 500 forks of an idle parent (the `DataLoader` pattern), 1 in 500 with two parent threads busy in
-  s3dlio calls, about 2% with four, and 1 to 9% (it depends on the load of the host) when eight parent
-  threads call s3dlio in a tight loop at the instant of each fork. All 55 hangs that were examined
-  with gdb were this mutex; no crash in 3000 children. If your parent has busy s3dlio threads when it
-  forks workers, prefer `spawn` or `forkserver`, or start the workers before those threads.
+- s3dlio never drops a Python reference without the GIL and its op-log lock is protected by fork
+  handlers, so a busy parent can fork safely: measured 0 hangs in several thousand forked children
+  with 4 and 8 parent threads calling s3dlio in a tight loop (see the Changelog). Earlier
+  builds hung 1 to 9% of such children; that was s3dlio's own off-GIL drops, not a PyO3 limit.
 - A streaming `Generator` created in a child whose ancestor already created one runs with one
   thread (dgen-data's pool is not fork-aware): correct, slower.
-- Fork from inside a thread-local destructor is not protected.
+- Fork from inside a thread-local destructor is not protected; one-time `OnceLock`/`Lazy`
+  initialisation that is running on another thread at the fork, and third-party tables (dashmap,
+  tracing), are theoretical windows.
 
 ### Python Convenience Helpers
 

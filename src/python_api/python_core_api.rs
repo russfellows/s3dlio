@@ -1593,6 +1593,9 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move { put_verified_with_retry(store.as_ref(), &uri, data_owned).await })
     });
+    // The payload (exact `bytes`) may have been released into the queue by a thread without the
+    // GIL: release it here, with this thread's GIL (#297).
+    super::put_payload::drain_pending_exports(py);
     // The put is over (it succeeded, failed, or the store gave up), but a backend may still hold
     // a clone of the payload (an SDK/hyper task, a detached writer). Wait until the LAST clone is
     // gone (the owner's drop), then release the export with this thread's real GIL token: the
@@ -2052,7 +2055,8 @@ fn prepare_guard<'py>(
 
 /// Counters of the buffer-export barrier (diagnostics and tests):
 /// `{"quiesce_timeouts", "queued", "internal_errors", "shutdown_attach_waits",
-/// "shutdown_attach_wait_timeouts", "releaser_attaches", "test_releaser_parked"}`.
+/// "shutdown_attach_wait_timeouts", "releaser_attaches", "test_releaser_parked", "deferred_decrefs",
+/// "async_gilref_deferred"}`.
 #[pyfunction]
 fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let s = export_stats();
@@ -2067,6 +2071,8 @@ fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     )?;
     d.set_item("releaser_attaches", s.releaser_attaches)?;
     d.set_item("test_releaser_parked", s.test_releaser_parked)?;
+    d.set_item("deferred_decrefs", s.deferred_decrefs)?;
+    d.set_item("async_gilref_deferred", s.async_gilref_deferred)?;
     Ok(d)
 }
 

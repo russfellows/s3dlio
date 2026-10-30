@@ -35,12 +35,22 @@
 //!
 //! The parent is never affected: a child only builds new state or touches its own copy.
 //!
-//! # What this cannot fix
+//! # The lock rule
 //!
-//! A lock that a parent thread holds at the instant of the fork stays locked in the child. s3dlio
-//! uses [`ForkCell`] for every lock-protected process-global that matters, so none of ITS locks
-//! can be inherited locked on the paths a child runs; a third-party lock (pyo3's reference pool
-//! mutex) can, and only the owner of that lock can fix it. See `docs/PYTHON_API_GUIDE.md`.
+//! A lock that a parent thread holds at the instant of the fork stays locked in the child. So:
+//! every process-global lock of s3dlio is inside a [`ForkCell`] (a child never touches the
+//! inherited one), EXCEPT `OP_LOG_STATE` (and the client-id lock), which the #294 `pthread_atfork`
+//! prepare/parent/child handlers hold across the fork; those handlers are registered by
+//! `init_op_logger` AND by `global_logger()` (taken on every store lookup), so they exist in any
+//! process that did s3dlio I/O.
+//!
+//! pyo3's own reference-pool mutex is taken off the GIL only by a `Py<..>` dropped on a thread
+//! without the GIL; s3dlio never does that (see `put_payload.rs`, `async_bridge.rs`), so no
+//! thread can hold it while the forking thread (which holds the GIL) forks.
+//!
+//! What remains (third party or one-time, none observed as a hang): std's environment lock (only
+//! `configure_s3` calls `set_var`, with the GIL held), `OnceLock`/`Lazy` initialisation in
+//! progress at the fork, dashmap's parking_lot table, tracing's callsite registry.
 
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
