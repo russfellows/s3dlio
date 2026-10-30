@@ -10,12 +10,6 @@ unit tests and Jupyter use. The lifecycle is now `Uninitialized` -> `Active` -> 
 session at a time, any number in a process. This supersedes the "One op-log session per process (#170)" behaviour
 listed under 0.10.0.
 
-Async calls (`get_async`, `put_bytes_async`, `mkdir_async`, `put_many_async`, `get_many_async`, the `MultiEndpointStore`
-methods, `get_item`, ...) capture the op-log session when the call is made, not when the runtime first polls the future,
-so an awaitable created in session 1 never writes into session 2 and one created while the op-log is off is never
-logged (this was a rare race; test: `tests/test_oplog_async_call_time_294.py`, which uses the hidden hook
-`s3dlio._hold_async_runtime()`).
-
 - **Init after a finalize** starts a new session: the file is created and truncated like a first init (a different
   path leaves the finished log untouched, the same path replaces it), with a fresh `Logger`, `op_log_stats()`
   restarting at zero (the new session's counts, never a sum) and a clock offset of 0. The process client ID carries
@@ -68,6 +62,18 @@ logged (this was a rare race; test: `tests/test_oplog_async_call_time_294.py`, w
   `tests/oplog_lifecycle_same_file_spellings.rs`, `tests/oplog_lifecycle_cycles_no_leaks.rs` and
   `tests/oplog_lifecycle_active_file_gone_or_odd.rs` (replacing `oplog_lifecycle_reinit_rejected.rs`). CI's Python job
   now also runs `tests/test_oplog_store_cache.py` and the permutation matrix.
+- **Async calls bind to the session active when the call is made** (not when the runtime first polls the future):
+  `get_async`, `get_range_async`, `put_bytes_async`, `put_many_async`, `mkdir_async`, `put_async`, `get_many_async`,
+  `get_many_stats_async` and the `MultiEndpointStore` async methods take the logger synchronously, so an awaitable
+  created in session 1 never writes into session 2 and one created while the op-log is off is never logged (this was a
+  rare race). **Datasets and loaders** (`create_dataset`, `create_async_loader`, `PyS3AsyncDataLoader`, ...) over
+  `s3://` capture the logger when they are CONSTRUCTED and use it for every fetch, like stores, readers and writers: one
+  built before `init_op_log` is never logged, one built in session 1 never writes into session 2. The synchronous
+  `get_many` on `s3://` takes the logger once, at entry: a call still running when `finalize_op_log()` runs writes no row
+  for the requests it starts afterwards, even if a new session has begun.
+- **Test hook:** `tests/test_oplog_async_call_time_294.py` makes the race deterministic with the hidden
+  `s3dlio._hold_async_runtime()`, which exists only in wheels built with the non-default `test-hooks` cargo feature (CI's
+  test wheel); the published wheels do not contain it, and `publish-pypi.yml` asserts that.
 
 ### Added — Caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267)
 

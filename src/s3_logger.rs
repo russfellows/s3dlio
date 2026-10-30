@@ -832,6 +832,10 @@ tokio::task_local! {
 /// #294): a call made in session 1 never writes into session 2 and a call made while the op-log
 /// is off is never logged. Code that cannot take the logger as a parameter (the S3 helper rows)
 /// reads it through this function.
+///
+/// The scope is a tokio task-local: it covers the scoped future and what it awaits ON THE SAME TASK. A
+/// `tokio::spawn` below a `Rows::Write` helper silently falls back to [`global_logger`], so such a
+/// spawn must be given the logger (see `get_objects_parallel_logged`).
 pub(crate) fn call_logger() -> Option<Logger> {
     CALL_LOGGER
         .try_with(Clone::clone)

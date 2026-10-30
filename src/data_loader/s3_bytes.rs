@@ -26,6 +26,11 @@ pub struct S3BytesDataset {
     reader_mode: ReaderMode,
     part_size: usize,
     max_inflight_parts: usize,
+    /// The op-log logger of the session that was Active when the dataset was CONSTRUCTED (`None`:
+    /// the op-log was off). Every fetch writes its rows to this logger, never to the session that
+    /// happens to be Active when the fetch runs (issue #294: objects capture the logger at
+    /// construction, like stores, readers and writers).
+    logger: Option<crate::s3_logger::Logger>,
 }
 
 impl S3BytesDataset {
@@ -57,6 +62,7 @@ impl S3BytesDataset {
             reader_mode: opts.reader_mode,
             part_size: opts.part_size,
             max_inflight_parts: opts.max_inflight_parts,
+            logger: crate::s3_logger::global_logger(),
         })
     }
 
@@ -89,6 +95,8 @@ impl Dataset for S3BytesDataset {
     }
 
     async fn get(&self, idx: usize) -> Result<Self::Item, DatasetError> {
+        // The S3 helper rows this fetch writes go to the logger captured at construction.
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
         let key = self
             .keys
             .get(idx)
@@ -231,5 +239,7 @@ impl Dataset for S3BytesDataset {
                 Ok(out.freeze())
             }
         }
+        })
+        .await
     }
 }

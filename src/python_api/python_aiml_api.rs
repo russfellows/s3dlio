@@ -113,12 +113,10 @@ impl PyDataset {
     /// Returns a PyBytesView for zero-copy access
     fn get_item<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Py<PyAny>> {
         let inner = Arc::clone(&self.inner);
-        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
-        let logger = crate::s3_logger::global_logger();
+        // The dataset captured the op-log logger when it was constructed and scopes every fetch
+        // with it (#294), so the awaitable needs nothing here.
         let bound_result = future_into_py(py, async move {
-            let data = crate::s3_logger::scope_call_logger(logger, inner.get(index))
-                .await
-                .map_err(py_err)?;
+            let data = inner.get(index).await.map_err(py_err)?;
             Python::attach(|py| {
                 // Return PyBytesView for zero-copy access
                 let view = PyBytesView::new(data);

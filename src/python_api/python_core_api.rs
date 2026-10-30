@@ -894,7 +894,8 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// ...) look the op-log up on every call: a call made while logging is active is
 /// recorded once, and a call made before init_op_log() or after
 /// finalize_op_log() is not, whichever call first used a given scheme. An
-/// *_async call is checked when it is made, not when the event loop first runs it. Objects
+/// *_async call is checked when it is made, not when the event loop first runs it. Datasets and
+/// loaders over s3:// are objects you construct: they capture the logger at construction. Objects
 /// you construct yourself (stores, readers, writers) capture the logger when
 /// they are constructed: those created before init_op_log() are never logged;
 /// those created before finalize_op_log() stop recording when it runs, and stay

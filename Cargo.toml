@@ -229,6 +229,11 @@ hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys"]  # HDF5 data format support - re
 profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always available
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 
+# TEST BUILDS ONLY (issue #294): registers `s3dlio._hold_async_runtime()`, which freezes every worker of the
+# async runtime so a test can run code between "the call was made" and "its first poll". Never in `default`, never
+# in the PyPI wheels; the publish workflow asserts the released wheels do not contain it.
+test-hooks = []
+
 test-npy-09 = []                     # Test ndarray-npy 0.9 API compatibility (temporary for testing)
 
 [[bench]]
