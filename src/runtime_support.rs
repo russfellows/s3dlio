@@ -286,31 +286,69 @@ pub(crate) fn blocking_io<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Minimum time between two probes after a failed one.
+const PROBE_RETRY_MS: u64 = 1000;
+
+/// Cache of tokio's default worker thread name: only a SUCCESSFUL probe is stored.
+struct NameCache {
+    name: OnceLock<String>,
+    /// Time (milliseconds since the process clock origin, plus one; 0 = never failed) of the last
+    /// failed probe.
+    last_failure_ms: AtomicU64,
+    /// The failure was logged.
+    warned: std::sync::atomic::AtomicBool,
+}
+
+impl NameCache {
+    const fn new() -> Self {
+        Self {
+            name: OnceLock::new(),
+            last_failure_ms: AtomicU64::new(0),
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The cached name; else, unless a probe failed less than [`PROBE_RETRY_MS`] ago, run `probe`.
+    /// A failure is remembered (rate limit) and logged once; it is never cached as a value.
+    fn get(&self, now_ms: u64, probe: impl FnOnce() -> Option<String>) -> Option<&str> {
+        if let Some(name) = self.name.get() {
+            return Some(name.as_str());
+        }
+        let failed_at = self.last_failure_ms.load(Ordering::Relaxed);
+        if failed_at != 0 && now_ms < (failed_at - 1).saturating_add(PROBE_RETRY_MS) {
+            return None;
+        }
+        match probe() {
+            Some(name) => Some(self.name.get_or_init(|| name).as_str()),
+            None => {
+                self.last_failure_ms.store(now_ms + 1, Ordering::Relaxed);
+                if !self.warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "s3dlio: could not measure tokio's default worker thread name; sync \
+                         wrappers called from an unmarked runtime wait without a worker hand-off \
+                         until it succeeds (mark the runtime with mark_tokio_worker_thread)"
+                    );
+                }
+                None
+            }
+        }
+    }
+}
+
 /// The thread name tokio gives its worker AND blocking-pool threads when the builder is not given
 /// one (`"tokio-rt-worker"` in tokio 1.52, `"tokio-runtime-worker"` in older releases). It is
 /// measured, not hard-coded: a throw-away one-worker runtime reports the name of its worker thread.
-/// Only a SUCCESSFUL probe is cached; after a failure (no thread available, ...) it is retried on
-/// a later call, and the failure is logged once. `None` while no probe has succeeded: rule 3 of
-/// [`blocking_wait`] is then off for this call (a plain wait, never a panic).
+/// Only a SUCCESSFUL probe is cached; after a failure (no thread available, ...) it is retried at
+/// most once per second, and the failure is logged once. `None` while no probe has succeeded:
+/// rule 3 of [`blocking_wait`] is then off for this call (a plain wait, never a panic).
 fn default_tokio_thread_name() -> Option<&'static str> {
-    static NAME: OnceLock<String> = OnceLock::new();
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if let Some(name) = NAME.get() {
-        return Some(name.as_str());
-    }
-    match probe_default_tokio_thread_name() {
-        Some(name) => Some(NAME.get_or_init(|| name).as_str()),
-        None => {
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    "s3dlio: could not measure tokio's default worker thread name; sync wrappers \
-                     called from an unmarked runtime will wait without a worker hand-off until \
-                     it succeeds (mark the runtime with mark_tokio_worker_thread)"
-                );
-            }
-            None
-        }
-    }
+    static CACHE: NameCache = NameCache::new();
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    let now_ms = ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    CACHE.get(now_ms, probe_default_tokio_thread_name)
 }
 
 fn probe_default_tokio_thread_name() -> Option<String> {
@@ -550,6 +588,49 @@ mod tests {
         }));
         // The measured default name is a worker name, not empty.
         assert!(default_tokio_thread_name().is_some_and(|n| n.contains("worker")));
+    }
+
+    /// The probe cache: a failure is never cached as a value, retries are rate limited to one per
+    /// second, the failure is logged once, and a success is cached for good.
+    #[test]
+    fn name_probe_failure_is_retried_at_most_once_per_interval() {
+        let cache = NameCache::new();
+        let calls = std::cell::Cell::new(0u32);
+        let probe = |result: Option<&str>| {
+            calls.set(calls.get() + 1);
+            result.map(str::to_owned)
+        };
+        // Fails: rule 3 off, warn flag set, nothing cached.
+        assert_eq!(cache.get(10_000, || probe(None)), None);
+        assert_eq!(calls.get(), 1);
+        assert!(cache.warned.load(Ordering::Relaxed));
+        assert!(cache.name.get().is_none());
+        // Before the interval: the probe is not called (it would succeed, but must not run).
+        assert_eq!(
+            cache.get(10_000 + PROBE_RETRY_MS - 1, || probe(Some("w"))),
+            None
+        );
+        assert_eq!(calls.get(), 1);
+        // A second failure after the interval is another probe, and re-arms the limiter.
+        assert_eq!(cache.get(10_000 + PROBE_RETRY_MS, || probe(None)), None);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            cache.get(11_000 + PROBE_RETRY_MS - 1, || probe(Some("w"))),
+            None
+        );
+        assert_eq!(calls.get(), 2);
+        // After the interval the probe succeeds: cached.
+        assert_eq!(
+            cache.get(11_000 + PROBE_RETRY_MS, || probe(Some("tokio-rt-worker"))),
+            Some("tokio-rt-worker")
+        );
+        assert_eq!(calls.get(), 3);
+        // Never probed again.
+        assert_eq!(
+            cache.get(99_999, || probe(Some("other"))),
+            Some("tokio-rt-worker")
+        );
+        assert_eq!(calls.get(), 3);
     }
 
     /// A panic raised by the closure propagates unchanged on a worker (with the hand-off) and
