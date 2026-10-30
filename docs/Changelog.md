@@ -33,13 +33,18 @@ in `Runtime::drop`.
   now s3dlio's own pool (not rayon's global one), built on the first parallel call, and every parallel iterator in
   s3dlio (`generate_data`, `generate_data_with_threads`, `generate_into_buffer`, `generate_npz_bytes`, the in-place
   fill, one-shot generation in `data_gen_alt`) runs inside it. `configure_tokio_threads(n)` still sets the sizes; it
-  builds nothing.
+  builds nothing. BEHAVIOUR CHANGE: s3dlio no longer configures rayon's global pool (an application that uses rayon
+  itself gets rayon's defaults, `RAYON_NUM_THREADS`); `s3dlio::s3_client::rayon_pool_threads()` reports the size of
+  s3dlio's own pool.
 - **tokio's `parking_lot` feature is removed** (`tokio` is now built without `full`), and the `parking_lot` dependency
   is gone; the sync loader iterators use `std::sync::Mutex`. A thread parked in parking_lot leaves an entry in a
   process-global table that points into its stack; a fork child's own parking_lot use then follows dangling
   pointers: with the feature on, 10 to 37% of children aborted (SIGABRT) in the investigation. A CI guard
   (`scripts/check_fork_safety_deps.sh`) fails if the feature returns or if any crate other than `dashmap` uses
-  `parking_lot_core`. Throughput of the tokio change is in `docs/investigation/` (release build, before/after).
+  `parking_lot_core`. Throughput of dropping the feature (release builds, same sources, interleaved runs on a busy
+  shared host): `get_into_local_bench` and a Python `get` loop moved by less than the run-to-run noise at 1 MiB and
+  below single-threaded, and not in the wrong direction at 4 KiB / 1 MiB with 8 to 32 threads (see the build report
+  numbers in the PR).
 - **Known limits.** (1) A parent thread that holds pyo3's own reference-pool mutex at the instant of the fork can hang the
   child's first Python call; it affects every PyO3 extension and only pyo3 can fix it (idle parent threads, as with a
   DataLoader, are practically never affected). (2) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware
@@ -47,10 +52,15 @@ in `Runtime::drop`.
   one thread (correct, slower) until dgen-data is fork-aware. (3) The remaining `dashmap` users (the parquet index and
   file-metadata caches, the redirect certificate store, the store cache) park only on contended shard locks held for a
   hash operation. (4) Rust callers that fork must not use a store, writer or generator created before the fork.
+  (5) std's process-wide environment lock: the child's rebuild reads settings with `std::env::var`, so a parent thread
+  that was inside `std::env::set_var` at the fork (s3dlio does that in `configure_s3` and when it applies a `.env` file)
+  leaves the lock held in the child. The warning line itself reads `S3DLIO_FORK_WARN` with `getenv`, so it cannot hang.
 - Tests: `python/tests/test_fork_297.py` (parent states x child entry points, inherited objects, drop/exit, warnings,
   fork while parent threads run s3dlio calls, nested fork, `multiprocessing` fork Pool, DataLoader, exec, a mock S3
-  server proving the child opens its own connection), the `fork_guard` unit tests (rebuild in the child, claim takeover,
-  a panic in `init` releases the claim, recursive init is detected, the no-drop rule) and `src/fork_tests.rs`.
+  server proving the child opens its own connection, a mock multipart upload the child must not abort),
+  `python/tests/stress_fork_297.py`, the `fork_guard` unit tests (rebuild in the child, claim takeover, a panic in
+  `init` releases the claim, recursive init is detected, the no-drop rule) and `tests/fork_globals_297.rs` (runtime,
+  rayon pool and data generation in a fork child).
 
 ### Fixed — Op-log can be restarted after `finalize_op_log()` (#294)
 

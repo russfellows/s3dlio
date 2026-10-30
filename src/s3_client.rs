@@ -145,12 +145,6 @@ pub(crate) fn rayon_pool() -> &'static rayon::ThreadPool {
 static RAYON_POOL: crate::fork_guard::ForkCell<rayon::ThreadPool> =
     crate::fork_guard::ForkCell::new();
 
-/// Test hook: whether THIS process built s3dlio's rayon pool (an inherited one does not count).
-#[cfg(test)]
-pub(crate) fn rayon_pool_built_here() -> bool {
-    RAYON_POOL.get().is_some()
-}
-
 /// Worker threads of s3dlio's rayon pool (builds the pool if it does not exist yet).
 #[doc(hidden)]
 pub fn rayon_pool_threads() -> usize {
@@ -158,8 +152,10 @@ pub fn rayon_pool_threads() -> usize {
 }
 
 /// Run `f` inside s3dlio's rayon pool: any `par_iter`/`par_chunks_mut` it uses runs on the
-/// pool's threads. The one way s3dlio uses rayon.
-pub(crate) fn with_rayon_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+/// pool's threads. The one way s3dlio uses rayon (and the way to run your own parallel work on
+/// a pool that survives a `fork()`: see `fork_guard`).
+#[doc(hidden)]
+pub fn with_rayon_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     rayon_pool().install(f)
 }
 

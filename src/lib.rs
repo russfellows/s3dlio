@@ -30,8 +30,7 @@ pub mod data_formats;
 pub mod dotenv; // `.env` handling: the one S3DLIO_LOAD_DOTENV switch (#243)
 pub mod download;
 pub mod fork_guard; // #297: fork-aware process-global state (ForkCell, Guarded, ForkStamp)
-#[cfg(all(test, unix))]
-mod fork_tests; // #297: the process-global state in a fork child
+
 pub mod memory;
 pub mod object_size_cache; // v0.9.10: Pre-stat size caching for benchmarking
 pub mod progress;

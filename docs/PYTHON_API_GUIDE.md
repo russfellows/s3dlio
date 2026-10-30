@@ -2176,9 +2176,11 @@ Known limits (fork cannot be made fully safe from a library):
 
 - If another parent thread holds **PyO3's internal reference-pool mutex** at the instant of the
   fork, the child's first Python call can wait for it for ever. Every PyO3 extension has this
-  window; only PyO3 can close it. It is tiny (nanoseconds) and practically only seen when parent
-  threads hammer s3dlio calls while a fork happens; idle parent threads (the `DataLoader` pattern)
-  are not affected.
+  window; only PyO3 can close it (the lock is private to PyO3, taken on every attach, and
+  held for a few instructions). Measured on a 96-core host: 0 hangs in 500 forks of a parent that
+  was idle or had two threads busy in s3dlio calls, and 2 to 3 hangs per 300 forks of a parent whose
+  eight threads called s3dlio in a tight loop at the instant of each fork (every one diagnosed with
+  gdb to this mutex). Idle parent threads (the `DataLoader` pattern) are not affected in practice.
 - A streaming `Generator` created in a child whose ancestor already created one runs with one
   thread (dgen-data's pool is not fork-aware): correct, slower.
 - Fork from inside a thread-local destructor is not protected.

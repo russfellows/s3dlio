@@ -237,9 +237,14 @@ jobs:
         run: scripts/check_fork_safety_deps.sh
 
       # The fork-safety unit tests (ForkCell rebuild in a child, claim takeover, panic in init,
-      # recursion, the no-drop rule) and the process-global state in a fork child.
+      # recursion, the no-drop rule), and the process-global state (runtime, rayon pool,
+      # data generation) in a fork child; the second one is its own test binary, like the
+      # op-log fork tests, because fork() in a process that runs unrelated tests on other
+      # threads can inherit a lock they hold.
       - name: Test (Rust - fork safety)
-        run: cargo test --release --lib --offline fork
+        run: |
+          cargo test --release --lib --offline fork_guard
+          cargo test --release --offline --test fork_globals_297
 
       # delete_batch bucket/server grouping (#179).  The integration test runs
       # against an in-process mock S3 endpoint (no network, no credentials).

@@ -7,10 +7,11 @@
     python stress_fork_297.py [CHILDREN=250] [BUSY_THREADS=8] [HANG_S=30]
 
 The parent keeps BUSY_THREADS threads inside s3dlio calls (get / list / put / async get / datagen
-/ checkpoint) and two kinds of PARKED threads (one blocked inside `s3dlio.get` on a FIFO, two
-consumers of one loader iterator, one blocked in the loader's blocking receive while the other
-waits for its lock), then forks CHILDREN children back to back. Each child does a small s3dlio
-workload and, one time in five, forks a grandchild that does the same.
+/ checkpoint) and PARKED threads (one blocked inside `s3dlio.get` on a mock S3 object that never
+answers, and two consumers of one loader iterator over such an object: one blocked in the loader's
+blocking receive, the other parked on the iterator's lock), then forks CHILDREN children back to
+back. Each child does a small s3dlio workload and, one time in five, forks a grandchild that does
+the same.
 
 Prints one JSON summary. A child that hangs is attached to with gdb (when installed) and its
 backtraces are written next to the script's scratch directory, so a hang can be attributed (or
@@ -38,16 +39,36 @@ HANG_S = float(sys.argv[3]) if len(sys.argv) > 3 else 30.0
 PR_SET_PTRACER = 0x59616D61
 PR_SET_PTRACER_ANY = ctypes.c_ulong(-1).value
 
+MOCK = r"""
+import http.server, socketserver, sys, os, time
+port, release = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def do_GET(self):
+        while not os.path.exists(release): time.sleep(0.05)      # the parked threads wait here
+        self.send_response(200); self.send_header("Content-Length", "5"); self.end_headers(); self.wfile.write(b"hello")
+    do_HEAD = do_GET
+class S(socketserver.ThreadingMixIn, http.server.HTTPServer): daemon_threads = True; allow_reuse_address = True
+S(("127.0.0.1", port), H).serve_forever()
+"""
+import socket as _socket
+with _socket.socket() as _s:
+    _s.bind(("127.0.0.1", 0))
+    MOCK_PORT = _s.getsockname()[1]
+os.environ.update(
+    AWS_ENDPOINT_URL=f"http://127.0.0.1:{MOCK_PORT}", AWS_ACCESS_KEY_ID="t", AWS_SECRET_ACCESS_KEY="t",
+    AWS_REGION="us-east-1", AWS_EC2_METADATA_DISABLED="true",
+)
 D = tempfile.mkdtemp(prefix="stress297_")
+RELEASE = f"{D}/release"
+_mock = subprocess.Popen([sys.executable, "-c", MOCK, str(MOCK_PORT), RELEASE])
+time.sleep(0.5)
 for i in range(4):
     with open(f"{D}/o{i}.bin", "wb") as f:
         f.write(bytes([i]) * 65536)
 URI = f"file://{D}/o0.bin"
 DIR = f"file://{D}/"
-FIFO_GET = f"{D}/fifo_get"
-FIFO_LOADER = f"{D}/fifo_loader"
-os.mkfifo(FIFO_GET)
-os.mkfifo(FIFO_LOADER)
 
 stop = threading.Event()
 
@@ -79,12 +100,12 @@ def busy(k):
 
 def blocked_get():
     try:
-        s3dlio.get(f"file://{FIFO_GET}")
+        s3dlio.get("s3://bkt/slow_get")
     except BaseException:  # noqa: BLE001
         pass
 
 
-ds = s3dlio.PyDataset.from_uris([f"file://{FIFO_LOADER}"])
+ds = s3dlio.PyDataset.from_uris(["s3://bkt/slow_loader"])
 loader = s3dlio.PyBytesAsyncDataLoader(ds, {"batch_size": 1})
 SHARED_IT = iter(loader)
 
@@ -101,7 +122,7 @@ threads += [threading.Thread(target=blocked_get, daemon=True)]
 threads += [threading.Thread(target=consumer, daemon=True) for _ in range(2)]
 for t in threads:
     t.start()
-time.sleep(1.0)
+time.sleep(1.5)
 
 
 def child_work(depth):
@@ -184,13 +205,9 @@ for i in range(N):
 
 parked_alive = [t.is_alive() for t in threads[BUSY:]]  # the parked threads are still parked
 stop.set()
-for fifo in (FIFO_GET, FIFO_LOADER):  # release the parked threads
-    try:
-        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-        os.write(fd, b"x" * 10)
-        os.close(fd)
-    except OSError:
-        pass
+open(RELEASE, "w").close()  # release the parked threads
+time.sleep(0.5)
+_mock.kill()
 summary = {
     "children": N, "busy_threads": BUSY, "seconds": round(time.time() - t_start, 1),
     "parked_threads_alive_at_end": parked_alive, "results": res, "crashes": crashes, "hang_backtraces": hangs, "scratch": D,

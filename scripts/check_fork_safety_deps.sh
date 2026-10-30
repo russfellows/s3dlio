@@ -26,8 +26,8 @@ for entry in "${sets[@]}"; do
   # shellcheck disable=SC2086
   feats="$(cargo tree -e features -i tokio $args 2>&1)" || { echo "cargo tree failed for [$name]:"; echo "$feats"; exit 2; }
   if grep -E 'tokio feature "(parking_lot|full)"' <<<"$feats" >/dev/null; then
-    echo "FAIL [$name]: tokio is built with a feature that enables parking_lot:"
-    grep -E 'tokio feature "(parking_lot|full)"' <<<"$feats"
+    echo "FAIL [$name]: tokio is built with a feature that enables parking_lot (first matches):"
+    grep -E 'tokio feature "(parking_lot|full)"' <<<"$feats" | sed -n '1,3p'
     fail=1
   else
     echo "ok   [$name]: tokio has no parking_lot feature"

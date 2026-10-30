@@ -88,6 +88,33 @@ pub fn register() {
 }
 
 /// `true` unless `S3DLIO_FORK_WARN` is `0`/`false`/`no`/`off`.
+///
+/// Read with `libc::getenv`, not `std::env::var`: std keeps a process-wide lock around the
+/// environment, and a parent thread that was inside `std::env::set_var` at the fork leaves that
+/// lock held for ever in the child. This is the first thing a child does after it notices the
+/// fork, so it must not be able to hang (found by a stress run of the unit tests, where other
+/// tests call `set_var` all the time). A fork child has one thread, so nothing races the read.
+#[cfg(unix)]
+fn warning_enabled() -> bool {
+    // SAFETY: a NUL-terminated name; the returned pointer is read at once.
+    let p = unsafe { libc::getenv(c"S3DLIO_FORK_WARN".as_ptr()) };
+    if p.is_null() {
+        return true;
+    }
+    // SAFETY: `getenv` returned a NUL-terminated string.
+    warn_value_enabled(unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes())
+}
+
+/// The value of `S3DLIO_FORK_WARN` says "warn" unless it is `0`/`false`/`no`/`off`.
+#[cfg(unix)]
+fn warn_value_enabled(v: &[u8]) -> bool {
+    let v = v.trim_ascii();
+    !(v == b"0"
+        || v.eq_ignore_ascii_case(b"false")
+        || v.eq_ignore_ascii_case(b"no")
+        || v.eq_ignore_ascii_case(b"off"))
+}
+#[cfg(not(unix))]
 fn warning_enabled() -> bool {
     !matches!(
         std::env::var("S3DLIO_FORK_WARN")
@@ -467,6 +494,9 @@ pub(crate) mod test_support {
         // SAFETY: the child runs the closure and `_exit`s.
         let pid = unsafe { libc::fork() };
         if pid == 0 {
+            // Let the parent attach gdb to a child that hangs (ptrace_scope=1 forbids it
+            // otherwise): PR_SET_PTRACER, PR_SET_PTRACER_ANY.
+            unsafe { libc::prctl(0x5961_6d61, libc::c_ulong::MAX, 0, 0, 0) };
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(false);
             unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
@@ -479,6 +509,22 @@ pub(crate) mod test_support {
                 break;
             }
             if std::time::Instant::now() > deadline {
+                // Say where the child hangs (best effort: needs gdb).
+                if let Ok(out) = std::process::Command::new("gdb")
+                    .args([
+                        "-p",
+                        &pid.to_string(),
+                        "-batch",
+                        "-ex",
+                        "thread apply all bt 25",
+                    ])
+                    .output()
+                {
+                    eprintln!(
+                        "HUNG fork child {pid}:\n{}",
+                        String::from_utf8_lossy(&out.stdout)
+                    );
+                }
                 unsafe { libc::kill(pid, libc::SIGKILL) };
                 unsafe { libc::waitpid(pid, &mut status, 0) };
                 return -9;
@@ -670,6 +716,16 @@ mod tests {
             1,
             "the parent drops its own normally"
         );
+    }
+
+    #[test]
+    fn s3dlio_fork_warn_values() {
+        for off in ["0", "false", "FALSE", " no ", "Off", "off\n"] {
+            assert!(!warn_value_enabled(off.as_bytes()), "{off:?}");
+        }
+        for on in ["1", "true", "yes", "on", "", "anything"] {
+            assert!(warn_value_enabled(on.as_bytes()), "{on:?}");
+        }
     }
 
     /// The warning is printed once per process, and not at all with S3DLIO_FORK_WARN=0.

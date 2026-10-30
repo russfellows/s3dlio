@@ -72,6 +72,9 @@ static DGEN_POOL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// pool in dgen-data (reported in #297).
 pub(crate) fn fork_safe_config(mut config: GeneratorConfig) -> GeneratorConfig {
     use std::sync::atomic::Ordering;
+    // A Rust caller that only ever uses streaming generators has touched no `ForkCell`: make
+    // sure the fork handler exists, or a child would never see its epoch change.
+    crate::fork_guard::register();
     let epoch = crate::fork_guard::epoch();
     match DGEN_POOL_EPOCH.compare_exchange(0, epoch + 1, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {}
