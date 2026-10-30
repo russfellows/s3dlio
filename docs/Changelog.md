@@ -1,5 +1,68 @@
 # s3dlio Changelog
 
+## Unreleased — Caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267)
+
+The caller-buffer GET and the typed HEAD that v0.10.0 added for S3, Azure and GCS (#264) now also work
+on the local file stores. `s3dlio.get_into_async("file:///path", buf, expected_len=n)`,
+`s3dlio.get_into_async("direct:///path", ...)` and `s3dlio.head_async(...)` no longer raise
+`UnsupportedOperationError`, and `object_capabilities` reports `get_into: True, head: True` for both
+schemes (in every build, including `arrow-backend`: the local file stores do not depend on a backend). The
+Rust methods are `ObjectStore::get_into` and `ObjectStore::head` on `FileSystemObjectStore` and
+`ConfigurableFileSystemObjectStore` (so also on every store `store_for_uri*` and `direct_io_store_for_uri*`
+build for these schemes, with or without the op-log wrapper).
+
+**Added**
+- `get_into` for `file://`: `pread` straight into the caller's buffer, in chunks of at most 16 MiB. No other
+  buffer of the object's size is allocated.
+- `get_into` for `direct://` (and for any store configured with `direct_io`, whatever the URI scheme, like its
+  `get`): a destination whose address is a multiple of the store alignment is read with O_DIRECT straight into
+  it, no copy. An unaligned address, and the sub-alignment tail of an aligned destination whose length is not a
+  multiple of the alignment, go through the existing shared bounce pool (`read_direct_into`, formerly the
+  test-only `read_all_direct_into`): the kernel fills an aligned bounce buffer and the bytes are copied once into
+  the destination. That copy is the documented O_DIRECT exception of Rule #1 and is bounded by the pool's buffers.
+  A file below the store's minimum direct size, and a filesystem that refuses O_DIRECT (counted in
+  `direct_io_counters().get_fallbacks`), are read with ordinary positional reads, still straight into the buffer.
+- `head` for both schemes, from `stat`: `HeadMetadata { size, etag: Some("file-<size>-<mtime seconds>"), version_id: None }`
+  (the identity `stat` reports), `Ok(None)` for a missing file or a path below a regular file, an error for a
+  directory or any non-regular file and for a refusal (`Forbidden`).
+- The #264 contract: `dst.len()` is the expected length, and the file's size is checked BEFORE anything is read, so a
+  file of another size is `LengthMismatch { expected, actual: Some(file size) }` with nothing written (and the size is
+  re-checked after the read, so a file that changed under it is an error too); a missing file is `NotFound`, an
+  unreadable one `Forbidden`, a directory `Other`; nothing is ever written past the destination; progress counts the
+  distinct destination positions filled, recorded after each copy (`SpanMark::record_copy`); the op-log writes exactly
+  one GET row (bytes = progress, also on an error) and one HEAD row.
+- Cancellation: `dst` is a borrowed `&mut [u8]`, so it is never given to `spawn_blocking`. Every read runs inside the
+  poll of the returned future (`block_in_place` on a multi-thread runtime, inline on a current-thread one), one chunk
+  at a time with a yield between chunks: dropping the future or aborting its task stops it at a chunk boundary with no
+  writer left. In Python the read runs on the runtime without the GIL.
+- `examples/get_into_local_bench.rs`: `get_into` against the allocating `get` (see Performance).
+
+**Changed (BEHAVIOUR CHANGE).** `object_capabilities("file://...")` and `("direct://...")` were `get_into: False, head: False`;
+they are now `True, True`, and `get_into_async` / `head_async` on those URIs read instead of raising
+`UnsupportedOperationError` synchronously. Code that used the `UnsupportedOperationError` to choose a fallback for
+local files no longer needs it. The Python mapping is as for the other schemes: `ObjectNotFoundError`,
+`LengthMismatchError`; a directory or a permission error is a `RuntimeError`. `MultiEndpointStore` does not
+implement `get_into` / `head` for any scheme (unchanged).
+
+**Performance** (Rust, release build, local NVMe ext4, 96-core box, median of 7 calls after a warm-up;
+`examples/get_into_local_bench.rs`; GiB/s, higher is better). `file://` is page-cache warm unless marked cold
+(every call after `echo 3 > /proc/sys/vm/drop_caches`).
+
+| scheme / state | size | `get` (allocates) | `get_into` reused buffer | `get_into` fresh buffer |
+|---|---|---|---|---|
+| `file://` warm | 64 MiB | 1.62 | 7.58 | 2.15 |
+| `file://` warm | 1 GiB | 1.99 | 7.47 | 1.99 |
+| `file://` cold | 1 GiB | 1.61 | 3.60 | 1.67 |
+| `direct://` aligned | 64 MiB | 2.08 | 4.23 | 2.42 |
+| `direct://` aligned | 1 GiB | 2.92 | 4.94 | 2.72 |
+| `direct://` unaligned (bounce) | 1 GiB | 2.92 | 3.15 (reused) | n/a |
+
+Reading into a buffer you already own is 3.7x (`file://`, warm) and 1.7x (`direct://`, aligned) faster than `get`
+for large objects, because the destination's pages are already mapped: the allocating call spends most of its time
+faulting fresh pages in. Into a freshly allocated buffer `get_into` runs at about the speed of `get` (within 10% in
+these runs: it does the same work, plus faulting the pages in). The bounce copy costs about 35% against a reused
+aligned destination, and a reused unaligned destination is still about 8% faster than `get`.
+
 ## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; zero copy everywhere (Rule #1); stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 
 This release adds a new public API surface (#264) and fixes twenty-three issues (#224, #230,

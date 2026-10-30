@@ -22,7 +22,8 @@ use tokio::fs;
 
 use crate::constants::DEFAULT_FILE_RANGE_ENGINE_THRESHOLD;
 use crate::object_store::{
-    CompressionConfig, ObjectMetadata, ObjectProperties, ObjectStore, ObjectWriter,
+    CompressionConfig, HeadMetadata, ObjectMetadata, ObjectProperties, ObjectStore, ObjectWriter,
+    ReceiveProgress,
 };
 
 /// A file modification time as an RFC 3339 UTC string (#263), the form `ObjectMetadata::last_modified`
@@ -501,16 +502,7 @@ impl FileSystemObjectStore {
         // Create ObjectMetadata compatible with S3ObjectStat
         let last_modified = metadata.modified().ok().and_then(modified_time_rfc3339);
 
-        let file_hash = format!(
-            "file-{}-{}",
-            metadata.len(),
-            metadata
-                .modified()
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        );
+        let file_hash = crate::file_get_into::stat_etag(metadata.len(), metadata.modified().ok());
 
         Ok(ObjectMetadata {
             size: metadata.len(),
@@ -721,6 +713,37 @@ impl ObjectStore for FileSystemObjectStore {
             uri
         );
         self.get_simple(uri, file_size).await
+    }
+
+    /// Caller-buffer GET: `pread` straight into `dst` (#295, #267); see
+    /// [`crate::file_get_into`] for the contract, the zero-copy and the cancellation story.
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        if !uri.starts_with("file://") {
+            bail!("FileSystemObjectStore expected file:// URI");
+        }
+        let path = Self::uri_to_path(uri)?;
+        debug!(
+            "FileSystemObjectStore::get_into uri='{}', expected_len={}",
+            uri,
+            dst.len()
+        );
+        let spec = crate::file_get_into::LocalRead {
+            path: &path,
+            provider: "file",
+            direct: None,
+            page_cache: Some(self.config.page_cache_mode.unwrap_or(PageCacheMode::Auto)),
+        };
+        crate::file_get_into::get_into(&spec, dst, progress).await
+    }
+
+    /// Typed HEAD from `stat`: `Ok(None)` for a missing file, an error for a directory.
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        if !uri.starts_with("file://") {
+            bail!("FileSystemObjectStore expected file:// URI");
+        }
+        let path = Self::uri_to_path(uri)?;
+        debug!("FileSystemObjectStore::head uri='{}'", uri);
+        crate::file_get_into::head(&path, "file").await
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {

@@ -457,6 +457,10 @@ async def read(uri):
 data = asyncio.run(read("s3://bucket/key"))
 s3dlio.object_capabilities("s3://bucket/key")  # {"provider": "s3", "get_into": True, "head": True}
 ```
+The same calls work on `file://` and `direct://` (#295): `file://` reads with `pread` straight into
+`buf`; `direct://` reads with O_DIRECT straight into a page-aligned `buf` and copies once, through a
+bounded bounce pool, into an unaligned one (a NumPy slice at an odd address, for example), with no
+whole-object allocation either way. `head_async` returns the size from `stat` and `None` for a missing file.
 Do not touch `buf` until the `await` returns; a size other than `expected_len` raises
 `LengthMismatchError`. See the [Python API guide](docs/PYTHON_API_GUIDE.md#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100).
 

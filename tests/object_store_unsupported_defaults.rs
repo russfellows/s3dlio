@@ -8,8 +8,8 @@
 //
 // * an existing implementer that overrides neither compiles unchanged and answers
 //   `Unsupported`, never a silent fallback to a download plus a copy;
-// * the stores that keep the default this round (here the real file:// and direct://
-//   stores) answer the same way;
+// * (the real file:// and direct:// stores used to keep the default; since #295 / #267 they
+//   override both methods, see the last test);
 // * the destination and the progress are left untouched;
 // * the error names the provider the URI's scheme implies, and its text carries nothing from
 //   the call but the operation name.
@@ -122,17 +122,26 @@ async fn minimal_store_defaults_to_unsupported_for_every_scheme() {
     }
 }
 
-/// The real file:// and direct:// stores keep the default this round: they answer
-/// `Unsupported` rather than silently downloading and copying.
+/// The real file:// and direct:// stores override both methods (#295 / #267): they no longer
+/// answer `Unsupported`; a 16-byte file read into a 16-byte destination succeeds.
 #[tokio::test]
-async fn file_and_direct_stores_keep_the_unsupported_default() {
+async fn file_and_direct_stores_no_longer_use_the_unsupported_default() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("object.bin");
     std::fs::write(&path, b"0123456789abcdef").unwrap();
 
-    for (scheme, provider) in [("file", "file"), ("direct", "direct")] {
+    for scheme in ["file", "direct"] {
         let uri = format!("{scheme}://{}", path.display());
         let store = store_for_uri(&uri).unwrap_or_else(|e| panic!("{uri}: {e:#}"));
-        assert_unsupported(store.as_ref(), &uri, provider).await;
+        let progress = ReceiveProgress::new();
+        let mut dst = [0u8; 16];
+        store
+            .get_into(&uri, &mut dst, &progress)
+            .await
+            .unwrap_or_else(|e| panic!("{uri}: {e:#}"));
+        assert_eq!(&dst, b"0123456789abcdef", "{uri}");
+        assert_eq!(progress.filled(), 16, "{uri}");
+        let head = store.head(&uri).await.unwrap().expect("present");
+        assert_eq!(head.size, 16, "{uri}");
     }
 }

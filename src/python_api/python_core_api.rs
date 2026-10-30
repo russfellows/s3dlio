@@ -6580,8 +6580,9 @@ async def scn_error_then_settle(start):
                 (provider, get_into, head)
             };
             assert_eq!(get("s3://bucket/key"), ("s3".to_string(), native, native));
-            assert_eq!(get("file:///tmp/x"), ("file".to_string(), false, false));
-            assert_eq!(get("direct:///tmp/x"), ("direct".to_string(), false, false));
+            // #295: the local file stores implement both operations in every build.
+            assert_eq!(get("file:///tmp/x"), ("file".to_string(), true, true));
+            assert_eq!(get("direct:///tmp/x"), ("direct".to_string(), true, true));
             assert_eq!(get("ftp://host/x"), ("unknown".to_string(), false, false));
         });
     }
@@ -6617,9 +6618,10 @@ async def scn_error_then_settle(start):
         Python::attach(|py| {
             let driver = Driver::new(py);
             let n = 4i32.into_pyobject(py).unwrap().into_any();
+            // file:// and direct:// are supported since #295; an unknown scheme is not.
             for uri in [
-                "file:///tmp/s3dlio-b3b-unsupported",
-                "direct:///tmp/s3dlio-b3b-x",
+                "ftp://host/s3dlio-b3b-unsupported",
+                "nosuchscheme://s3dlio-b3b-x",
             ] {
                 let ex = driver.exporter(16);
                 let err = get_into_async(py, uri, &ex, &n).expect_err("unsupported");
@@ -8135,20 +8137,20 @@ def metadata_is_immutable_and_hashable(a, b, c):
 def capabilities_dict(core):
     d = core.object_capabilities('file:///x')
     assert type(d) is dict, type(d)
-    assert d == {'provider': 'file', 'get_into': False, 'head': False}, d
+    assert d == {'provider': 'file', 'get_into': True, 'head': True}, d
     return True
 
 def unsupported_is_raised_synchronously(core):
     buf = bytearray(1)
     try:
-        core.get_into_async('file:///x', buf, expected_len=1)
+        core.get_into_async('ftp://host/x', buf, expected_len=1)
     except core.UnsupportedOperationError as e:
         assert isinstance(e, NotImplementedError)
     else:
         raise AssertionError('get_into_async did not raise UnsupportedOperationError')
     buf.append(0)  # nothing was exported
     try:
-        core.head_async('file:///x')
+        core.head_async('ftp://host/x')
     except core.UnsupportedOperationError:
         pass
     else:
@@ -8254,7 +8256,7 @@ def unsupported_is_raised_synchronously(core):
             checks
                 .getattr("unsupported_is_raised_synchronously")
                 .and_then(|f| f.call1((&core,)))
-                .expect("a file:// URI raises UnsupportedOperationError at the call");
+                .expect("an unknown-scheme URI raises UnsupportedOperationError at the call");
         });
     }
 
