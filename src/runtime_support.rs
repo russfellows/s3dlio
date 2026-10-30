@@ -60,6 +60,11 @@
 //! thread a worker can ever be. (There is no per-role hook: a thread is a `spawn_blocking`
 //! thread and a worker thread at different times, and the names are shared.)
 //!
+//! The marker follows the THREAD, not the runtime. A thread that carries it keeps it whatever it
+//! does next: a marked `spawn_blocking` thread of runtime A that drives a `LocalSet` on ANY
+//! runtime, even an unmarked runtime B (`b.block_on(local.run_until(read))`), also needs
+//! [`inline_blocking_io`] (see `tests::a_marked_thread_driving_a_localset_on_another_runtime_needs_the_inline_scope`).
+//!
 //! The price: `spawn_blocking` threads of the same runtime carry the marker too. That is
 //! harmless for every closure except one: a `spawn_blocking` closure that drives a
 //! [`tokio::task::LocalSet`] itself (`handle.block_on(local.run_until(..))`) and runs s3dlio
@@ -81,9 +86,12 @@
 //! # drop(rt);
 //! ```
 //!
-//! Without the opt-in the file stores still work in every context; they just run each read
-//! chunk (at most 16 MiB) inline on the polling worker instead of handing the worker's queue
-//! off first, so a neighbouring task can wait for up to one chunk. The trade-off, measured with
+//! Without the opt-in the file stores still work in every context; they just run every blocking
+//! step inline on the polling worker: `direct://` and `file://` reads (open, each chunk of at most
+//! 16 MiB, finish), `file://` borrowed-slice writes, and the `direct://` writer's O_DIRECT write
+//! chunks, per-chunk fsync (`sync_writes`), `sync_all()` and finalize (sync, buffered tail append,
+//! fsync). That is every caller of the crate-internal `blocking_io`. Nothing hands the worker's
+//! queue off first, so a neighbouring task can wait for up to one chunk. The trade-off, measured with
 //! `examples/runtime_handoff_bench.rs` (release build, 96-core Linux box, 4 workers, 1 GiB
 //! file in the warm page cache on ext4, `get_into` into a reused buffer):
 //!
@@ -96,6 +104,12 @@
 //! saturated pool measured by the reviewer: about 3 ms against 60 ms.) The hand-off costs about
 //! 2.6 ms per 16 MiB chunk here, so a single reader is about twice as fast inline; s3dlio's own
 //! runtimes keep the hand-off because neighbour latency matters more than one reader's peak.
+//!
+//! The same trade-off for s3dlio's own runtimes as seen from Python (1 GiB `get_into_async`, warm
+//! page cache, single reader; 3 repetitions, noisy, 2-socket box): `file://` 3.8-6.9 GiB/s with the
+//! hand-off against 5.6-7.7 GiB/s inline, `direct://` 4.4-4.8 against 4.9-5.5; a neighbour stalls
+//! about 2 ms with the hand-off against about 10 ms inline (4 readers on 4 workers). Both are far
+//! above the allocating `get` (1.5-2.0 GiB/s).
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -137,6 +151,21 @@ pub fn mark_tokio_worker_thread() {
     MARKED.with(|m| m.set(true));
 }
 
+/// A multi-thread runtime builder whose threads carry the worker marker: the ONE way s3dlio's own
+/// production code builds a multi-thread runtime (`tests::every_production_multi_thread_runtime_is_marked`
+/// scans `src/` and fails on any other `new_multi_thread`). Add the usual `enable_all()`,
+/// `worker_threads(..)`, `thread_name(..)` and `build()`; do not replace the `on_thread_start` hook
+/// (the builder keeps one callback only), call [`mark_tokio_worker_thread`] from yours instead.
+///
+/// Public only because the `s3-cli` binary is a separate crate. Embedders can use it, or the one-line
+/// `on_thread_start` shown in the module documentation; it is not semver-stable API.
+#[doc(hidden)]
+pub fn marked_multi_thread_builder() -> tokio::runtime::Builder {
+    let mut b = tokio::runtime::Builder::new_multi_thread();
+    b.on_thread_start(mark_tokio_worker_thread);
+    b
+}
+
 /// Guard returned by [`inline_blocking_io`]. Not `Send`: it belongs to the thread that made it.
 #[must_use = "the scope ends when the guard is dropped"]
 pub struct InlineBlockingIo {
@@ -175,13 +204,15 @@ pub fn inline_blocking_io() -> InlineBlockingIo {
 }
 
 /// How many times [`blocking_io`] handed a worker off with `block_in_place` in this process.
-/// Test instrumentation, not API.
+/// Test instrumentation, not API: hidden, and NOT semver-stable (it may change or go away in any
+/// release; the integration tests of this crate need it, nothing else should).
 #[doc(hidden)]
 pub fn handoff_count() -> u64 {
     HANDOFFS.load(Ordering::Relaxed)
 }
 
-/// True when [`blocking_io`] would hand the worker off here and now (test instrumentation).
+/// True when [`blocking_io`] would hand the worker off here and now. Test instrumentation, not API:
+/// hidden, and NOT semver-stable (see [`handoff_count`]).
 #[doc(hidden)]
 pub fn would_hand_off() -> bool {
     MARKED.with(|m| m.get())
@@ -449,6 +480,120 @@ mod tests {
             unscoped.is_err(),
             "tokio no longer panics in this case: the inline_blocking_io documentation (and \
              this test) can be relaxed"
+        );
+    }
+
+    /// The marker follows the THREAD, not the runtime: a marked `spawn_blocking` thread of runtime
+    /// A that drives a `LocalSet` on ANY runtime, even an unmarked runtime B, reaches
+    /// `block_in_place` and tokio panics there; `inline_blocking_io` avoids it.
+    #[test]
+    fn a_marked_thread_driving_a_localset_on_another_runtime_needs_the_inline_scope() {
+        fn drive(b: tokio::runtime::Handle, scoped: bool) -> std::thread::Result<u32> {
+            catch_unwind(AssertUnwindSafe(|| {
+                let _inline = scoped.then(inline_blocking_io);
+                let local = tokio::task::LocalSet::new();
+                b.block_on(local.run_until(async {
+                    // The thread is marked (by runtime A) and runtime B is multi-thread.
+                    tokio::task::spawn_local(async { blocking_io(|| 41 + 1) })
+                        .await
+                        .unwrap()
+                }))
+            }))
+        }
+        let a = marked_rt(2);
+        let b = plain_rt(2); // NOT marked
+        let hb = b.handle().clone();
+        let (h1, h2) = (hb.clone(), hb);
+        let scoped = a.block_on(async move {
+            tokio::task::spawn_blocking(move || drive(h1, true))
+                .await
+                .unwrap()
+        });
+        assert_eq!(scoped.expect("with the scope it runs inline"), 42);
+        let unscoped = a.block_on(async move {
+            tokio::task::spawn_blocking(move || drive(h2, false))
+                .await
+                .unwrap()
+        });
+        assert!(
+            unscoped.is_err(),
+            "tokio no longer panics in this case: the documentation (marker follows the thread) \
+             and this test can be relaxed"
+        );
+    }
+
+    /// The builder helper marks every thread of the runtime it builds.
+    #[test]
+    fn marked_builder_marks_workers() {
+        let rt = marked_multi_thread_builder()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(rt.block_on(async { tokio::spawn(async { would_hand_off() }).await.unwrap() }));
+    }
+
+    /// Every production `new_multi_thread` in `src/` goes through `marked_multi_thread_builder`
+    /// (so no s3dlio runtime can lose the marker unnoticed). Test-only modules are exempt, and so
+    /// is this file (it defines the helper).
+    #[test]
+    fn every_production_multi_thread_runtime_is_marked() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(
+            files.len() > 20,
+            "scan found too few files: {}",
+            files.len()
+        );
+        let mut offenders = Vec::new();
+        for f in files {
+            if f.ends_with("runtime_support.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            // Top-level `#[cfg(test)]` items (module or fn) are test code: from the attribute to
+            // the closing `}` in column 0 (or the `;` ending a one-line item).
+            let (mut pending, mut in_test) = (false, false);
+            for (i, line) in text.lines().enumerate() {
+                if in_test {
+                    if line == "}" {
+                        in_test = false;
+                    }
+                    continue;
+                }
+                if line.trim_end() == "#[cfg(test)]" || line.starts_with("#[cfg(all(test") {
+                    pending = true;
+                    continue;
+                }
+                if pending && !line.starts_with("#[") && !line.is_empty() {
+                    pending = false;
+                    if !line.trim_end().ends_with(';') {
+                        in_test = line != "}";
+                    }
+                    continue;
+                }
+                if line.contains("new_multi_thread") && !line.trim_start().starts_with("//") {
+                    offenders.push(format!("{}:{}", f.display(), i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use runtime_support::marked_multi_thread_builder() instead of \
+             Builder::new_multi_thread() in production code: {offenders:?}"
         );
     }
 }

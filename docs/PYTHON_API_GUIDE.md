@@ -590,7 +590,14 @@ stores, with these local specifics:
   read-time version check above uses nanoseconds and is not affected.
 - Embedding in Rust? The file stores hand a runtime worker off around each read chunk only on threads marked with
   `s3dlio::runtime_support::mark_tokio_worker_thread` (s3dlio's own runtimes, including everything the Python
-  module starts, are marked); see the Rust section of the changelog and the `runtime_support` rustdoc.
+  module starts, are marked); an unmarked embedder runtime runs `direct://` / `file://` reads, writes, fsyncs and
+  finalize inline on the polling worker (the remedy is that one `on_thread_start` line; a marked `spawn_blocking`
+  thread that drives a `LocalSet`, on any runtime, needs `inline_blocking_io()`). See the Rust section of the
+  changelog and the `runtime_support` rustdoc.
+- Cost of the hand-off, for the runtimes s3dlio starts for Python (1 GiB `get_into_async`, warm page cache, one reader;
+  3 repetitions, noisy, 2-socket box): `file://` 3.8-6.9 GiB/s against 5.6-7.7 GiB/s without the hand-off,
+  `direct://` 4.4-4.8 against 4.9-5.5. In exchange a neighbouring task stalls about 2 ms instead of about 10 ms
+  (4 readers on 4 workers). Both are far above the allocating `get` (1.5-2.0 GiB/s).
 - The read runs without the GIL, in chunks of at most 16 MiB. Cancelling the awaitable stops it at the next
   chunk boundary; as everywhere, the awaitable ends only after the last write into `dst`.
 

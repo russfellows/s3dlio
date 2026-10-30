@@ -166,7 +166,7 @@ jobs:
           mkdir -p "$S3DLIO_TEST_DIR"
           pip install pytest pytest-asyncio numpy
           python -m pytest -q -rs python/tests/test_get_into_file_direct_295.py \
-            python/tests/test_caller_buffer_get_into.py
+            python/tests/test_caller_buffer_get_into.py python/tests/test_conftest_fail_on_skip_295.py
 
   # Rust-only integration tests that do not depend on the Python version. They
   # run once per OS, in parallel with the `test` matrix, instead of six times

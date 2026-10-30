@@ -110,8 +110,32 @@ build for these schemes, with or without the op-log wrapper).
   on every `block_in_place`; the park hooks fire only on a worker's own park path, so replacement workers would lose
   the marker exactly when the pool is saturated).
 - BEHAVIOUR CHANGE for embedders: a multi-thread runtime that is NOT marked used to get `block_in_place` for the
-  `file://` writer's borrowed-slice writes (and for the new reads); it now runs them inline (never a panic).
-  Add the one-line `on_thread_start` to keep the hand-off.
+  `file://` writer's borrowed-slice writes; it now runs ALL of these inline on the polling worker (never a panic):
+  `direct://` and `file://` `get_into` reads (open, each chunk of at most 16 MiB, finish), `file://` borrowed-slice
+  writes, and the `direct://` writer's O_DIRECT write chunks, the per-chunk fsync with `sync_writes`, `sync_all()`,
+  and finalize (`sync_file`, the buffered tail append and its fsync). That is every caller of
+  `runtime_support::blocking_io` (`file_get_into.rs`, `file_store.rs`, `file_store_direct.rs`). The remedy is one line:
+  `.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)` on your multi-thread runtime builder.
+- The marker follows the THREAD, not the runtime. A marked `spawn_blocking` thread of runtime A that drives a
+  `LocalSet` on ANY runtime (even an unmarked runtime B: `b.block_on(local.run_until(read))`) reaches
+  `block_in_place` on a thread that is not a worker and tokio panics there; wrap that closure in
+  `inline_blocking_io()`. A unit test pins both halves (panics without the scope, works with it).
+- Production wiring is guarded: s3dlio's own multi-thread runtimes are all built from
+  `runtime_support::marked_multi_thread_builder()` (hidden, not semver-stable); a source scan test fails on any other
+  `new_multi_thread` in `src/`, and tests build the global, decode (extension-module), checkpoint (extension-module) and
+  CLI runtimes and check that their workers are marked (the global runtime also through a real `file://` `get_into`).
+- CI/test harness: `python/tests/conftest.py` now also turns module-level skips (`pytest.importorskip` at collection)
+  into failures when `S3DLIO_REQUIRE_ODIRECT_TESTS` / `S3DLIO_FAIL_ON_SKIP` is set, and leaves `xfail` tests alone
+  (`python/tests/test_conftest_fail_on_skip_295.py` runs a child pytest and is part of the CI step);
+  `scripts/test_panic_abort_295.sh` finds the binary through `cargo metadata` (`CARGO_TARGET_DIR` / `build.target-dir`)
+  and passes `--offline` only with `S3DLIO_CARGO_OFFLINE=1`.
+- Test probes `would_hand_off` / `handoff_count` are `pub` + `#[doc(hidden)]` because the integration tests need them;
+  they are not semver-stable.
+- Measured trade-off of the hand-off for s3dlio's own runtimes, from Python (1 GiB `get_into_async`, warm page cache,
+  single reader; 3 repetitions, noisy, 2-socket box): `file://` 3.8-6.9 GiB/s with the hand-off against 5.6-7.7 inline;
+  `direct://` 4.4-4.8 against 4.9-5.5. A neighbour's stall is about 2 ms with the hand-off against about 10 ms inline
+  (4 readers on 4 workers). Both are far above the allocating `get` (1.5-2.0 GiB/s), so the hand-off costs a single
+  reader up to about 1.5x but keeps neighbouring tasks responsive.
 - Other `block_in_place` call sites that are NOT changed here and have the same LocalSet limitation
   (`python_core_api.rs` store-builder wait, `s3_client.rs` `run_on_global_rt`, `s3_utils.rs` `stat_object_uri`): follow-up.
 - macOS: the new `get_into` code compiles without `libc::O_DIRECT` (it is Linux only; elsewhere `direct://` reads are

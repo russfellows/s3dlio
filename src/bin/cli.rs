@@ -776,12 +776,28 @@ fn run() -> Result<()> {
         eprintln!("warning: {problem}");
     }
 
-    tokio::runtime::Builder::new_multi_thread()
+    build_runtime()?.block_on(async_main())
+}
+
+/// The CLI's runtime: multi-thread, workers marked for the file-store hand-off (#295).
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    s3dlio::runtime_support::marked_multi_thread_builder()
         .enable_all()
-        .on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)
         .build()
-        .context("failed to build the Tokio runtime")?
-        .block_on(async_main())
+        .context("failed to build the Tokio runtime")
+}
+
+#[cfg(test)]
+mod runtime_marker_tests {
+    #[test]
+    fn cli_runtime_workers_are_marked() {
+        let rt = super::build_runtime().unwrap();
+        assert!(rt.block_on(async {
+            tokio::spawn(async { s3dlio::runtime_support::would_hand_off() })
+                .await
+                .unwrap()
+        }));
+    }
 }
 
 async fn async_main() -> Result<()> {
