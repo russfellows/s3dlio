@@ -7,6 +7,7 @@ use crate::checksum::Crc32c;
 use crate::memory::{AlignedAllocError, AlignedBuf, BufferPool, BufferPoolConfig};
 use crate::object_store::WriterOptions;
 use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
+use crate::runtime_support::blocking_io;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -24,7 +25,9 @@ use crate::constants::{
     DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD, DEFAULT_DIRECT_IO_WRITER_STAGING_SIZE,
     DEFAULT_MIN_IO_SIZE, DEFAULT_PAGE_SIZE, MAX_SINGLE_IO_BYTES,
 };
-use crate::object_store::{CompressionConfig, ObjectMetadata, ObjectStore, ObjectWriter};
+use crate::object_store::{
+    CompressionConfig, HeadMetadata, ObjectMetadata, ObjectStore, ObjectWriter, ReceiveProgress,
+};
 
 /// Configuration options for FileSystem operations
 ///
@@ -279,6 +282,16 @@ static PUT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static DIRECT_GETS: AtomicU64 = AtomicU64::new(0);
 static GET_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
+/// Count one `get_into` that was carried out with O_DIRECT reads.
+pub(crate) fn note_direct_get() {
+    DIRECT_GETS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count one `get_into` where O_DIRECT was refused and the read went through buffered I/O.
+pub(crate) fn note_get_fallback() {
+    GET_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Snapshot of the process-wide [`DirectIoCounters`].
 pub fn direct_io_counters() -> DirectIoCounters {
     DirectIoCounters {
@@ -315,18 +328,6 @@ fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Resul
     let mut f = file;
     f.seek(SeekFrom::Start(offset))?;
     f.write_all(buf)
-}
-
-/// Run blocking file I/O from async code without stalling a runtime worker: on a
-/// multi-thread runtime the worker hands its queue to another thread first; otherwise the
-/// closure just runs inline.
-fn blocking_io<R>(f: impl FnOnce() -> R) -> R {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
 }
 
 /// Allocation function used for bounce buffers (injectable so tests can simulate failure).
@@ -597,7 +598,7 @@ impl AsRef<[u8]> for AlignedBytes {
 
 /// `pread` into raw memory, retrying EINTR. Returns the bytes read (0 at EOF).
 #[cfg(unix)]
-fn pread_raw(
+pub(crate) fn pread_raw(
     file: &std::fs::File,
     buf: crate::direct_bounce::SendPtr,
     len: usize,
@@ -624,48 +625,57 @@ fn pread_raw(
     }
 }
 
-/// Read `file_size` bytes of `file` (opened with O_DIRECT) into `dest` (any alignment) through
-/// the shared bounce pool: the read of chunk `k+1` overlaps the copy of chunk `k`. This is the
-/// building block of a caller-supplied-buffer GET (`get_into`).
+/// Read `len` bytes of `file` (opened with O_DIRECT), starting at file offset `base` (a multiple
+/// of `alignment`), into `dest` (any alignment) through the shared bounce pool: the read of
+/// chunk `k+1` overlaps the copy of chunk `k`. This is the building block of the caller-buffer
+/// GET (`get_into`) for a destination O_DIRECT cannot read into directly; the bounce copy is the
+/// documented, allowed copy of an unaligned destination.
 ///
-/// Errors when the file is shorter than `file_size` (it shrank), so the caller can fall back to
-/// a buffered read.
+/// `copied(offset, len)` is called after each chunk lands in `dest` (`offset` relative to
+/// `dest`), so the caller can report exactly the positions filled.
+///
+/// Fails with `UnexpectedEof` when the file ends before `len` bytes (it shrank), so the caller
+/// can classify it, and with `Interrupted` when `cancel` was set while waiting for buffers.
 ///
 /// # Safety
-/// `dest` must be valid for `file_size` bytes of writes and not be used meanwhile.
+/// `dest` must be valid for `len` bytes of writes and not be used meanwhile.
 #[cfg(unix)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "building block of the later public get_into; only tests call it so far"
-    )
-)]
-pub(crate) unsafe fn read_all_direct_into(
+pub(crate) unsafe fn read_direct_into(
     file: &std::fs::File,
-    file_size: usize,
+    base: u64,
+    len: usize,
     alignment: usize,
     dest: *mut u8,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<()> {
-    use crate::direct_bounce::{pooled_get, SendPtr};
+    copied: &mut dyn FnMut(usize, usize) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use crate::direct_bounce::{pooled_get_with, SendPtr};
 
     let alignment = alignment.max(1);
     let dest = SendPtr(dest);
-    let read_at = |buf, len, off| pread_raw(file, buf, len, off);
-    if pooled_get(file_size, alignment, dest, cancel, &read_at)? {
+    let read_at = |buf, want, off| pread_raw(file, buf, want, base + off);
+    if pooled_get_with(len, alignment, dest, cancel, &read_at, copied)? {
         return Ok(());
     }
     // The pool could not serve the read: one private bounce buffer (implicit, counted, outside
     // the pooled cap).
     let size = crate::direct_bounce::config()
         .buffer_size
-        .min(round_up(file_size, alignment));
-    let buf = AlignedBuf::new(size, alignment)?;
+        .min(round_up(len, alignment));
+    let buf = AlignedBuf::new(size, alignment)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
     crate::direct_bounce::note_implicit_bounce(crate::direct_bounce::Direction::Get, size);
     let ptr = [SendPtr(buf.as_ptr() as *mut u8)];
-    crate::direct_bounce::pingpong_get(file_size, alignment, size, dest, &ptr, &read_at, &|_| {})?;
-    Ok(())
+    crate::direct_bounce::pingpong_get_with(
+        len,
+        alignment,
+        size,
+        dest,
+        &ptr,
+        &read_at,
+        &|_| {},
+        copied,
+    )
 }
 
 /// Read `file_size` bytes from `file` (opened with O_DIRECT) and return them as `Bytes` backed by
@@ -1305,16 +1315,7 @@ impl ConfigurableFileSystemObjectStore {
             .ok()
             .and_then(crate::file_store::modified_time_rfc3339);
 
-        let file_hash = format!(
-            "file-{}-{}",
-            metadata.len(),
-            metadata
-                .modified()
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        );
+        let file_hash = crate::file_get_into::stat_etag(metadata.len(), metadata.modified().ok());
 
         Ok(ObjectMetadata {
             size: metadata.len(),
@@ -2003,6 +2004,45 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
 
         // Use simple read for small files or when RangeEngine disabled
         self.get_simple(uri, size).await
+    }
+
+    /// Caller-buffer GET (#295, #267), for `file://` and `direct://` URIs alike, read the way
+    /// this store's `get` reads: with O_DIRECT when `direct_io` is set (an aligned destination
+    /// straight into the caller's buffer, an unaligned one through the bounce pool), with
+    /// positional buffered reads otherwise. See [`crate::file_get_into`].
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        if !Self::is_valid_file_uri(uri) {
+            bail!("FileSystemObjectStore expected file:// or direct:// URI");
+        }
+        let path = Self::uri_to_path(uri)?;
+        debug!(
+            "ConfigurableFileSystemObjectStore::get_into uri='{}', expected_len={}",
+            uri,
+            dst.len()
+        );
+        let spec = crate::file_get_into::LocalRead {
+            path: &path,
+            provider: crate::file_get_into::provider_of(uri),
+            direct: self
+                .config
+                .direct_io
+                .then(|| crate::file_get_into::DirectParams {
+                    alignment: self.alignment(),
+                    min_io_size: self.config.min_io_size,
+                }),
+            page_cache: None,
+        };
+        crate::file_get_into::get_into(&spec, dst, progress).await
+    }
+
+    /// Typed HEAD from `stat`: `Ok(None)` for a missing file, an error for a directory.
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        if !Self::is_valid_file_uri(uri) {
+            bail!("FileSystemObjectStore expected file:// or direct:// URI");
+        }
+        let path = Self::uri_to_path(uri)?;
+        debug!("ConfigurableFileSystemObjectStore::head uri='{}'", uri);
+        crate::file_get_into::head(&path, crate::file_get_into::provider_of(uri)).await
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
@@ -3050,11 +3090,13 @@ mod direct_io_chunking_tests {
                 .custom_flags(libc::O_DIRECT)
                 .open(d.path().join("probe"));
             if let Err(e) = probe {
-                eprintln!(
-                    "SKIPPED: {} does not support O_DIRECT ({e}); set S3DLIO_TEST_DIR to a \
+                let msg = format!(
+                    "{} does not support O_DIRECT ({e}); set S3DLIO_TEST_DIR to a \
                      directory on a real filesystem (not tmpfs)",
                     d.path().display()
                 );
+                // CI sets S3DLIO_REQUIRE_ODIRECT_TESTS=1: a skip is then a failure.
+                crate::test_env::skip(&msg);
                 return None;
             }
             Some(d)
@@ -3190,12 +3232,14 @@ mod direct_io_chunking_tests {
                     let mut dest = vec![0x77u8; len + off + 8];
                     // SAFETY: dest has room for len bytes at off.
                     unsafe {
-                        read_all_direct_into(
+                        read_direct_into(
                             &rf,
+                            0,
                             len,
                             A,
                             dest.as_mut_ptr().add(off),
                             &NEVER_CANCELLED,
+                            &mut |_, _| Ok(()),
                         )
                     }
                     .unwrap();
@@ -3225,7 +3269,15 @@ mod direct_io_chunking_tests {
             }
             let mut dest = vec![0u8; 16 * MIB];
             assert!(unsafe {
-                read_all_direct_into(&rf, 16 * MIB, A, dest.as_mut_ptr(), &NEVER_CANCELLED)
+                read_direct_into(
+                    &rf,
+                    0,
+                    16 * MIB,
+                    A,
+                    dest.as_mut_ptr(),
+                    &NEVER_CANCELLED,
+                    &mut |_, _| Ok(()),
+                )
             }
             .is_err());
         }

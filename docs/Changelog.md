@@ -1,6 +1,6 @@
 # s3dlio Changelog
 
-## Unreleased
+## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267)
 
 ### Fixed
 
@@ -99,6 +99,185 @@
     module-level calls look the op-log up on every call, so they need no change.
   - Tests: `tests/oplog_lifecycle_reinit_{after_finalize,same_path,waits_for_drain,old_store}.rs`
     (replacing `oplog_lifecycle_reinit_rejected.rs`) and `tests/test_oplog_lifecycle.py`.
+### Added — Caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267)
+
+The caller-buffer GET and the typed HEAD that v0.10.0 added for S3, Azure and GCS (#264) now also work
+on the local file stores. `s3dlio.get_into_async("file:///path", buf, expected_len=n)`,
+`s3dlio.get_into_async("direct:///path", ...)` and `s3dlio.head_async(...)` no longer raise
+`UnsupportedOperationError`, and `object_capabilities` reports `get_into: True, head: True` for both
+schemes (in every build, including `arrow-backend`: the local file stores do not depend on a backend). The
+Rust methods are `ObjectStore::get_into` and `ObjectStore::head` on `FileSystemObjectStore` and
+`ConfigurableFileSystemObjectStore` (so also on every store `store_for_uri*` and `direct_io_store_for_uri*`
+build for these schemes, with or without the op-log wrapper).
+
+**Added**
+- `get_into` for `file://`: `pread` straight into the caller's buffer, in chunks of at most 16 MiB. No other
+  buffer of the object's size is allocated.
+- `get_into` for `direct://` (and for any store configured with `direct_io`, whatever the URI scheme, like its
+  `get`): a destination whose address is a multiple of the store alignment is read with O_DIRECT straight into
+  it, no copy. An unaligned address, and the sub-alignment tail of an aligned destination whose length is not a
+  multiple of the alignment, go through the existing shared bounce pool (`read_direct_into`, formerly the
+  test-only `read_all_direct_into`): the kernel fills an aligned bounce buffer and the bytes are copied once into
+  the destination. That copy is the documented O_DIRECT exception of Rule #1 and is bounded by the pool's buffers.
+  A file below the store's minimum direct size, and a filesystem that refuses O_DIRECT (counted in
+  `direct_io_counters().get_fallbacks`), are read with ordinary positional reads, still straight into the buffer.
+  The refusal path is tested against a real refusing filesystem (ramfs) by the opt-in
+  `tests/direct_get_into_no_odirect_fs_295.rs` (set `S3DLIO_TEST_NO_ODIRECT_DIR`; see `docs/Environment_Variables.md`).
+- `head` for both schemes, from `stat`: `HeadMetadata { size, etag: Some("file-<size>-<mtime seconds>"), version_id: None }`
+  (the identity `stat` reports), `Ok(None)` for a missing file or a path below a regular file, an error for a
+  directory or any non-regular file and for a refusal (`Forbidden`).
+- The #264 contract: `dst.len()` is the expected length, and the file's size is checked BEFORE anything is read, so a
+  file of another size is `LengthMismatch { expected, actual: Some(file size) }` with nothing written (and the size is
+  re-checked after the read, so a file that changed under it is an error too); a missing file is `NotFound`, an
+  unreadable one `Forbidden`, a directory `Other`; nothing is ever written past the destination; progress counts the
+  distinct destination positions filled, recorded after each copy (`SpanMark::record_copy`); the op-log writes exactly
+  one GET row (bytes = progress, also on an error) and one HEAD row.
+- Cancellation: `dst` is a borrowed `&mut [u8]`, so it is never given to `spawn_blocking`. Every read runs inside the
+  poll of the returned future (`block_in_place` on a marked worker of a multi-thread runtime, inline everywhere else; see
+  "Runtime support"), one chunk at a time with a yield between chunks: dropping the future or aborting its task stops it at
+  a chunk boundary with no writer left. In Python the read runs on the runtime without the GIL.
+- A file that is modified WHILE it is read is an error, never `Ok` with mixed data. The open file's `mtime` and
+  `ctime` (nanoseconds) are recorded when it is opened and compared after the last chunk: a different size is
+  `LengthMismatch` (with the size it has now); the same size but a changed `mtime` or `ctime` (an overwrite in place,
+  truncate-then-regrow, a replacement by `rename`, a deletion, or a `chmod`/`chown`/hard link, which also move
+  `ctime`) is `VersionChanged` ("the object changed after the read pinned its version"; in Python a `RuntimeError`
+  whose message says "version changed"). The check is conservative about metadata changes and cannot see a change
+  that leaves both timestamps as they were: on Linux a write always moves `ctime`, but the kernel clock that stamps
+  it is coarse (one tick, 1-10 ms on ext4, finer with multigrain timestamps on recent kernels), so a write in the
+  SAME tick as the last change before the read opened the file, made while the read runs, goes unseen; filesystems with
+  one- or two-second timestamps (some network and legacy filesystems) widen that window; a write through a shared
+  `mmap` updates the timestamps only when the kernel writes the page back. A retry after `VersionChanged` or
+  `LengthMismatch` is always safe.
+- `examples/get_into_local_bench.rs`: `get_into` against the allocating `get` (see Performance).
+
+**Hardened after review (same release)**
+- No panic in any polling context, and no panic machinery. `block_in_place` panics ("can call blocking only when
+  running on the multi-threaded runtime") inside a tokio `LocalSet` that a non-worker thread drives on a multi-thread
+  runtime (`rt.block_on(local.run_until(..))`, `LocalSet::block_on`, `spawn_local` inside either), which used to take
+  `file://` and `direct://` `get_into` and the `direct://` writer down. The first fix probed `block_in_place` under
+  `catch_unwind` with a process-wide chained panic hook; the second review found that this aborts the process under
+  `panic = "abort"`, that every panic hook an application installs later sees one false panic per probe, and that a
+  genuine panic of tokio's could be swallowed. The probe, the hook and `catch_unwind` are gone. The shared helper
+  (`runtime_support::blocking_io`) decides from thread-local state and tokio's public API alone: it calls
+  `block_in_place` only on a thread carrying the worker marker, on a multi-thread runtime, outside an
+  `inline_blocking_io()` scope, and runs the closure inline everywhere else; a panic in the closure propagates
+  unchanged. See "Runtime support" below.
+- A mid-read fall back from O_DIRECT (the kernel answers EINVAL for a later chunk) now clears `O_DIRECT` on the SAME open
+  file descriptor (`fcntl(F_SETFL)`) instead of reopening the path, so a rename-replace between two chunks can no
+  longer feed the rest of the read from another file. Progress is not double counted for the chunk that is read twice.
+- A filesystem that refuses O_DIRECT is logged at WARN once per process and at DEBUG afterwards (it used to log a WARN for
+  every call); `direct_io_counters().get_fallbacks` still counts every call.
+- A read that hits the end of the file says so (`<path> ended during the read, after N bytes had been read; its size
+  is now M bytes ...`); a file that was truncated and refilled to its old size is `VersionChanged` rather than the old
+  "expected N bytes, got N". The `std::thread::scope` helper thread that an unaligned `direct://` read starts for each 16 MiB
+  chunk costs 54 us (median of 2000): 64 chunks per GiB is 3.5 ms against 254 ms for a 1 GiB bounce read
+  (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=4`, 4.03 GiB/s), 1.4%, so it was left as is.
+- `get_into` on `direct://` always sends an unaligned destination through the shared bounce pool
+  (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, `_PAIRS_PER_NODE`, `_WHEN_BUSY` apply) and does NOT honour
+  `S3DLIO_DIRECT_IO_GET_MODE`: `direct` mode of the allocating `get` means one fresh aligned buffer of the OBJECT'S size,
+  which a bounded, caller-buffer GET must never allocate. A Python `bytearray` is only 16-byte aligned, so on `direct://` it
+  always takes the bounce copy; see "Local files" in the Python API guide for page-aligned buffers.
+- Tests added: file changes during the read (grow, shrink, truncate-and-regrow, in-place overwrite, rename-replace,
+  unlink, chmod, concurrent reader) in both schemes, aligned and unaligned destinations
+  (`tests/get_into_mid_read_295.rs`, deterministic: the future is polled by hand once, the file changed, the future polled
+  to the end); a mid-read EINVAL, the page-cache hint (`mincore`), the file identity and the fallback log
+  (`src/file_get_into_tests.rs`); 4 MiB bounce buffers over a size sweep at 16 MiB +- 1 and unaligned addresses
+  (`tests/direct_get_into_small_bounce_295.rs`); 24 concurrent unaligned reads through a one-pair pool in both busy policies on a
+  one-worker multi-thread and a current-thread runtime, in child processes under a timeout
+  (`tests/direct_get_into_tiny_pool_295.rs`); op-log rows of a failed, a dropped and an unpolled `get_into`
+  (`tests/oplog_file_get_into_midread_295.rs`: a failed read is one GET row with the bytes filled so far, a dropped one is one
+  row with `error = cancelled` and the count at the drop, an unpolled one no row: the same as the network stores); an
+  unreadable zero-byte file is `Ok` without being opened. The Python test helper `aligned_view` could return a view cut
+  short at some page offsets (flaky) and is fixed and tested over 400 random allocations.
+
+**Runtime support (public, Rust).** New module `s3dlio::runtime_support`:
+- `mark_tokio_worker_thread()`: pass it to `tokio::runtime::Builder::on_thread_start` of a multi-thread runtime you
+  build yourself to get the worker hand-off for `file://` / `direct://` reads and writes. s3dlio's own multi-thread
+  runtimes (the global runtime, the Python decode and checkpoint runtimes, the CLI) already do. Without it the file
+  stores work in every context but run each read chunk (at most 16 MiB) inline on the polling worker: a
+  neighbouring task can wait up to one chunk, and a single reader is about twice as fast. Measured with
+  `examples/runtime_handoff_bench.rs` (release, 96-core Linux, 4 workers, 1 GiB warm file on ext4): single reader
+  3.3 GiB/s with the hand-off against 7.4 GiB/s inline; with 4 readers saturating the 4 workers a neighbour's
+  1 ms timer fires late by p99 1.8 ms / max 2.1 ms with the hand-off against p99 9.8 ms / max 10.8 ms inline (on tmpfs
+  max 2.0 against 14.9 ms; the reviewer's heavier saturation: about 3 ms against 60 ms). The hand-off costs about 2.6 ms per
+  16 MiB chunk on this box; s3dlio's own runtimes keep it because neighbour latency matters more than one reader's peak.
+- `inline_blocking_io()`: a guard that keeps the file stores inline on this thread while it lives. Needed in exactly
+  one case: a `spawn_blocking` closure, on a runtime whose threads carry the marker, that drives a `LocalSet` itself
+  and runs s3dlio file I/O in it (tokio gives the library no way to tell that thread from a worker, and `block_in_place`
+  panics there). Why the marker is set at thread start rather than by the park hooks, and why that is robust:
+  see the module documentation (tokio's workers are blocking-pool threads and a worker's core moves between them
+  on every `block_in_place`; the park hooks fire only on a worker's own park path, so replacement workers would lose
+  the marker exactly when the pool is saturated).
+- BEHAVIOUR CHANGE for embedders: a multi-thread runtime that is NOT marked used to get `block_in_place` for the
+  `file://` writer's borrowed-slice writes; it now runs ALL of these inline on the polling worker (never a panic):
+  `direct://` and `file://` `get_into` reads (open, each chunk of at most 16 MiB, finish), `file://` borrowed-slice
+  writes, and the `direct://` writer's O_DIRECT write chunks, the per-chunk fsync with `sync_writes`, `sync_all()`,
+  and finalize (`sync_file`, the buffered tail append and its fsync). That is every caller of
+  `runtime_support::blocking_io` (`file_get_into.rs`, `file_store.rs`, `file_store_direct.rs`). The remedy is one line:
+  `.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)` on your multi-thread runtime builder.
+- The marker follows the THREAD, not the runtime. A marked `spawn_blocking` thread of runtime A that drives a
+  `LocalSet` on ANY runtime (even an unmarked runtime B: `b.block_on(local.run_until(read))`) reaches
+  `block_in_place` on a thread that is not a worker and tokio panics there; wrap that closure in
+  `inline_blocking_io()`. A unit test pins both halves (panics without the scope, works with it).
+- Production wiring is guarded: s3dlio's own multi-thread runtimes are all built from
+  `runtime_support::marked_multi_thread_builder()` (hidden, not semver-stable); a source scan test fails on any other
+  `new_multi_thread` in `src/`, and tests build the global, decode (extension-module), checkpoint (extension-module) and
+  CLI runtimes and check that their workers are marked (the global runtime also through a real `file://` `get_into`).
+- CI/test harness: `python/tests/conftest.py` now also turns module-level skips (`pytest.importorskip` at collection)
+  into failures when `S3DLIO_REQUIRE_ODIRECT_TESTS` / `S3DLIO_FAIL_ON_SKIP` is set, and leaves `xfail` tests alone
+  (`python/tests/test_conftest_fail_on_skip_295.py` runs a child pytest and is part of the CI step);
+  `scripts/test_panic_abort_295.sh` finds the binary through `cargo metadata` (`CARGO_TARGET_DIR` / `build.target-dir`)
+  and passes `--offline` only with `S3DLIO_CARGO_OFFLINE=1`.
+- Test probes `would_hand_off` / `handoff_count` are `pub` + `#[doc(hidden)]` because the integration tests need them;
+  they are not semver-stable.
+- Measured trade-off of the hand-off for s3dlio's own runtimes, from Python (1 GiB `get_into_async`, warm page cache,
+  single reader; 3 repetitions, noisy, 2-socket box): `file://` 3.8-6.9 GiB/s with the hand-off against 5.6-7.7 inline;
+  `direct://` 4.4-4.8 against 4.9-5.5. A neighbour's stall is about 2 ms with the hand-off against about 10 ms inline
+  (4 readers on 4 workers). Both are far above the allocating `get` (1.5-2.0 GiB/s), so the hand-off costs a single
+  reader up to about 1.5x but keeps neighbouring tasks responsive.
+- Other `block_in_place` call sites that are NOT changed here and have the same LocalSet limitation
+  (`python_core_api.rs` store-builder wait, `s3_client.rs` `run_on_global_rt`, `s3_utils.rs` `stat_object_uri`): follow-up.
+- macOS: the new `get_into` code compiles without `libc::O_DIRECT` (it is Linux only; elsewhere `direct://` reads are
+  buffered like the fallback). The crate as a whole still does not build on macOS (`file_store_direct.rs` uses
+  `libc::O_DIRECT` throughout, as before this change).
+- Test and CI: `tests/get_into_panic_hook_295.rs` (an application hook installed after the first read sees zero calls),
+  `tests/get_into_runtime_contexts_295.rs` (every context, marked and unmarked runtimes, `file://` put included),
+  unit tests in `runtime_support` (the rule table, panics propagate on a worker and inline, the hand-off observed
+  with a one-worker runtime), and `scripts/test_panic_abort_295.sh` (builds `examples/abort_localset_295.rs` with the
+  `abort-test` profile, `panic = "abort"`, and requires exit 0). CI now runs every `tests/*_295.rs` binary, the
+  `panic=abort` script and both Python test files; `S3DLIO_REQUIRE_ODIRECT_TESTS=1` (see `docs/Environment_Variables.md`)
+  turns any skip in them into a failure. `the_page_cache_hint_is_applied_and_takes_effect` now uses a real-filesystem
+  scratch directory (`S3DLIO_TEST_DIR`, else `target/tmp`), skips on tmpfs/ramfs (where `DONTNEED` cannot drop anything) and
+  skips when the freshly read file is not fully cached (memory pressure); it used to fail with `TMPDIR=/dev/shm`.
+- Documented limits of the same-size overwrite detection: NFS, Lustre, GPFS, BeeGFS, CephFS and SMB serve cached
+  attributes and coarse or lagging timestamps, so a write by another node can go unseen for seconds (best effort there);
+  the `head` etag has second granularity (a pre-existing format, unchanged).
+
+**Changed (BEHAVIOUR CHANGE).** `object_capabilities("file://...")` and `("direct://...")` were `get_into: False, head: False`;
+they are now `True, True`, and `get_into_async` / `head_async` on those URIs read instead of raising
+`UnsupportedOperationError` synchronously. Code that used the `UnsupportedOperationError` to choose a fallback for
+local files no longer needs it. The Python mapping is as for the other schemes: `ObjectNotFoundError`,
+`LengthMismatchError`; a directory or a permission error is a `RuntimeError`. `MultiEndpointStore` does not
+implement `get_into` / `head` for any scheme (unchanged).
+
+**Performance** (Rust, release build, local NVMe ext4, 96-core box, median of 7 calls after a warm-up;
+`examples/get_into_local_bench.rs`; GiB/s, higher is better). `file://` is page-cache warm unless marked cold
+(every call after `echo 3 > /proc/sys/vm/drop_caches`).
+
+| scheme / state | size | `get` (allocates) | `get_into` reused buffer | `get_into` fresh buffer |
+|---|---|---|---|---|
+| `file://` warm | 64 MiB | 1.62 | 7.58 | 2.15 |
+| `file://` warm | 1 GiB | 1.99 | 7.47 | 1.99 |
+| `file://` cold | 1 GiB | 1.61 | 3.60 | 1.67 |
+| `direct://` aligned | 64 MiB | 2.08 | 4.23 | 2.42 |
+| `direct://` aligned | 1 GiB | 2.92 | 4.94 | 2.72 |
+| `direct://` unaligned (bounce) | 1 GiB | 2.92 | 3.15 (reused) | n/a |
+
+Reading into a buffer you already own is 3.7x (`file://`, warm) and 1.7x (`direct://`, aligned) faster than `get`
+for large objects, because the destination's pages are already mapped: the allocating call spends most of its time
+faulting fresh pages in. Into a freshly allocated buffer `get_into` runs at about the speed of `get` (within 10% in
+these runs: it does the same work, plus faulting the pages in). The bounce copy costs about 35% against a reused
+aligned destination, and a reused unaligned destination is still about 8% faster than `get`.
 
 ## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; zero copy everywhere (Rule #1); stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 

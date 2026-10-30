@@ -32,8 +32,9 @@ fn every_scheme_reports_what_this_build_compiled() {
         ),
         ("gs://bucket/key", "gs", gcs),
         ("gcs://bucket/key", "gs", gcs),
-        ("file:///tmp/x", "file", false),
-        ("direct:///tmp/x", "direct", false),
+        // #295 / #267: the local file stores implement both operations in every build.
+        ("file:///tmp/x", "file", true),
+        ("direct:///tmp/x", "direct", true),
         ("ftp://host/x", "unknown", false),
     ];
     for (uri, provider, supported) in table {
@@ -94,7 +95,8 @@ fn default_build_literal_values() {
         ("s3://bucket/key", "s3", true),
         ("az://account/container/key", "az", false),
         ("gs://bucket/key", "gs", false),
-        ("file:///tmp/x", "file", false),
+        ("file:///tmp/x", "file", true),
+        ("direct:///tmp/x", "direct", true),
         ("ftp://host/x", "unknown", false),
     ] {
         let c = caps(uri);

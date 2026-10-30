@@ -535,12 +535,71 @@ s3dlio.object_capabilities("az://account/container/key")
   on) or the GCS generation.
 - On `s3://` and `gs://`, `head_async` also returns `None` for a missing bucket: the provider
   cannot tell it from a missing object. A missing Azure container raises.
-- Supported: S3 and S3-compatible endpoints, Azure Blob, and native GCS in builds with the GCS
-  backend (the PyPI wheels have S3 and Azure). Not supported: `file://`, `direct://`.
+- Supported: S3 and S3-compatible endpoints, Azure Blob, native GCS in builds with the GCS
+  backend (the PyPI wheels have S3 and Azure), and the local `file://` and `direct://` stores in
+  every build (unreleased, #295, #267; see "Local files" below).
 - Once native work has started, the op-log writes one GET row per `get_into_async` and one HEAD
   row per `head_async`, with the real outcome (also after an error or cancellation). A call
   refused up front writes no row.
 - A call still running when the interpreter exits is not waited for.
+
+**Local files: `file://` and `direct://`.** Both calls work with the same contract as the network
+stores, with these local specifics:
+- `get_into_async` on `file://` is a `pread` straight into `dst`; no other buffer of the object's size
+  is allocated. On `direct://` a destination whose **address** is a multiple of the store alignment
+  (the page size, 4096) is read with O_DIRECT straight into `dst`, with no copy: an aligned NumPy
+  array, an `mmap`, a page-aligned ctypes buffer. The last, sub-alignment part of an object whose
+  size is not a multiple of the alignment, and every byte of a destination at an unaligned address
+  (a `bytearray`, or a NumPy slice at an odd offset), is read through the shared bounce pool: the
+  kernel fills an aligned bounce buffer and the bytes are copied once into `dst`. That copy cannot be
+  avoided (O_DIRECT forbids unaligned memory); it is bounded by the pool's own buffers, never by the
+  size of the object. A file smaller than the store's minimum direct size, and a filesystem that
+  refuses O_DIRECT, are read with ordinary positional reads (still straight into `dst`).
+- A Python `bytearray` (and `bytes`-like buffers from `bytearray(n)`) is only 16-byte aligned, so on `direct://` it
+  ALWAYS takes the bounce copy. To read with no copy, give `get_into_async` page-aligned memory: an anonymous `mmap`
+  (`buf = mmap.mmap(-1, n)`), or a NumPy view cut at a page boundary:
+  ```python
+  raw = np.empty(n + 4096, dtype=np.uint8)
+  dst = raw[(-raw.ctypes.data) % 4096:][:n]      # dst.ctypes.data % 4096 == 0
+  ```
+  `n` need not be a multiple of 4096 (the last, sub-page part is bounced). The bounce pool is shared by every unaligned
+  `direct://` transfer and is tuned by `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE` and
+  `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY`; `get_into_async` ignores `S3DLIO_DIRECT_IO_GET_MODE` (its `direct` mode allocates
+  a buffer of the object's size, which a caller-buffer GET must not do).
+- The size is checked first: a file whose size is not `expected_len` raises `LengthMismatchError`
+  (`.actual` is the file's size) and nothing is written to `dst`. The read is also re-checked at the
+  end, so a file that changed size during the read is an error too (`LengthMismatchError` with the size it has now).
+- A file modified in place while it is read, with its size unchanged (a same-size overwrite, truncate-then-regrow, a
+  replacement by `rename`, a deletion), raises `RuntimeError` ("version changed"), never a successful read of mixed
+  data: the open file's modification and status-change times are compared before and after the read. A metadata-only
+  change (`chmod`, `chown`, a hard link) moves the status-change time and is reported too; retry. Limits: a write
+  in the same kernel timestamp tick (1-10 ms on ext4) as the last change before the read opened the file goes unseen;
+  filesystems with 1-2 s timestamps widen that window; a write through a shared `mmap` is stamped only at write-back.
+  The check cannot protect against a writer that is still writing when the read ends successfully.
+  **Network and cluster filesystems (NFS, Lustre, GPFS, BeeGFS, CephFS, SMB):** the timestamps are the ones the
+  client has cached. Attribute caching (`actimeo`, the revalidation interval), server-to-client clock or mtime lag and
+  coarse timestamp granularity mean a same-size overwrite made by ANOTHER node can go unseen for seconds, so the
+  version check is best effort there (the size check is only as current as the client's cached size). If another
+  node may rewrite a file you are reading, coordinate with a lock or a handshake, or use an object store.
+- A missing file (or a path below a regular file) raises `ObjectNotFoundError`; `head_async` returns `None`.
+  A directory raises `RuntimeError` from both. A file you may not read raises `RuntimeError` naming the
+  permission error (`head_async`, which only needs `stat`, still succeeds).
+- `head_async` is a `stat`: `size`, `etag` = `file-<size>-<mtime seconds>` (the identity
+  `ObjectStore.stat` reports; it is not a content hash) and `version_id` = `None`. The etag has second
+  granularity (a historical format, unchanged): two same-size rewrites within one second share it. The
+  read-time version check above uses nanoseconds and is not affected.
+- Embedding in Rust? The file stores hand a runtime worker off around each read chunk only on threads marked with
+  `s3dlio::runtime_support::mark_tokio_worker_thread` (s3dlio's own runtimes, including everything the Python
+  module starts, are marked); an unmarked embedder runtime runs `direct://` / `file://` reads, writes, fsyncs and
+  finalize inline on the polling worker (the remedy is that one `on_thread_start` line; a marked `spawn_blocking`
+  thread that drives a `LocalSet`, on any runtime, needs `inline_blocking_io()`). See the Rust section of the
+  changelog and the `runtime_support` rustdoc.
+- Cost of the hand-off, for the runtimes s3dlio starts for Python (1 GiB `get_into_async`, warm page cache, one reader;
+  3 repetitions, noisy, 2-socket box): `file://` 3.8-6.9 GiB/s against 5.6-7.7 GiB/s without the hand-off,
+  `direct://` 4.4-4.8 against 4.9-5.5. In exchange a neighbouring task stalls about 2 ms instead of about 10 ms
+  (4 readers on 4 workers). Both are far above the allocating `get` (1.5-2.0 GiB/s).
+- The read runs without the GIL, in chunks of at most 16 MiB. Cancelling the awaitable stops it at the next
+  chunk boundary; as everywhere, the awaitable ends only after the last write into `dst`.
 
 ### list() — List Objects
 
@@ -741,7 +800,9 @@ themselves is outside s3dlio.
 | 1 | **Network / SDK chunk into the destination.** Each chunk the transport hands up is copied once into its final place (the buffer `get()` returns, a window of the range-engine buffer, or your buffer in `get_into_async`) | Every read from `s3://`, `az://`, `gs://`. This is the one unavoidable copy: the chunk belongs to the transport. s3dlio makes it exactly once per byte and never again | Cannot be avoided. `get_into_async` makes it straight into memory you own |
 | 1a | The same, for an S3 response **without `Content-Length`** (chunked body): the chunks are kept and joined once, so the peak is 2x the body | Rare (S3 sends `Content-Length` on every GET) | Nothing to do; a body with a `Content-Length` peaks at 1x |
 | 2 | **Transforms.** zstd compression when writing a shard or stream with a compression option; zstd decoding of a `.zst` checkpoint shard; the little-endian `float32` decode of `read_npz` (the stored member is sliced out of the archive in place and CRC-checked, then each element is decoded into the aligned array NumPy takes over, because the member's bytes are only 1-byte aligned inside the archive); inflating a compressed NPZ member | Only when you use compression or `read_npz` | Write checkpoints uncompressed to skip the encoder and decoder. The zstd decoder pre-sizes its output when the frame header records the size (frames written with a known size); frames from the streaming encoder carry no size, so their output grows as it is read |
-| 3 | **O_DIRECT bounce for unaligned memory.** `direct://` cannot use unaligned memory with `O_DIRECT`, so (a) a PUT from a source whose address is not page-aligned is copied once through a reused aligned bounce buffer, and the last partial block is always bounced; (b) a range-engine read of a large `direct://` object copies each range once from the aligned read buffer into its window of the (unaligned) result; (c) a `direct://` `get_range` served from the shared bounce pool is copied out once, because the pool buffer is reused | `direct://` with O_DIRECT (what `direct://` uses unless configured otherwise) | Use page-aligned memory for PUTs (a `BytesView` from `s3dlio.get("direct://...")` is aligned). A `get_range` whose read buffer is private to the call is returned as a slice with no copy. Buffered `direct://` (O_DIRECT off) has none of these |
+| 3 | **O_DIRECT bounce for unaligned memory.** `direct://` cannot use unaligned memory with `O_DIRECT`, so (a) a PUT from a source whose address is not page-aligned is copied once through a reused aligned bounce buffer, and the last partial block is always bounced; (a2) a `get_into_async` into an unaligned destination (an odd
+address, or the sub-alignment tail of an object whose size is not a multiple of the alignment) is read through the
+bounce pool and copied once into your buffer; an aligned destination is read straight into it; (b) a range-engine read of a large `direct://` object copies each range once from the aligned read buffer into its window of the (unaligned) result; (c) a `direct://` `get_range` served from the shared bounce pool is copied out once, because the pool buffer is reused | `direct://` with O_DIRECT (what `direct://` uses unless configured otherwise) | Use page-aligned memory for PUTs and for `get_into_async` destinations (a `BytesView` from `s3dlio.get("direct://...")` is aligned; a NumPy array whose `ctypes.data` is a multiple of 4096 is too). A `get_range` whose read buffer is private to the call is returned as a slice with no copy. Buffered `direct://` (O_DIRECT off) has none of these |
 | 4 | **Non-contiguous source.** A strided, reversed or transposed array/view must be gathered into logical order | Any write that is given such an array | Pass a C-contiguous array (make it contiguous once, up front, with `np.ascontiguousarray`) |
 | 5 | **Object with only `__bytes__()`.** Python builds one `bytes` for it | A payload that is neither a buffer nor `bytes` | Expose the buffer protocol (or pass a `bytes`/`BytesView`) |
 | 6 | **`bytes`-returning compatibility APIs.** A Python `bytes` owns its memory, so building one from a fetched buffer is one copy: `load_checkpoint_with_validation` (returns `bytes`), `bytes(item)` / `bytes(view)`, `ObjectStoreMapDataset(return_type="bytes")`, and `read()` of the file-like reader of `return_type="reader"` (it returns `bytes` slices, as file objects do; the reader itself holds the fetched buffer without copying it) | Only when you call them | `load_checkpoint_with_validation_view` (a `BytesView`), `memoryview(item)` / `np.frombuffer(item)` / `item.data`, `return_type="tensor"` |
@@ -2118,7 +2179,7 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | Name | Description |
 |------|-------------|
 | `ObjectMetadata` | Frozen value returned by `head_async`: `size`, `etag` (opaque, not an MD5), `version_id` (S3 or Azure version ID when versioning is on, the GCS generation) |
-| `ObjectNotFoundError` | `FileNotFoundError` subclass: `get_into_async` on a missing object |
+| `ObjectNotFoundError` | `FileNotFoundError` subclass: `get_into_async` on a missing object (or a missing `file://` / `direct://` file) |
 | `LengthMismatchError` | `ValueError` subclass with `.expected` and `.actual` (`None` when unknown): the object's size is not `expected_len` |
 | `UnsupportedOperationError` | `NotImplementedError` subclass: the build or provider lacks the operation (no fallback download is attempted) |
 | `ExportStillReferencedError` | A backend still references your buffer after `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`; the buffer stays pinned |

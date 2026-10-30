@@ -86,9 +86,9 @@ const GCS_OFFICIAL_COMPILED: bool = cfg!(feature = "backend-gcs");
 /// | `s3://` | true (native-backend builds) |
 /// | `az://`, Azure blob host | true only when `backend-azure` is compiled |
 /// | `gs://`, `gcs://` | true only with `backend-gcs` (the official SDK) |
-/// | `file://`, `direct://` | false |
+/// | `file://`, `direct://` | true (every build: the local file stores do not depend on a backend) |
 /// | unknown scheme | provider `"unknown"`, false |
-/// | any `arrow-backend` build | false |
+/// | any `arrow-backend` build | false (except `file://` and `direct://`, above) |
 ///
 /// # Errors
 ///
@@ -119,8 +119,9 @@ pub fn object_capabilities(uri: &str) -> Result<Capabilities> {
             let on = NATIVE_BACKENDS && GCS_OFFICIAL_COMPILED;
             Ok(Capabilities::new("gs", on, on))
         }
-        Scheme::File => Ok(Capabilities::new("file", false, false)),
-        Scheme::Direct => Ok(Capabilities::new("direct", false, false)),
+        // The local file stores implement both operations whatever backend is compiled (#295).
+        Scheme::File => Ok(Capabilities::new("file", true, true)),
+        Scheme::Direct => Ok(Capabilities::new("direct", true, true)),
         Scheme::Unknown => Ok(Capabilities::new("unknown", false, false)),
     }
 }
@@ -613,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn file_and_direct_never_support_it() {
+    fn file_and_direct_always_support_it() {
         for (uri, provider) in [
             ("file:///tmp/x", "file"),
             ("file://relative/x", "file"),
@@ -623,8 +624,8 @@ mod tests {
                 caps(uri),
                 Capabilities {
                     provider,
-                    get_into: false,
-                    head: false
+                    get_into: true,
+                    head: true
                 },
                 "{uri}"
             );
@@ -1122,7 +1123,8 @@ mod tests {
             ("s3://bucket/key", "s3", true),
             ("az://account/container/key", "az", false),
             ("gs://bucket/key", "gs", false),
-            ("file:///tmp/x", "file", false),
+            ("file:///tmp/x", "file", true),
+            ("direct:///tmp/x", "direct", true),
             ("ftp://host/x", "unknown", false),
         ] {
             let c = caps(uri);

@@ -29,6 +29,25 @@
 
 use tokio::sync::{Mutex, MutexGuard};
 
+/// True when a test that cannot run on this machine must FAIL instead of skipping
+/// (`S3DLIO_REQUIRE_ODIRECT_TESTS` is `1`, `true` or `yes`; CI sets it so that a runner whose
+/// scratch directory cannot do O_DIRECT or does not cache pages cannot turn the suite into a
+/// quiet no-op).
+pub(crate) fn skips_are_failures() -> bool {
+    std::env::var("S3DLIO_REQUIRE_ODIRECT_TESTS")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Report that a test is skipped; panic instead when [`skips_are_failures`]. Call, then return.
+pub(crate) fn skip(reason: &str) {
+    eprintln!("SKIPPED: {reason}");
+    assert!(
+        !skips_are_failures(),
+        "S3DLIO_REQUIRE_ODIRECT_TESTS is set, so a skipped test is a failure: {reason}"
+    );
+}
+
 static ENV_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Take the guard from a synchronous `#[test]`.

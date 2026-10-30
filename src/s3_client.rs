@@ -17,7 +17,9 @@ use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::{env, thread, time::Duration};
-use tokio::runtime::{Builder as TokioBuilder, Handle};
+#[cfg(feature = "extension-module")]
+use tokio::runtime::Builder as TokioBuilder;
+use tokio::runtime::Handle;
 use tokio::sync::{oneshot, OnceCell};
 use tracing::{debug, info}; // For logging
 
@@ -194,11 +196,7 @@ pub fn configure_thread_pools(threads: usize) {
     // streaming pipeline) -- only present in Python extension builds.
     #[cfg(feature = "extension-module")]
     {
-        let mut builder = TokioBuilder::new_multi_thread();
-        builder.worker_threads(threads);
-        builder.enable_all();
-        builder.thread_name("s3dlio-decode");
-        pyo3_async_runtimes::tokio::init(builder);
+        pyo3_async_runtimes::tokio::init(decode_runtime_builder(threads));
     }
 
     // Rayon global pool (NPZ/data-gen par_chunks_mut hot paths). Ignore the
@@ -210,6 +208,17 @@ pub fn configure_thread_pools(threads: usize) {
         .num_threads(threads)
         .thread_name(|i| format!("s3dlio-rayon-{i}"))
         .build_global();
+}
+
+/// The builder of the pyo3-async-runtimes Tokio runtime (Arrow decode streaming, the async Python
+/// entry points). A function so a test can build it and look at its threads.
+#[cfg(feature = "extension-module")]
+pub(crate) fn decode_runtime_builder(threads: usize) -> TokioBuilder {
+    let mut builder = crate::runtime_support::marked_multi_thread_builder();
+    builder.worker_threads(threads);
+    builder.enable_all();
+    builder.thread_name("s3dlio-decode");
+    builder
 }
 
 /// Returns `true` when `S3DLIO_UNSIGNED_PAYLOAD=1` (or `true`/`yes`/`on`/`enable`).
@@ -267,7 +276,7 @@ pub(crate) fn global_rt_handle() -> &'static Handle {
                 let threads = get_runtime_threads();
                 debug!("Creating Tokio runtime with {} worker threads", threads);
 
-                let rt = TokioBuilder::new_multi_thread()
+                let rt = crate::runtime_support::marked_multi_thread_builder()
                     .enable_io()
                     .enable_time()
                     .worker_threads(threads)
@@ -1141,6 +1150,56 @@ pub(crate) mod issue173_worker_reentrancy_tests {
             Some(r) => assert_eq!(r.expect("foreign worker caller failed"), 9),
             None => panic!("run_on_global_rt from a foreign 1-worker runtime hung"),
         }
+    }
+}
+
+/// Every production runtime must carry the worker marker (#295): the global runtime (the one the
+/// Python entry points and `run_on_global_rt` use) and, under `extension-module`, the decode runtime.
+#[cfg(test)]
+mod runtime_marker_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A real `file://` `get_into` on the global runtime hands the worker off.
+    #[test]
+    fn global_runtime_hands_off_file_get_into() {
+        use crate::object_store::store_for_uri;
+        let dir = std::env::temp_dir().join(format!("s3dlio-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("obj.bin");
+        std::fs::write(&path, vec![7u8; 1 << 20]).unwrap();
+        let uri = format!("file://{}", path.display());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let before = crate::runtime_support::handoff_count();
+        global_rt_handle().spawn(async move {
+            let on_marked = crate::runtime_support::would_hand_off();
+            let store = store_for_uri(&uri).expect("store");
+            let mut buf = vec![0u8; 1 << 20];
+            let progress = crate::object_store::ReceiveProgress::new();
+            let n = store.get_into(&uri, &mut buf[..], &progress).await;
+            let _ = tx.send((on_marked, n.is_ok(), buf[0]));
+        });
+        let (on_marked, ok, b0) = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("read finished");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(on_marked, "a global-runtime worker is not marked");
+        assert!(ok && b0 == 7);
+        assert!(
+            crate::runtime_support::handoff_count() > before,
+            "get_into on the global runtime did not hand the worker off"
+        );
+    }
+
+    #[cfg(feature = "extension-module")]
+    #[test]
+    fn decode_runtime_workers_are_marked() {
+        let rt = decode_runtime_builder(2).build().unwrap();
+        assert!(rt.block_on(async {
+            tokio::spawn(async { crate::runtime_support::would_hand_off() })
+                .await
+                .unwrap()
+        }));
     }
 }
 

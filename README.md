@@ -457,8 +457,22 @@ async def read(uri):
 data = asyncio.run(read("s3://bucket/key"))
 s3dlio.object_capabilities("s3://bucket/key")  # {"provider": "s3", "get_into": True, "head": True}
 ```
+The same calls work on `file://` and `direct://` (#295): `file://` reads with `pread` straight into
+`buf`; `direct://` reads with O_DIRECT straight into a page-aligned `buf` and copies once, through a
+bounded bounce pool, into an unaligned one (a NumPy slice at an odd address, for example), with no
+whole-object allocation either way. `head_async` returns the size from `stat` and `None` for a missing file.
 Do not touch `buf` until the `await` returns; a size other than `expected_len` raises
-`LengthMismatchError`. See the [Python API guide](docs/PYTHON_API_GUIDE.md#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100).
+`LengthMismatchError`, and a local file modified while it is read (same size, new timestamps) raises
+`RuntimeError` ("version changed") instead of returning mixed data. A `bytearray` is only 16-byte aligned, so on
+`direct://` it takes the bounce copy: use an `mmap` or a page-aligned NumPy view for the zero-copy path (see the guide).
+Rust embedders that build their own multi-thread tokio runtime can opt in to the worker hand-off around each read chunk with
+`.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)` (s3dlio's own runtimes already do; without it `direct://`
+and `file://` reads and writes, fsyncs and finalize all run inline on the polling worker and never panic, a single reader is
+up to about 2x faster and neighbouring tasks can wait up to 16 MiB of read time; a marked `spawn_blocking` thread that
+drives a `LocalSet` needs `inline_blocking_io()`; details in `s3dlio::runtime_support`). Tests: `S3DLIO_TEST_DIR` names a real-filesystem scratch directory,
+`S3DLIO_REQUIRE_ODIRECT_TESTS=1` turns skips into failures (CI), and the opt-in
+`tests/direct_get_into_no_odirect_fs_295.rs` needs a ramfs (`S3DLIO_TEST_NO_ODIRECT_DIR`); see
+[docs/Environment_Variables.md](docs/Environment_Variables.md). See the [Python API guide](docs/PYTHON_API_GUIDE.md#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100).
 
 **Writes borrow your buffer (v0.10.0):** async writes read your buffer in place until the `await` finishes; pass
 `borrow=False` for a copy.

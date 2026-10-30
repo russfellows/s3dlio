@@ -377,7 +377,6 @@ pub(crate) fn is_cancelled(e: &anyhow::Error) -> bool {
 }
 
 /// A cancel flag that is never set (callers that cannot be cancelled).
-#[cfg(test)]
 pub(crate) static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1092,6 +1091,7 @@ pub(crate) fn pingpong_put(
 /// # Safety
 /// `dest` must be valid for `file_size` bytes of writes and not used by anything else meanwhile
 /// (it may have any alignment).
+#[cfg(test)]
 pub(crate) unsafe fn pingpong_get(
     file_size: usize,
     align: usize,
@@ -1100,6 +1100,37 @@ pub(crate) unsafe fn pingpong_get(
     bufs: &[SendPtr],
     read_at: &(dyn Fn(SendPtr, usize, u64) -> io::Result<usize> + Sync),
     on_copy: &(dyn Fn(usize) + Sync),
+) -> io::Result<()> {
+    pingpong_get_with(
+        file_size,
+        align,
+        buf_size,
+        dest,
+        bufs,
+        read_at,
+        on_copy,
+        &mut |_, _| Ok(()),
+    )
+}
+
+/// [`pingpong_get`] that also calls `copied(offset, len)` AFTER each chunk has been copied
+/// into `dest` (`offset` is the chunk's position within the transfer), on the calling thread,
+/// so a caller can report progress for exactly the positions that were filled. An error from
+/// `copied` stops the transfer.
+///
+/// # Safety
+/// As [`pingpong_get`].
+// One transfer: geometry, buffers, two I/O hooks and one progress hook; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn pingpong_get_with(
+    file_size: usize,
+    align: usize,
+    buf_size: usize,
+    dest: SendPtr,
+    bufs: &[SendPtr],
+    read_at: &(dyn Fn(SendPtr, usize, u64) -> io::Result<usize> + Sync),
+    on_copy: &(dyn Fn(usize) + Sync),
+    copied: &mut dyn FnMut(usize, usize) -> io::Result<()>,
 ) -> io::Result<()> {
     let align = align.max(1);
     let size = (buf_size / align * align).max(align);
@@ -1126,6 +1157,7 @@ pub(crate) unsafe fn pingpong_get(
             }
             on_copy(k);
             std::ptr::copy_nonoverlapping(bufs[0].0, dest.0.add(k * size), take(k));
+            copied(k * size, take(k))?;
         }
         return Ok(());
     }
@@ -1151,6 +1183,7 @@ pub(crate) unsafe fn pingpong_get(
             }
             on_copy(k);
             std::ptr::copy_nonoverlapping(bufs[k % 2].0, dest.0.add(k * size), take(k));
+            copied(k * size, take(k))?;
         }
         Ok(())
     })?
@@ -1252,6 +1285,22 @@ pub(crate) unsafe fn pooled_get(
     cancel: &AtomicBool,
     read_at: &(dyn Fn(SendPtr, usize, u64) -> io::Result<usize> + Sync),
 ) -> io::Result<bool> {
+    pooled_get_with(file_size, align, dest, cancel, read_at, &mut |_, _| Ok(()))
+}
+
+/// [`pooled_get`] that reports each chunk copied into `dest` through `copied(offset, len)`
+/// (see [`pingpong_get_with`]).
+///
+/// # Safety
+/// As [`pooled_get`].
+pub(crate) unsafe fn pooled_get_with(
+    file_size: usize,
+    align: usize,
+    dest: SendPtr,
+    cancel: &AtomicBool,
+    read_at: &(dyn Fn(SendPtr, usize, u64) -> io::Result<usize> + Sync),
+    copied: &mut dyn FnMut(usize, usize) -> io::Result<()>,
+) -> io::Result<bool> {
     let Some(src) = source(Direction::Get, file_size, align, cancel).map_err(cancelled_io)? else {
         return Ok(false);
     };
@@ -1268,7 +1317,7 @@ pub(crate) unsafe fn pooled_get(
             (&one, b.0.len())
         }
     };
-    pingpong_get(file_size, align, size, dest, bufs, read_at, &|_| {})?;
+    pingpong_get_with(file_size, align, size, dest, bufs, read_at, &|_| {}, copied)?;
     Ok(true)
 }
 

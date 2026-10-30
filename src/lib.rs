@@ -90,10 +90,12 @@ pub mod data_gen;
 pub mod data_gen_alt; // Alternative data generation with ChaCha20
 pub mod data_loader;
 pub mod direct_bounce;
+mod file_get_into; // shared caller-buffer GET + typed HEAD of the file stores (#295)
 pub mod file_store;
 pub mod file_store_direct;
 pub mod object_store_logger; // Op-log support for all backends
 pub mod page_cache;
+pub mod runtime_support; // tokio worker marker + the blocking-I/O rule of the file stores (#295)
 pub mod streaming_writer;
 pub mod tfrecord_index;
 

@@ -1587,7 +1587,7 @@ impl PyAsyncDataLoaderIter {
 /// independently claiming all of them.
 #[cfg(feature = "extension-module")]
 fn build_checkpoint_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
+    crate::runtime_support::marked_multi_thread_builder()
         .worker_threads(crate::constants::effective_thread_budget())
         .enable_all()
         .thread_name("s3dlio-checkpoint")
@@ -4627,5 +4627,19 @@ mod loader_options_tests {
                 ("sequential".to_string(), None, None, None)
             );
         });
+    }
+}
+
+#[cfg(all(test, feature = "extension-module"))]
+mod checkpoint_runtime_marker_tests {
+    /// The checkpoint runtime hands workers off around file I/O (#295).
+    #[test]
+    fn checkpoint_runtime_workers_are_marked() {
+        let rt = super::build_checkpoint_runtime().unwrap();
+        assert!(rt.block_on(async {
+            tokio::spawn(async { crate::runtime_support::would_hand_off() })
+                .await
+                .unwrap()
+        }));
     }
 }

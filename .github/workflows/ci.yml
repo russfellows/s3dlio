@@ -77,8 +77,16 @@ jobs:
       - name: Build (Rust)
         run: cargo build --release --offline
 
+      # S3DLIO_TEST_DIR is a directory on the runner's disk (ext4, supports O_DIRECT and caches
+      # pages); S3DLIO_REQUIRE_ODIRECT_TESTS=1 turns a test that would SKIP (scratch filesystem
+      # without O_DIRECT, tmpfs where the page-cache hint cannot be observed) into a failure.
       - name: Test (Rust)
-        run: cargo test --release --lib --offline
+        env:
+          S3DLIO_REQUIRE_ODIRECT_TESTS: "1"
+        run: |
+          export S3DLIO_TEST_DIR="$GITHUB_WORKSPACE/target/odirect-scratch"
+          mkdir -p "$S3DLIO_TEST_DIR"
+          cargo test --release --lib --offline
 
       # The slower Rust-only integration steps (delete_batch grouping, the
       # GCS/Azure feature build, the op-log lifecycle binaries) run once per OS
@@ -144,6 +152,22 @@ jobs:
           pip install pytest
           python -m pytest -q tests/test_oplog_lifecycle.py tests/test_python_oplog.py \
             tests/test_oplog_store_cache.py tests/test_oplog_lifecycle_permutations_294.py
+
+      # Caller-buffer get_into / typed head / object_capabilities for file:// and direct://
+      # (#295, #267) and the S3 caller-buffer tests, against the wheel installed above. The
+      # scratch directory is on the runner's disk (O_DIRECT works there); with
+      # S3DLIO_REQUIRE_ODIRECT_TESTS=1 python/tests/conftest.py turns EVERY skip in these files
+      # (no O_DIRECT, numpy or pytest-asyncio missing, a wheel without the native S3 path) into a
+      # failure.
+      - name: Test (Python - get_into file:// direct:// and S3 caller-buffer)
+        env:
+          S3DLIO_REQUIRE_ODIRECT_TESTS: "1"
+        run: |
+          export S3DLIO_TEST_DIR="$GITHUB_WORKSPACE/odirect-scratch"
+          mkdir -p "$S3DLIO_TEST_DIR"
+          pip install pytest pytest-asyncio numpy
+          python -m pytest -q -rs python/tests/test_get_into_file_direct_295.py \
+            python/tests/test_caller_buffer_get_into.py python/tests/test_conftest_fail_on_skip_295.py
 
   # Rust-only integration tests that do not depend on the Python version. They
   # run once per OS, in parallel with the `test` matrix, instead of six times
@@ -267,6 +291,43 @@ jobs:
               exit "$status"
             fi
           done
+
+      # #295 / #267: caller-buffer GET and typed HEAD for file:// and direct://. Every
+      # tests/*_295.rs is its own binary (its own process: some set process-wide state such as a
+      # panic hook or a tiny bounce pool), run by name. The scratch directory is on the runner's
+      # disk and S3DLIO_REQUIRE_ODIRECT_TESTS=1 makes a test that would skip (no O_DIRECT, root
+      # ignoring permissions) FAIL. direct_get_into_no_odirect_fs_295 stays opt-in: it needs a
+      # ramfs mount (S3DLIO_TEST_NO_ODIRECT_DIR, see docs/Environment_Variables.md) and reports
+      # SKIPPED here by design.
+      - name: Test (Rust - file:// direct:// get_into, #295)
+        env:
+          S3DLIO_REQUIRE_ODIRECT_TESTS: "1"
+        run: |
+          set -euo pipefail
+          export S3DLIO_TEST_DIR="$GITHUB_WORKSPACE/target/odirect-scratch"
+          mkdir -p "$S3DLIO_TEST_DIR"
+          shopt -s nullglob
+          files=(tests/*_295.rs)
+          if [ "${#files[@]}" -lt 10 ]; then
+            echo "expected the tests/*_295.rs binaries, found ${#files[@]}" >&2
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            name="$(basename "$f" .rs)"
+            echo "::group::$name"
+            status=0
+            cargo test --release --offline --test "$name" || status=$?
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              exit "$status"
+            fi
+          done
+
+      # The same file stores in a binary built with panic = "abort" (a downstream crate's release
+      # profile): a LocalSet read must work and must not abort. Builds the `abort-test` profile
+      # (Cargo.toml), which recompiles the dependencies once.
+      - name: Test (Rust - panic=abort LocalSet read/write, #295)
+        run: scripts/test_panic_abort_295.sh
 
   lint:
     name: Lint
