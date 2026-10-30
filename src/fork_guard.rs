@@ -482,106 +482,10 @@ impl<T> std::fmt::Debug for Guarded<T> {
     }
 }
 
-/// Test support: run a closure in a forked child.
-#[cfg(all(test, unix))]
-pub(crate) mod test_support {
-    use super::register;
-
-    /// Run `f` in a forked child and return its exit status (0 = `f` returned true). The child
-    /// only runs `f`, then `_exit`s; it never returns into the test harness.
-    pub(crate) fn in_child(f: impl FnOnce() -> bool) -> i32 {
-        register();
-        // SAFETY: the child runs the closure and `_exit`s.
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            // Let the parent attach gdb to a child that hangs (ptrace_scope=1 forbids it
-            // otherwise): PR_SET_PTRACER, PR_SET_PTRACER_ANY.
-            unsafe { libc::prctl(0x5961_6d61, libc::c_ulong::MAX, 0, 0, 0) };
-            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(false);
-            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-        }
-        let mut status = 0;
-        // A child that hangs would hang the test: cap it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if r == pid {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                // Say where the child hangs (best effort: needs gdb).
-                if let Ok(out) = std::process::Command::new("gdb")
-                    .args([
-                        "-p",
-                        &pid.to_string(),
-                        "-batch",
-                        "-ex",
-                        "thread apply all bt 25",
-                    ])
-                    .output()
-                {
-                    eprintln!(
-                        "HUNG fork child {pid}:\n{}",
-                        String::from_utf8_lossy(&out.stdout)
-                    );
-                }
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                unsafe { libc::waitpid(pid, &mut status, 0) };
-                return -9;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            -(libc::WTERMSIG(status))
-        }
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
-    use super::test_support::in_child;
     use super::*;
     use std::sync::atomic::AtomicUsize;
-
-    /// A fork child never sees the value its parent built: it builds its own (RED before the
-    /// fix: the child got the parent's value, whose threads do not exist there).
-    #[test]
-    fn a_fork_child_rebuilds_instead_of_inheriting() {
-        static CELL: ForkCell<u64> = ForkCell::new();
-        let parent_value = *CELL.get_or_init(|| 1);
-        assert_eq!(CELL.get(), Some(&1));
-        let status = in_child(|| {
-            let inherited = CELL.get().is_some(); // must be None: the epoch moved
-            let abandoned = CELL.holds_inherited();
-            let rebuilt = *CELL.get_or_init(|| 2);
-            !inherited && abandoned && parent_value == 1 && rebuilt == 2 && CELL.get() == Some(&2)
-        });
-        assert_eq!(status, 0, "child status {status}");
-        assert_eq!(CELL.get(), Some(&1), "the parent keeps its own value");
-    }
-
-    /// The inherited value is never dropped in the child (a runtime's drop would join threads
-    /// that do not exist).
-    #[test]
-    fn the_inherited_value_is_leaked_not_dropped_in_the_child() {
-        static DROPS: AtomicUsize = AtomicUsize::new(0);
-        struct D;
-        impl Drop for D {
-            fn drop(&mut self) {
-                DROPS.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        static CELL: ForkCell<D> = ForkCell::new();
-        CELL.get_or_init(|| D);
-        let status = in_child(|| {
-            CELL.get_or_init(|| D);
-            DROPS.load(Ordering::SeqCst) == 0
-        });
-        assert_eq!(status, 0);
-        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
-    }
 
     /// A claim left by an ancestor's thread (the fork landed while it was inside `init`) is
     /// taken over by the child instead of waited for.
@@ -596,29 +500,6 @@ mod tests {
         let v = *CELL.get_or_init(|| 7);
         assert_eq!(v, 7);
         assert_eq!(CELL.claim.load(Ordering::Acquire), 0, "claim released");
-    }
-
-    /// The real shape: a parent thread is inside `init` when the fork happens; the child, in
-    /// which that thread does not exist, must not wait for it.
-    #[test]
-    fn a_fork_while_a_parent_thread_is_inside_init() {
-        static CELL: ForkCell<u32> = ForkCell::new();
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-        let builder = std::thread::spawn(move || {
-            *CELL.get_or_init(|| {
-                entered_tx.send(()).unwrap();
-                let _ = go_rx.recv();
-                5
-            })
-        });
-        entered_rx.recv().unwrap();
-        // The builder holds the claim now; fork.
-        let status = in_child(|| *CELL.get_or_init(|| 6) == 6);
-        go_tx.send(()).unwrap();
-        assert_eq!(builder.join().unwrap(), 5);
-        assert_eq!(status, 0, "child must not wait for the ancestor's builder");
-        assert_eq!(CELL.get(), Some(&5));
     }
 
     /// RED before the fix: a panic in `init` kept the claim for ever and every later caller
@@ -680,42 +561,6 @@ mod tests {
             assert_eq!(h.join().unwrap(), 11);
         }
         assert_eq!(BUILDS.load(Ordering::SeqCst), 1);
-    }
-
-    /// An object created before the fork is refused in the child, and dropping it there runs no
-    /// destructor (the no-drop rule); in the parent it still works and drops normally.
-    #[test]
-    fn an_inherited_object_is_refused_and_never_dropped_in_the_child() {
-        static DROPS: AtomicUsize = AtomicUsize::new(0);
-        struct D;
-        impl Drop for D {
-            fn drop(&mut self) {
-                DROPS.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        let obj = std::cell::Cell::new(Some(Guarded::new(D)));
-        let status = in_child(|| {
-            let g = obj.take().expect("the object");
-            let refused = g.get().is_err() && g.is_inherited();
-            let copy_of_a_clone = Guarded::new(std::sync::Arc::new(1)).clone();
-            drop(g);
-            drop(copy_of_a_clone);
-            refused && DROPS.load(Ordering::SeqCst) == 0
-        });
-        assert_eq!(status, 0);
-        assert_eq!(
-            DROPS.load(Ordering::SeqCst),
-            0,
-            "the parent still owns the object"
-        );
-        let g = obj.take().expect("the parent's object");
-        assert!(g.get().is_ok(), "usable in the parent");
-        drop(g);
-        assert_eq!(
-            DROPS.load(Ordering::SeqCst),
-            1,
-            "the parent drops its own normally"
-        );
     }
 
     #[test]

@@ -34,7 +34,7 @@ import time
 import s3dlio
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 250
-BUSY = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+BUSY = int(sys.argv[2]) if len(sys.argv) > 2 else 8  # S3DLIO_STRESS_NO_ASYNC=1: no async calls in the parent
 HANG_S = float(sys.argv[3]) if len(sys.argv) > 3 else 30.0
 PR_SET_PTRACER = 0x59616D61
 PR_SET_PTRACER_ANY = ctypes.c_ulong(-1).value
@@ -63,7 +63,12 @@ os.environ.update(
 D = tempfile.mkdtemp(prefix="stress297_")
 RELEASE = f"{D}/release"
 _mock = subprocess.Popen([sys.executable, "-c", MOCK, str(MOCK_PORT), RELEASE])
-time.sleep(0.5)
+for _ in range(200):  # wait until the mock accepts connections (a loaded host can be slow)
+    try:
+        _socket.create_connection(("127.0.0.1", MOCK_PORT), timeout=0.2).close()
+        break
+    except OSError:
+        time.sleep(0.05)
 for i in range(4):
     with open(f"{D}/o{i}.bin", "wb") as f:
         f.write(bytes([i]) * 65536)
@@ -88,7 +93,10 @@ def busy(k):
             if m == 0:
                 s3dlio.generate_data(2 << 20)
             elif m == 1:
-                asyncio.run(_ag())
+                if os.environ.get("S3DLIO_STRESS_NO_ASYNC") == "1":
+                    s3dlio.get(URI)  # the async delivery path is left out of the parent's load
+                else:
+                    asyncio.run(_ag())
             else:
                 if st is None:
                     st = s3dlio.PyCheckpointStore(f"file://{D}/ck{k}")
@@ -123,6 +131,8 @@ threads += [threading.Thread(target=consumer, daemon=True) for _ in range(2)]
 for t in threads:
     t.start()
 time.sleep(1.5)
+if not all(t.is_alive() for t in threads[BUSY:]):
+    sys.exit("stress scenario failed: the parked threads are not parked (mock S3 not answering as designed)")
 
 
 def child_work(depth):

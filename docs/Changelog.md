@@ -46,8 +46,10 @@ in `Runtime::drop`.
   below single-threaded, and not in the wrong direction at 4 KiB / 1 MiB with 8 to 32 threads (see the build report
   numbers in the PR).
 - **Known limits.** (1) A parent thread that holds pyo3's own reference-pool mutex at the instant of the fork can hang the
-  child's first Python call; it affects every PyO3 extension and only pyo3 can fix it (idle parent threads, as with a
-  DataLoader, are practically never affected). (2) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware
+  child's first Python call; it affects every PyO3 extension and only pyo3 can fix it. Measured: 0 hangs in 500 forks of
+  an idle parent (the DataLoader pattern), about 2% with four parent threads busy in s3dlio calls, 1 to 9% with eight
+  threads in a tight loop (all 55 examined with gdb were this mutex; no crash in 3000 children). A parent with busy s3dlio
+  threads should prefer `spawn`/`forkserver`. (2) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware
   rayon pool: a streaming `Generator`/`ObjectGen` created in a child whose ancestor already created one is limited to
   one thread (correct, slower) until dgen-data is fork-aware. (3) The remaining `dashmap` users (the parquet index and
   file-metadata caches, the redirect certificate store, the store cache) park only on contended shard locks held for a
