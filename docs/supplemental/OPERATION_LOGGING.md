@@ -268,16 +268,125 @@ To achieve true first-byte tracking, we would need:
 - Use RangeEngine for per-chunk timing (requires large_object_threshold config)
 - Consider object_store crate's get_range() for manual chunking
 
-## Lifecycle: one op-log session per process
+## Lifecycle: one op-log session at a time, restartable (#294)
 
-The op-log moves through `Uninitialized` -> `Active` -> `Finalized`, and
-`Finalized` is terminal: a process supports **exactly one** op-log session.
+The op-log moves through `Uninitialized` -> `Active` -> `Finalized`, and from
+`Finalized` back to `Active` on the next init: a process runs **one session at a
+time**, and after finalize it can start another, any number of times (repeated unit
+tests, notebooks). In earlier builds `Finalized` was terminal and a second init failed
+with "op-log was already finalized and cannot be restarted" (issue #294).
 
 | Call | Uninitialized | Active | Finalized |
 |---|---|---|---|
-| `init_op_logger(path)` (`init_op_log`) | creates the file, becomes Active (a failed init stays Uninitialized, so it can be retried) | returns `Ok`; the new path is **not** created or truncated | **error** (Python: `RuntimeError`); no file is created or truncated |
+| `init_op_logger(path)` (`init_op_log`) | creates the file, becomes Active (a failed init stays Uninitialized, so it can be retried) | the **same file** (any spelling or link): returns `Ok`, nothing created or truncated; **another file**: `Err(ResourceBusy)` naming both files, nothing created | starts a **new session** (see below); a failed init stays Finalized, so it can be retried |
 | `finalize_op_logger()` (`finalize_op_log`) | no-op | writes every accepted record (unless the writer fails: an I/O error or a writer-thread panic), finishes the zstd stream, waits until the writer signals it has finished, becomes Finalized | no-op (waits if another finalize is still draining) |
 | `global_logger()` / `is_op_log_active()` | `None` / `False` | `Some` / `True` | `None` / `False` |
+
+What a restart does:
+
+- **Waits for the previous drain.** If the previous session's writer is still
+  draining (finalize running on another thread released the lifecycle lock before
+  its shutdown finished), init waits for it, so two writers never exist at once and
+  the old file is a complete zstd stream before the new file is opened. If another
+  thread initialises while this call waits, this call is treated as an init
+  while Active (a no-op for the same file, an error for another).
+- **Same file semantics as a first init:** the file is created with
+  create-and-truncate. A **different path** leaves the finished log untouched; the
+  **same path replaces** it (the file then holds only the new session). The old
+  session's file is never appended to.
+- **Fresh state:** a new `Logger`, `op_log_stats()` / `Logger::stats()` restart at
+  zero (the finished session's stats are replaced, so read them before
+  re-initialising; they never add up across sessions), and the clock offset is 0
+  again. The process client ID (`set_client_id`) carries over.
+- **Old handles stay closed.** A store, reader or writer captured in an earlier
+  session holds that session's closed `Logger`: it keeps working but never writes
+  a row into a later session's file (its entries are counted as `rejected_closed`
+  of the old logger, which is no longer readable). Build new stores after the
+  re-init to record them. Python's module-level calls (`get`, `put_bytes`, ...)
+  look the op-log up on every call, so they are recorded in the new session with
+  no further action.
+
+### Init while Active (#294, round 2)
+
+A second `init_op_logger(path)` while a session is Active never starts a second
+writer and never creates or truncates `path`:
+
+- **Same file: no-op.** "Same" is decided by file identity, not by comparing
+  strings: `x`, `./x`, `/abs/x`, `file:///abs/x`, `dir/../x`, a symlink to the
+  file and a hard link to it are all the same file. On Unix the session records
+  the `(device, inode)` of its file right after creating it and a request is
+  `stat`-ed (following symlinks) and compared; elsewhere the canonical paths are
+  compared. A request that does not exist is, by definition, another file. The
+  identity is read from the OPEN file (`fstat` of the descriptor the session
+  writes), never by looking the path up again after creation.
+- **A file renamed, deleted or replaced behind the session's back** (log rotation, a
+  cleanup job) is a different file from then on: the session keeps writing the open
+  inode, and a request for the old name is an error (the name is not created), whose
+  message says so instead of the contradictory "already active and writing '<old
+  name>'": `... the op-log is already active; its session is writing a file that was
+  originally '/data/a.tsv.zst' but has since been renamed or deleted; the open file
+  is now named '/data/a.tsv.zst.1' ...`. On Linux the current name comes from
+  `/proc/self/fd/<n>` (an unlinked file shows `(deleted)`); `(a different file now
+  has that name)` is added when another file sits at the old path.
+- **Requests that cannot be an op-log file at all** while a session is Active (a
+  directory, `/dev/null` or another device, a FIFO, a socket, a dangling symlink)
+  are errors that say what the request is (`... it is a directory, and the op-log
+  is already active ...`); nothing is created (a dangling symlink's target is not
+  created either).
+- **A relative path means a different file after `chdir`.** The error names both the
+  file being written (`'x' (resolved to '/d1/x')`) and the requested one (`'x'
+  (resolves to '/d2/x')`); going back to the first directory makes it the same file
+  again (a no-op).
+- **Limitation (identity is authoritative):** a filesystem that does not give a file
+  a stable `(device, inode)` can report a DIFFERENT identity for the same path: FUSE
+  without `use_ino`, CIFS/SMB with `noserverino`, overlayfs without `xino` (and some
+  network filesystems after a server-side change). A same-path `init_op_log` while
+  Active then fails with `ResourceBusy` instead of being a no-op. The semantics are
+  deliberately not relaxed (a rotated file that was replaced under the same name
+  must stay an error); finalize first, or call `init_op_log` once. A bind mount of
+  the file's directory has the same `(device, inode)` and is the same file (opt-in
+  test `test_21_bind_mount...`, see `docs/Environment_Variables.md`).
+- **Another file: error.** `ErrorKind::ResourceBusy`, which Python's `py_err`
+  maps (like every `io::Error`) to **`RuntimeError`**. The message names the file
+  being written (as given, and resolved when spelled differently) and the
+  requested path, and says to finalize first, e.g.
+  `cannot start an op-log session for 'b.tsv.zst': the op-log is already active
+  and writing '/data/a.tsv.zst'. Call finalize_op_log() first, then start the new
+  session (nothing was created or changed)`.
+  A destination that cannot be resolved at all (`s3://...`, `file://`) is an error
+  as usual (`InvalidInput`).
+- **Concurrent inits** are serialised by the lifecycle lock, which is held while the
+  file is created: with the same file exactly one call creates it and the rest
+  return `Ok`; with different files exactly one wins and every other call gets
+  the error.
+
+### Many threads, fork and exit (#294, round 2)
+
+- `init_op_log` and `finalize_op_log` release the GIL, so other Python threads run
+  during a drain. Module-level calls look the op-log up once per call. A call that
+  already holds the old session's logger when finalize begins is counted in that
+  session's `rejected_closed` (not written, not carried into the next session); a
+  call that starts after `init` returned is recorded in the new session. So for the
+  operations issued while a session is Active: every operation that begins and ends
+  inside the window is in that session's file (`accepted`, plus `dropped_full` in
+  the default lossy mode); an operation overlapping `finalize`/`init` is in the
+  file, in `rejected_closed`, or in neither (it ran while no session was Active).
+  Never in two files.
+- `os.fork()` (and `multiprocessing` with the `fork` start method): see "Fork
+  safety" below. In short: the child sees the op-log as **not initialised**
+  (`is_op_log_active()` is `False`, `op_log_stats()` is `None`, `finalize_op_log()`
+  is a no-op), may start its own session on another file, and can never initialise a
+  file that an ancestor process is still writing (a log the ancestor had already
+  finalized is not protected). With the `spawn` and `forkserver` start
+  methods the child starts clean. Forking a process that has already used s3dlio I/O
+  is a separate matter: the runtime threads are not copied either.
+- **Interpreter exit** with a session Active (no `finalize_op_log()`): the process
+  exits normally; queued rows and the zstd frame end are lost, as documented above.
+  Daemon threads that are inside an s3dlio I/O call at exit can abort the
+  interpreter (`FATAL: exception not rethrown`); that happens with or without an
+  op-log and is unrelated to it.
+- **Ctrl-C / signals:** `init_op_log` waiting for a drain releases the GIL but is
+  not interruptible: a `KeyboardInterrupt` is raised when the call returns.
 
 Stores capture the logger when they are constructed
 (`store_for_uri_with_logger(uri, global_logger())`):
@@ -285,7 +394,7 @@ Stores capture the logger when they are constructed
 - stores created **before** init are unlogged for their whole life;
 - stores created **before** finalize stop recording when finalize runs (their
   later entries are rejected with `LogOutcome::Closed`, not written);
-- stores created **after** finalize are unlogged.
+- stores created **after** finalize (and before the next init) are unlogged.
 
 `Logger::log(entry)` returns `()`, as it always has. `Logger::try_log(entry)`
 does the same work and returns a `LogOutcome` (`Accepted`, `Full`, `Closed`,
@@ -295,9 +404,70 @@ the writer thread, after which `try_log` returns `WriterFailed`). The serializer
 lifecycle work (header, column order, idx numbering, operation names, zstd
 framing); see "What the format tests establish" below for what is checked.
 
-After finalize, `set_clock_offset` / `get_clock_offset` return an error of kind
-`Unsupported` saying the op-log was already finalized (before any init the kind
-is `NotFound`, "Logger not initialized").
+After finalize (until the next init), `set_clock_offset` / `get_clock_offset`
+return an error of kind `Unsupported` saying the op-log was finalized (before any
+init the kind is `NotFound`, "Logger not initialized").
+
+### Fork safety (#294, round 3)
+
+The writer thread exists only in the process that started the session, so a
+`fork` child that kept the parent's session could never write or finish it: a
+lossless `log()` on a full queue and `finalize` would block for ever, and the child
+could inherit the lifecycle lock held by a parent thread that does not exist in
+it. s3dlio registers `pthread_atfork` handlers on the first `init_op_logger` (Unix):
+
+- **prepare (parent, before the fork):** takes the lifecycle lock, then the
+  client-id lock (always in that order), and holds them until `fork` returns, so no
+  other thread owns either at the instant of the fork. It also allocates the one
+  record the child may need, so the child handler never allocates. A failed
+  `fork()` (for example `EAGAIN` under `RLIMIT_NPROC`) still runs the parent
+  handler, which releases the locks.
+- **child:** closes the gate of the inherited session (every clone of its `Logger`,
+  including those inside stores created before the fork, rejects entries at once as
+  `LogOutcome::Closed`, never blocking), leaks the logger (never dropped or waited
+  for) and leaves the op-log `Uninitialized`. The first rejected entry prints one
+  line saying the process was FORKED and that the parent's session belongs to the
+  parent (not the "finalized" note). Reads and writes through such stores still work;
+  they are just not recorded.
+- **Inherited files, for the life of the process.** The child records the file of
+  the session it inherited, if a writer may still be writing it (the session was ACTIVE at the fork, or finalized with its writer still draining), in a
+  process-lifetime, append-only set. `init_op_logger` refuses every file in that set with `ResourceBusy`, whatever
+  the child does in between: it may finalize and re-init its own files as often as
+  it likes, a grandchild inherits the child's set plus the child's live file, and
+  none of them can truncate a log an ancestor is still writing (`... which was
+  still writing it when this process was forked`). Why only Active sessions: the
+  hazard is truncating a log with a live writer. An Active session's descriptor is
+  inherited and, with the leaked logger, stays open in every descendant, so its
+  inode number cannot be reused while the descendant lives and the `(device,
+  inode)` identity is exact. A log the ancestor had already FINALIZED has no writer
+  to corrupt, and its owner may replace it by initialising the same path again, so a
+  child may too (protecting it was also wrong: its descriptor is closed, so after
+  the file is deleted the inode number is reused and an unrelated new path was
+  refused). Only the last session of each ancestor can be Active, so a finished
+  log of an earlier session is never protected either. The check compares the
+  `(device, inode)` of an EXISTING file as opened (before it is truncated), so every
+  spelling, symlink or hard link to it is refused, and a refused request leaves the
+  file untouched. A file that does not exist is created with `O_CREAT|O_EXCL` and
+  never refused (a new inode cannot be an ancestor's live file), so a refusal never
+  leaves a new file behind. Unrelated files are unaffected.
+- **Registration is not a `Once`.** A fork that lands while another thread is inside
+  the very first registration would leave a `Once` RUNNING in the child for ever (its
+  registering thread does not exist there) and the child's first init would hang.
+  The claim records the claiming process id instead: a child that finds a claim by
+  another pid takes it over and registers itself; another thread of the same process
+  waits for the claimant, so no session starts before the handlers exist. (A child
+  may end up with the handlers registered twice; they are idempotent.)
+- **A `fork()` from a thread-local destructor** runs after the handlers' own
+  thread-local is destroyed. The handlers use `try_with` and do nothing in that case
+  (that fork is unprotected: the child keeps the inherited session, which cannot make progress,
+  and its file is not recorded) instead of panicking, which would abort the process.
+- **A `File::create` that hangs blocks `fork()` in the process.** The lifecycle lock
+  is held while a session's file is opened (a dead NFS server, a FIFO with no
+  reader), and `prepare` needs that lock, so `fork()` waits until the open returns.
+  Open op-log destinations on healthy local storage.
+- Non-Unix targets have no `fork`; the handlers and the inherited set compile away
+  (checked by compiling the crate with the Unix code configured out; a real Windows
+  target could not be built on the development host, which has no MinGW toolchain).
 
 ### Detecting lost records
 
@@ -439,7 +609,8 @@ finalize only after the workers that log have stopped, and check
 `rejected_closed == 0` as well as `is_complete()`.
 
 `op_log_stats()` / `Logger::stats()` work while the op-log is Active **and after
-it is Finalized** (`None` only before init, including after a failed init), so a
+it is Finalized** (`None` only before the first init, including after a failed
+first init; after a restart they are the new session's), so a
 program can finalize and then check the totals. The counts cover every clone of
 the session's `Logger`. While threads are still logging they are relaxed atomics
 (a snapshot is a progress report, not a transaction). Once finalize has returned,
@@ -509,7 +680,8 @@ not a machine-checked inventory:
 
 - `init_op_logger` / `init_op_log` after `finalize_op_logger` / `finalize_op_log`
   now fails (`ErrorKind::Unsupported`; Python `RuntimeError`) and touches no file.
-  Before, it returned `Ok` and did nothing.
+  Before, it returned `Ok` and did nothing. **Superseded by issue #294:** init after
+  finalize now starts a new session (see the lifecycle section above).
 - After finalize, `global_logger()` is `None` and `is_op_log_active()` is `False`.
   Before, both still reported the dead logger.
 - After finalize, entries from a `Logger` that was captured earlier are rejected

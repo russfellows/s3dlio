@@ -1,5 +1,105 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Op-log can be restarted after `finalize_op_log()` (#294).** `init_op_log(path)` /
+  `init_op_logger(path)` after a finalize used to fail with "op-log was already finalized and
+  cannot be restarted; a process supports only one op-log session" (even with a different file),
+  which broke repeated unit tests and Jupyter use. The lifecycle is now `Uninitialized` ->
+  `Active` -> `Finalized` -> `Active` -> ...: one session at a time, any number in a process.
+  This supersedes the "One op-log session per process (#170)" behaviour listed under 0.10.0.
+  - A re-init starts a new session: new file (create-and-truncate, like a first init: a
+    different path leaves the finished log untouched, the same path replaces it), a fresh
+    `Logger`, `op_log_stats()` restarting at zero (it is the new session's, never a sum) and a
+    clock offset of 0; the process client ID carries over.
+  - A re-init never lets two writers overlap: if the previous session's writer is still
+    draining (a finalize on another thread), init waits for that drain before opening the new
+    file. If another thread initialises meanwhile, the call is the Active no-op.
+  - A failed init after a finalize leaves the op-log Finalized so a corrected call can succeed.
+  - **Init while a session is Active** (round 2, decided by the maintainer): the same file (any
+    spelling: `x`, `./x`, absolute, `file:///abs/x`, `dir/../x`, a symlink or hard link to it;
+    decided by `(device, inode)` on Unix, canonical paths elsewhere) is a no-op and nothing is
+    truncated; ANY OTHER file is now an error (`ErrorKind::ResourceBusy`, `RuntimeError` in
+    Python) naming the file being written and the requested path and saying to finalize first;
+    the requested path is not created. BEHAVIOUR CHANGE: this used to be a silent no-op for any
+    path, which let a caller believe it was logging to the new file. Of N concurrent inits with
+    different files exactly one wins and the others get the error.
+  - **Fork safety:** a child created by `fork` (`os.fork`, `multiprocessing` fork) inherited the
+    parent's Active session without its writer thread: a lossless `log()` on a full queue and
+    `finalize_op_log()` blocked forever, and the child could deadlock on the lifecycle lock if
+    another parent thread held it during the fork. The child now sees the op-log as not
+    initialised (`pthread_atfork`; the lock is held across the fork), may start its own session,
+    and is refused (`ResourceBusy`) if it initialises a file the parent was still writing (see
+    round 4: finished logs are not protected).
+  - The permutation matrix: `tests/test_oplog_lifecycle_permutations_294.py` (single thread,
+    16 threads racing init/finalize, workers running during 50 cycles, asyncio, fork/spawn,
+    exit; lossy and lossless) and `tests/oplog_lifecycle_{same_file_spellings,
+    concurrent_init_same_file,concurrent_init_different_files,cycles_no_leaks}.rs`.
+  - **Round 3 (second adversarial review):**
+    - *Fork guard hole closed (S2).* The parent's file was remembered only until the child
+      started a session of its own, so `child: init(c); finalize; init(parent file)` truncated
+      the parent's live log (a grandchild forgot its grandparent's file too). The files of
+      every ancestor session are now kept in a process-lifetime, append-only set (linked from
+      the atfork child handler with a node allocated in `prepare`, so the handler does not
+      allocate) and refused on every init (round 4 narrowed this to sessions that were Active at
+      the fork). The new file is opened WITHOUT truncation, its
+      identity read from the open descriptor, vetted, and only then truncated, so a refused
+      request never touches the file. The message now says whether the ancestor was still
+      writing the file or had finished it (N5; both are refused: truncating a finished log
+      destroys data too).
+    - *Session identity from the open file (N6a):* `(device, inode)` comes from `fstat` of the
+      created descriptor, not from a path lookup afterwards. Documented limitation (N6b):
+      filesystems without stable inodes (FUSE without `use_ino`, CIFS `noserverino`, overlayfs
+      without `xino`) can make a same-path init while Active fail with `ResourceBusy`.
+    - *Accurate messages (N7):* a session whose file was renamed or deleted says so (and, on
+      Linux, what the file is now called) instead of "already active and writing '<old name>'";
+      a request that is a directory, a device, a FIFO or a dangling symlink is described as
+      such; the requested path is shown resolved (`chdir` between two inits of a relative path
+      names both files).
+    - *Fork handlers hardened (N8):* registration is an atomic claim that records the process
+      id (a `Once` could stay RUNNING in a child forked during the first init and hang its
+      init); handlers use `try_with` (a fork from a thread-local destructor no longer aborts);
+      the client-id mutex is held across the fork too (lock order: lifecycle, then client id;
+      `GLOBAL_CLIENT_ID` is now a plain `static Mutex`); the child's note says the process was
+      forked, not that the op-log was finalized; the `Forked` state is gone (the child is
+      `Uninitialized` plus the inherited set), so non-Unix builds have no dead code. Documented:
+      a hung `File::create` under the lifecycle lock also blocks `fork()`.
+    - *CI (B1):* the Python job now runs `tests/test_oplog_store_cache.py` and
+      `tests/test_oplog_lifecycle_permutations_294.py` (skipped without the `zstd` CLI, which
+      CI installs); the permutation file's scenarios use real paths so messages compare exactly.
+    - *Tests:* `tests/oplog_lifecycle_fork_{child_logger_closed,holds_lock,inherited_files,
+      from_tls_destructor}.rs`, `tests/oplog_lifecycle_active_file_gone_or_odd.rs`, unit tests
+      for the registration protocol and for the identify-then-vet-then-truncate open, and
+      Python `test_16e`-`test_16i`, `test_18`-`test_20` and the opt-in bind-mount
+      `test_21` (`S3DLIO_TEST_BIND_MOUNT_DIR`, see `docs/Environment_Variables.md`).
+  - **Round 4 (third adversarial review):**
+    - *Inode reuse refused a NEW path (B1) and S1.* Round 3 also refused the files of
+      FINALIZED ancestor sessions, compared by `(device, inode)`. A finalized session's
+      descriptor is closed, so once its file was deleted the inode number was reused at once
+      (ext4): `parent: init a; finalize; rm a; fork; child: init NEW b0` failed with
+      `ResourceBusy`, the message said "nothing was created", and b0 was left behind as an empty
+      file. Only the last session was recorded either way (S1). Now only sessions that were
+      ACTIVE at the fork (or finalized with the writer still draining: its file is still being written) are protected: the hazard is truncating a log an ancestor is still
+      WRITING, an Active session's descriptor stays open in every descendant (so its inode can
+      never be reused and the identity is exact), and a finished log has no writer to corrupt
+      (its owner may replace it by initialising the same path too; so may a child). The refusal
+      message and docs say exactly that. A new file is created with `O_CREAT|O_EXCL` and is
+      never vetted (it cannot be an ancestor's live file); only an existing file is opened
+      without truncation, vetted and then truncated, so a refusal never leaves a new file.
+    - *N2:* the double-registration early return in `prepare` is now tested (handlers
+      registered twice, then a fork with an Active session: no deadlock). *N3:* the
+      `/proc/self/fd` identity check in `current_name` is tested (a reused descriptor number
+      is not trusted). *N4:* the registration wait yields 64 times, then sleeps 50 us growing
+      to 1 ms instead of spinning. *N1 (unchanged, documented):* a `fork()` from a thread-local
+      destructor is unprotected.
+  - Stores, readers and writers captured in an earlier session keep that session's closed
+    logger: they keep working but never write into a later session's file. The Python
+    module-level calls look the op-log up on every call, so they need no change.
+  - Tests: `tests/oplog_lifecycle_reinit_{after_finalize,same_path,waits_for_drain,old_store}.rs`
+    (replacing `oplog_lifecycle_reinit_rejected.rs`) and `tests/test_oplog_lifecycle.py`.
+
 ## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; zero copy everywhere (Rule #1); stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 
 This release adds a new public API surface (#264) and fixes twenty-three issues (#224, #230,

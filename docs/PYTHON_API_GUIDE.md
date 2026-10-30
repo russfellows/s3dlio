@@ -1961,16 +1961,40 @@ destinations (`s3://`, `gs://`, `az://`, `direct://`, etc.) are not supported. A
 string like `s3:bucket/key` (no `//`) is not a URI here: it is treated as a literal
 local file name.
 
-A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
-`init_op_log` while already active is a no-op; after `finalize_op_log` it raises
-`RuntimeError` and touches no file. `finalize_op_log` is safe to repeat. The
+A process runs **one op-log session at a time**: `init_op_log` -> `finalize_op_log`,
+and after `finalize_op_log` a new `init_op_log` starts a new session (issue #294),
+any number of times. `init_op_log` while already active is a no-op when it names the
+file being written (any spelling: `x`, `./x`, an absolute path, `file:///abs/x`,
+`dir/../x`, a symlink or hard link to it) and raises `RuntimeError` for any other file:
+the message names the file being written and the requested path and says to call
+`finalize_op_log()` first; the requested file is not created or truncated and the
+session carries on. Of several threads calling `init_op_log` at once exactly one
+creates the file (same file: every call returns; different files: the rest raise). After
+`os.fork()` the child does not share the parent's session (its writer thread is not
+copied): `is_op_log_active()` is `False` in the child, which can start its own session,
+but never on a file an ancestor process was still writing at the fork, however often
+the child starts and finishes sessions of its own (a `RuntimeError`: initialising it
+would truncate a live log; a log the ancestor had already finalized is not protected
+and may be initialised). Stores
+created before the fork stay silent in the child (one line on stderr says why). If the
+active file was renamed or deleted behind the session's back (log rotation), a request
+for the old name is a `RuntimeError` saying the session is writing a file that was
+renamed or deleted (it keeps writing the open file); a request that is a directory,
+`/dev/null`, a FIFO or a dangling symlink is described as such. Files are compared by
+`(device, inode)`: on a filesystem without stable inode numbers (FUSE without `use_ino`,
+CIFS `noserverino`, overlayfs without `xino`) the same path can look like another file
+and raise while active; finalize first. A re-init waits
+for the previous session's writer to finish (with the GIL released), then creates
+its file exactly as a first init does: the same path replaces the old log, a
+different path leaves it untouched. `finalize_op_log` is safe to repeat. The
 module-level functions (`get`, `put_bytes`, `stat`, `list`, `delete`, `get_async`,
 ...) check the op-log on every call: a call made while it is active is recorded
 once, a call made before `init_op_log` or after `finalize_op_log` is not,
 whichever call first used the scheme. Objects you construct yourself (stores,
 readers, writers) capture the logger at construction: those created before
 `init_op_log` are never logged, and those created before `finalize_op_log` stop
-recording when it runs.
+recording when it runs and stay silent after a later `init_op_log` (they never
+write into the new session).
 
 The op-log is **lossy by default**: if the writer cannot keep up and the queue
 (`S3DLIO_OPLOG_BUF`, default 8192 entries) fills, entries are dropped rather than
@@ -2027,7 +2051,8 @@ completion, not durability (there is no fsync). The stats do **not** cover:
 Calls made after `finalize_op_log()` began (a store created before finalize that
 a worker still uses) are counted as `rejected_closed` and are **not in the file**;
 they are not part of "complete", but a program should finalize only after its
-workers stop and check `rejected_closed == 0` too.
+workers stop and check `rejected_closed == 0` too. Such stores stay rejected after a
+re-init: their calls never reach the new session's file.
 
 `op_log_stats()` works while logging is active and after `finalize_op_log()`
 (while active, `accepted > written` is normal). `finalize_op_log()` prints one
@@ -2195,8 +2220,8 @@ snapshot).
 | Function | Description |
 |----------|-------------|
 | `init_logging(level)` | Set log level: trace, debug, info, warn, error |
-| `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089); `RuntimeError` after finalize |
-| `finalize_op_log()` | Write all accepted records (unless the writer fails: an I/O error or a writer-thread panic) and close the log; **call it before the process exits, nothing does it for you**; releases the GIL while draining; terminal and idempotent |
+| `init_op_log(path)` | Start an op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089). Allowed again after `finalize_op_log()` (new session, fresh `op_log_stats()`; the same path is truncated, #294); while a session is active: a no-op for the same file, `RuntimeError` for another file |
+| `finalize_op_log()` | Write all accepted records (unless the writer fails: an I/O error or a writer-thread panic) and close the log; **call it before the process exits, nothing does it for you**; releases the GIL while draining; idempotent; ends the session, `init_op_log` can start a new one (#294) |
 | `is_op_log_active()` | True between init and finalize only |
 | `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `written` / `dropped_full` / `rejected_closed` / `writer_failed` / `writer_error` / `lossless` / `rejected_unformattable` / `rejected_unsafe_field` / `normalized_error_text`, available while active and after finalize, to detect lost records (complete = `accepted == written`, no drops, no refusals, `writer_error is None`, `rejected_unformattable == 0`, `rejected_unsafe_field == 0`; `normalized_error_text` is a disclosure, not a loss) |
 
