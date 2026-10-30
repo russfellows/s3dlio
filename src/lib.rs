@@ -286,7 +286,9 @@ mod test_env;
 // PyO3 module init -----------------------------------------------------------
 // ---------------------------------------------------------------------------
 #[cfg(feature = "extension-module")]
-#[pymodule]
+// `gil_used = true`: PyO3 0.28 made free-threaded support the default; s3dlio has not been audited
+// for it, so keep the 0.27 behaviour (a free-threaded interpreter re-enables the GIL on import).
+#[pymodule(gil_used = true)]
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     Python::initialize();
 
