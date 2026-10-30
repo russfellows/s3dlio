@@ -1961,16 +1961,20 @@ destinations (`s3://`, `gs://`, `az://`, `direct://`, etc.) are not supported. A
 string like `s3:bucket/key` (no `//`) is not a URI here: it is treated as a literal
 local file name.
 
-A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
-`init_op_log` while already active is a no-op; after `finalize_op_log` it raises
-`RuntimeError` and touches no file. `finalize_op_log` is safe to repeat. The
+A process runs **one op-log session at a time**: `init_op_log` -> `finalize_op_log`,
+and after `finalize_op_log` a new `init_op_log` starts a new session (issue #294),
+any number of times. `init_op_log` while already active is a no-op. A re-init waits
+for the previous session's writer to finish (with the GIL released), then creates
+its file exactly as a first init does: the same path replaces the old log, a
+different path leaves it untouched. `finalize_op_log` is safe to repeat. The
 module-level functions (`get`, `put_bytes`, `stat`, `list`, `delete`, `get_async`,
 ...) check the op-log on every call: a call made while it is active is recorded
 once, a call made before `init_op_log` or after `finalize_op_log` is not,
 whichever call first used the scheme. Objects you construct yourself (stores,
 readers, writers) capture the logger at construction: those created before
 `init_op_log` are never logged, and those created before `finalize_op_log` stop
-recording when it runs.
+recording when it runs and stay silent after a later `init_op_log` (they never
+write into the new session).
 
 The op-log is **lossy by default**: if the writer cannot keep up and the queue
 (`S3DLIO_OPLOG_BUF`, default 8192 entries) fills, entries are dropped rather than
@@ -2027,7 +2031,8 @@ completion, not durability (there is no fsync). The stats do **not** cover:
 Calls made after `finalize_op_log()` began (a store created before finalize that
 a worker still uses) are counted as `rejected_closed` and are **not in the file**;
 they are not part of "complete", but a program should finalize only after its
-workers stop and check `rejected_closed == 0` too.
+workers stop and check `rejected_closed == 0` too. Such stores stay rejected after a
+re-init: their calls never reach the new session's file.
 
 `op_log_stats()` works while logging is active and after `finalize_op_log()`
 (while active, `accepted > written` is normal). `finalize_op_log()` prints one

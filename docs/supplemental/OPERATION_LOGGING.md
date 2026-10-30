@@ -536,7 +536,8 @@ not a machine-checked inventory:
 
 - `init_op_logger` / `init_op_log` after `finalize_op_logger` / `finalize_op_log`
   now fails (`ErrorKind::Unsupported`; Python `RuntimeError`) and touches no file.
-  Before, it returned `Ok` and did nothing.
+  Before, it returned `Ok` and did nothing. **Superseded by issue #294:** init after
+  finalize now starts a new session (see the lifecycle section above).
 - After finalize, `global_logger()` is `None` and `is_op_log_active()` is `False`.
   Before, both still reported the dead logger.
 - After finalize, entries from a `Logger` that was captured earlier are rejected

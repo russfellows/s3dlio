@@ -881,8 +881,10 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// those created before finalize_op_log() stop recording when it runs, and stay
 /// silent after a later init_op_log() (they never write into the new session).
 #[pyfunction]
-pub fn init_op_log(path: &str) -> PyResult<()> {
-    init_op_logger(path).map_err(py_err)
+pub fn init_op_log(py: Python<'_>, path: &str) -> PyResult<()> {
+    // A re-init may wait for the previous session to drain (#294): release the GIL
+    // meanwhile, as finalize_op_log does.
+    py.detach(|| init_op_logger(path)).map_err(py_err)
 }
 
 /// Finish operation logging: write every accepted record (unless the writer
