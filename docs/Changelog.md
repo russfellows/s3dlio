@@ -22,6 +22,8 @@ build for these schemes, with or without the op-log wrapper).
   the destination. That copy is the documented O_DIRECT exception of Rule #1 and is bounded by the pool's buffers.
   A file below the store's minimum direct size, and a filesystem that refuses O_DIRECT (counted in
   `direct_io_counters().get_fallbacks`), are read with ordinary positional reads, still straight into the buffer.
+  The refusal path is tested against a real refusing filesystem (ramfs) by the opt-in
+  `tests/direct_get_into_no_odirect_fs_295.rs` (set `S3DLIO_TEST_NO_ODIRECT_DIR`; see `docs/Environment_Variables.md`).
 - `head` for both schemes, from `stat`: `HeadMetadata { size, etag: Some("file-<size>-<mtime seconds>"), version_id: None }`
   (the identity `stat` reports), `Ok(None)` for a missing file or a path below a regular file, an error for a
   directory or any non-regular file and for a refusal (`Forbidden`).
