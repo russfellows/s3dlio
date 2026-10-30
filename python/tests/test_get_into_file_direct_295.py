@@ -78,11 +78,18 @@ def uri_for(scheme, path):
 def aligned_view(size, offset_in_page=0, tail=CANARY_LEN):
     """A numpy uint8 buffer of `size` bytes whose address is `offset_in_page` bytes past a page
     boundary, inside a larger FILL-ed backing array with CANARY bytes after it."""
-    backing = np.empty(size + 2 * PAGE + tail, dtype=np.uint8)
+    # The view starts at (-address) % PAGE + PAGE + offset_in_page <= 3 * PAGE - 2 bytes into the
+    # backing array (the first PAGE bytes are a FILL-ed guard before it), so 3 * PAGE of slack is
+    # enough for the view and the canary behind it, whatever address numpy returned.
+    assert 0 <= offset_in_page < PAGE
+    backing = np.empty(size + 3 * PAGE + tail, dtype=np.uint8)
     start = (-backing.ctypes.data) % PAGE + PAGE + offset_in_page
     backing[:] = FILL
     backing[start + size : start + size + tail] = CANARY
-    return backing, backing[start : start + size], start
+    view = backing[start : start + size]
+    assert view.size == size and start + size + tail <= backing.size
+    assert view.ctypes.data % PAGE == offset_in_page
+    return backing, view, start
 
 
 def assert_around_untouched(backing, start, size):
@@ -90,6 +97,34 @@ def assert_around_untouched(backing, start, size):
     assert (backing[start + size : start + size + CANARY_LEN] == CANARY).all(), (
         "wrote past the destination"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# the test helper itself
+# ---------------------------------------------------------------------------------------------
+
+
+def test_aligned_view_is_always_whole_at_every_page_offset():
+    """`aligned_view` must hand back exactly `size` bytes at exactly `offset_in_page` past a page
+    boundary, with the whole canary after it, whatever address numpy happened to allocate (a view
+    cut short by a bad backing size made other tests flaky). Randomised over many allocations
+    and every kind of offset, so it cannot regress unnoticed."""
+    rng = np.random.default_rng(295)
+    offsets = [0, 1, 2, 15, 16, 17, PAGE // 2, PAGE - 17, PAGE - 16, PAGE - 2, PAGE - 1]
+    sizes = [1, 7, PAGE - 1, PAGE, PAGE + 1, 64 * 1024 + 5, MIB + 3]
+    for _ in range(400):
+        offset = (
+            int(rng.choice(offsets))
+            if rng.random() < 0.5
+            else int(rng.integers(0, PAGE))
+        )
+        size = int(rng.choice(sizes))
+        backing, view, start = aligned_view(size, offset)
+        assert view.size == size, (size, offset, view.size)
+        assert view.ctypes.data % PAGE == offset, (size, offset)
+        assert start + size + CANARY_LEN <= backing.size, (size, offset)
+        assert (backing[start + size : start + size + CANARY_LEN] == CANARY).all()
+        assert (backing[:start] == FILL).all()
 
 
 # ---------------------------------------------------------------------------------------------

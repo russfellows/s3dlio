@@ -34,10 +34,59 @@ build for these schemes, with or without the op-log wrapper).
   distinct destination positions filled, recorded after each copy (`SpanMark::record_copy`); the op-log writes exactly
   one GET row (bytes = progress, also on an error) and one HEAD row.
 - Cancellation: `dst` is a borrowed `&mut [u8]`, so it is never given to `spawn_blocking`. Every read runs inside the
-  poll of the returned future (`block_in_place` on a multi-thread runtime, inline on a current-thread one), one chunk
-  at a time with a yield between chunks: dropping the future or aborting its task stops it at a chunk boundary with no
-  writer left. In Python the read runs on the runtime without the GIL.
+  poll of the returned future (`block_in_place` on a multi-thread runtime, inline on a current-thread one or inside
+  a `LocalSet`), one chunk at a time with a yield between chunks: dropping the future or aborting its task stops it at
+  a chunk boundary with no writer left. In Python the read runs on the runtime without the GIL.
+- A file that is modified WHILE it is read is an error, never `Ok` with mixed data. The open file's `mtime` and
+  `ctime` (nanoseconds) are recorded when it is opened and compared after the last chunk: a different size is
+  `LengthMismatch` (with the size it has now); the same size but a changed `mtime` or `ctime` (an overwrite in place,
+  truncate-then-regrow, a replacement by `rename`, a deletion, or a `chmod`/`chown`/hard link, which also move
+  `ctime`) is `VersionChanged` ("the object changed after the read pinned its version"; in Python a `RuntimeError`
+  whose message says "version changed"). The check is conservative about metadata changes and cannot see a change
+  that leaves both timestamps as they were: on Linux a write always moves `ctime`, but the kernel clock that stamps
+  it is coarse (one tick, 1-10 ms on ext4, finer with multigrain timestamps on recent kernels), so a write in the
+  SAME tick as the last change before the read opened the file, made while the read runs, goes unseen; filesystems with
+  one- or two-second timestamps (some network and legacy filesystems) widen that window; a write through a shared
+  `mmap` updates the timestamps only when the kernel writes the page back. A retry after `VersionChanged` or
+  `LengthMismatch` is always safe.
 - `examples/get_into_local_bench.rs`: `get_into` against the allocating `get` (see Performance).
+
+**Hardened after review (same release)**
+- No panic in any polling context. `block_in_place` panics ("can call blocking only when running on the
+  multi-threaded runtime") inside a tokio `LocalSet` that a non-worker thread drives on a multi-thread runtime
+  (`rt.block_on(local.run_until(..))`, `LocalSet::block_on`, `spawn_local` inside either), which used to take
+  `file://` and `direct://` `get_into` and the `direct://` writer down. tokio 1.52 has no way to ask whether that is the case,
+  so the shared helper (`file_get_into::blocking_io`) probes `block_in_place` under `catch_unwind` with the closure held
+  back (the panic is raised before the closure starts) and runs it inline when refused. A one-time chained panic hook
+  keeps that probe from printing a message; it is silent only on a thread inside the probe window, and a panic raised
+  by the closure itself is neither hidden nor altered. Tested in 13 contexts (`tests/get_into_runtime_contexts_295.rs`).
+- A mid-read fall back from O_DIRECT (the kernel answers EINVAL for a later chunk) now clears `O_DIRECT` on the SAME open
+  file descriptor (`fcntl(F_SETFL)`) instead of reopening the path, so a rename-replace between two chunks can no
+  longer feed the rest of the read from another file. Progress is not double counted for the chunk that is read twice.
+- A filesystem that refuses O_DIRECT is logged at WARN once per process and at DEBUG afterwards (it used to log a WARN for
+  every call); `direct_io_counters().get_fallbacks` still counts every call.
+- A read that hits the end of the file says so (`<path> ended during the read, after N bytes had been read; its size
+  is now M bytes ...`); a file that was truncated and refilled to its old size is `VersionChanged` rather than the old
+  "expected N bytes, got N". The `std::thread::scope` helper thread that an unaligned `direct://` read starts for each 16 MiB
+  chunk costs 54 us (median of 2000): 64 chunks per GiB is 3.5 ms against 254 ms for a 1 GiB bounce read
+  (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=4`, 4.03 GiB/s), 1.4%, so it was left as is.
+- `get_into` on `direct://` always sends an unaligned destination through the shared bounce pool
+  (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, `_PAIRS_PER_NODE`, `_WHEN_BUSY` apply) and does NOT honour
+  `S3DLIO_DIRECT_IO_GET_MODE`: `direct` mode of the allocating `get` means one fresh aligned buffer of the OBJECT'S size,
+  which a bounded, caller-buffer GET must never allocate. A Python `bytearray` is only 16-byte aligned, so on `direct://` it
+  always takes the bounce copy; see "Local files" in the Python API guide for page-aligned buffers.
+- Tests added: file changes during the read (grow, shrink, truncate-and-regrow, in-place overwrite, rename-replace,
+  unlink, chmod, concurrent reader) in both schemes, aligned and unaligned destinations
+  (`tests/get_into_mid_read_295.rs`, deterministic: the future is polled by hand once, the file changed, the future polled
+  to the end); a mid-read EINVAL, the page-cache hint (`mincore`), the file identity and the fallback log
+  (`src/file_get_into_tests.rs`); 4 MiB bounce buffers over a size sweep at 16 MiB +- 1 and unaligned addresses
+  (`tests/direct_get_into_small_bounce_295.rs`); 24 concurrent unaligned reads through a one-pair pool in both busy policies on a
+  one-worker multi-thread and a current-thread runtime, in child processes under a timeout
+  (`tests/direct_get_into_tiny_pool_295.rs`); op-log rows of a failed, a dropped and an unpolled `get_into`
+  (`tests/oplog_file_get_into_midread_295.rs`: a failed read is one GET row with the bytes filled so far, a dropped one is one
+  row with `error = cancelled` and the count at the drop, an unpolled one no row: the same as the network stores); an
+  unreadable zero-byte file is `Ok` without being opened. The Python test helper `aligned_view` could return a view cut
+  short at some page offsets (flaky) and is fixed and tested over 400 random allocations.
 
 **Changed (BEHAVIOUR CHANGE).** `object_capabilities("file://...")` and `("direct://...")` were `get_into: False, head: False`;
 they are now `True, True`, and `get_into_async` / `head_async` on those URIs read instead of raising

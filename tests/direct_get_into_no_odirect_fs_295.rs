@@ -22,6 +22,9 @@
 // Every read must fall back to ordinary positional reads straight into the caller's buffer:
 // same bytes, nothing written outside the destination, progress equal to the length, the
 // fallback counted in `get_fallbacks`, no O_DIRECT get counted and the bounce pool never used.
+// The refusal is logged at WARN once per process and at DEBUG afterwards (a flood of identical
+// warnings is not a diagnostic), while the counter still ticks for every call; both are checked
+// from the real log output at the end.
 // The counters are process-wide, so every scenario runs in ONE test, one after another.
 
 use s3dlio::direct_bounce::{bounce_stats, BounceStats};
@@ -31,8 +34,10 @@ use s3dlio::file_store_direct::{
 use s3dlio::memory::AlignedBuf;
 use s3dlio::object_error::{object_error, ObjectErrorKind};
 use s3dlio::object_store::{ObjectStore, ReceiveProgress};
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const MIB: usize = 1024 * 1024;
 const PAGE: usize = 4096;
@@ -74,6 +79,20 @@ fn refusing_dir() -> Option<tempfile::TempDir> {
     Some(dir)
 }
 
+/// Collects everything the process logs.
+#[derive(Clone, Default)]
+struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn write(dir: &Path, name: &str, data: &[u8]) -> String {
     let path = dir.join(name);
     std::fs::write(&path, data).unwrap();
@@ -105,6 +124,18 @@ async fn a_filesystem_that_refuses_o_direct_is_read_buffered_into_the_caller_buf
         return;
     };
     let dir = dir.path();
+    let log = LogBuf::default();
+    {
+        let sink = log.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || sink.clone())
+                .finish(),
+        )
+        .expect("this test binary installs the only log subscriber");
+    }
     let store = ConfigurableFileSystemObjectStore::with_direct_io();
 
     // (name, length, offset of the destination in a page-aligned backing buffer, whether the
@@ -180,4 +211,28 @@ async fn a_filesystem_that_refuses_o_direct_is_read_buffered_into_the_caller_buf
         })
     );
     assert!(dst.iter().all(|b| *b == FILL), "mismatch wrote nothing");
+
+    // The log: one WARN for the whole process, a DEBUG line for each later refusal (the
+    // counter, checked above, ticked for every one of them).
+    check_log(&log, cases.iter().filter(|c| c.3).count());
+}
+
+// (appended to the test above through `check_log`, called at its end)
+fn check_log(log: &LogBuf, direct_attempts: usize) {
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let refusals: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("O_DIRECT open failed"))
+        .collect();
+    let warns = refusals.iter().filter(|l| l.contains(" WARN ")).count();
+    let debugs = refusals.iter().filter(|l| l.contains(" DEBUG ")).count();
+    assert_eq!(
+        warns, 1,
+        "the refusal is a WARN once per process, got {warns} in {refusals:#?}"
+    );
+    assert_eq!(
+        debugs,
+        direct_attempts - 1,
+        "every later refusal is a DEBUG line: {refusals:#?}"
+    );
 }

@@ -625,3 +625,67 @@ async fn capabilities_say_true_for_file_and_direct() {
         assert!(c.head, "{u}: head");
     }
 }
+
+/// An empty file read into an empty destination is `Ok` WITHOUT opening it: a zero-byte file the
+/// process is not allowed to read (mode 000) still succeeds, in every store, while a non-empty
+/// file with the same mode is `Forbidden` (the control: the permission really blocks an open).
+/// Skipped as root, which can read anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_empty_file_is_ok_without_being_opened() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("SKIPPED: running as root, a mode-000 file is readable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty-000");
+    let full = dir.path().join("full-000");
+    std::fs::write(&empty, b"").unwrap();
+    std::fs::write(&full, vec![1u8; 8192]).unwrap();
+    for p in [&empty, &full] {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    let stores: Vec<(&str, Box<dyn ObjectStore>)> = vec![
+        ("file", Box::new(FileSystemObjectStore::new())),
+        (
+            "file (configurable)",
+            Box::new(ConfigurableFileSystemObjectStore::new(
+                FileSystemConfig::default(),
+            )),
+        ),
+        (
+            "direct",
+            Box::new(ConfigurableFileSystemObjectStore::with_direct_io()),
+        ),
+    ];
+    for (name, store) in &stores {
+        let scheme = if *name == "direct" { "direct" } else { "file" };
+        let progress = ReceiveProgress::new();
+        store
+            .get_into(
+                &format!("{scheme}://{}", empty.display()),
+                &mut [],
+                &progress,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: an empty file must not need to be opened: {e:#}"));
+        assert_eq!(progress.filled(), 0, "{name}");
+
+        let mut dst = vec![0u8; 8192];
+        let err = store
+            .get_into(
+                &format!("{scheme}://{}", full.display()),
+                &mut dst,
+                &ReceiveProgress::new(),
+            )
+            .await
+            .expect_err("a non-empty unreadable file is refused");
+        assert_eq!(
+            object_error(&err).map(|e| e.kind),
+            Some(ObjectErrorKind::Forbidden),
+            "{name}: {err:#}"
+        );
+    }
+}

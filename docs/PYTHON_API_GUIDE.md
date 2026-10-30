@@ -555,9 +555,27 @@ stores, with these local specifics:
   avoided (O_DIRECT forbids unaligned memory); it is bounded by the pool's own buffers, never by the
   size of the object. A file smaller than the store's minimum direct size, and a filesystem that
   refuses O_DIRECT, are read with ordinary positional reads (still straight into `dst`).
+- A Python `bytearray` (and `bytes`-like buffers from `bytearray(n)`) is only 16-byte aligned, so on `direct://` it
+  ALWAYS takes the bounce copy. To read with no copy, give `get_into_async` page-aligned memory: an anonymous `mmap`
+  (`buf = mmap.mmap(-1, n)`), or a NumPy view cut at a page boundary:
+  ```python
+  raw = np.empty(n + 4096, dtype=np.uint8)
+  dst = raw[(-raw.ctypes.data) % 4096:][:n]      # dst.ctypes.data % 4096 == 0
+  ```
+  `n` need not be a multiple of 4096 (the last, sub-page part is bounced). The bounce pool is shared by every unaligned
+  `direct://` transfer and is tuned by `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE` and
+  `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY`; `get_into_async` ignores `S3DLIO_DIRECT_IO_GET_MODE` (its `direct` mode allocates
+  a buffer of the object's size, which a caller-buffer GET must not do).
 - The size is checked first: a file whose size is not `expected_len` raises `LengthMismatchError`
   (`.actual` is the file's size) and nothing is written to `dst`. The read is also re-checked at the
-  end, so a file that changed size during the read is an error too.
+  end, so a file that changed size during the read is an error too (`LengthMismatchError` with the size it has now).
+- A file modified in place while it is read, with its size unchanged (a same-size overwrite, truncate-then-regrow, a
+  replacement by `rename`, a deletion), raises `RuntimeError` ("version changed"), never a successful read of mixed
+  data: the open file's modification and status-change times are compared before and after the read. A metadata-only
+  change (`chmod`, `chown`, a hard link) moves the status-change time and is reported too; retry. Limits: a write
+  in the same kernel timestamp tick (1-10 ms on ext4) as the last change before the read opened the file goes unseen;
+  filesystems with 1-2 s timestamps widen that window; a write through a shared `mmap` is stamped only at write-back.
+  The check cannot protect against a writer that is still writing when the read ends successfully.
 - A missing file (or a path below a regular file) raises `ObjectNotFoundError`; `head_async` returns `None`.
   A directory raises `RuntimeError` from both. A file you may not read raises `RuntimeError` naming the
   permission error (`head_async`, which only needs `stat`, still succeeds).

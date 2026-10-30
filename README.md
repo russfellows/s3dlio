@@ -462,7 +462,9 @@ The same calls work on `file://` and `direct://` (#295): `file://` reads with `p
 bounded bounce pool, into an unaligned one (a NumPy slice at an odd address, for example), with no
 whole-object allocation either way. `head_async` returns the size from `stat` and `None` for a missing file.
 Do not touch `buf` until the `await` returns; a size other than `expected_len` raises
-`LengthMismatchError`. See the [Python API guide](docs/PYTHON_API_GUIDE.md#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100).
+`LengthMismatchError`, and a local file modified while it is read (same size, new timestamps) raises
+`RuntimeError` ("version changed") instead of returning mixed data. A `bytearray` is only 16-byte aligned, so on
+`direct://` it takes the bounce copy: use an `mmap` or a page-aligned NumPy view for the zero-copy path (see the guide). See the [Python API guide](docs/PYTHON_API_GUIDE.md#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100).
 
 **Writes borrow your buffer (v0.10.0):** async writes read your buffer in place until the `await` finishes; pass
 `borrow=False` for a copy.
