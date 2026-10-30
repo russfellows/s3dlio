@@ -7199,6 +7199,92 @@ mod helper_row_tests {
         assert_eq!(seen(&helper_key, "HEAD"), 1);
     }
 
+    /// #294: a `MultiEndpointStore` is a store, so it captures the op-log logger when it is
+    /// CONSTRUCTED and uses it for every operation (its bucket-form S3 endpoints write the GET/PUT
+    /// helper rows). One built in session 1 and used after finalize + init(other) writes nothing into
+    /// session 2; one built before any init is never logged; one built in session 2 is logged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_multi_endpoint_store_keeps_the_logger_it_was_built_with() {
+        use crate::multi_endpoint::{LoadBalanceStrategy, MultiEndpointStore};
+        use crate::s3_logger::finalize_op_logger;
+
+        let _guard = s3_object_store_tests::CRED_LOCK.lock().await;
+        for name in ["S3DLIO_OPLOG_BUF", "S3DLIO_OPLOG_LOSSLESS"] {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("S3DLIO_LOAD_DOTENV", "0");
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+        let (_, server) = ensure_mock_s3_server();
+
+        let key = |tag: &str| format!("mep/{}", unique_test_key(&format!("mepcap-{tag}")));
+        let (old_a, old_b, new_c) = (key("old-a"), key("old-b"), key("new-c"));
+        for k in [&old_a, &old_b, &new_c] {
+            server.put_object(BUCKET, k, MockObject::new(vec![9u8; 32]));
+        }
+        let build = || {
+            MultiEndpointStore::new(
+                vec![format!("s3://{BUCKET}/mep/")],
+                LoadBalanceStrategy::RoundRobin,
+                None,
+            )
+            .expect("multi-endpoint store")
+        };
+        let uri = |k: &str| format!("s3://{BUCKET}/{k}");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s1 = dir.path().join("s1.tsv.zst");
+        let s2 = dir.path().join("s2.tsv.zst");
+
+        let built_before_init = build(); // the op-log is off
+        crate::s3_logger::init_op_logger(s1.to_str().expect("utf-8 path")).expect("init s1");
+        let built_in_session_1 = build();
+        finalize_op_logger();
+        crate::s3_logger::init_op_logger(s2.to_str().expect("utf-8 path")).expect("init s2");
+
+        for (store, k) in [(&built_in_session_1, &old_a), (&built_before_init, &old_b)] {
+            store.get(&uri(k)).await.expect("old store get");
+            store
+                .put(&uri(k), bytes::Bytes::from_static(b"y"))
+                .await
+                .expect("old store put");
+            store
+                .get_from_endpoint(0, &uri(k))
+                .await
+                .expect("old get_from_endpoint");
+        }
+        let built_in_session_2 = build();
+        built_in_session_2
+            .get(&uri(&new_c))
+            .await
+            .expect("new store get");
+        built_in_session_2
+            .put(&uri(&new_c), bytes::Bytes::from_static(b"z"))
+            .await
+            .expect("new store put");
+
+        finalize_op_logger();
+        let rows = rows_of(&s2);
+        for old in [&old_a, &old_b] {
+            assert!(
+                !rows.iter().any(|(_, f)| f.contains(old.as_str())),
+                "a store built before session 2 wrote into session 2 ({old}): {rows:?}"
+            );
+        }
+        let of = |op: &str| {
+            rows.iter()
+                .filter(|(o, f)| o == op && f.contains(new_c.as_str()))
+                .count()
+        };
+        assert_eq!(of("GET"), 1, "the session-2 store logs its GET: {rows:?}");
+        assert_eq!(of("PUT"), 1, "the session-2 store logs its PUT: {rows:?}");
+        assert_eq!(rows.len(), 2, "nothing else is recorded: {rows:?}");
+        let rows1 = rows_of(&s1);
+        assert!(
+            rows1.is_empty(),
+            "session 1 got rows after finalize: {rows1:?}"
+        );
+    }
+
     /// #294: the S3 helper rows (`get_object_uri_async`, `get_objects_parallel`, the put batch)
     /// belong to the op-log session of the CALL that started them, not to the session that is
     /// active when the work finally runs. A Python `*_async` call snapshots `global_logger()`

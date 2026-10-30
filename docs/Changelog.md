@@ -63,17 +63,19 @@ listed under 0.10.0.
   `tests/oplog_lifecycle_active_file_gone_or_odd.rs` (replacing `oplog_lifecycle_reinit_rejected.rs`). CI's Python job
   now also runs `tests/test_oplog_store_cache.py` and the permutation matrix.
 - **Async calls bind to the session active when the call is made** (not when the runtime first polls the future):
-  `get_async`, `get_range_async`, `put_bytes_async`, `put_many_async`, `mkdir_async`, `put_async`, `get_many_async`,
-  and `get_many_stats_async` take the logger synchronously, so an awaitable
-  created in session 1 never writes into session 2 and one created while the op-log is off is never logged (this was a
-  rare race). **Datasets, loaders and `MultiEndpointStore` objects** (`create_dataset`, `create_async_loader`,
-  `create_multi_endpoint_store*`, ...) capture the logger when they are CONSTRUCTED and use it for every fetch, like stores, readers and writers: one
-  built before `init_op_log` is never logged, one built in session 1 never writes into session 2. (BEHAVIOUR CHANGE for
-  `MultiEndpointStore`: in 0.10.0 its bucket-form `s3://` endpoints wrote their GET/PUT rows to whichever op-log was
-  active when each operation ran, so a store built before `init_op_log` was logged and one built in session 1 wrote into
-  session 2; both now stay silent, as the documented rule for objects you construct says.) The synchronous
-  `get_many` on `s3://` takes the logger once, at entry: a call still running when `finalize_op_log()` runs writes no row
-  for the requests it starts afterwards, even if a new session has begun.
+  `get_async`, `get_range_async`, `put_bytes_async`, `put_many_async`, `mkdir_async`, `put_async`, `get_many_async` and
+  `get_many_stats_async` take the logger synchronously, so an awaitable created in session 1 never writes into
+  session 2 and one created while the op-log is off is never logged (this was a rare race). The synchronous
+  `get_many` on `s3://` takes the logger once, at entry: a call still running when `finalize_op_log()` runs writes no
+  row for the requests it starts afterwards, even if a new session has begun.
+- **Datasets, loaders and `MultiEndpointStore` capture the logger when they are constructed** and use it for every
+  fetch or operation, like stores, readers and writers: one built before `init_op_log` is never logged, and one built
+  in session 1 never writes into session 2. This covers `create_dataset`, `create_async_loader` and
+  `create_multi_endpoint_store*` in Python and the Rust `S3BytesDataset` and `MultiEndpointStore`.
+  BEHAVIOUR CHANGE for `MultiEndpointStore` (Python and Rust): in 0.10.0 its bucket-form `s3://` endpoints wrote their
+  GET/PUT rows to whichever op-log was active when each operation ran, so a store built before `init_op_log` was
+  logged and one built in session 1 wrote into session 2; both now stay silent, as the documented rule for objects you
+  construct says.
 - **Test hook:** `tests/test_oplog_async_call_time_294.py` makes the race deterministic with the hidden
   `s3dlio._hold_async_runtime()`, which exists only in wheels built with the non-default `test-hooks` cargo feature (CI's
   test wheel); the published wheels do not contain it, and `publish-pypi.yml` asserts that.
