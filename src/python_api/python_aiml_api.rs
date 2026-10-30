@@ -57,7 +57,7 @@ use crate::s3_client::run_on_global_rt;
 // s3dlio#161).
 use crate::python_api::python_core_api::py_err;
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyS3Dataset {
     inner: S3BytesDataset,
@@ -82,7 +82,7 @@ impl PyS3Dataset {
 }
 
 // Generic dataset that works with all URI schemes
-#[pyclass]
+#[pyclass(from_py_object)]
 pub struct PyDataset {
     inner: Arc<dyn Dataset<Item = Bytes>>,
 }
@@ -193,7 +193,7 @@ impl Clone for PyDataset {
 }
 
 // Generic async loader that works with PyDataset
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyBytesAsyncDataLoader {
     dataset: PyDataset,
@@ -1023,7 +1023,7 @@ pub fn read_npz(py: Python<'_>, uri: &str, array_name: Option<&str>) -> PyResult
 // ---------------------------------------------------------------------------
 // LoaderOptions Python wrapper with AI/ML realism knobs
 // ---------------------------------------------------------------------------
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyLoaderOptions {
     inner: LoaderOptions,
@@ -1319,7 +1319,7 @@ impl PyLoaderOptions {
 // ---------------------------------------------------------------------------
 // DataLoader bindings
 // ---------------------------------------------------------------------------
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyVecDataset {
     inner: Vec<i32>,
@@ -3252,7 +3252,7 @@ pub fn create_async_loader(
 
 /// Compatibility wrapper - creates a PyDataset but only for S3 URIs
 /// DEPRECATED: Use PyDataset or create_dataset() instead
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyS3DatasetCompat {
     inner: PyDataset,

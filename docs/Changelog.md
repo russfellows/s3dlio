@@ -1,6 +1,6 @@
 # s3dlio Changelog
 
-## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267)
+## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267); exit abort with daemon threads (#298)
 
 ### Fixed — Op-log can be restarted after `finalize_op_log()` (#294)
 
@@ -208,6 +208,36 @@ large objects, because the destination's pages are already mapped: the allocatin
 faulting fresh pages in. Into a freshly allocated buffer `get_into` runs at about the speed of `get` (within 10% in
 these runs: it does the same work, plus faulting the pages in). The bounce copy costs about 35% against a reused
 aligned destination, and a reused unaligned destination is still about 8% faster than `get`.
+
+### Fixed — exit abort with daemon threads (#298)
+
+On CPython **before 3.13.8** (every 3.11 and 3.12, and 3.13.0 to 3.13.7), a process died with SIGABRT (exit code 134,
+often `FATAL: exception not rethrown` on stderr) when the main thread returned while a daemon thread was inside an
+s3dlio call (sync `get`, `put_bytes`, `list`, `stat`, `get_many`, `get_range`, streaming writers, `get_into_async` on the
+thread's event loop, and so on). Remaining `atexit` handlers, buffered output and final log flushes were lost, and a
+scheduler or CI system saw a crash. It was not specific to s3dlio (a trivial PyO3 0.27 module that only sleeps with the
+GIL released aborts the same way) and not specific to 3.12 as first reported: CPython 3.13.8 and 3.14 no longer end such
+a thread with `pthread_exit`, 3.11 and 3.12 still do.
+
+- **Fix:** PyO3, `numpy` and `pyo3-async-runtimes` are upgraded from 0.27 to 0.29. PyO3 0.29 wraps the GIL re-acquire in
+  a guard that parks the thread instead of letting the forced unwind cross Rust frames. `pyo3` is pinned to **exactly
+  0.29.3** (`=0.29.3`): 0.29.0 to 0.29.2 lack the follow-up fix (PyO3 #6404). Do not loosen it to `^0.29`.
+- **Behaviour now:** the process exits with code 0 and runs its `atexit` handlers; the daemon threads are simply
+  abandoned, as on 3.13.8+ and 3.14. Non-daemon threads are unaffected (Python waits for them). Python 3.13.8+ and 3.14
+  were never affected. No API change. The `#[pyclass]` types that Python code passes back by value
+  (`PyDataset`, `PyBytesAsyncDataLoader`, `PyLoaderOptions`, `PyVecDataset`, `PyS3Dataset`, `PyS3DatasetCompat`,
+  `ObjectMetadata`) keep their by-value extraction (`#[pyclass(from_py_object)]`, the PyO3 0.28 opt-in), and the module
+  declares `gil_used = true` so a free-threaded interpreter keeps re-enabling the GIL, as with PyO3 0.27.
+- **Not covered:** a thread parked at exit keeps whatever Rust state it holds above the call (it never runs
+  its destructors); that is the same as 3.13.8+. Other extensions (NumPy C code, torch) that release the GIL are not
+  changed by this fix. Do not build s3dlio with `panic = "abort"` for release: the guard needs unwinding.
+- **Tests:** `python/tests/test_exit_daemon_threads_298.py` runs each scenario in a fresh subprocess with a timeout:
+  sync `get`, `put_bytes`, `list`, `stat`, `get_many`, `get_range`, a streaming writer, a call blocked on an unresponsive
+  endpoint, async calls (including `get_into_async` and a never-completing one) on a daemon thread's event loop, op-log
+  active at exit, `atexit` handlers that call s3dlio while daemon threads are busy, and a non-daemon-thread case. CI's
+  Python job runs it.
+- **Workarounds on an older wheel:** use Python 3.13.8 or later, or stop and `join()` worker threads before the main
+  thread returns.
 
 ## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; zero copy everywhere (Rule #1); stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 

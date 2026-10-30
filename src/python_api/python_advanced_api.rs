@@ -638,7 +638,7 @@ impl PyMultipartUploadWriter {
             return Err(PyErr::fetch(py));
         }
         // SAFETY: `raw` is a non-null owned reference.
-        let mv = unsafe { Py::<PyAny>::from_owned_ptr(py, raw) };
+        let mv = unsafe { Bound::<PyAny>::from_owned_ptr(py, raw).unbind() };
         self.pending_reservation = Some(block);
         Ok(mv)
     }

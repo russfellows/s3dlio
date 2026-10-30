@@ -2124,7 +2124,7 @@ create_exception!(
 /// The result of `head_async` for an object that exists: its size and opaque identity.
 ///
 /// Frozen: the fields cannot be assigned, and equal values hash equal.
-#[pyclass(name = "ObjectMetadata", frozen, eq, hash)]
+#[pyclass(name = "ObjectMetadata", frozen, eq, hash, from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PyHeadMetadata {
     /// The object size in bytes (never negative).

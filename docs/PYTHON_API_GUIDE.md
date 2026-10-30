@@ -64,7 +64,9 @@ pip install s3dlio
 
 ### Requirements
 
-- Python 3.11+ (release validation targets CPython 3.11–3.13)
+- Python 3.11+ (release validation targets CPython 3.11–3.13). Exit with daemon threads inside s3dlio calls is
+  clean on every supported interpreter since the PyO3 0.29.3 upgrade (#298); see
+  [Interpreter exit with daemon threads](#interpreter-exit-with-daemon-threads-298)
 - Rust 1.94.1+ (for building from source)
 - Optional: PyTorch, JAX, or TensorFlow for ML integration
 
@@ -253,6 +255,22 @@ export S3DLIO_WORKER_THREADS=16
 ```
 
 ---
+
+### Interpreter exit with daemon threads (#298)
+
+If the main thread returns while daemon threads are inside s3dlio calls (sync calls, a streaming writer, or
+`get_into_async` on a daemon thread's event loop), the interpreter finalizes and the daemon threads are abandoned: the
+process exits with code 0 and `atexit` handlers run. A daemon thread that returns from its blocking call after
+finalization began is parked forever; it never runs again, so its remaining Python code and Rust destructors do not run.
+
+- **Before the fix** (wheels built with PyO3 0.27 or older, including `s3dlio==0.10.0`): on CPython **before 3.13.8**
+  (3.11, 3.12 and 3.13.0 to 3.13.7) this was a SIGABRT (exit code 134, often `FATAL: exception not rethrown`). Python
+  3.13.8+ and 3.14 were never affected. Workarounds for such a wheel: use Python 3.13.8+, or signal your workers to stop
+  and `join()` them (for example in a `try/finally` around `main()`) before the main thread returns.
+- **Now** (PyO3 0.29.3): no abort on any supported Python.
+- Non-daemon threads are unaffected: Python waits for them before finalizing.
+- Parking a thread is not a clean shutdown. Work a daemon thread had in flight is lost; stop and join your workers (and
+  call `finalize_op_log()`) if you need it to complete.
 
 ## Core Storage Operations
 
