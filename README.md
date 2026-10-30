@@ -662,7 +662,7 @@ s3dlio.init_op_log("operations2.tsv.zst")
 s3dlio.finalize_op_log()
 ```
 
-`init_op_log()` after `finalize_op_log()` starts a fresh session with its own file and stats (it waits for the previous session to finish draining); calling it while a session is active is a no-op.
+`init_op_log()` after `finalize_op_log()` starts a fresh session with its own file and stats (it waits for the previous session to finish draining); calling it while a session is active is a no-op for the same file and a `RuntimeError` (naming the file being written and the requested one, asking you to finalize first) for any other file. After `os.fork()` a child does not share the parent's session: it sees the op-log as not initialised and may start its own (never on the parent's file).
 
 See [S3DLIO OpLog Implementation](docs/S3DLIO_OPLOG_IMPLEMENTATION_SUMMARY.md) for detailed usage.
 

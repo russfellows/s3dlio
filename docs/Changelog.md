@@ -17,8 +17,25 @@
   - A re-init never lets two writers overlap: if the previous session's writer is still
     draining (a finalize on another thread), init waits for that drain before opening the new
     file. If another thread initialises meanwhile, the call is the Active no-op.
-  - Init while a session is Active is unchanged (a no-op returning success). A failed init
-    after a finalize leaves the op-log Finalized so a corrected call can succeed.
+  - A failed init after a finalize leaves the op-log Finalized so a corrected call can succeed.
+  - **Init while a session is Active** (round 2, decided by the maintainer): the same file (any
+    spelling: `x`, `./x`, absolute, `file:///abs/x`, `dir/../x`, a symlink or hard link to it;
+    decided by `(device, inode)` on Unix, canonical paths elsewhere) is a no-op and nothing is
+    truncated; ANY OTHER file is now an error (`ErrorKind::ResourceBusy`, `RuntimeError` in
+    Python) naming the file being written and the requested path and saying to finalize first;
+    the requested path is not created. BEHAVIOUR CHANGE: this used to be a silent no-op for any
+    path, which let a caller believe it was logging to the new file. Of N concurrent inits with
+    different files exactly one wins and the others get the error.
+  - **Fork safety:** a child created by `fork` (`os.fork`, `multiprocessing` fork) inherited the
+    parent's Active session without its writer thread: a lossless `log()` on a full queue and
+    `finalize_op_log()` blocked forever, and the child could deadlock on the lifecycle lock if
+    another parent thread held it during the fork. The child now sees the op-log as not
+    initialised (`pthread_atfork`; the lock is held across the fork), may start its own session,
+    and is refused (`ResourceBusy`) if it initialises the parent's file, which would truncate it.
+  - The permutation matrix: `tests/test_oplog_lifecycle_permutations_294.py` (single thread,
+    16 threads racing init/finalize, workers running during 50 cycles, asyncio, fork/spawn,
+    exit; lossy and lossless) and `tests/oplog_lifecycle_{same_file_spellings,
+    concurrent_init_same_file,concurrent_init_different_files,cycles_no_leaks}.rs`.
   - Stores, readers and writers captured in an earlier session keep that session's closed
     logger: they keep working but never write into a later session's file. The Python
     module-level calls look the op-log up on every call, so they need no change.

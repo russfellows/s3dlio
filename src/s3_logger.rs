@@ -11,6 +11,7 @@
 use once_cell::sync::OnceCell;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{
     mpsc::{channel, sync_channel, Receiver, SyncSender, TrySendError},
@@ -30,10 +31,207 @@ use zstd::stream::write::Encoder;
 /// repeated or concurrent finalize can wait for the first one to finish draining,
 /// and a re-init waits for that drain before it opens the next file, so two
 /// writers never overlap. It also keeps that session's stats readable.
+///
+/// `Forked` is what a CHILD process (created by `fork`) sees of a session that
+/// was Active or Finalized in its parent: the writer thread does not exist in the
+/// child, so the inherited session can never write or finish. The child treats
+/// the op-log as not initialised (it can start its own session), but remembers
+/// the parent's file so that it cannot truncate it by initialising the same path.
 enum OpLogState {
     Uninitialized,
-    Active(Logger),
-    Finalized(Logger),
+    Active(Session),
+    Finalized(Session),
+    Forked(SessionFile),
+}
+
+/// One op-log session: its logger and the file it writes.
+struct Session {
+    logger: Logger,
+    file: SessionFile,
+}
+
+/// The identity of the file a session writes, so that a later `init_op_logger`
+/// can tell "the same file" from "another file" whatever the spelling (`x`,
+/// `./x`, `/abs/x`, `file:///abs/x`, `dir/../x`, a symlink or hard link to it).
+///
+/// On Unix the identity is the `(device, inode)` pair read right after the file
+/// was created, and a request is compared by `stat`-ing it (which follows
+/// symlinks): that is exact for every spelling and link, with no string
+/// processing to get wrong. A request that does not exist (or cannot be
+/// `stat`ed) cannot be the active file. Elsewhere (and if the `stat` failed) the
+/// canonical paths are compared. The check runs under the lifecycle lock, but a
+/// file removed or replaced behind the session's back is a different file, by
+/// design: the session writes the unlinked inode.
+struct SessionFile {
+    /// What the caller passed to `init` (for messages).
+    given: String,
+    /// The canonical absolute path, resolved right after creation (for messages
+    /// and for the non-Unix comparison).
+    canonical: PathBuf,
+    /// `(device, inode)` of the created file.
+    #[cfg(unix)]
+    id: Option<(u64, u64)>,
+}
+
+impl SessionFile {
+    /// Record the identity of `local` (the resolved path of a file that was just
+    /// created); `given` is the text the caller passed to `init`.
+    fn of_created(given: &str, local: &str) -> Self {
+        let canonical = std::fs::canonicalize(local).unwrap_or_else(|_| PathBuf::from(local));
+        #[cfg(unix)]
+        let id = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&canonical)
+                .ok()
+                .map(|m| (m.dev(), m.ino()))
+        };
+        SessionFile {
+            given: given.to_string(),
+            canonical,
+            #[cfg(unix)]
+            id,
+        }
+    }
+
+    /// True if the local path `requested` is this file.
+    fn is_same_file(&self, requested: &str) -> bool {
+        #[cfg(unix)]
+        if let Some(id) = self.id {
+            use std::os::unix::fs::MetadataExt;
+            return std::fs::metadata(requested)
+                .map(|m| (m.dev(), m.ino()) == id)
+                .unwrap_or(false);
+        }
+        std::fs::canonicalize(requested)
+            .map(|c| c == self.canonical)
+            .unwrap_or(false)
+    }
+
+    /// The file as the user would recognise it: as given, plus the resolved path
+    /// when that is spelled differently.
+    fn describe(&self) -> String {
+        let canonical = self.canonical.display().to_string();
+        if canonical == self.given {
+            format!("'{canonical}'")
+        } else {
+            format!("'{}' (resolved to '{canonical}')", self.given)
+        }
+    }
+}
+
+/// `init_op_logger(requested)` while a session is Active on `active`: the same
+/// file is a no-op, any other file (or an unusable destination) is an error that
+/// names both files. Nothing is created or truncated either way.
+fn check_request_against_active(active: &SessionFile, requested: &str) -> std::io::Result<()> {
+    let local = resolve_local_oplog_path(requested)?;
+    if active.is_same_file(local) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::ResourceBusy,
+        format!(
+            "cannot start an op-log session for '{requested}': the op-log is already \
+             active and writing {}. Call finalize_op_log() first, then start the new \
+             session (nothing was created or changed)",
+            active.describe()
+        ),
+    ))
+}
+
+/// A child of `fork` asked to start a session on the file its parent's session
+/// writes: refused (initialising it would truncate the parent's log).
+fn check_request_against_parent(parent: &SessionFile, requested: &str) -> std::io::Result<()> {
+    let local = resolve_local_oplog_path(requested)?;
+    if parent.is_same_file(local) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ResourceBusy,
+            format!(
+                "cannot start an op-log session for '{requested}': that is the op-log file \
+                 of the PARENT process, which this process was forked from and which is \
+                 still writing it. Use a different file in the child (nothing was created \
+                 or changed)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Fork safety (issue #294): the writer thread exists only in the process that
+/// started the session, so after `fork` the child would block forever on the
+/// inherited session (a lossless `log()` on a full queue, `finalize`'s wait for
+/// the writer), and could deadlock on the lifecycle lock if another parent thread
+/// held it at the instant of the fork. `pthread_atfork` handlers fix both: the
+/// parent's `prepare` takes the lifecycle lock for the duration of the fork, and
+/// the child's handler abandons any inherited session (closing its gate, so every
+/// logger clone, including those inside stores, rejects entries at once) and
+/// turns the state into `Forked`. They do nothing but atomics, moves and
+/// forgetting, so they are safe to run between `fork` and `exec` too.
+#[cfg(unix)]
+mod fork_safety {
+    use super::{lock_state, OpLogState, GATE_CLOSED};
+    use std::cell::RefCell;
+    use std::sync::atomic::Ordering;
+    use std::sync::{MutexGuard, Once};
+
+    thread_local! {
+        /// The lifecycle lock, held by the forking thread from `prepare` until
+        /// `parent` / `child` run (those run on the same thread).
+        static HELD: RefCell<Option<MutexGuard<'static, OpLogState>>> = const { RefCell::new(None) };
+    }
+
+    extern "C" fn prepare() {
+        let guard = lock_state();
+        HELD.with(|held| *held.borrow_mut() = Some(guard));
+    }
+
+    extern "C" fn parent() {
+        HELD.with(|held| drop(held.borrow_mut().take()));
+    }
+
+    extern "C" fn child() {
+        let Some(mut state) = HELD.with(|held| held.borrow_mut().take()) else {
+            return;
+        };
+        let file = match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
+            OpLogState::Uninitialized => None,
+            OpLogState::Forked(file) => Some(file),
+            OpLogState::Active(session) | OpLogState::Finalized(session) => {
+                // No writer exists here: reject everything from now on. The
+                // logger is leaked on purpose (never dropped or waited for).
+                session
+                    .logger
+                    .shared
+                    .gate
+                    .fetch_or(GATE_CLOSED, Ordering::AcqRel);
+                let super::Session { logger, file } = session;
+                std::mem::forget(logger);
+                Some(file)
+            }
+        };
+        if let Some(file) = file {
+            *state = OpLogState::Forked(file);
+        }
+    }
+
+    /// Register the handlers once per process (first `init_op_logger`).
+    pub(super) fn register() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // SAFETY: the handlers are `extern "C" fn()`, live for the whole
+            // process and only touch this module's state.
+            let rc = unsafe { libc::pthread_atfork(Some(prepare), Some(parent), Some(child)) };
+            if rc != 0 {
+                tracing::warn!(
+                    "pthread_atfork failed ({rc}): op-log sessions are not fork-safe in this process"
+                );
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+mod fork_safety {
+    pub(super) fn register() {}
 }
 
 // Global variables
@@ -118,6 +316,14 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
     OP_LOG_STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Create the file for a new session (create-and-truncate) and start its writer.
+fn new_session(path: &str) -> std::io::Result<OpLogState> {
+    let logger = Logger::new(path)?;
+    let local = resolve_local_oplog_path(path)?;
+    let file = SessionFile::of_created(path, local);
+    Ok(OpLogState::Active(Session { logger, file }))
+}
+
 /// Start an op-log session, writing to `path`.
 ///
 /// The lifecycle is `Uninitialized` -> `Active` -> `Finalized` -> `Active` -> ...:
@@ -129,8 +335,16 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
 ///   s3dlio's file-store convention, not full RFC 8089), creates
 ///   the file and becomes Active. A failed init (bad path, unsupported scheme,
 ///   I/O error) leaves the op-log Uninitialized, so a corrected call can succeed.
-/// - Active: a no-op returning `Ok(())`. The new `path` is **not** created or
-///   truncated and the session keeps writing to the original file.
+/// - Active, `path` is the file being written (any spelling: `x`, `./x`,
+///   `/abs/x`, `file:///abs/x`, `dir/../x`, a symlink or hard link to it): a
+///   no-op returning `Ok(())`; nothing is created or truncated.
+/// - Active, `path` is any other file: **an error** (`ErrorKind::ResourceBusy`;
+///   a `RuntimeError` in Python) naming the file being written and the requested
+///   path and saying to finalize first. The requested path is not created or
+///   truncated and the session carries on. A `path` that cannot be resolved
+///   (unsupported scheme, empty `file://`) is an error too (`InvalidInput`).
+///   Whether two paths are the same file is decided by file identity
+///   (`(device, inode)` on Unix), not by comparing text; see `SessionFile`.
 /// - Finalized: starts a **new session**. If the previous session's writer is
 ///   still draining (a finalize on another thread has not finished), this call
 ///   first waits for it, so two writers never exist at once. The file is then
@@ -140,7 +354,16 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
 ///   clock offset of 0; the process client ID ([`set_client_id`]) carries over. A
 ///   failed init leaves the op-log Finalized (the old session's stats stay
 ///   readable) so a corrected call can succeed. If another thread initialises
-///   the op-log while this call waits, this call is the Active no-op.
+///   the op-log while this call waits, this call is treated as an init while
+///   Active (a no-op for the same file, an error for another).
+/// - After a `fork` (in the child): the inherited session is not usable (its
+///   writer thread does not exist in the child), so the op-log is treated as
+///   not initialised and the child may start its own session, except on the
+///   parent's file, which is refused (`ResourceBusy`) rather than truncated.
+///
+/// Concurrent calls: the lifecycle lock is held while a file is created, so with
+/// the same file exactly one call creates it and the rest are no-ops; with
+/// different files exactly one wins and every other call gets the error.
 ///
 /// Stores capture the logger at construction (`store_for_uri_with_logger(uri,
 /// global_logger())`): stores created before init are unlogged, and stores
@@ -151,18 +374,27 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
 /// stores and calls made during that session.
 pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
     let path = path.as_ref();
+    fork_safety::register();
     loop {
         let previous = {
             let mut state = lock_state();
             match &*state {
-                OpLogState::Active(_) => return Ok(()),
-                OpLogState::Finalized(previous) if !previous.is_drained() => previous.clone(),
+                OpLogState::Active(active) => {
+                    return check_request_against_active(&active.file, path)
+                }
+                OpLogState::Finalized(previous) if !previous.logger.is_drained() => {
+                    previous.logger.clone()
+                }
+                OpLogState::Forked(parent) => {
+                    check_request_against_parent(parent, path)?;
+                    *state = new_session(path)?;
+                    break;
+                }
                 OpLogState::Uninitialized | OpLogState::Finalized(_) => {
                     // Nothing is writing (never started, or the previous writer has
                     // finished). Created while the lifecycle lock is held, so
                     // concurrent inits cannot both create a file.
-                    let logger = Logger::new(path)?;
-                    *state = OpLogState::Active(logger);
+                    *state = new_session(path)?;
                     break;
                 }
             }
@@ -193,8 +425,8 @@ pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
 /// and stay rejected after a later re-init: it never writes into a newer session.
 pub fn global_logger() -> Option<Logger> {
     match &*lock_state() {
-        OpLogState::Active(logger) => Some(logger.clone()),
-        OpLogState::Uninitialized | OpLogState::Finalized(_) => None,
+        OpLogState::Active(session) => Some(session.logger.clone()),
+        OpLogState::Uninitialized | OpLogState::Finalized(_) | OpLogState::Forked(_) => None,
     }
 }
 
@@ -500,8 +732,10 @@ fn normalized_note(stats: &OpLogStats) -> Option<String> {
 /// records.
 pub fn op_log_stats() -> Option<OpLogStats> {
     match &*lock_state() {
-        OpLogState::Active(logger) | OpLogState::Finalized(logger) => Some(logger.stats()),
-        OpLogState::Uninitialized => None,
+        OpLogState::Active(session) | OpLogState::Finalized(session) => {
+            Some(session.logger.stats())
+        }
+        OpLogState::Uninitialized | OpLogState::Forked(_) => None,
     }
 }
 
@@ -548,8 +782,8 @@ pub fn get_clock_offset() -> std::io::Result<i64> {
 /// `init_op_logger()` to start another session (issue #294).
 fn with_active_logger<T>(what: &str, f: impl FnOnce(&Logger) -> T) -> std::io::Result<T> {
     match &*lock_state() {
-        OpLogState::Active(logger) => Ok(f(logger)),
-        OpLogState::Uninitialized => Err(std::io::Error::new(
+        OpLogState::Active(session) => Ok(f(&session.logger)),
+        OpLogState::Uninitialized | OpLogState::Forked(_) => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("{what}: Logger not initialized - call init_op_logger() first"),
         )),
@@ -629,8 +863,14 @@ pub fn finalize_op_logger() {
         let mut state = lock_state();
         match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
             OpLogState::Uninitialized => return,
-            OpLogState::Active(logger) | OpLogState::Finalized(logger) => {
-                *state = OpLogState::Finalized(logger.clone());
+            // A forked child has nothing to drain (see `OpLogState::Forked`).
+            OpLogState::Forked(file) => {
+                *state = OpLogState::Forked(file);
+                return;
+            }
+            OpLogState::Active(session) | OpLogState::Finalized(session) => {
+                let logger = session.logger.clone();
+                *state = OpLogState::Finalized(session);
                 logger
             }
         }

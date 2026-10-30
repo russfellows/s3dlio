@@ -111,9 +111,10 @@ fn init_after_finalize_starts_a_fresh_session() {
     let fresh = op_log_stats().expect("stats of the new session");
     assert_eq!(fresh.accepted, 0, "stats are the new session's: {fresh:?}");
 
-    // Init while Active is still a no-op: the new path is not created.
-    init_op_logger(third.to_str().unwrap()).unwrap();
+    // Init while Active with another file is an error: the new path is not created.
+    init_op_logger(third.to_str().unwrap()).expect_err("init with another file while Active");
     assert!(!third.exists(), "init while Active created a file");
+    init_op_logger(second.to_str().unwrap()).expect("the active file again: a no-op");
 
     let logger2 = global_logger().unwrap();
     for i in 0..3 {

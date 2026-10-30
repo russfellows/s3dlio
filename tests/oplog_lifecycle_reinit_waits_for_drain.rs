@@ -139,7 +139,8 @@ fn reinit_waits_for_the_previous_session_to_drain() {
     }
 
     // Many threads re-init at once from Finalized: exactly one file is created
-    // (the losers see Active and no-op), and the session works.
+    // and exactly one call succeeds (the losers see Active with another file and
+    // get the error), and the session works.
     const THREADS: usize = 8;
     let paths: Vec<_> = (0..THREADS)
         .map(|t| dir.path().join(format!("concurrent-{t}.tsv.zst")))
@@ -151,13 +152,16 @@ fn reinit_waits_for_the_previous_session_to_drain() {
             let (p, barrier) = (p.clone(), Arc::clone(&barrier));
             std::thread::spawn(move || {
                 barrier.wait();
-                init_op_logger(p.to_str().unwrap()).unwrap();
+                init_op_logger(p.to_str().unwrap())
             })
         })
         .collect();
-    for h in handles {
-        h.join().unwrap();
-    }
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        1,
+        "exactly one init wins: {results:?}"
+    );
     let created: Vec<_> = paths.iter().filter(|p| p.exists()).collect();
     assert_eq!(created.len(), 1, "exactly one init wins: {created:?}");
     assert_eq!(

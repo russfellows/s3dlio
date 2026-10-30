@@ -862,8 +862,21 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 ///     - First call: creates the file and starts logging. A call that fails
 ///       (bad path, unsupported scheme) leaves logging uninitialized, so a
 ///       corrected call can succeed.
-///     - Call while logging is already active: returns without effect; the new
-///       path is not created or truncated.
+///     - Call while logging is already active with the SAME file (any
+///       spelling: "x", "./x", "/abs/x", "file:///abs/x", "dir/../x", a symlink
+///       or hard link to it): returns without effect; nothing is created or
+///       truncated and the session continues.
+///     - Call while logging is already active with a DIFFERENT file: raises
+///       RuntimeError naming the file being written and the requested path and
+///       saying to call finalize_op_log() first. The requested path is not
+///       created or truncated and the session carries on unaffected. A path
+///       that cannot be used (unsupported scheme, empty "file://") raises too.
+///       Exactly one of several threads calling at once wins (same file: all
+///       return, one creates it; different files: the others raise).
+///     - In a child process created by os.fork() the parent's session does not
+///       exist (its writer thread is not copied): is_op_log_active() is False
+///       there and the child may start its OWN session, but not on the
+///       parent's file (RuntimeError: it would truncate the parent's log).
 ///     - Call after finalize_op_log(): starts a NEW session. If the previous
 ///       session's writer is still draining (finalize running on another
 ///       thread), it waits for that first. The file is created like a first

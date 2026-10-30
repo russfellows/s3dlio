@@ -278,7 +278,7 @@ with "op-log was already finalized and cannot be restarted" (issue #294).
 
 | Call | Uninitialized | Active | Finalized |
 |---|---|---|---|
-| `init_op_logger(path)` (`init_op_log`) | creates the file, becomes Active (a failed init stays Uninitialized, so it can be retried) | returns `Ok`; the new path is **not** created or truncated | starts a **new session** (see below); a failed init stays Finalized, so it can be retried |
+| `init_op_logger(path)` (`init_op_log`) | creates the file, becomes Active (a failed init stays Uninitialized, so it can be retried) | the **same file** (any spelling or link): returns `Ok`, nothing created or truncated; **another file**: `Err(ResourceBusy)` naming both files, nothing created | starts a **new session** (see below); a failed init stays Finalized, so it can be retried |
 | `finalize_op_logger()` (`finalize_op_log`) | no-op | writes every accepted record (unless the writer fails: an I/O error or a writer-thread panic), finishes the zstd stream, waits until the writer signals it has finished, becomes Finalized | no-op (waits if another finalize is still draining) |
 | `global_logger()` / `is_op_log_active()` | `None` / `False` | `Some` / `True` | `None` / `False` |
 
@@ -288,7 +288,8 @@ What a restart does:
   draining (finalize running on another thread released the lifecycle lock before
   its shutdown finished), init waits for it, so two writers never exist at once and
   the old file is a complete zstd stream before the new file is opened. If another
-  thread initialises while this call waits, this call is the Active no-op.
+  thread initialises while this call waits, this call is treated as an init
+  while Active (a no-op for the same file, an error for another).
 - **Same file semantics as a first init:** the file is created with
   create-and-truncate. A **different path** leaves the finished log untouched; the
   **same path replaces** it (the file then holds only the new session). The old
@@ -304,6 +305,65 @@ What a restart does:
   re-init to record them. Python's module-level calls (`get`, `put_bytes`, ...)
   look the op-log up on every call, so they are recorded in the new session with
   no further action.
+
+### Init while Active (#294, round 2)
+
+A second `init_op_logger(path)` while a session is Active never starts a second
+writer and never creates or truncates `path`:
+
+- **Same file: no-op.** "Same" is decided by file identity, not by comparing
+  strings: `x`, `./x`, `/abs/x`, `file:///abs/x`, `dir/../x`, a symlink to the
+  file and a hard link to it are all the same file. On Unix the session records
+  the `(device, inode)` of its file right after creating it and a request is
+  `stat`-ed (following symlinks) and compared; elsewhere the canonical paths are
+  compared. A request that does not exist is, by definition, another file. (A file
+  deleted or replaced behind the session's back is a different file: the session
+  keeps writing the unlinked inode.)
+- **Another file: error.** `ErrorKind::ResourceBusy`, which Python's `py_err`
+  maps (like every `io::Error`) to **`RuntimeError`**. The message names the file
+  being written (as given, and resolved when spelled differently) and the
+  requested path, and says to finalize first, e.g.
+  `cannot start an op-log session for 'b.tsv.zst': the op-log is already active
+  and writing '/data/a.tsv.zst'. Call finalize_op_log() first, then start the new
+  session (nothing was created or changed)`.
+  A destination that cannot be resolved at all (`s3://...`, `file://`) is an error
+  as usual (`InvalidInput`).
+- **Concurrent inits** are serialised by the lifecycle lock, which is held while the
+  file is created: with the same file exactly one call creates it and the rest
+  return `Ok`; with different files exactly one wins and every other call gets
+  the error.
+
+### Many threads, fork and exit (#294, round 2)
+
+- `init_op_log` and `finalize_op_log` release the GIL, so other Python threads run
+  during a drain. Module-level calls look the op-log up once per call. A call that
+  already holds the old session's logger when finalize begins is counted in that
+  session's `rejected_closed` (not written, not carried into the next session); a
+  call that starts after `init` returned is recorded in the new session. So for the
+  operations issued while a session is Active: every operation that begins and ends
+  inside the window is in that session's file (`accepted`, plus `dropped_full` in
+  the default lossy mode); an operation overlapping `finalize`/`init` is in the
+  file, in `rejected_closed`, or in neither (it ran while no session was Active).
+  Never in two files.
+- `os.fork()` (and `multiprocessing` with the `fork` start method): the writer
+  thread is not copied into the child, so an inherited session could never write or
+  finish (lossless mode would block on a full queue, finalize would wait forever).
+  The child therefore sees the op-log as **not initialised**: `is_op_log_active()`
+  is `False`, `op_log_stats()` is `None`, `finalize_op_log()` is a no-op, stores the
+  child inherited record nothing, and the child may start its own session on a
+  different file; initialising the parent's file in the child is refused
+  (`ResourceBusy`) because it would truncate the parent's log. The parent is not
+  affected. The lifecycle lock is held across the fork (`pthread_atfork`) so a child
+  cannot inherit it locked. With the `spawn` and `forkserver` start methods the child
+  starts clean. Forking a process that has already used s3dlio I/O is a separate
+  matter: the runtime threads are not copied either.
+- **Interpreter exit** with a session Active (no `finalize_op_log()`): the process
+  exits normally; queued rows and the zstd frame end are lost, as documented above.
+  Daemon threads that are inside an s3dlio I/O call at exit can abort the
+  interpreter (`FATAL: exception not rethrown`); that happens with or without an
+  op-log and is unrelated to it.
+- **Ctrl-C / signals:** `init_op_log` waiting for a drain releases the GIL but is
+  not interruptible: a `KeyboardInterrupt` is raised when the call returns.
 
 Stores capture the logger when they are constructed
 (`store_for_uri_with_logger(uri, global_logger())`):

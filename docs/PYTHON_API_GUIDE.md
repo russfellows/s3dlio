@@ -1963,7 +1963,16 @@ local file name.
 
 A process runs **one op-log session at a time**: `init_op_log` -> `finalize_op_log`,
 and after `finalize_op_log` a new `init_op_log` starts a new session (issue #294),
-any number of times. `init_op_log` while already active is a no-op. A re-init waits
+any number of times. `init_op_log` while already active is a no-op when it names the
+file being written (any spelling: `x`, `./x`, an absolute path, `file:///abs/x`,
+`dir/../x`, a symlink or hard link to it) and raises `RuntimeError` for any other file:
+the message names the file being written and the requested path and says to call
+`finalize_op_log()` first; the requested file is not created or truncated and the
+session carries on. Of several threads calling `init_op_log` at once exactly one
+creates the file (same file: every call returns; different files: the rest raise). After
+`os.fork()` the child does not share the parent's session (its writer thread is not
+copied): `is_op_log_active()` is `False` in the child, which can start its own session,
+but not on the parent's file. A re-init waits
 for the previous session's writer to finish (with the GIL released), then creates
 its file exactly as a first init does: the same path replaces the old log, a
 different path leaves it untouched. `finalize_op_log` is safe to repeat. The
@@ -2200,7 +2209,7 @@ snapshot).
 | Function | Description |
 |----------|-------------|
 | `init_logging(level)` | Set log level: trace, debug, info, warn, error |
-| `init_op_log(path)` | Start an op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089). Allowed again after `finalize_op_log()` (new session, fresh `op_log_stats()`; the same path is truncated, #294); a no-op while a session is active |
+| `init_op_log(path)` | Start an op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089). Allowed again after `finalize_op_log()` (new session, fresh `op_log_stats()`; the same path is truncated, #294); while a session is active: a no-op for the same file, `RuntimeError` for another file |
 | `finalize_op_log()` | Write all accepted records (unless the writer fails: an I/O error or a writer-thread panic) and close the log; **call it before the process exits, nothing does it for you**; releases the GIL while draining; idempotent; ends the session, `init_op_log` can start a new one (#294) |
 | `is_op_log_active()` | True between init and finalize only |
 | `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `written` / `dropped_full` / `rejected_closed` / `writer_failed` / `writer_error` / `lossless` / `rejected_unformattable` / `rejected_unsafe_field` / `normalized_error_text`, available while active and after finalize, to detect lost records (complete = `accepted == written`, no drops, no refusals, `writer_error is None`, `rejected_unformattable == 0`, `rejected_unsafe_field == 0`; `normalized_error_text` is a disclosure, not a loss) |
