@@ -65,7 +65,7 @@ pip install s3dlio
 ### Requirements
 
 - Python 3.11+ (release validation targets CPython 3.11–3.13). Exit with daemon threads inside s3dlio calls is
-  fixed since the PyO3 0.29.3 upgrade (#298), with one 3.14 async exception (#302); see
+  fixed since the PyO3 0.29.3 upgrade (#298) and the #302 fix for async calls on 3.14; see
   [Interpreter exit with daemon threads](#interpreter-exit-with-daemon-threads-298)
 - Rust 1.94.1+ (for building from source)
 - Optional: PyTorch, JAX, or TensorFlow for ML integration
@@ -269,9 +269,9 @@ finalization began is parked forever; it never runs again, so its remaining Pyth
   and `join()` them (for example in a `try/finally` around `main()`) before the main thread returns.
 - **Now** (PyO3 0.29.3 or later 0.29.x): fixed for daemon threads in sync calls and in the async cases listed in the
   changelog entry (`put_bytes_async`, `get_into_async`, a never-completing `get_async`), on Python 3.11 to 3.13 (all
-  patch levels) and 3.14. One exception: on Python 3.14 a daemon thread's asyncio loop with `get_async` calls in
-  flight at exit still crashes, identically before and after this fix; it is tracked as
-  [#302](https://github.com/russfellows/s3dlio/issues/302).
+  patch levels) and 3.14. Until [#302](https://github.com/russfellows/s3dlio/issues/302) was fixed, a daemon thread's
+  asyncio loop with `get_async` (and the other async calls the changelog lists) in flight at exit crashed on Python
+  3.14 (and only 3.14); wheels from before the #302 fix still do.
 - Non-daemon threads are unaffected: Python waits for them before finalizing.
 - Parking a thread is not a clean shutdown. Work a daemon thread had in flight is lost; stop and join your workers (and
   call `finalize_op_log()`) if you need it to complete.

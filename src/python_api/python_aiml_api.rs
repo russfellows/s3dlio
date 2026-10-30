@@ -115,11 +115,9 @@ impl PyDataset {
         let inner = Arc::clone(&self.inner);
         let bound_result = future_into_py(py, async move {
             let data = inner.get(index).await.map_err(py_err)?;
-            Python::attach(|py| {
-                // Return PyBytesView for zero-copy access
-                let view = PyBytesView::new(data);
-                Ok(Py::new(py, view)?.into_any())
-            })
+            // Return PyBytesView for zero-copy access; the Python object is created inside the
+            // exit-safe delivery (issue #302), not on this tokio worker.
+            Ok(PyBytesView::new(data))
         })?;
         Ok(bound_result.unbind())
     }
@@ -896,17 +894,8 @@ impl PyBytesAsyncDataLoaderIter {
         let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
             match guard.recv().await {
-                Some(Ok(batch)) => {
-                    Python::attach(|py| {
-                        // Return list of PyBytesView for zero-copy access
-                        let py_list = PyList::empty(py);
-                        for item in batch {
-                            let view = PyBytesView::new(item);
-                            py_list.append(Py::new(py, view)?)?;
-                        }
-                        Ok(py_list.into_any().unbind())
-                    })
-                }
+                // A list of PyBytesView (zero-copy), built inside the exit-safe delivery (issue #302).
+                Some(Ok(batch)) => Ok(batch.into_iter().map(PyBytesView::new).collect::<Vec<_>>()),
                 Some(Err(e)) => Err(py_err(e)),
                 None => Err(PyStopAsyncIteration::new_err("StopAsyncIteration")),
             }
@@ -963,17 +952,8 @@ impl PyS3AsyncDataLoader {
         let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
             match guard.recv().await {
-                Some(Ok(batch)) => Python::attach(|py| {
-                    // Return list of PyBytesView for zero-copy access
-                    let out: Vec<Py<PyAny>> = batch
-                        .into_iter()
-                        .map(|b| {
-                            let view = PyBytesView::new(b);
-                            Py::new(py, view).map(|p| p.into_any())
-                        })
-                        .collect::<PyResult<Vec<_>>>()?;
-                    out.into_py_any(py)
-                }),
+                // A list of PyBytesView (zero-copy), built inside the exit-safe delivery (issue #302).
+                Some(Ok(batch)) => Ok(batch.into_iter().map(PyBytesView::new).collect::<Vec<_>>()),
                 Some(Err(e)) => Err(py_err(e)),
                 None => Err(PyStopAsyncIteration::new_err("end of stream")),
             }
@@ -1560,7 +1540,8 @@ impl PyAsyncDataLoaderIter {
         let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
             match guard.recv().await {
-                Some(Ok(batch)) => Python::attach(|py| batch.into_py_any(py)),
+                // Converted inside the exit-safe delivery (issue #302).
+                Some(Ok(batch)) => Ok(batch),
                 Some(Err(e)) => Err(py_err(e)),
                 None => Err(PyStopAsyncIteration::new_err("end of loader")),
             }

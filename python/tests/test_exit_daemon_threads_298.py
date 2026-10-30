@@ -11,6 +11,11 @@ forced unwind; with PyO3 < 0.29 it crosses the Rust trampoline and the process d
 (exit 134, sometimes "FATAL: exception not rethrown" on stderr).  PyO3 0.29.3 parks such threads
 instead.  CPython 3.13.8+ and 3.14 park them themselves, so this file passes there for any PyO3.
 
+Issue #302 (CPython 3.14): a tokio worker that attached to Python itself to build its result (a bare
+`Python::attach` inside a `future_into_py` body) creates a thread state during interpreter finalization and
+corrupts it (SIGSEGV/SIGABRT, "PyInterpreterState_Delete: remaining threads").  The `async_*`, `mes_*`,
+`ds_get_item` and `async_loader` scenarios below cover every async entry point that used to do that.
+
 Do NOT rely on the "FATAL" check alone: release builds can abort silently inside pthread_exit;
 the exit code is the load-bearing assertion.
 """
@@ -23,7 +28,7 @@ import pytest
 NWORKERS = 8
 
 SCRIPT = textwrap.dedent('''
-    import asyncio, atexit, os, socket, sys, threading, time
+    import asyncio, atexit, http.server, os, socket, socketserver, sys, threading, time
     import s3dlio
 
     mode, d = sys.argv[1], sys.argv[2]
@@ -44,6 +49,65 @@ SCRIPT = textwrap.dedent('''
         while True:
             held.append(srv.accept()[0])
     threading.Thread(target=accept_forever, daemon=True).start()
+
+    # The "many" calls are S3-only (they use the process-wide S3 client), so those scenarios talk to a tiny
+    # in-process S3 stand-in that serves one 1 MiB object for any key (HEAD, GET and ranged GET).
+    S3_URI = "s3://bkt/obj.bin"
+    DATA = os.urandom(1 << 20)
+    class FakeS3(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a):
+            pass
+        def _head(self, code, n, extra=None):
+            self.send_response(code)
+            for k, v in {"Content-Length": str(n), "ETag": '"abc"', "Accept-Ranges": "bytes",
+                         "Last-Modified": "Wed, 21 Oct 2015 07:28:00 GMT",
+                         "Content-Type": "application/octet-stream", **(extra or {})}.items():
+                self.send_header(k, v)
+            self.end_headers()
+        def do_HEAD(self):
+            self._head(200, len(DATA))
+        def do_GET(self):
+            r = self.headers.get("Range")
+            if r and r.startswith("bytes="):
+                a, _, b = r[6:].partition("-")
+                a = int(a)
+                b = min(int(b) if b else len(DATA) - 1, len(DATA) - 1)
+                body = DATA[a:b + 1]
+                self._head(206, len(body), {"Content-Range": "bytes %d-%d/%d" % (a, b, len(DATA))})
+            else:
+                body = DATA
+                self._head(200, len(body))
+            self.wfile.write(body)
+    class FakeS3Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+    if mode in ("async_get_many", "async_get_many_stats", "async_stat_many"):
+        fake = FakeS3Server(("127.0.0.1", 0), FakeS3)
+        threading.Thread(target=fake.serve_forever, daemon=True).start()
+        os.environ["AWS_ENDPOINT_URL"] = "http://127.0.0.1:%d" % fake.server_address[1]
+
+    # ---- fixtures for the #302 entry points ---------------------------------------------------
+    if mode.startswith("mes_"):
+        eps = ["file://%s/ep%d/" % (d, i) for i in range(2)]
+        for i in range(2):
+            os.makedirs("%s/ep%d" % (d, i), exist_ok=True)
+            with open("%s/ep%d/obj.bin" % (d, i), "wb") as f:
+                f.write(os.urandom(1 << 20))
+        mes = s3dlio.create_multi_endpoint_store(uris=eps, strategy="round_robin")
+    if mode in ("ds_get_item", "async_loader"):
+        os.makedirs(d + "/ds", exist_ok=True)
+        for i in range(8):
+            with open("%s/ds/f%d.bin" % (d, i), "wb") as f:
+                f.write(os.urandom(256 << 10))
+        dsuri = "file://" + d + "/ds/"
+        ds = s3dlio.create_dataset(dsuri)
+
+    async def loader_once():
+        n = 0
+        async for _ in s3dlio.create_async_loader(dsuri, {"batch_size": 2}):
+            n += 1
+            if n >= 3:
+                break
 
     lock = threading.Lock()
     started, completed, errors = set(), [0], []
@@ -88,6 +152,19 @@ SCRIPT = textwrap.dedent('''
         "async_put_bytes": lambda: s3dlio.put_bytes_async("file://%s/a%d.bin" % (d, tid()), b"y" * (1 << 20)),
         "async_pending": lambda: s3dlio.get_async("s3://bkt/key"),   # never completes
         "get_into_async": gi_async,                                  # sync detach on the loop thread
+        # issue #302: every entry point whose result used to be built by an attaching tokio worker
+        "async_get_range": lambda: s3dlio.get_range_async(uri, 0, 1 << 20),
+        "async_get_many": lambda: s3dlio.get_many_async([S3_URI] * 4),
+        "async_get_many_stats": lambda: s3dlio.get_many_stats_async([S3_URI] * 4),
+        "async_stat": lambda: s3dlio.stat_async(uri),
+        "async_stat_many": lambda: s3dlio.stat_many_async([S3_URI] * 4),
+        "async_put": lambda: s3dlio.put_async("file://%s/pa%d/" % (d, tid()), 2, size=1 << 20,
+                                              should_create_bucket=True),
+        "mes_get": lambda: mes.get(eps[0] + "obj.bin"),
+        "mes_get_range": lambda: mes.get_range(eps[0] + "obj.bin", 0, 1 << 19),
+        "mes_get_from_endpoint": lambda: mes.get_from_endpoint(1, eps[1] + "obj.bin"),
+        "ds_get_item": lambda: ds.get_item(3),
+        "async_loader": lambda: loader_once(),
     }
     BLOCKS = {"sync_blackhole", "async_pending"}   # never complete a call
 
@@ -158,6 +235,8 @@ SCRIPT = textwrap.dedent('''
 DAEMON_MODES = [
     "get", "put_bytes", "list", "stat", "get_many", "get_range", "writer", "sync_blackhole",
     "async_get", "async_put_bytes", "async_pending", "get_into_async",
+    "async_get_range", "async_get_many", "async_get_many_stats", "async_stat", "async_stat_many", "async_put",
+    "mes_get", "mes_get_range", "mes_get_from_endpoint", "ds_get_item", "async_loader",
     "oplog_get", "oplog_put", "atexit_get", "atexit_oplog_finalize",
 ]
 
@@ -169,19 +248,8 @@ def _run(mode, tmp_path):
     )
 
 
-# Known, separate problem (issue #302; NOT #298, NOT fixed by PyO3 0.29.3): on CPython 3.14 a daemon thread's event
-# loop with s3dlio `get_async` calls in flight at exit crashes ~90% of the time ("Fatal Python error:
-# PyInterpreterState_Delete: remaining threads", SIGSEGV/SIGABRT), with PyO3 0.27.2 (25/30) and 0.29.3
-# (28/30) alike. The sync calls, `get_into_async`, `put_bytes_async` and a never-completing `get_async`
-# are clean on 3.14. xfail (not skip) so the case still runs and an upstream fix shows up as XPASS.
-_PY314_ASYNC_GET = pytest.mark.xfail(
-    sys.version_info >= (3, 14), strict=False,
-    reason="CPython 3.14 get_async on a daemon loop at exit: separate from #298, pre-existing, issue #302")
-MODE_PARAMS = [pytest.param(m, marks=_PY314_ASYNC_GET) if m == "async_get" else m for m in DAEMON_MODES]
-
-
 @pytest.mark.parametrize("attempt", range(3))
-@pytest.mark.parametrize("mode", MODE_PARAMS)
+@pytest.mark.parametrize("mode", DAEMON_MODES)
 def test_exit_with_daemon_threads_in_s3dlio_calls(mode, attempt, tmp_path):
     r = _run(mode, tmp_path)
     assert r.returncode == 0, "exit code %r\nstdout:\n%s\nstderr:\n%s" % (

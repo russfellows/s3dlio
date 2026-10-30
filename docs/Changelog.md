@@ -1,6 +1,6 @@
 # s3dlio Changelog
 
-## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267); exit abort with daemon threads (#298)
+## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267); exit abort with daemon threads (#298); exit crash with async calls on CPython 3.14 (#302)
 
 ### Fixed — Op-log can be restarted after `finalize_op_log()` (#294)
 
@@ -209,6 +209,34 @@ faulting fresh pages in. Into a freshly allocated buffer `get_into` runs at abou
 these runs: it does the same work, plus faulting the pages in). The bounce copy costs about 35% against a reused
 aligned destination, and a reused unaligned destination is still about 8% faster than `get`.
 
+### Fixed — exit crash with async calls in flight on CPython 3.14 (#302)
+
+On CPython 3.14, a process crashed at exit (`Fatal Python error: PyInterpreterState_Delete: remaining threads`,
+`double free or corruption`, exit 139 or 134) when the main thread returned while a daemon thread's asyncio loop had an
+s3dlio async call in flight. 28 of 30 runs of `get_async` crashed on 3.14.10, identically with PyO3 0.27.2 and 0.29.3;
+Python 3.11 to 3.13 (all patch levels) were never affected. No API change.
+
+- **Root cause.** Every affected `async` entry point finished its future with a bare `Python::attach` on a Tokio
+  worker thread (to build the `BytesView`, dict or list the caller awaits). A thread that is not a Python thread gets a
+  brand-new thread state from `PyGILState_Ensure` on every attach. CPython 3.14 does not refuse to create one while
+  the interpreter is finalizing, and (unlike 3.13) it parks only the thread states that existed when finalization
+  started, so a worker that attached late ran against a half-torn-down interpreter and corrupted it (a use after free of
+  its thread state, or a thread state left behind for `PyInterpreterState_Delete`). PyO3's own "is the interpreter
+  finalizing" check does not help: `Python::attach` consults `Py_IsInitialized()` first, CPython clears that as soon as
+  finalization begins, and `attach` then attaches anyway. The #192 exit gate only covered the result delivery, not
+  these attaches.
+- **Fix.** These futures now return plain Rust values (`BytesView` wrapping the same `Bytes`, a `(count, total)` tuple,
+  a stat wrapper, `Vec<BytesView>`, `Option<()>`) and the Python object is built by PyO3's `IntoPyObject` inside the
+  exit-safe delivery (the gated `spawn_blocking` of #192), which the exit drain waits for and which is refused once
+  the gate has closed. No Tokio worker attaches to Python on its own any more. Zero-copy is unchanged (the same `Bytes`,
+  no copy), and one `Python::attach` per call is saved. Affected: `get_async`, `get_range_async`, `get_many_async`,
+  `get_many_stats_async`, `stat_async`, `stat_many_async`, `put_async`, `MultiEndpointStore.get`, `.get_range`,
+  `.get_from_endpoint`, `PyDataset.get_item`, and the async data-loader iterators (`create_async_loader`,
+  `PyS3AsyncDataLoader`, the bytes and numeric loaders).
+- **Tests.** `python/tests/test_exit_daemon_threads_298.py` loses its 3.14 `xfail` and gains a scenario for each entry
+  point above (`async_get_range`, `async_get_many`, `async_get_many_stats`, `async_stat`, `async_stat_many`, `async_put`,
+  `mes_get`, `mes_get_range`, `mes_get_from_endpoint`, `ds_get_item`, `async_loader`).
+
 ### Fixed — exit abort with daemon threads (#298)
 
 On CPython **before 3.13.8** (every 3.11 and 3.12, and 3.13.0 to 3.13.7), a process died with SIGABRT (exit code 134,
@@ -237,14 +265,11 @@ a thread with `pthread_exit`, 3.11 and 3.12 still do.
 - **Not covered:** a thread parked at exit keeps whatever Rust state it holds above the call (it never runs
   its destructors); that is the same as 3.13.8+. Other extensions (NumPy C code, torch) that release the GIL are not
   changed by this fix. Do not build s3dlio with `panic = "abort"` for release: the guard needs unwinding.
-- **Known separate problem (not #298, not fixed here):** on CPython 3.14 a daemon thread's event loop with `get_async`
-  calls in flight at exit usually crashes (`Fatal Python error: PyInterpreterState_Delete: remaining threads`),
-  identically with PyO3 0.27.2 and 0.29.3 (tracked as
-  [#302](https://github.com/russfellows/s3dlio/issues/302)). Sync calls, `get_into_async`, `put_bytes_async` and a pending `get_async` are
-  clean on 3.14. The test marks that one case `xfail` on 3.14.
+- **The one 3.14 async exception is fixed too (#302, next entry).**
 - **Tests:** `python/tests/test_exit_daemon_threads_298.py` runs each scenario in a fresh subprocess with a timeout:
   sync `get`, `put_bytes`, `list`, `stat`, `get_many`, `get_range`, a streaming writer, a call blocked on an unresponsive
-  endpoint, async calls (including `get_into_async` and a never-completing one) on a daemon thread's event loop, op-log
+  endpoint, async calls (including `get_into_async`, a never-completing one and every #302 entry point) on a daemon
+  thread's event loop, op-log
   active at exit, `atexit` handlers that call s3dlio while daemon threads are busy, and a non-daemon-thread case. CI's
   Python job runs it.
 - **Workarounds on an older wheel:** use Python 3.13.8 or later, or stop and `join()` worker threads before the main

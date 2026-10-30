@@ -1250,7 +1250,9 @@ pub(crate) fn put_async_py<'p>(
         })
         .await
         .map_err(py_err)??;
-        Python::attach(|py| Ok(py.None()))
+        // Python `None`, converted inside the exit-safe delivery (issue #302): a tokio worker must
+        // never attach to Python itself.
+        Ok(None::<()>)
     })
 }
 
@@ -1392,10 +1394,8 @@ fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAn
 
     future_into_py(py, async move {
         let os = store.stat(&uri).await.map_err(py_err)?;
-        Python::attach(|py| {
-            let obj: Py<PyAny> = stat_to_pydict(py, os)?.unbind().into();
-            Ok::<Py<PyAny>, PyErr>(obj)
-        })
+        // The dict is built inside the exit-safe delivery (issue #302), not on this worker.
+        Ok(StatDict(os))
     })
 }
 
@@ -1403,15 +1403,25 @@ fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAn
 fn stat_many_async<'py>(py: Python<'py>, uris: Vec<String>) -> PyResult<pyo3::Bound<'py, PyAny>> {
     future_into_py(py, async move {
         let metas = stat_object_many_async(uris).await.map_err(py_err)?;
-        Python::attach(|py| {
-            let list = PyList::empty(py);
-            for os in metas {
-                // append accepts any IntoPyObject<'py>; Bound<'py, PyDict> works directly
-                list.append(stat_to_pydict(py, os)?)?;
-            }
-            Ok::<Py<PyAny>, PyErr>(list.unbind().into())
-        })
+        // The list of dicts is built inside the exit-safe delivery (issue #302).
+        Ok(metas.into_iter().map(StatDict).collect::<Vec<_>>())
     })
+}
+
+/// An object's metadata on its way to Python as a `dict`.
+///
+/// Lets the async stat futures return a plain Rust value: the `dict` is built by `IntoPyObject`
+/// inside the exit-safe result delivery (issue #302), never by a tokio worker attaching to Python.
+struct StatDict(crate::s3_utils::ObjectStat);
+
+impl<'py> IntoPyObject<'py> for StatDict {
+    type Target = PyDict;
+    type Output = Bound<'py, PyDict>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        stat_to_pydict(py, self.0)
+    }
 }
 
 /// Helper function to map Rust to Python for stat call
@@ -2697,7 +2707,8 @@ pub fn get_many_stats_async<'p>(
         .await
         .map_err(py_err)??;
 
-        Python::attach(|py| (count, total).into_py_any(py))
+        // A `(count, total)` tuple, converted inside the exit-safe delivery (issue #302).
+        Ok((count, total))
     })
 }
 
@@ -2717,13 +2728,12 @@ pub(crate) fn get_many_async_py<'p>(
         .await
         .map_err(py_err)??;
 
-        Python::attach(|_py| {
-            let out = pairs
-                .into_iter()
-                .map(|(u, b)| (u, PyBytesView::new(b)))
-                .collect::<Vec<_>>();
-            Ok(out)
-        })
+        // `PyBytesView` wraps the same `Bytes` (no copy); the Python objects are created inside the
+        // exit-safe delivery (issue #302), not on this worker.
+        Ok(pairs
+            .into_iter()
+            .map(|(u, b)| (u, PyBytesView::new(b)))
+            .collect::<Vec<_>>())
     })
 }
 
@@ -2790,7 +2800,9 @@ pub fn get_async_py<'p>(py: Python<'p>, uri: &str) -> PyResult<Bound<'p, PyAny>>
     future_into_py(py, async move {
         let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
         let bytes = store.get(&uri_owned).await.map_err(py_err)?;
-        Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
+        // Zero-copy `BytesView` over the same `Bytes`; the Python object is created inside the
+        // exit-safe delivery (issue #302): this worker never attaches to Python.
+        Ok(PyBytesView::new(bytes))
     })
 }
 
@@ -2810,7 +2822,9 @@ pub fn get_range_async_py<'p>(
             .get_range(&uri_owned, offset, length)
             .await
             .map_err(py_err)?;
-        Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
+        // Zero-copy `BytesView` over the same `Bytes`; the Python object is created inside the
+        // exit-safe delivery (issue #302): this worker never attaches to Python.
+        Ok(PyBytesView::new(bytes))
     })
 }
 
@@ -3990,7 +4004,8 @@ impl PyMultiEndpointStore {
                 .await
                 .map_err(|e| py_err(e.context("Get failed")))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            // The `BytesView` is created inside the exit-safe delivery (issue #302).
+            Ok(PyBytesView::new(data))
         })
     }
 
@@ -4012,7 +4027,8 @@ impl PyMultiEndpointStore {
                 .await
                 .map_err(|e| py_err(e.context("Get range failed")))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            // The `BytesView` is created inside the exit-safe delivery (issue #302).
+            Ok(PyBytesView::new(data))
         })
     }
 
@@ -4132,7 +4148,8 @@ impl PyMultiEndpointStore {
                 .get_from_endpoint(index, &uri)
                 .await
                 .map_err(|e| py_err(e.context("Get from endpoint failed")))?;
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            // The `BytesView` is created inside the exit-safe delivery (issue #302).
+            Ok(PyBytesView::new(data))
         })
     }
 
