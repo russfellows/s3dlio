@@ -10,6 +10,12 @@ unit tests and Jupyter use. The lifecycle is now `Uninitialized` -> `Active` -> 
 session at a time, any number in a process. This supersedes the "One op-log session per process (#170)" behaviour
 listed under 0.10.0.
 
+Async calls (`get_async`, `put_bytes_async`, `mkdir_async`, `put_many_async`, `get_many_async`, the `MultiEndpointStore`
+methods, `get_item`, ...) capture the op-log session when the call is made, not when the runtime first polls the future,
+so an awaitable created in session 1 never writes into session 2 and one created while the op-log is off is never
+logged (this was a rare race; test: `tests/test_oplog_async_call_time_294.py`, which uses the hidden hook
+`s3dlio._hold_async_runtime()`).
+
 - **Init after a finalize** starts a new session: the file is created and truncated like a first init (a different
   path leaves the finished log untouched, the same path replaces it), with a fresh `Logger`, `op_log_stats()`
   restarting at zero (the new session's counts, never a sum) and a clock offset of 0. The process client ID carries

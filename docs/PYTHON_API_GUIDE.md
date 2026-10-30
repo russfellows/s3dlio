@@ -2052,7 +2052,8 @@ different path leaves it untouched. `finalize_op_log` is safe to repeat. The
 module-level functions (`get`, `put_bytes`, `stat`, `list`, `delete`, `get_async`,
 ...) check the op-log on every call: a call made while it is active is recorded
 once, a call made before `init_op_log` or after `finalize_op_log` is not,
-whichever call first used the scheme. Objects you construct yourself (stores,
+whichever call first used the scheme. An `*_async` call is checked when it is made, not when the
+event loop first runs it: an awaitable created in one session never writes into a later one. Objects you construct yourself (stores,
 readers, writers) capture the logger at construction: those created before
 `init_op_log` are never logged, and those created before `finalize_op_log` stop
 recording when it runs and stay silent after a later `init_op_log` (they never

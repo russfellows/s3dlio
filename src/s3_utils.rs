@@ -411,7 +411,9 @@ async fn build_ops_for(rows: Rows) -> Result<S3Ops> {
     let client = aws_s3_client_async().await?;
     Ok(match rows {
         Rows::Write => {
-            let logger = global_logger();
+            // The snapshot of the Python call this runs for when one was scoped (#294), else
+            // the op-log that is active now.
+            let logger = crate::s3_logger::call_logger();
             let client_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
             let endpoint = crate::s3_client::s3_endpoint_url_from_env().unwrap_or_default();
             S3Ops::new(client, logger, &client_id, &endpoint)
@@ -2218,6 +2220,17 @@ pub fn get_object_uri(uri: &str) -> anyhow::Result<Bytes> {
 ///   On subsequent epochs the cache is already warm; zero HEADs issued.
 /// - O(N log N) sort: replaced O(N²) linear scan with a pre-built HashMap index.
 pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec<(String, Bytes)>> {
+    get_objects_parallel_logged(uris, max_in_flight, global_logger())
+}
+
+/// [`get_objects_parallel`] writing its rows to `logger` instead of the op-log that is active
+/// when the work runs. The Python `*_async` entry points snapshot `global_logger()` when the
+/// call is made and pass it here, so the batch belongs to the session of the call (#294).
+pub(crate) fn get_objects_parallel_logged(
+    uris: &[String],
+    max_in_flight: usize,
+    logger: Option<crate::s3_logger::Logger>,
+) -> Result<Vec<(String, Bytes)>> {
     // Issue #211: a limit of 0 would hang; refuse it before anything else.
     crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Issue #197: refuse the whole batch up front if any URI names another server.
@@ -2295,11 +2308,15 @@ pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec
 
         for uri in uris.iter().cloned() {
             let sem = Arc::clone(&sem);
-            futs.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.unwrap();
-                let data = get_object_uri_optimized_async(&uri).await?;
-                Ok::<_, anyhow::Error>((uri, data))
-            }));
+            let logger = logger.clone();
+            futs.push(tokio::spawn(crate::s3_logger::scope_call_logger(
+                logger,
+                async move {
+                    let _permit = sem.acquire_owned().await.unwrap();
+                    let data = get_object_uri_optimized_async(&uri).await?;
+                    Ok::<_, anyhow::Error>((uri, data))
+                },
+            )));
         }
         let mut out = Vec::with_capacity(uris.len());
         // Full-drain-first-then-error (issue #148 finding 3.2): the previous
@@ -3295,6 +3312,25 @@ pub fn put_objects_with_random_data_and_type_with_progress(
     config: Config,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<()> {
+    put_objects_with_random_data_and_type_logged(
+        uris,
+        size,
+        max_in_flight,
+        config,
+        progress_callback,
+        global_logger(),
+    )
+}
+
+/// [`put_objects_with_random_data_and_type_with_progress`] writing its rows to `logger` (#294).
+pub(crate) fn put_objects_with_random_data_and_type_logged(
+    uris: &[String],
+    size: usize,
+    max_in_flight: usize,
+    config: Config,
+    progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
+    logger: Option<crate::s3_logger::Logger>,
+) -> Result<()> {
     // Issue #211: a limit of 0 would hang; refuse it before generating data.
     crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     info!(
@@ -3312,7 +3348,13 @@ pub fn put_objects_with_random_data_and_type_with_progress(
         buffer.len(),
         uris_vec.len()
     );
-    put_objects_parallel_with_progress(uris_vec, buffer, max_in_flight, progress_callback)
+    put_objects_parallel_with_progress_logged(
+        uris_vec,
+        buffer,
+        max_in_flight,
+        progress_callback,
+        logger,
+    )
 }
 
 /// Upload a single object to S3 **with op‑logging**: with the op-log active it is
@@ -3450,10 +3492,27 @@ pub(crate) fn put_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> anyhow::Result<()> {
+    // Get the global logger once, outside the async block
+    put_objects_parallel_with_progress_logged(
+        uris,
+        data,
+        max_in_flight,
+        progress_callback,
+        global_logger(),
+    )
+}
+
+/// [`put_objects_parallel_with_progress`] writing its rows to `logger` (the snapshot a Python
+/// `*_async` call took when it was made, #294) instead of the op-log active when this runs.
+pub(crate) fn put_objects_parallel_with_progress_logged(
+    uris: Vec<String>,
+    data: Bytes, // ref-counted, cheap to clone
+    max_in_flight: usize,
+    progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
+    logger: Option<crate::s3_logger::Logger>,
+) -> anyhow::Result<()> {
     // Issue #211: a limit of 0 would hang; refuse it before anything else.
     crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
-    // Get the global logger once, outside the async block
-    let logger = global_logger();
 
     run_on_global_rt(async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));

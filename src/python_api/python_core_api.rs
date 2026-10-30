@@ -893,7 +893,8 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// The module-level functions (get, put_bytes, stat, list, delete, get_async,
 /// ...) look the op-log up on every call: a call made while logging is active is
 /// recorded once, and a call made before init_op_log() or after
-/// finalize_op_log() is not, whichever call first used a given scheme. Objects
+/// finalize_op_log() is not, whichever call first used a given scheme. An
+/// *_async call is checked when it is made, not when the event loop first runs it. Objects
 /// you construct yourself (stores, readers, writers) capture the logger when
 /// they are constructed: those created before init_op_log() are never logged;
 /// those created before finalize_op_log() stop recording when it runs, and stay
@@ -1241,12 +1242,18 @@ pub(crate) fn put_async_py<'p>(
         .with_chunk_size(chunk_size);
 
     let prefix = prefix.to_string();
+    // The op-log session is bound NOW, when the call is made, not when the runtime first polls
+    // the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
         task::spawn_blocking(move || {
             if should_create_bucket {
                 create_put_bucket(&prefix).map_err(py_err)?;
             }
-            put_objects_with_random_data_and_type(&uris, sz, jobs, config).map_err(py_err)
+            crate::s3_utils::put_objects_with_random_data_and_type_logged(
+                &uris, sz, jobs, config, None, logger,
+            )
+            .map_err(py_err)
         })
         .await
         .map_err(py_err)??;
@@ -1699,9 +1706,11 @@ fn put_bytes_async<'py>(
     let payload = put_payload(py, data, usage)?;
     let latch = payload.latch;
     let data_owned = payload.bytes;
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
 
     guarded_put(py, latch, move || async move {
-        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri, logger).map_err(py_err)?;
         put_verified_with_retry(store.as_ref(), &uri, data_owned)
             .await
             .map_err(py_err)?;
@@ -2653,9 +2662,11 @@ pub fn mkdir(py: Python<'_>, uri: &str) -> PyResult<()> {
 #[pyfunction]
 fn mkdir_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
 
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri, logger).map_err(py_err)?;
         store.mkdir(&uri).await.map_err(py_err)?;
         // Python `None` (the Rust unit would reach Python as `()`, an empty tuple; issue #233).
         // `Option<()>` converts to `None` INSIDE the exit-safe delivery (issue #192). This body
@@ -2688,9 +2699,12 @@ pub fn get_many_stats_async<'p>(
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
         let (count, total) = task::spawn_blocking(move || {
-            let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
+            let res = crate::s3_utils::get_objects_parallel_logged(&uris, max_in_flight, logger)
+                .map_err(py_err)?;
             let bytes = res.iter().map(|(_, b)| b.len()).sum::<usize>();
             Ok::<(usize, usize), PyErr>((res.len(), bytes))
         })
@@ -2709,10 +2723,13 @@ pub(crate) fn get_many_async_py<'p>(
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
         // get_objects_parallel returns Vec<(String, Bytes)> - keep as Bytes for zero-copy
         let pairs: Vec<(String, Bytes)> = task::spawn_blocking(move || {
-            get_objects_parallel(&uris, max_in_flight).map_err(py_err)
+            crate::s3_utils::get_objects_parallel_logged(&uris, max_in_flight, logger)
+                .map_err(py_err)
         })
         .await
         .map_err(py_err)??;
@@ -2787,8 +2804,10 @@ pub fn get_range_py(
 #[pyo3(signature = (uri))]
 pub fn get_async_py<'p>(py: Python<'p>, uri: &str) -> PyResult<Bound<'p, PyAny>> {
     let uri_owned = uri.to_owned();
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri_owned, logger).map_err(py_err)?;
         let bytes = store.get(&uri_owned).await.map_err(py_err)?;
         Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
     })
@@ -2804,8 +2823,10 @@ pub fn get_range_async_py<'p>(
     length: Option<u64>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let uri_owned = uri.to_owned();
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri_owned, logger).map_err(py_err)?;
         let bytes = store
             .get_range(&uri_owned, offset, length)
             .await
@@ -3590,11 +3611,17 @@ pub fn put_many_async<'py>(
         latch,
     } = batch_payloads(py, items, usage)?;
 
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
+
     guarded_put(py, latch, move || async move {
-        let puts = owned_items.into_iter().map(|(uri, data)| async move {
-            let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
-            store.put(&uri, data).await.map_err(py_err)?;
-            Ok::<(), PyErr>(())
+        let puts = owned_items.into_iter().map(|(uri, data)| {
+            let logger = logger.clone();
+            async move {
+                let store = get_or_create_store(&uri, logger).map_err(py_err)?;
+                store.put(&uri, data).await.map_err(py_err)?;
+                Ok::<(), PyErr>(())
+            }
         });
         run_bounded_puts(puts.collect(), max_in_flight, py_err).await?;
         // Python `None`, converted inside the exit-safe delivery (issue #271; see `mkdir_async`).
@@ -3983,15 +4010,20 @@ impl PyMultiEndpointStore {
     fn get<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        future_into_py(py, async move {
-            let data = store
-                .get(&uri)
-                .await
-                .map_err(|e| py_err(e.context("Get failed")))?;
-            // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
-        })
+        future_into_py(
+            py,
+            crate::s3_logger::scope_call_logger(logger, async move {
+                let data = store
+                    .get(&uri)
+                    .await
+                    .map_err(|e| py_err(e.context("Get failed")))?;
+                // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
+                Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            }),
+        )
     }
 
     /// Get a byte range from an object (zero-copy via BytesView)
@@ -4005,15 +4037,20 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        future_into_py(py, async move {
-            let data = store
-                .get_range(&uri, offset, length)
-                .await
-                .map_err(|e| py_err(e.context("Get range failed")))?;
-            // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
-        })
+        future_into_py(
+            py,
+            crate::s3_logger::scope_call_logger(logger, async move {
+                let data = store
+                    .get_range(&uri, offset, length)
+                    .await
+                    .map_err(|e| py_err(e.context("Get range failed")))?;
+                // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
+                Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            }),
+        )
     }
 
     /// Put an object to the multi-endpoint store.
@@ -4040,14 +4077,18 @@ impl PyMultiEndpointStore {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        guarded_put(py, payload.latch, move || async move {
-            store
-                .put(&uri, payload.bytes)
-                .await
-                .map_err(|e| py_err(e.context("Put failed")))?;
-            // Python `None`, converted inside the exit-safe delivery (issue #271).
-            Ok(None::<()>)
+        guarded_put(py, payload.latch, move || {
+            crate::s3_logger::scope_call_logger(logger, async move {
+                store
+                    .put(&uri, payload.bytes)
+                    .await
+                    .map_err(|e| py_err(e.context("Put failed")))?;
+                // Python `None`, converted inside the exit-safe delivery (issue #271).
+                Ok(None::<()>)
+            })
         })
     }
 
@@ -4062,30 +4103,40 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        future_into_py(py, async move {
-            let objects = store
-                .list(&prefix, recursive)
-                .await
-                .map_err(|e| py_err(e.context("List failed")))?;
-            // Return Vec<String> - PyO3 automatically converts to Python list
-            Ok(objects)
-        })
+        future_into_py(
+            py,
+            crate::s3_logger::scope_call_logger(logger, async move {
+                let objects = store
+                    .list(&prefix, recursive)
+                    .await
+                    .map_err(|e| py_err(e.context("List failed")))?;
+                // Return Vec<String> - PyO3 automatically converts to Python list
+                Ok(objects)
+            }),
+        )
     }
 
     /// Delete an object
     fn delete<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        future_into_py(py, async move {
-            store
-                .delete(&uri)
-                .await
-                .map_err(|e| py_err(e.context("Delete failed")))?;
-            // Python `None`, converted inside the exit-safe delivery (issue #271).
-            Ok(None::<()>)
-        })
+        future_into_py(
+            py,
+            crate::s3_logger::scope_call_logger(logger, async move {
+                store
+                    .delete(&uri)
+                    .await
+                    .map_err(|e| py_err(e.context("Delete failed")))?;
+                // Python `None`, converted inside the exit-safe delivery (issue #271).
+                Ok(None::<()>)
+            }),
+        )
     }
 
     /// List objects from ALL endpoints and merge results (deduplicated).
@@ -4103,14 +4154,19 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        future_into_py(py, async move {
-            let objects = store
-                .list_all_endpoints(&prefix, recursive)
-                .await
-                .map_err(|e| py_err(e.context("List-all-endpoints failed")))?;
-            Ok(objects)
-        })
+        future_into_py(
+            py,
+            crate::s3_logger::scope_call_logger(logger, async move {
+                let objects = store
+                    .list_all_endpoints(&prefix, recursive)
+                    .await
+                    .map_err(|e| py_err(e.context("List-all-endpoints failed")))?;
+                Ok(objects)
+            }),
+        )
     }
 
     /// Get an object from a specific configured endpoint, bypassing load
@@ -4126,14 +4182,19 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        future_into_py(py, async move {
-            let data = store
-                .get_from_endpoint(index, &uri)
-                .await
-                .map_err(|e| py_err(e.context("Get from endpoint failed")))?;
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
-        })
+        future_into_py(
+            py,
+            crate::s3_logger::scope_call_logger(logger, async move {
+                let data = store
+                    .get_from_endpoint(index, &uri)
+                    .await
+                    .map_err(|e| py_err(e.context("Get from endpoint failed")))?;
+                Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            }),
+        )
     }
 
     /// Put an object to a specific configured endpoint, bypassing load
@@ -4156,14 +4217,18 @@ impl PyMultiEndpointStore {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        guarded_put(py, payload.latch, move || async move {
-            store
-                .put_to_endpoint(index, &uri, payload.bytes)
-                .await
-                .map_err(|e| py_err(e.context("Put to endpoint failed")))?;
-            // Python `None`, converted inside the exit-safe delivery (issue #271).
-            Ok(None::<()>)
+        guarded_put(py, payload.latch, move || {
+            crate::s3_logger::scope_call_logger(logger, async move {
+                store
+                    .put_to_endpoint(index, &uri, payload.bytes)
+                    .await
+                    .map_err(|e| py_err(e.context("Put to endpoint failed")))?;
+                // Python `None`, converted inside the exit-safe delivery (issue #271).
+                Ok(None::<()>)
+            })
         })
     }
 
@@ -4179,15 +4244,20 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        future_into_py(py, async move {
-            store
-                .delete_from_endpoint(index, &uri)
-                .await
-                .map_err(|e| py_err(e.context("Delete from endpoint failed")))?;
-            // Python `None`, converted inside the exit-safe delivery (issue #271).
-            Ok(None::<()>)
-        })
+        future_into_py(
+            py,
+            crate::s3_logger::scope_call_logger(logger, async move {
+                store
+                    .delete_from_endpoint(index, &uri)
+                    .await
+                    .map_err(|e| py_err(e.context("Delete from endpoint failed")))?;
+                // Python `None`, converted inside the exit-safe delivery (issue #271).
+                Ok(None::<()>)
+            }),
+        )
     }
 
     /// Put the same object to every configured endpoint (fan-out write), for
@@ -4211,14 +4281,18 @@ impl PyMultiEndpointStore {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
         let store = self.store.clone();
+        // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+        let logger = global_logger();
 
-        guarded_put(py, payload.latch, move || async move {
-            store
-                .put_all_endpoints(&uri, payload.bytes)
-                .await
-                .map_err(|e| py_err(e.context("Put-all-endpoints failed")))?;
-            // Python `None`, converted inside the exit-safe delivery (issue #271).
-            Ok(None::<()>)
+        guarded_put(py, payload.latch, move || {
+            crate::s3_logger::scope_call_logger(logger, async move {
+                store
+                    .put_all_endpoints(&uri, payload.bytes)
+                    .await
+                    .map_err(|e| py_err(e.context("Put-all-endpoints failed")))?;
+                // Python `None`, converted inside the exit-safe delivery (issue #271).
+                Ok(None::<()>)
+            })
         })
     }
 
