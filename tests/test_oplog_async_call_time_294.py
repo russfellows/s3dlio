@@ -45,7 +45,8 @@ ENTRIES = {
         True,
     ),
     "put_many_async": ("lambda p: s3dlio.put_many_async([(u(p), b'x')])", True),
-    "mkdir_async": ("lambda p: s3dlio.mkdir_async(u(p) + '/')", True),
+    # mkdir on file:// writes no row (only the S3 helper path does): only "no leak" is pinned.
+    "mkdir_async": ("lambda p: s3dlio.mkdir_async(u(p) + '/')", False),
     "stat_async": ("lambda p: s3dlio.stat_async(u(p))", True),
     "exists_async": ("lambda p: s3dlio.exists_async(u(p))", True),
     "head_async": ("lambda p: s3dlio.head_async(u(p))", True),
