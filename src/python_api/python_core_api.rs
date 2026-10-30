@@ -844,7 +844,8 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 
 /// Enable operation logging to a local zstd-compressed TSV file.
 ///
-/// A process supports exactly ONE op-log session (init -> finalize, no restart).
+/// One op-log session runs at a time. After finalize_op_log() a new session can be
+/// started with another init_op_log() call (issue #294), any number of times.
 ///
 /// Args:
 ///     path: Local filesystem path (e.g. "/tmp/ops.tsv.zst") or a file://
@@ -863,7 +864,13 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 ///       corrected call can succeed.
 ///     - Call while logging is already active: returns without effect; the new
 ///       path is not created or truncated.
-///     - Call after finalize_op_log(): raises RuntimeError and touches no file.
+///     - Call after finalize_op_log(): starts a NEW session. If the previous
+///       session's writer is still draining (finalize running on another
+///       thread), it waits for that first. The file is created like a first
+///       init (create-and-truncate: the same path REPLACES the previous log, a
+///       different path leaves it untouched); op_log_stats() restarts from zero
+///       for the new session and the process client ID carries over. A failed
+///       call leaves logging finalized, so a corrected call can succeed.
 ///
 /// The module-level functions (get, put_bytes, stat, list, delete, get_async,
 /// ...) look the op-log up on every call: a call made while logging is active is
@@ -871,7 +878,8 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// finalize_op_log() is not, whichever call first used a given scheme. Objects
 /// you construct yourself (stores, readers, writers) capture the logger when
 /// they are constructed: those created before init_op_log() are never logged;
-/// those created before finalize_op_log() stop recording when it runs.
+/// those created before finalize_op_log() stop recording when it runs, and stay
+/// silent after a later init_op_log() (they never write into the new session).
 #[pyfunction]
 pub fn init_op_log(path: &str) -> PyResult<()> {
     init_op_logger(path).map_err(py_err)
@@ -881,8 +889,9 @@ pub fn init_op_log(path: &str) -> PyResult<()> {
 /// fails: an I/O error or a panic in the writer thread, see op_log_stats()),
 /// close the zstd stream and wait until the writer has finished and signalled
 /// completion. Call it before the process exits: nothing does it for you (no
-/// atexit hook), and without it queued records and the zstd frame end are lost. Terminal for this process (see
-/// init_op_log). Safe to call repeatedly, or before init_op_log() (no effect).
+/// atexit hook), and without it queued records and the zstd frame end are lost. It
+/// ends the current session; init_op_log() can start a new one (see init_op_log).
+/// Safe to call repeatedly, or before init_op_log() (no effect).
 /// After it returns is_op_log_active() is False and operations on objects
 /// created earlier are no longer recorded. The GIL is released while the
 /// pending records are drained, so other Python threads keep running.
@@ -892,7 +901,8 @@ pub fn finalize_op_log(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-/// True only between a successful init_op_log() and finalize_op_log().
+/// True only between a successful init_op_log() and the next finalize_op_log()
+/// (and again after a re-init).
 #[pyfunction]
 pub fn is_op_log_active() -> PyResult<bool> {
     Ok(global_logger().is_some())
@@ -902,7 +912,10 @@ pub fn is_op_log_active() -> PyResult<bool> {
 /// init_op_log() and finalize_op_log(), so you can detect most ways records are
 /// lost.
 ///
-/// Returns None before init_op_log(); otherwise a dict (available while
+/// The counts are those of the CURRENT session: a new init_op_log() after
+/// finalize_op_log() starts again from zero (read them before re-initialising).
+///
+/// Returns None before the first init_op_log(); otherwise a dict (available while
 /// logging is active AND after finalize_op_log()):
 ///
 ///     accepted         entries queued for the writer

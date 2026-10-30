@@ -21,11 +21,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 use zstd::stream::write::Encoder;
 
-/// Process-wide op-log lifecycle: `Uninitialized` -> `Active` -> `Finalized`.
+/// Process-wide op-log lifecycle: `Uninitialized` -> `Active` -> `Finalized`,
+/// and `Finalized` -> `Active` again on the next [`init_op_logger`] (issue #294).
 ///
-/// `Finalized` is terminal: a process supports exactly one op-log session
-/// (issue #170). It keeps the (closed) logger only so that a repeated or
-/// concurrent finalize can wait for the first one to finish draining.
+/// A process runs one op-log session at a time; each `init` after a finalize
+/// starts a NEW session with its own file, [`Logger`] and statistics. `Finalized`
+/// keeps the (closed) logger of the session that just ended, for two reasons: a
+/// repeated or concurrent finalize can wait for the first one to finish draining,
+/// and a re-init waits for that drain before it opens the next file, so two
+/// writers never overlap. It also keeps that session's stats readable.
 enum OpLogState {
     Uninitialized,
     Active(Logger),
@@ -114,10 +118,12 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
     OP_LOG_STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Start the process's op-log session, writing to `path`.
+/// Start an op-log session, writing to `path`.
 ///
-/// A process supports **exactly one** op-log session:
-/// `Uninitialized` -> `Active` -> `Finalized` (terminal).
+/// The lifecycle is `Uninitialized` -> `Active` -> `Finalized` -> `Active` -> ...:
+/// one session at a time, and after [`finalize_op_logger`] a new one may be
+/// started, any number of times (issue #294; useful for repeated unit tests and
+/// notebooks).
 ///
 /// - Uninitialized: resolves `path` (plain local path or `file://` destination,
 ///   s3dlio's file-store convention, not full RFC 8089), creates
@@ -125,34 +131,48 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
 ///   I/O error) leaves the op-log Uninitialized, so a corrected call can succeed.
 /// - Active: a no-op returning `Ok(())`. The new `path` is **not** created or
 ///   truncated and the session keeps writing to the original file.
-/// - Finalized: returns an error and performs no filesystem action. The
-///   op-log cannot be restarted after [`finalize_op_logger`].
+/// - Finalized: starts a **new session**. If the previous session's writer is
+///   still draining (a finalize on another thread has not finished), this call
+///   first waits for it, so two writers never exist at once. The file is then
+///   created exactly as for a first init (create-and-truncate): re-using the
+///   previous session's path REPLACES that log, a different path leaves it
+///   untouched. The new session has a fresh [`Logger`], fresh [`OpLogStats`] and a
+///   clock offset of 0; the process client ID ([`set_client_id`]) carries over. A
+///   failed init leaves the op-log Finalized (the old session's stats stay
+///   readable) so a corrected call can succeed. If another thread initialises
+///   the op-log while this call waits, this call is the Active no-op.
 ///
 /// Stores capture the logger at construction (`store_for_uri_with_logger(uri,
 /// global_logger())`): stores created before init are unlogged, and stores
-/// created before finalize stop recording when it runs.
+/// created before finalize stop recording when it runs. A store keeps the
+/// [`Logger`] of the session that was Active when it was built; it is never
+/// moved to a later session, so after a re-init it still writes nothing (its
+/// old logger is closed) and the new session's file contains only rows from
+/// stores and calls made during that session.
 pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
     let path = path.as_ref();
-    {
-        let mut state = lock_state();
-        match &*state {
-            OpLogState::Active(_) => return Ok(()),
-            // Checked before any filesystem action: must not create or truncate `path`.
-            OpLogState::Finalized(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    format!(
-                        "op-log was already finalized and cannot be restarted; a process \
-                         supports only one op-log session, so '{path}' was not opened"
-                    ),
-                ))
+    loop {
+        let previous = {
+            let mut state = lock_state();
+            match &*state {
+                OpLogState::Active(_) => return Ok(()),
+                OpLogState::Finalized(previous) if !previous.is_drained() => previous.clone(),
+                OpLogState::Uninitialized | OpLogState::Finalized(_) => {
+                    // Nothing is writing (never started, or the previous writer has
+                    // finished). Created while the lifecycle lock is held, so
+                    // concurrent inits cannot both create a file.
+                    let logger = Logger::new(path)?;
+                    *state = OpLogState::Active(logger);
+                    break;
+                }
             }
-            OpLogState::Uninitialized => {}
-        }
-        // Created while the lifecycle lock is held, so concurrent inits cannot
-        // both create a file.
-        let logger = Logger::new(path)?;
-        *state = OpLogState::Active(logger);
+        };
+        // The previous session's writer may still be draining (finalize released
+        // the lock before its shutdown finished). Wait for it with the lock
+        // released: `shutdown` is idempotent and blocks until the first caller
+        // has finished. Then look at the state again: another thread may have
+        // initialised (or the drain may still be in progress after a panic).
+        previous.shutdown();
     }
 
     // Logged after the lifecycle lock is released: a tracing subscriber may be
@@ -163,11 +183,14 @@ pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
 }
 
 /// Fetch the global logger. `Some` only while the op-log is Active: `None`
-/// before [`init_op_logger`] and again after [`finalize_op_logger`].
+/// before [`init_op_logger`] and again after [`finalize_op_logger`], until the
+/// next [`init_op_logger`] starts a new session (which returns that session's
+/// logger).
 ///
 /// Stores capture the returned logger when they are constructed. A store built
 /// before init is unlogged forever; a store built before finalize keeps its
-/// clone, but its entries are rejected (`LogOutcome::Closed`) once finalize runs.
+/// clone, but its entries are rejected (`LogOutcome::Closed`) once finalize runs,
+/// and stay rejected after a later re-init: it never writes into a newer session.
 pub fn global_logger() -> Option<Logger> {
     match &*lock_state() {
         OpLogState::Active(logger) => Some(logger.clone()),
@@ -179,7 +202,9 @@ pub fn global_logger() -> Option<Logger> {
 /// session, so a caller can detect most ways records are lost.
 ///
 /// Available while the session is Active and after it is Finalized (`None`
-/// only before [`init_op_logger`]). The outcome counts cover every `log` /
+/// only before the first [`init_op_logger`]). After a re-init (issue #294) they
+/// are the NEW session's, starting from zero; the finished session's stats are
+/// no longer available, so read them before starting the next session. The outcome counts cover every `log` /
 /// `try_log` call that reached the session's [`Logger`] (through any clone)
 /// between init and finalize; `written` and `writer_error` come from the writer
 /// thread.
@@ -468,9 +493,11 @@ fn normalized_note(stats: &OpLogStats) -> Option<String> {
     ))
 }
 
-/// Statistics of the process's op-log session: `Some` while it is Active and
-/// after it is Finalized, `None` only before [`init_op_logger`]. See
-/// [`OpLogStats`] for how to use them to detect dropped records.
+/// Statistics of the current op-log session: `Some` while it is Active and
+/// after it is Finalized, `None` only before the first [`init_op_logger`]. After a
+/// re-init they are the new session's (zeroed at its start); they never add up
+/// across sessions. See [`OpLogStats`] for how to use them to detect dropped
+/// records.
 pub fn op_log_stats() -> Option<OpLogStats> {
     match &*lock_state() {
         OpLogState::Active(logger) | OpLogState::Finalized(logger) => Some(logger.stats()),
@@ -486,8 +513,9 @@ pub fn op_log_stats() -> Option<OpLogStats> {
 /// # Returns
 /// - `Ok(())` if the op-log is Active and the offset was set
 /// - `Err(NotFound)` if the op-log was never initialised
-/// - `Err(Unsupported)` if the op-log was already finalized: the session is over,
-///   so there is nothing left to configure (see [`finalize_op_logger`])
+/// - `Err(Unsupported)` if the op-log is finalized: the session is over, so there
+///   is nothing left to configure until [`init_op_logger`] starts a new one (see
+///   [`finalize_op_logger`]). A new session starts with an offset of 0.
 ///
 /// # Example
 /// ```ignore
@@ -516,7 +544,8 @@ pub fn get_clock_offset() -> std::io::Result<i64> {
 
 /// Run `f` on the Active global logger, or explain why there is none. The two
 /// failure states are told apart because the remedy differs: a logger that was
-/// never initialised needs `init_op_logger()`, a finalized one can never come back.
+/// never initialised needs `init_op_logger()`, a finalized one needs a new
+/// `init_op_logger()` to start another session (issue #294).
 fn with_active_logger<T>(what: &str, f: impl FnOnce(&Logger) -> T) -> std::io::Result<T> {
     match &*lock_state() {
         OpLogState::Active(logger) => Ok(f(logger)),
@@ -527,8 +556,8 @@ fn with_active_logger<T>(what: &str, f: impl FnOnce(&Logger) -> T) -> std::io::R
         OpLogState::Finalized(_) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!(
-                "{what}: the op-log was already finalized (a process supports only one \
-                 op-log session), so there is no active logger"
+                "{what}: the op-log was finalized, so there is no active logger \
+                 (call init_op_logger() to start a new session)"
             ),
         )),
     }
@@ -588,11 +617,13 @@ pub fn get_client_id() -> String {
 /// The process must call this before it exits: nothing finalizes the log
 /// automatically, so without it queued entries and the zstd frame end are lost.
 ///
-/// Finalize is terminal and idempotent. Entries submitted once it has begun are
-/// rejected (`LogOutcome::Closed`), [`global_logger`] returns `None` and the
-/// op-log cannot be initialised again in this process. Called while
-/// Uninitialized it is a no-op; called again (or concurrently) after
-/// finalization it waits for the first call to finish and returns.
+/// Finalize ends the session and is idempotent. Entries submitted once it has
+/// begun are rejected (`LogOutcome::Closed`) and [`global_logger`] returns `None`.
+/// A later [`init_op_logger`] starts a new session (issue #294); it waits for this
+/// drain to finish first. Called while Uninitialized it is a no-op; called again
+/// (or concurrently) after finalization it waits for the first call to finish and
+/// returns; it only ever closes the session that was current when it took the
+/// lifecycle lock.
 pub fn finalize_op_logger() {
     let logger = {
         let mut state = lock_state();
@@ -1556,6 +1587,13 @@ impl Logger {
             stderr_note("op-log writer has stopped after an error; entries are being dropped");
         }
         outcome
+    }
+
+    /// True once [`Logger::shutdown`] has run to completion: the writer has
+    /// finished and no file is being written any more. A re-init
+    /// ([`init_op_logger`]) opens the next file only when this is true.
+    fn is_drained(&self) -> bool {
+        self.shared.final_published.load(Ordering::Acquire)
     }
 
     /// Close the logger, drain every accepted entry and wait for the writer.

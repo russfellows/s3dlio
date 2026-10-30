@@ -268,16 +268,42 @@ To achieve true first-byte tracking, we would need:
 - Use RangeEngine for per-chunk timing (requires large_object_threshold config)
 - Consider object_store crate's get_range() for manual chunking
 
-## Lifecycle: one op-log session per process
+## Lifecycle: one op-log session at a time, restartable (#294)
 
-The op-log moves through `Uninitialized` -> `Active` -> `Finalized`, and
-`Finalized` is terminal: a process supports **exactly one** op-log session.
+The op-log moves through `Uninitialized` -> `Active` -> `Finalized`, and from
+`Finalized` back to `Active` on the next init: a process runs **one session at a
+time**, and after finalize it can start another, any number of times (repeated unit
+tests, notebooks). In earlier builds `Finalized` was terminal and a second init failed
+with "op-log was already finalized and cannot be restarted" (issue #294).
 
 | Call | Uninitialized | Active | Finalized |
 |---|---|---|---|
-| `init_op_logger(path)` (`init_op_log`) | creates the file, becomes Active (a failed init stays Uninitialized, so it can be retried) | returns `Ok`; the new path is **not** created or truncated | **error** (Python: `RuntimeError`); no file is created or truncated |
+| `init_op_logger(path)` (`init_op_log`) | creates the file, becomes Active (a failed init stays Uninitialized, so it can be retried) | returns `Ok`; the new path is **not** created or truncated | starts a **new session** (see below); a failed init stays Finalized, so it can be retried |
 | `finalize_op_logger()` (`finalize_op_log`) | no-op | writes every accepted record (unless the writer fails: an I/O error or a writer-thread panic), finishes the zstd stream, waits until the writer signals it has finished, becomes Finalized | no-op (waits if another finalize is still draining) |
 | `global_logger()` / `is_op_log_active()` | `None` / `False` | `Some` / `True` | `None` / `False` |
+
+What a restart does:
+
+- **Waits for the previous drain.** If the previous session's writer is still
+  draining (finalize running on another thread released the lifecycle lock before
+  its shutdown finished), init waits for it, so two writers never exist at once and
+  the old file is a complete zstd stream before the new file is opened. If another
+  thread initialises while this call waits, this call is the Active no-op.
+- **Same file semantics as a first init:** the file is created with
+  create-and-truncate. A **different path** leaves the finished log untouched; the
+  **same path replaces** it (the file then holds only the new session). The old
+  session's file is never appended to.
+- **Fresh state:** a new `Logger`, `op_log_stats()` / `Logger::stats()` restart at
+  zero (the finished session's stats are replaced, so read them before
+  re-initialising; they never add up across sessions), and the clock offset is 0
+  again. The process client ID (`set_client_id`) carries over.
+- **Old handles stay closed.** A store, reader or writer captured in an earlier
+  session holds that session's closed `Logger`: it keeps working but never writes
+  a row into a later session's file (its entries are counted as `rejected_closed`
+  of the old logger, which is no longer readable). Build new stores after the
+  re-init to record them. Python's module-level calls (`get`, `put_bytes`, ...)
+  look the op-log up on every call, so they are recorded in the new session with
+  no further action.
 
 Stores capture the logger when they are constructed
 (`store_for_uri_with_logger(uri, global_logger())`):
@@ -285,7 +311,7 @@ Stores capture the logger when they are constructed
 - stores created **before** init are unlogged for their whole life;
 - stores created **before** finalize stop recording when finalize runs (their
   later entries are rejected with `LogOutcome::Closed`, not written);
-- stores created **after** finalize are unlogged.
+- stores created **after** finalize (and before the next init) are unlogged.
 
 `Logger::log(entry)` returns `()`, as it always has. `Logger::try_log(entry)`
 does the same work and returns a `LogOutcome` (`Accepted`, `Full`, `Closed`,
@@ -295,9 +321,9 @@ the writer thread, after which `try_log` returns `WriterFailed`). The serializer
 lifecycle work (header, column order, idx numbering, operation names, zstd
 framing); see "What the format tests establish" below for what is checked.
 
-After finalize, `set_clock_offset` / `get_clock_offset` return an error of kind
-`Unsupported` saying the op-log was already finalized (before any init the kind
-is `NotFound`, "Logger not initialized").
+After finalize (until the next init), `set_clock_offset` / `get_clock_offset`
+return an error of kind `Unsupported` saying the op-log was finalized (before any
+init the kind is `NotFound`, "Logger not initialized").
 
 ### Detecting lost records
 
@@ -439,7 +465,8 @@ finalize only after the workers that log have stopped, and check
 `rejected_closed == 0` as well as `is_complete()`.
 
 `op_log_stats()` / `Logger::stats()` work while the op-log is Active **and after
-it is Finalized** (`None` only before init, including after a failed init), so a
+it is Finalized** (`None` only before the first init, including after a failed
+first init; after a restart they are the new session's), so a
 program can finalize and then check the totals. The counts cover every clone of
 the session's `Logger`. While threads are still logging they are relaxed atomics
 (a snapshot is a progress report, not a transaction). Once finalize has returned,

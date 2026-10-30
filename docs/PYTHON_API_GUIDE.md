@@ -2195,8 +2195,8 @@ snapshot).
 | Function | Description |
 |----------|-------------|
 | `init_logging(level)` | Set log level: trace, debug, info, warn, error |
-| `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089); `RuntimeError` after finalize |
-| `finalize_op_log()` | Write all accepted records (unless the writer fails: an I/O error or a writer-thread panic) and close the log; **call it before the process exits, nothing does it for you**; releases the GIL while draining; terminal and idempotent |
+| `init_op_log(path)` | Start an op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089). Allowed again after `finalize_op_log()` (new session, fresh `op_log_stats()`; the same path is truncated, #294); a no-op while a session is active |
+| `finalize_op_log()` | Write all accepted records (unless the writer fails: an I/O error or a writer-thread panic) and close the log; **call it before the process exits, nothing does it for you**; releases the GIL while draining; idempotent; ends the session, `init_op_log` can start a new one (#294) |
 | `is_op_log_active()` | True between init and finalize only |
 | `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `written` / `dropped_full` / `rejected_closed` / `writer_failed` / `writer_error` / `lossless` / `rejected_unformattable` / `rejected_unsafe_field` / `normalized_error_text`, available while active and after finalize, to detect lost records (complete = `accepted == written`, no drops, no refusals, `writer_error is None`, `rejected_unformattable == 0`, `rejected_unsafe_field == 0`; `normalized_error_text` is a disclosure, not a loss) |
 

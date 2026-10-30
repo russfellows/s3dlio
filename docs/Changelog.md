@@ -1,5 +1,30 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Op-log can be restarted after `finalize_op_log()` (#294).** `init_op_log(path)` /
+  `init_op_logger(path)` after a finalize used to fail with "op-log was already finalized and
+  cannot be restarted; a process supports only one op-log session" (even with a different file),
+  which broke repeated unit tests and Jupyter use. The lifecycle is now `Uninitialized` ->
+  `Active` -> `Finalized` -> `Active` -> ...: one session at a time, any number in a process.
+  This supersedes the "One op-log session per process (#170)" behaviour listed under 0.10.0.
+  - A re-init starts a new session: new file (create-and-truncate, like a first init: a
+    different path leaves the finished log untouched, the same path replaces it), a fresh
+    `Logger`, `op_log_stats()` restarting at zero (it is the new session's, never a sum) and a
+    clock offset of 0; the process client ID carries over.
+  - A re-init never lets two writers overlap: if the previous session's writer is still
+    draining (a finalize on another thread), init waits for that drain before opening the new
+    file. If another thread initialises meanwhile, the call is the Active no-op.
+  - Init while a session is Active is unchanged (a no-op returning success). A failed init
+    after a finalize leaves the op-log Finalized so a corrected call can succeed.
+  - Stores, readers and writers captured in an earlier session keep that session's closed
+    logger: they keep working but never write into a later session's file. The Python
+    module-level calls look the op-log up on every call, so they need no change.
+  - Tests: `tests/oplog_lifecycle_reinit_{after_finalize,same_path,waits_for_drain,old_store}.rs`
+    (replacing `oplog_lifecycle_reinit_rejected.rs`) and `tests/test_oplog_lifecycle.py`.
+
 ## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; zero copy everywhere (Rule #1); stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 
 This release adds a new public API surface (#264) and fixes twenty-three issues (#224, #230,

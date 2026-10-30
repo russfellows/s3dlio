@@ -60,7 +60,7 @@
 // for native GCS the prefix state is printed, not asserted.
 //
 // Op-log (S3 path only): `s3_path::op_log_one_row_per_call` initialises the op-log, which is
-// process-global and cannot be restarted, to a temporary file, builds its own store with the
+// process-global (one session at a time), to a temporary file, builds its own store with the
 // logger, finalises it at the end and counts rows.  No other test in this file builds a logged
 // store, so they are unaffected.  If another op-log session is already active in the process
 // the test says so and skips.  The runner may add S3DLIO_OPLOG_LOSSLESS=1 so a full queue

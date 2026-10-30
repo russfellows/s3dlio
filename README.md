@@ -657,7 +657,12 @@ import s3dlio
 s3dlio.init_op_log("operations.tsv.zst")
 # All operations automatically logged
 s3dlio.finalize_op_log()
+# A new session can start in the same process (repeated tests, notebooks): #294
+s3dlio.init_op_log("operations2.tsv.zst")
+s3dlio.finalize_op_log()
 ```
+
+`init_op_log()` after `finalize_op_log()` starts a fresh session with its own file and stats (it waits for the previous session to finish draining); calling it while a session is active is a no-op.
 
 See [S3DLIO OpLog Implementation](docs/S3DLIO_OPLOG_IMPLEMENTATION_SUMMARY.md) for detailed usage.
 
