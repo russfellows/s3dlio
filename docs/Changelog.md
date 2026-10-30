@@ -220,20 +220,27 @@ GIL released aborts the same way) and not specific to 3.12 as first reported: CP
 a thread with `pthread_exit`, 3.11 and 3.12 still do.
 
 - **Fix:** PyO3, `numpy` and `pyo3-async-runtimes` are upgraded from 0.27 to 0.29. PyO3 0.29 wraps the GIL re-acquire in
-  a guard that parks the thread instead of letting the forced unwind cross Rust frames. `pyo3` is pinned to **exactly
-  0.29.3** (`=0.29.3`): 0.29.0 to 0.29.2 lack the follow-up fix (PyO3 #6404). Do not loosen it to `^0.29`.
+  a guard that parks the thread instead of letting the forced unwind cross Rust frames. `pyo3` must be
+  **0.29.3 or later in the 0.29 series (`>=0.29.3, <0.30`)**: 0.29.0 to 0.29.2 lack the follow-up fix (PyO3 #6404), so the
+  lower bound must not be lowered. `Cargo.lock` resolves 0.29.3.
 - **Behaviour now:** the process exits with code 0 and runs its `atexit` handlers; the daemon threads are simply
   abandoned, as on 3.13.8+ and 3.14. Non-daemon threads are unaffected (Python waits for them). Python 3.13.8+ and 3.14
   were never affected. No API change. The `#[pyclass]` types that Python code passes back by value
   (`PyDataset`, `PyBytesAsyncDataLoader`, `PyLoaderOptions`, `PyVecDataset`, `PyS3Dataset`, `PyS3DatasetCompat`,
   `ObjectMetadata`) keep their by-value extraction (`#[pyclass(from_py_object)]`, the PyO3 0.28 opt-in), and the module
-  declares `gil_used = true` so a free-threaded interpreter keeps re-enabling the GIL, as with PyO3 0.27.
+  declares `#[pymodule(gil_used = true)]`, which keeps the PyO3 0.27 behaviour on free-threaded CPython (the GIL is
+  re-enabled on import); it has no effect on regular CPython.
+- **One user-visible side effect:** PyO3 0.29 no longer rewrites argument-extraction `TypeError`s. For example
+  `s3dlio.get(123)` still raises `TypeError`, but the message changes from "argument 'uri': 'int' object cannot be cast
+  as 'str'" to "'int' object is not an instance of 'str'"; the argument name moves to the exception's `__notes__`.
+  Code that matches on the old message text must be updated; the exception type is unchanged.
 - **Not covered:** a thread parked at exit keeps whatever Rust state it holds above the call (it never runs
   its destructors); that is the same as 3.13.8+. Other extensions (NumPy C code, torch) that release the GIL are not
   changed by this fix. Do not build s3dlio with `panic = "abort"` for release: the guard needs unwinding.
 - **Known separate problem (not #298, not fixed here):** on CPython 3.14 a daemon thread's event loop with `get_async`
   calls in flight at exit usually crashes (`Fatal Python error: PyInterpreterState_Delete: remaining threads`),
-  identically with PyO3 0.27.2 and 0.29.3. Sync calls, `get_into_async`, `put_bytes_async` and a pending `get_async` are
+  identically with PyO3 0.27.2 and 0.29.3 (tracked as
+  [#302](https://github.com/russfellows/s3dlio/issues/302)). Sync calls, `get_into_async`, `put_bytes_async` and a pending `get_async` are
   clean on 3.14. The test marks that one case `xfail` on 3.14.
 - **Tests:** `python/tests/test_exit_daemon_threads_298.py` runs each scenario in a fresh subprocess with a timeout:
   sync `get`, `put_bytes`, `list`, `stat`, `get_many`, `get_range`, a streaming writer, a call blocked on an unresponsive

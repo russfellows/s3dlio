@@ -171,7 +171,7 @@ jobs:
 
       # Interpreter exit with daemon threads inside s3dlio calls (#298): every scenario runs in a
       # fresh subprocess and must exit 0 with no FATAL on stderr. RED on CPython < 3.13.8 (the 3.11
-      # and 3.12 matrix cells) with PyO3 < 0.29.3; the exact `=0.29.3` pin in Cargo.toml keeps it green.
+      # and 3.12 matrix cells) with PyO3 < 0.29.3; the `>=0.29.3, <0.30` requirement in Cargo.toml keeps it green.
       - name: Test (Python - exit with daemon threads, #298)
         run: |
           pip install pytest
