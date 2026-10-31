@@ -984,7 +984,9 @@ mod mpi_aware_runtime_sizing_tests {
         with_clean_state(|| {
             std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
             let cpus = num_cpus::get();
-            let expected = (cpus / 4).max(1);
+            // The global runtime keeps at least 2 workers (#303 round 1): on a 4-CPU host
+            // (GitHub runners) the per-rank share 4 / 4 = 1 is raised to 2.
+            let expected = (cpus / 4).max(2);
             assert_eq!(
                 get_runtime_threads(),
                 expected,
