@@ -206,7 +206,7 @@ jobs:
       # The Rust unit tests of the Python extension (everything under `python_api::`: the release
       # queue, the async bridge, the store cache, ...) only compile with `extension-module`, which
       # leaves libpython unlinked: link the interpreter's SHARED libpython explicitly. Fails loudly
-      # when the interpreter has none. (After the pyo3 0.29 upgrade, #298, move this to pyo3's
+      # when the interpreter has none. (Could later move to pyo3's
       # `auto-initialize` for tests and drop the RUSTFLAGS.)
       - name: Test (Rust unit tests of the Python extension)
         env:

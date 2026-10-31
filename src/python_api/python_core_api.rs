@@ -6689,7 +6689,10 @@ async def scn_error_then_settle(start):
     }
 
     /// A Python callable `() -> bool` over a Rust closure.
-    fn bool_fn<'py>(py: Python<'py>, f: impl Fn() -> bool + Send + 'static) -> Bound<'py, PyAny> {
+    fn bool_fn<'py>(
+        py: Python<'py>,
+        f: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Bound<'py, PyAny> {
         pyo3::types::PyCFunction::new_closure(
             py,
             None,
@@ -6703,7 +6706,7 @@ async def scn_error_then_settle(start):
     }
 
     /// A Python callable `()` that runs a Rust closure and returns `None`.
-    fn action_fn<'py>(py: Python<'py>, f: impl Fn() + Send + 'static) -> Bound<'py, PyAny> {
+    fn action_fn<'py>(py: Python<'py>, f: impl Fn() + Send + Sync + 'static) -> Bound<'py, PyAny> {
         pyo3::types::PyCFunction::new_closure(
             py,
             None,
