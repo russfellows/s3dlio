@@ -1,12 +1,12 @@
 # s3dlio - Universal Storage I/O Library
 
 [![CI](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-1893-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-2030-brightgreen)](docs/Changelog.md)
 [![Version](https://img.shields.io/badge/version-0.10.1-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94.1%2B-orange)](https://www.rust-lang.org)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
@@ -14,7 +14,7 @@ Full-backend builds support the stable Azure Blob Storage Rust SDK 1.x API (1.1)
 
 ## Recent Releases
 
-- **v0.10.1** — Bug fixes: fork safety, Python exit crashes/aborts, stalled pooled connections, `LocalSet` sync wrappers, op-log restart, `get_into`/`head` for `file://` and `direct://` (#294, #295, #267, #297, #298, #300, #302, #303, #304)
+- **v0.10.1** — Bug fixes: fork safety, Python exit crashes/aborts, stalled pooled connections, `LocalSet` sync wrappers, op-log restart, `get_into`/`head` for `file://` and `direct://` (#294, #295, #267, #276, #297, #298, #300, #302, #303, #304) — [PR #308](https://github.com/russfellows/s3dlio/pull/308)
 - **v0.10.0** — Caller-buffer GET, typed HEAD; zero copy everywhere; official GCS only — [PR #293](https://github.com/russfellows/s3dlio/pull/293)
 - **v0.9.128** — Zero-copy writes, opt-in `.env`, Azure credentials — [PR #262](https://github.com/russfellows/s3dlio/pull/262)
 - **v0.9.126** — Exact URI selection; routing, upload fixes — [PR #237](https://github.com/russfellows/s3dlio/pull/237)

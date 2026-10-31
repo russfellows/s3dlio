@@ -539,6 +539,37 @@ affected. No API change.
   Display/Debug attaches inside PyO3), and requires `python_call_scope()` before every Python call of the awaitable
   machinery; each rule is mutation-checked. It is a lexical scan and says so; the exit scenarios are the behavioural barrier.
 
+### Tests and CI
+
+- New in CI: Python 3.14 in the test matrix; the #297 fork tests and their Rust binaries
+  (`fork_globals_297`, `fork_oplog_idle/fifo/edges_297`, `fork_io_runtime_303`); an off-GIL drop oracle
+  job (a wheel built with `--cfg pyo3_disable_reference_pool`, where a `Py` dropped without the GIL
+  aborts); the Rust unit tests of the Python extension (`python_api::`; the 3.11 cells skip
+  `caller_buffer_tests`, which need PEP 688 `__buffer__`, CPython >= 3.12); the #302 source guard; the
+  #303 pooled-connection binaries (S3, Azure, GCS) and `tests/test_abort_at_exit_303.py`; the #298/#302/#304
+  exit file with `S3DLIO_EXIT_ATTEMPTS=8`.
+- `test-hooks` cargo feature (never in the PyPI wheels; `publish-pypi.yml` asserts both hook symbols
+  are absent). CI's test wheel is built with it and sets `S3DLIO_REQUIRE_TEST_HOOKS=1`.
+- CI runs without ANSI color in cargo output (`CARGO_TERM_COLOR=never`).
+- The PyPI wheels now include CPython 3.14 (`publish-pypi.yml`).
+- R2 of the zero-copy proofs (an S3 `get` / `get_range` receives into one pre-sized buffer) moved to
+  `tests/test_zero_copy_s3_receive.rs`, which counts allocations on every thread of its process except
+  the mock server's: since #303 the transport of an S3 read runs on the I/O-owner runtime, not on the
+  caller's thread, so the old per-thread count no longer saw the body chunks (its positive control
+  failed).
+
+### Validation
+
+- Rust: `cargo fmt`; clippy with `-D warnings` (default, `extension-module`, `extension-module,test-hooks`,
+  `backend-azure,backend-gcs`, `--tests`, `arrow-backend`); the full default-feature test run on the
+  release source (2030 passed, 0 failed, 59 ignored); the library tests with `backend-azure,backend-gcs`
+  (1221 passed) and the Python-extension unit tests (`python_api::`, 222 passed).
+- Python 3.11, 3.12, 3.13 (3.13.7 and 3.13.18) and 3.14: the exit (#298/#302/#304), fork and no-off-GIL
+  (#297), op-log (#294), `get_into` (#295), abort-at-exit (#303) and Azure-backend suites; the off-GIL
+  oracle (285 passed); a fork stress run of 3000 children on the release wheel (0 hung, 0 crashed).
+- GitHub Actions (PR #308): every job green on x86-64 and arm64.
+- Known, pre-existing: `test_direct_put_cancel_intact` fails intermittently on multi-NUMA hosts (#299).
+
 ## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; zero copy everywhere (Rule #1); stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 
 This release adds a new public API surface (#264) and fixes twenty-three issues (#224, #230,
