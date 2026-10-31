@@ -130,16 +130,25 @@ mod tier4_length_guard_tests {
 /// Blocking-receive helper shared by every `std::sync::Mutex`-guarded sync
 /// iterator (`PyObjectDataLoaderSyncIter`, `PyBytesDataLoaderSyncIter`,
 /// `ParquetStreamIter`) -- design doc docs/DESIGN_TIER4_FFI_HARDENING.md
-/// item 4, Option C. `parking_lot::Mutex` never poisons, so an unrelated
+/// item 4, Option C. A poisoned lock is recovered (`PoisonError::into_inner`), so an unrelated
 /// panic elsewhere while the lock happens to be held no longer wedges the
 /// iterator for the rest of its lifetime the way `std::sync::Mutex` +
 /// `.expect(...)` did. Pure/GIL-free (the caller is always a plain
 /// synchronous `py.detach(|| ...)` closure, never an `.await` point) so
 /// it's unit-testable without the `extension-module` feature.
+///
+/// It is a `std::sync::Mutex`, not a `parking_lot` one, on purpose (#297): a second consumer
+/// thread of the same iterator waits on this lock for the whole `blocking_recv`, i.e. it is
+/// PARKED while a fork can happen. A thread parked in parking_lot leaves an entry in
+/// parking_lot's process-global table that points into its (copied, never running) stack; the
+/// fork child's own parking_lot use then follows a dangling pointer. A std (futex) lock keeps
+/// no such table.
 pub fn blocking_recv_locked<T>(
-    mtx: &parking_lot::Mutex<tokio::sync::mpsc::Receiver<T>>,
+    mtx: &std::sync::Mutex<tokio::sync::mpsc::Receiver<T>>,
 ) -> Option<T> {
-    mtx.lock().blocking_recv()
+    mtx.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .blocking_recv()
 }
 
 #[cfg(test)]
@@ -165,21 +174,25 @@ mod tier4_mutex_poisoning_tests {
         );
     }
 
-    /// The actual replacement helper (`blocking_recv_locked` over
-    /// `parking_lot::Mutex`) must survive the identical scenario: a panic
+    /// The actual replacement helper (`blocking_recv_locked`, which recovers a poisoned
+    /// `std::sync::Mutex`) must survive the identical scenario: a panic
     /// on another thread while the lock is held must not wedge later calls.
     #[test]
     fn blocking_recv_locked_survives_panic_while_held() {
         let (tx, rx) = tokio::sync::mpsc::channel::<i32>(4);
-        let mtx = std::sync::Arc::new(parking_lot::Mutex::new(rx));
+        let mtx = std::sync::Arc::new(std::sync::Mutex::new(rx));
 
         let mtx_for_panic = std::sync::Arc::clone(&mtx);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = mtx_for_panic.lock();
             panic!("simulated panic while holding the lock");
         }));
+        assert!(
+            mtx.is_poisoned(),
+            "the lock is poisoned: recovered, not wedged"
+        );
 
-        // The mutex must still be usable -- no poisoning, no wedge. Mirrors
+        // The mutex must still be usable -- recovered from poisoning. Mirrors
         // the real call sites: `blocking_recv_locked` runs on a plain OS
         // thread (inside `py.detach`), never inside the runtime it's
         // receiving from.

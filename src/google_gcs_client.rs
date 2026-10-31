@@ -31,8 +31,11 @@ use tokio::sync::OnceCell;
 use tracing::{debug, info, trace, warn};
 
 // Global cached GCS clients - initialized once and reused across all operations
-static GCS_STORAGE: OnceCell<Arc<Storage>> = OnceCell::const_new();
-static GCS_CONTROL: OnceCell<Arc<StorageControl>> = OnceCell::const_new();
+// Fork-aware (#297): a fork child builds its own clients, never reusing the parent's gRPC channels.
+static GCS_STORAGE: crate::fork_guard::ForkCell<OnceCell<Arc<Storage>>> =
+    crate::fork_guard::ForkCell::new();
+static GCS_CONTROL: crate::fork_guard::ForkCell<OnceCell<Arc<StorageControl>>> =
+    crate::fork_guard::ForkCell::new();
 static EFFECTIVE_GCS_RAPID_MODE: std::sync::OnceLock<RapidMode> = std::sync::OnceLock::new();
 const GCS_FULL_READ_REPAIR_MAX_ATTEMPTS: usize = 4;
 const GCS_FULL_READ_RETRY_MAX_ATTEMPTS: usize = 3;
@@ -325,9 +328,12 @@ pub fn get_gcs_rapid_mode() -> Option<bool> {
 /// Each entry is a `OnceCell<bool>` so that concurrent callers for the same
 /// bucket block on the *same* detection future rather than all racing to call
 /// `get_storage_layout()` simultaneously (thundering herd fix).
-static BUCKET_RAPID_CACHE: std::sync::LazyLock<
+///
+/// Fork-aware (#297): a detection that was in flight in a parent thread at the fork would leave
+/// its cell "initialising" for ever in the child, so a child starts with an empty cache.
+static BUCKET_RAPID_CACHE: crate::fork_guard::ForkCell<
     std::sync::Mutex<HashMap<String, Arc<OnceCell<bool>>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+> = crate::fork_guard::ForkCell::new();
 
 /// Minimal object metadata for GCS objects.
 /// Maps to the provider-neutral ObjectMetadata type in object_store.rs.
@@ -422,6 +428,7 @@ impl GcsClient {
         // Custom endpoint / emulator (None: the SDK defaults, byte for byte as before).
         let endpoint = resolve_gcs_endpoint();
         let storage = GCS_STORAGE
+            .get_or_init(OnceCell::new)
             .get_or_try_init(|| async {
                 debug!("Initializing GCS Storage client (first time only)");
 
@@ -503,6 +510,7 @@ impl GcsClient {
             .await?;
 
         let control = GCS_CONTROL
+            .get_or_init(OnceCell::new)
             .get_or_try_init(|| async {
                 debug!("Initializing GCS StorageControl client (first time only)");
 
@@ -561,7 +569,10 @@ impl GcsClient {
         // Get or create the per-bucket OnceCell. The std::sync::Mutex is held
         // only for this brief map lookup/insert — no I/O while locked.
         let cell: Arc<OnceCell<bool>> = {
-            let mut map = BUCKET_RAPID_CACHE.lock().unwrap();
+            let mut map = BUCKET_RAPID_CACHE
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap();
             map.entry(bucket.to_string())
                 .or_insert_with(|| Arc::new(OnceCell::new()))
                 .clone()

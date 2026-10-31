@@ -66,7 +66,7 @@ fn generate_data(
             block_size: None,
             seed: None,
         };
-        dgen_generate_data(config)
+        crate::s3_client::with_rayon_pool(|| dgen_generate_data(config))
     });
 
     // Convert to Bytes (zero-copy for UMA via Bytes::from(vec)) and wrap
@@ -115,7 +115,7 @@ fn generate_data_with_threads(
             block_size: None,
             seed: None,
         };
-        dgen_generate_data(config)
+        crate::s3_client::with_rayon_pool(|| dgen_generate_data(config))
     });
 
     // Convert to Bytes (zero-copy for UMA via Bytes::from(vec)) and wrap
@@ -187,7 +187,7 @@ fn generate_into_buffer(
             block_size: None,
             seed: None,
         };
-        dgen_generate_data(config)
+        crate::s3_client::with_rayon_pool(|| dgen_generate_data(config))
     });
 
     // Write into buffer (single copy only - can't avoid this since user provided the buffer)
@@ -269,7 +269,9 @@ fn py_total_cpus() -> usize {
 /// ```
 #[pyclass(name = "Generator")]
 struct PyGenerator {
-    inner: DataGenerator,
+    /// Guarded: a generator made before a fork() keeps dgen-data's parent-owned thread pool
+    /// state and is refused in the child (#297).
+    inner: crate::fork_guard::Guarded<DataGenerator>,
     chunk_size: usize,
 }
 
@@ -308,7 +310,9 @@ impl PyGenerator {
         let chunk_size = chunk_size.unwrap_or_else(DataGenerator::recommended_chunk_size);
 
         Ok(Self {
-            inner: DataGenerator::new(config),
+            inner: crate::fork_guard::Guarded::new(DataGenerator::new(
+                crate::data_gen_alt::fork_safe_config(config),
+            )),
             chunk_size,
         })
     }
@@ -344,23 +348,25 @@ impl PyGenerator {
         let size = buf.len_bytes();
 
         // Generate DIRECTLY into Python buffer without holding GIL
+        let inner = self.inner.get_mut()?;
         let written = py.detach(|| unsafe {
             let dst_ptr = buf.buf_ptr() as *mut u8;
             let dst_slice = std::slice::from_raw_parts_mut(dst_ptr, size);
-            self.inner.fill_chunk(dst_slice)
+            inner.fill_chunk(dst_slice)
         });
 
         Ok(written)
     }
 
     /// Check if generation is complete
-    fn is_complete(&self) -> bool {
-        self.inner.is_complete()
+    fn is_complete(&self) -> PyResult<bool> {
+        Ok(self.inner.get()?.is_complete())
     }
 
     /// Reset generator to start
-    fn reset(&mut self) {
-        self.inner.reset();
+    fn reset(&mut self) -> PyResult<()> {
+        self.inner.get_mut()?.reset();
+        Ok(())
     }
 }
 

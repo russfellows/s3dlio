@@ -143,16 +143,16 @@
 //!   and are now refused with a `RuntimeError` (before: the awaitable never resolved). Handlers
 //!   registered after the import run before the drain and are unaffected.
 
-use std::cell::OnceCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use pyo3::conversion::IntoPyObjectExt;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3::IntoPyObject;
-use pyo3_async_runtimes::generic::{self, ContextExt, Runtime};
-use pyo3_async_runtimes::TaskLocals;
+use pyo3_async_runtimes::generic::Runtime;
 
 /// Count of result deliveries that have been handed to the blocking pool and
 /// have not yet fully returned.
@@ -252,10 +252,15 @@ impl Drop for DeliveryTicket {
 }
 
 /// Process-wide tracker for deliveries made through [`S3dlioRuntime`].
-static DELIVERIES: DeliveryTracker = DeliveryTracker::new();
+///
+/// Fork-aware (#297): the count belongs to the threads and tasks of the process that made it,
+/// and its mutex may have been held by one of them at a fork. A fork child starts with a fresh,
+/// open tracker (the inherited one is leaked, never used).
+static DELIVERIES_CELL: crate::fork_guard::ForkCell<DeliveryTracker> =
+    crate::fork_guard::ForkCell::new();
 
-tokio::task_local! {
-    static TASK_LOCALS: OnceCell<TaskLocals>;
+fn deliveries() -> &'static DeliveryTracker {
+    DELIVERIES_CELL.get_or_init(DeliveryTracker::new)
 }
 
 /// `pyo3_async_runtimes` runtime adapter over the shared pyo3-async-runtimes
@@ -271,14 +276,14 @@ impl Runtime for S3dlioRuntime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        pyo3_async_runtimes::tokio::get_runtime().spawn(fut)
+        crate::s3_client::pyo3_runtime().spawn(fut)
     }
 
     fn spawn_blocking<F>(f: F) -> Self::JoinHandle
     where
         F: FnOnce() + Send + 'static,
     {
-        spawn_gated(&DELIVERIES, f)
+        spawn_gated(deliveries(), f)
     }
 }
 
@@ -299,7 +304,7 @@ fn spawn_gated<F>(tracker: &'static DeliveryTracker, f: F) -> tokio::task::JoinH
 where
     F: FnOnce() + Send + 'static,
 {
-    let runtime = pyo3_async_runtimes::tokio::get_runtime();
+    let runtime = crate::s3_client::pyo3_runtime();
     match tracker.enter() {
         Some(ticket) => runtime.spawn_blocking(move || {
             // Release buffer exports queued by a finished `put_bytes_async(borrow=True)` BEFORE
@@ -334,21 +339,28 @@ where
     }
 }
 
-impl ContextExt for S3dlioRuntime {
-    fn scope<F, R>(locals: TaskLocals, fut: F) -> Pin<Box<dyn Future<Output = R> + Send>>
-    where
-        F: Future<Output = R> + Send + 'static,
-    {
-        let cell = OnceCell::new();
-        // A fresh cell is empty, so this `set` cannot fail.
-        let _ = cell.set(locals);
-        Box::pin(TASK_LOCALS.scope(cell, fut))
+/// A Python reference that is NEVER dropped by pyo3's off-GIL path.
+///
+/// Dropping a `Py<..>` on a thread without the GIL makes pyo3 push the pointer onto its global
+/// reference pool, a `Mutex` that is locked by every such drop. A parent thread that holds that
+/// mutex at a `fork()` leaves it locked for ever in the child, and the child's first Python call
+/// waits for it (#297). Every Python reference that lives in a task or closure of this module is
+/// therefore wrapped here: it is consumed with the GIL held ([`GilRef::into_bound`]), and if it is
+/// dropped anywhere else (a task dropped at runtime shutdown, a delivery refused by the closed
+/// gate) it is queued for a GIL holder to decref ([`super::put_payload::defer_decref`]).
+struct GilRef(Option<Py<PyAny>>);
+
+impl GilRef {
+    fn new(obj: Py<PyAny>) -> Self {
+        Self(Some(obj))
     }
 
-    fn get_task_locals() -> Option<TaskLocals> {
-        TASK_LOCALS
-            .try_with(|cell| cell.get().cloned())
-            .unwrap_or_default()
+    /// Take the reference; the `py` token proves the GIL is held.
+    fn into_bound(mut self, py: Python<'_>) -> Bound<'_, PyAny> {
+        self.0
+            .take()
+            .expect("a GilRef is consumed once")
+            .into_bound(py)
     }
 }
 
@@ -395,7 +407,7 @@ impl Drop for PythonCallScope {
 /// interpreter is exiting. Hold the scope across every call into Python that an async entry point
 /// makes from Rust, and release it (drop it) before any long wait.
 pub(crate) fn python_call_scope() -> PyResult<PythonCallScope> {
-    scope_in(&DELIVERIES)
+    scope_in(deliveries())
 }
 
 /// [`python_call_scope`] on an explicit tracker (tests).
@@ -432,7 +444,7 @@ pub(crate) fn arm_close_gate_after_next_spawn() {
 pub(crate) fn after_spawn_hook() {
     #[cfg(feature = "test-hooks")]
     if CLOSE_GATE_AFTER_NEXT_SPAWN.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        DELIVERIES.close();
+        deliveries().close();
     }
 }
 
@@ -440,8 +452,116 @@ pub(crate) fn after_spawn_hook() {
 pub(crate) const EXITING_MESSAGE: &str =
     "s3dlio: the interpreter is exiting; the call was refused (issue #304)";
 
-/// Drop-in replacement for `pyo3_async_runtimes::tokio::future_into_py` whose
-/// result deliveries are visible to the exit drain (see the module docs).
+impl Drop for GilRef {
+    fn drop(&mut self) {
+        if let Some(obj) = self.0.take() {
+            super::put_payload::ASYNC_GILREF_DEFERRED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::put_payload::defer_decref(obj.into_ptr());
+        }
+    }
+}
+
+/// `add_done_callback` target: a cancelled Python future cancels the Rust future.
+#[pyclass]
+struct DoneCallback {
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[pymethods]
+impl DoneCallback {
+    fn __call__(&mut self, fut: &Bound<'_, PyAny>) -> PyResult<()> {
+        if future_cancelled(fut).unwrap_or(false) {
+            if let Some(tx) = self.cancel_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Runs on the event loop thread: completes the future unless it was cancelled meanwhile.
+#[pyclass]
+struct CheckedCompletor;
+
+#[pymethods]
+impl CheckedCompletor {
+    fn __call__(
+        &self,
+        future: &Bound<'_, PyAny>,
+        complete: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if future_cancelled(future)? {
+            return Ok(());
+        }
+        complete.call1((value,))?;
+        Ok(())
+    }
+}
+
+fn future_cancelled(future: &Bound<'_, PyAny>) -> PyResult<bool> {
+    future
+        .getattr(pyo3::intern!(future.py(), "cancelled"))?
+        .call0()?
+        .is_truthy()
+}
+
+/// Hand the outcome to the event loop thread (`loop.call_soon_threadsafe`).
+fn set_result(
+    event_loop: &Bound<'_, PyAny>,
+    future: &Bound<'_, PyAny>,
+    result: PyResult<Py<PyAny>>,
+) -> PyResult<()> {
+    let py = event_loop.py();
+    let none = py.None().into_bound(py);
+    let (complete, val) = match result {
+        Ok(val) => (
+            future.getattr(pyo3::intern!(py, "set_result"))?,
+            val.into_bound(py),
+        ),
+        Err(err) => (
+            future.getattr(pyo3::intern!(py, "set_exception"))?,
+            err.into_bound_py_any(py)?,
+        ),
+    };
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(pyo3::intern!(py, "context"), &none)?;
+    event_loop.call_method(
+        pyo3::intern!(py, "call_soon_threadsafe"),
+        (CheckedCompletor, future, complete, val),
+        Some(&kwargs),
+    )?;
+    Ok(())
+}
+
+fn panic_message(any: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = any.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = any.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "unknown error"
+    }
+}
+
+/// What the Rust side of an awaitable ended with.
+enum BridgeOutcome<T> {
+    Value(PyResult<T>),
+    /// The Python future was cancelled first: nothing to deliver.
+    Cancelled,
+    Panicked(String),
+}
+
+/// Replacement for `pyo3_async_runtimes::tokio::future_into_py` whose result deliveries are
+/// visible to the exit drain (see the module docs) and which never drops a Python reference
+/// without the GIL (#297).
+///
+/// The upstream function keeps a spare `Py` of the awaitable (for the panic path) in the task
+/// that spawns the delivery; that task ends on a Tokio worker, which drops the reference without
+/// the GIL on EVERY call. Here the awaitable and the event loop each have exactly one owner at
+/// any time (the task, then the delivery closure) and both are consumed under the GIL; a Rust
+/// panic is caught inside the task and delivered the same way, so no second reference is needed.
 pub(crate) fn future_into_py<F, T>(py: Python<'_>, fut: F) -> PyResult<Bound<'_, PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
@@ -451,11 +571,76 @@ where
     // finished (see `body_finished_hook`). Absent from the shipped extension.
     #[cfg(test)]
     let fut = body_finished_hook::observe(fut);
-    // `generic::future_into_py` calls `loop.create_future()` (Python bytecode) on THIS thread from
-    // inside Rust frames: hold an exit-gate scope for it (issue #304).
-    let _scope = python_call_scope()?;
-    // exit-gate: allowed (the bridge itself: S3dlioRuntime gates the delivery, python_call_scope gates this call)
-    generic::future_into_py::<S3dlioRuntime, _, T>(py, fut)
+
+    // The three Python calls below (get_running_loop, create_future, add_done_callback) run on THIS
+    // thread from inside Rust frames: exit-gate scope (#304), refused before anything exists.
+    let scope = python_call_scope()?;
+    let event_loop = pyo3_async_runtimes::get_running_loop(py)?;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let py_fut = event_loop.call_method0(pyo3::intern!(py, "create_future"))?;
+    py_fut.call_method1(
+        pyo3::intern!(py, "add_done_callback"),
+        (DoneCallback {
+            cancel_tx: Some(cancel_tx),
+        },),
+    )?;
+    let loop_ref = GilRef::new(event_loop.unbind());
+    let fut_ref = GilRef::new(py_fut.clone().unbind());
+    drop(scope); // the spawn below needs no Python call
+
+    S3dlioRuntime::spawn(async move {
+        use futures::FutureExt;
+        let body = async move {
+            tokio::pin!(fut);
+            let mut cancel_rx = Some(cancel_rx);
+            std::future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(v) = fut.as_mut().poll(cx) {
+                    return std::task::Poll::Ready(BridgeOutcome::Value(v));
+                }
+                if let Some(rx) = cancel_rx.as_mut() {
+                    match Pin::new(rx).poll(cx) {
+                        std::task::Poll::Ready(Ok(())) => {
+                            return std::task::Poll::Ready(BridgeOutcome::Cancelled)
+                        }
+                        // The callback was dropped without a cancellation: keep waiting.
+                        std::task::Poll::Ready(Err(_)) => cancel_rx = None,
+                        std::task::Poll::Pending => {}
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await
+        };
+        let outcome = match std::panic::AssertUnwindSafe(body).catch_unwind().await {
+            Ok(o) => o,
+            Err(payload) => BridgeOutcome::Panicked(format!(
+                "rust future panicked: {}",
+                panic_message(&*payload)
+            )),
+        };
+        // Not on this worker: the delivery needs the GIL (see the module docs).
+        S3dlioRuntime::spawn_blocking(move || {
+            // exit-gate: allowed (inside the ticketed delivery: the exit drain waits for it)
+            Python::attach(move |py| {
+                let event_loop = loop_ref.into_bound(py);
+                let future = fut_ref.into_bound(py);
+                let result = match outcome {
+                    BridgeOutcome::Cancelled => return,
+                    BridgeOutcome::Value(r) => r.and_then(|v| v.into_py_any(py)),
+                    BridgeOutcome::Panicked(msg) => {
+                        Err(pyo3_async_runtimes::err::RustPanic::new_err(msg))
+                    }
+                };
+                if future_cancelled(&future).unwrap_or(false) {
+                    return;
+                }
+                if let Err(e) = set_result(&event_loop, &future, result) {
+                    e.print_and_set_sys_last_vars(py);
+                }
+            });
+        });
+    });
+    Ok(py_fut)
 }
 
 /// Test-only observation of "the future body handed to [`future_into_py`] has returned".
@@ -500,15 +685,17 @@ pub(crate) mod body_finished_hook {
 #[pyfunction]
 fn drain_async_deliveries_at_exit(py: Python<'_>) {
     let timeout = crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT;
-    DELIVERIES.close();
-    let drained = py.detach(|| DELIVERIES.wait_idle(timeout));
+    // Silent: a child that never used s3dlio must not warn merely because it exits.
+    let tracker = DELIVERIES_CELL.get_or_init_silent(DeliveryTracker::new);
+    tracker.close();
+    let drained = py.detach(|| tracker.wait_idle(timeout));
     // Close the buffer-export releaser's attach gate, wait (GIL detached) for any attach scope it
     // is already in, release what is queued and stop releasing for good (issue #238): nothing
     // may attach to the interpreter once it starts finalizing.
     super::put_payload::begin_shutdown(py);
     if !drained {
         tracing::warn!(
-            in_flight = DELIVERIES.in_flight(),
+            in_flight = tracker.in_flight(),
             timeout = ?timeout,
             "s3dlio: async result deliveries still in flight at interpreter exit; \
              giving up the wait (issue #192 drain timed out)"
@@ -684,7 +871,7 @@ mod tests {
         });
         // `f` is dropped synchronously, before the handle is even awaited.
         assert!(dropped.load(Ordering::SeqCst), "closure must be dropped");
-        pyo3_async_runtimes::tokio::get_runtime()
+        crate::s3_client::pyo3_runtime()
             .block_on(handle)
             .expect("join no-op handle");
         assert!(!ran.load(Ordering::SeqCst), "closure must NOT run");
@@ -698,7 +885,7 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_in_task = Arc::clone(&ran);
         let handle = spawn_gated(t, move || ran_in_task.store(true, Ordering::SeqCst));
-        pyo3_async_runtimes::tokio::get_runtime()
+        crate::s3_client::pyo3_runtime()
             .block_on(handle)
             .expect("join delivery");
         assert!(ran.load(Ordering::SeqCst));
@@ -711,7 +898,7 @@ mod tests {
     fn panicking_delivery_releases_its_ticket_exactly_once() {
         let t = tracker();
         let handle = spawn_gated(t, || std::panic::panic_any("simulated delivery panic"));
-        let joined = pyo3_async_runtimes::tokio::get_runtime().block_on(handle);
+        let joined = crate::s3_client::pyo3_runtime().block_on(handle);
         assert!(joined.is_err_and(|e| e.is_panic()));
         assert_eq!(t.in_flight(), 0);
         assert!(t.wait_idle(Duration::from_millis(10)));
@@ -777,26 +964,74 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let finished_in_task = Arc::clone(&finished);
 
-        let before = DELIVERIES.in_flight();
+        let before = deliveries().in_flight();
         let handle = <S3dlioRuntime as Runtime>::spawn_blocking(move || {
             let _ = started_tx.send(());
             let _ = release_rx.recv();
             finished_in_task.store(true, Ordering::SeqCst);
         });
-        assert_eq!(DELIVERIES.in_flight(), before + 1, "counted at enqueue");
+        assert_eq!(deliveries().in_flight(), before + 1, "counted at enqueue");
 
         started_rx
             .recv_timeout(Duration::from_secs(30))
             .expect("closure started");
-        assert_eq!(DELIVERIES.in_flight(), before + 1, "held while running");
+        assert_eq!(deliveries().in_flight(), before + 1, "held while running");
         assert!(!finished.load(Ordering::SeqCst));
 
         release_tx.send(()).expect("release");
-        pyo3_async_runtimes::tokio::get_runtime()
+        crate::s3_client::pyo3_runtime()
             .block_on(handle)
             .expect("join delivery");
         assert!(finished.load(Ordering::SeqCst));
-        assert!(DELIVERIES.wait_idle(Duration::from_secs(10)));
-        assert_eq!(DELIVERIES.in_flight(), before);
+        assert!(deliveries().wait_idle(Duration::from_secs(10)));
+        assert_eq!(deliveries().in_flight(), before);
+    }
+}
+
+#[cfg(test)]
+mod gilref_tests {
+    use super::*;
+    use pyo3::types::PyDict;
+    use std::sync::atomic::Ordering;
+
+    /// A `GilRef` that is NOT consumed under the GIL (a task dropped at runtime shutdown, a
+    /// delivery refused by the closed gate) and is dropped on a thread without the GIL does not
+    /// touch Python (no decref there, nothing registered in pyo3's reference pool): it is queued
+    /// for a GIL holder and counted; a consumed one is not counted (#297).
+    #[test]
+    fn an_unconsumed_gilref_is_queued_not_dropped_and_a_consumed_one_is_not_counted() {
+        let _serial = super::super::put_payload::test_serial_guard();
+        Python::initialize();
+        Python::attach(|py| {
+            let obj: Py<PyAny> = PyDict::new(py).into_any().unbind();
+            let refcnt = || unsafe { pyo3::ffi::Py_REFCNT(obj.as_ptr()) };
+            assert_eq!(refcnt(), 1);
+
+            // Consumed under the GIL: no fallback, count restored by the Bound's own drop.
+            let counted = super::super::put_payload::ASYNC_GILREF_DEFERRED.load(Ordering::Relaxed);
+            let consumed = GilRef::new(obj.clone_ref(py));
+            assert_eq!(refcnt(), 2);
+            drop(consumed.into_bound(py));
+            assert_eq!(refcnt(), 1);
+            assert_eq!(
+                super::super::put_payload::ASYNC_GILREF_DEFERRED.load(Ordering::Relaxed),
+                counted
+            );
+
+            // Dropped un-consumed on a thread that does not hold the GIL (we hold it here for
+            // the whole test, so nothing can drain the queue meanwhile).
+            let stray = GilRef::new(obj.clone_ref(py));
+            assert_eq!(refcnt(), 2);
+            std::thread::spawn(move || drop(stray))
+                .join()
+                .expect("dropping thread");
+            assert!(
+                super::super::put_payload::ASYNC_GILREF_DEFERRED.load(Ordering::Relaxed) > counted,
+                "the fallback is counted"
+            );
+            assert_eq!(refcnt(), 2, "not released by the dropping thread");
+            super::super::put_payload::drain_pending_exports(py);
+            assert_eq!(refcnt(), 1, "released exactly once by the GIL holder");
+        });
     }
 }

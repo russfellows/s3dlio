@@ -58,7 +58,7 @@ tracing-subscriber = { version = "^0.3", features = ["env-filter", "fmt"] }  # S
 tracing-log = "^0.2"  # Bridge to capture log crate messages from dependencies
 
 # --- async / net stack ----------------------------------------------------
-tokio   = { version = "^1", features = ["full"] }
+tokio   = { version = "^1", default-features = false, features = ["fs","io-util","io-std","macros","net","process","rt","rt-multi-thread","signal","sync","time"] }
 tokio-stream = { version = "^0.1", features = ["sync"] }
 tokio-util = "^0.7"  # For CancellationToken and other utilities
 async-stream = "^0.3"  # For stream! macro in list_stream implementations
@@ -78,7 +78,7 @@ dotenvy     = "^0.15"
 anyhow      = "^1"
 thiserror   = "1.0"
 clap        = { version = "4", features = ["derive"] }
-indicatif   = { version = "0.17", features = ["rayon"] }
+indicatif   = { version = "0.17" }
 serde       = { version = "^1.0", features = ["derive"] }
 serde_json  = "^1.0"
 regex       = "1.11"
@@ -133,7 +133,6 @@ glob        = "^0.3"
 # Performance monitoring
 hdrhistogram = "^7.5"    # High Dynamic Range histograms for detailed analysis
 metrics     = "^0.23"    # Metrics collection framework with histogram support
-parking_lot = "^0.12"    # High-performance RwLock for metrics
 dashmap     = "^6.1"     # Lock-free concurrent HashMap for Python client caching
 
 async-trait  = "^0.1"

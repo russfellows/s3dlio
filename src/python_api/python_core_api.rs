@@ -80,7 +80,6 @@ use crate::object_store::{
 // ---------------------------------------------------------------------------
 
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use std::sync::Arc;
 
 /// Cache key: uniquely identifies an ObjectStore configuration
@@ -198,7 +197,14 @@ impl StoreSlot {
 /// per key and the slot makes the build happen once.
 ///
 /// Performance: <100ns per lookup (DashMap sharded locking)
-static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<StoreSlot>>> = Lazy::new(DashMap::new);
+static STORE_CACHE_CELL: crate::fork_guard::ForkCell<DashMap<StoreKey, Arc<StoreSlot>>> =
+    crate::fork_guard::ForkCell::new();
+
+/// The store cache of THIS process: a fork child starts with an empty one (the inherited
+/// stores own connection pools whose tasks ran on the parent's runtime, #297).
+fn store_cache() -> &'static DashMap<StoreKey, Arc<StoreSlot>> {
+    STORE_CACHE_CELL.get_or_init(DashMap::new)
+}
 
 /// Test hook: the URI of every store `get_or_create_store` built (not served from the
 /// cache), in order.  Lets a test count the builds for one URI.
@@ -245,11 +251,11 @@ fn get_or_create_store(
     let key = StoreKey::from_uri(uri)?;
 
     // Fast path: the slot exists (cache hit >99% in typical workloads).
-    let existing = STORE_CACHE.get(&key).map(|slot| Arc::clone(slot.value()));
+    let existing = store_cache().get(&key).map(|slot| Arc::clone(slot.value()));
     let slot = match existing {
         Some(slot) => slot,
         None => Arc::clone(
-            STORE_CACHE
+            store_cache()
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(StoreSlot::new()))
                 .value(),
@@ -1326,7 +1332,7 @@ pub fn configure_s3(
     }
     // Clear the store cache so subsequent operations create fresh stores
     // with the updated configuration rather than reusing stale ones.
-    STORE_CACHE.clear();
+    store_cache().clear();
     Ok(())
 }
 
@@ -1603,6 +1609,9 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move { put_verified_with_retry(store.as_ref(), &uri, data_owned).await })
     });
+    // The payload (exact `bytes`) may have been released into the queue by a thread without the
+    // GIL: release it here, with this thread's GIL (#297).
+    super::put_payload::drain_pending_exports(py);
     // The put is over (it succeeded, failed, or the store gave up), but a backend may still hold
     // a clone of the payload (an SDK/hyper task, a detached writer). Wait until the LAST clone is
     // gone (the owner's drop), then release the export with this thread's real GIL token: the
@@ -2094,7 +2103,8 @@ fn prepare_guard<'py>(
 
 /// Counters of the buffer-export barrier (diagnostics and tests):
 /// `{"quiesce_timeouts", "queued", "internal_errors", "shutdown_attach_waits",
-/// "shutdown_attach_wait_timeouts", "releaser_attaches", "test_releaser_parked"}`.
+/// "shutdown_attach_wait_timeouts", "releaser_attaches", "test_releaser_parked", "deferred_decrefs",
+/// "async_gilref_deferred"}`.
 #[pyfunction]
 fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let s = export_stats();
@@ -2109,6 +2119,8 @@ fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     )?;
     d.set_item("releaser_attaches", s.releaser_attaches)?;
     d.set_item("test_releaser_parked", s.test_releaser_parked)?;
+    d.set_item("deferred_decrefs", s.deferred_decrefs)?;
+    d.set_item("async_gilref_deferred", s.async_gilref_deferred)?;
     Ok(d)
 }
 
@@ -3780,6 +3792,19 @@ fn lock_ignoring_poison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard
 pub struct PyObjectWriter {
     inner: std::sync::Mutex<Option<Box<dyn ObjectWriter>>>,
     stats: std::sync::Mutex<WriterStats>,
+    /// The process that created the writer. In a fork child the writer is refused and never
+    /// dropped (a multipart writer's drop would abort the PARENT's upload) (#297).
+    stamp: crate::fork_guard::ForkStamp,
+}
+
+impl Drop for PyObjectWriter {
+    fn drop(&mut self) {
+        let writer = match self.inner.get_mut() {
+            Ok(slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        self.stamp.leak_on_drop(writer);
+    }
 }
 
 impl PyObjectWriter {
@@ -3788,6 +3813,7 @@ impl PyObjectWriter {
         Self {
             inner: std::sync::Mutex::new(Some(writer)),
             stats: std::sync::Mutex::new(stats),
+            stamp: crate::fork_guard::ForkStamp::new(),
         }
     }
 
@@ -3807,7 +3833,7 @@ impl PyObjectWriter {
         data: &[u8],
     ) -> PyResult<()> {
         let writer = writer.as_mut().ok_or_else(Self::finalized_error)?;
-        let result = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+        let result = crate::s3_client::pyo3_runtime().block_on(async {
             writer
                 .write_chunk(data)
                 .await
@@ -3821,6 +3847,7 @@ impl PyObjectWriter {
     /// call without the GIL: an exported buffer the caller promised not to modify, or an
     /// immutable `bytes`.
     fn write_detached(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        self.stamp.check()?;
         py.detach(|| {
             let mut guard = lock_ignoring_poison(&self.inner);
             self.write_locked(&mut guard, data)
@@ -3854,6 +3881,7 @@ impl PyObjectWriter {
     ///
     /// Calls on one writer from several threads run one after another.
     fn write_chunk(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.stamp.check()?;
         // Strict: bytes-like or `__bytes__()` only (never an int or an arbitrary iterable).
         let held = hold_for_call(py, data)?;
         let result = self.write_detached(py, held.as_slice());
@@ -3897,6 +3925,7 @@ impl PyObjectWriter {
 
     /// Finalize the writer and complete the upload
     fn finalize(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        self.stamp.check()?;
         py.detach(|| {
             let mut guard = lock_ignoring_poison(&self.inner);
             let writer = guard
@@ -4068,7 +4097,9 @@ fn endpoint_payload(
 /// Python wrapper for MultiEndpointStore
 #[pyclass(name = "MultiEndpointStore")]
 struct PyMultiEndpointStore {
-    store: Arc<MultiEndpointStore>,
+    /// Owns clients and connection pools of the creating process: refused in a fork child and
+    /// leaked, never dropped, there (#297).
+    store: crate::fork_guard::Guarded<Arc<MultiEndpointStore>>,
 }
 
 #[pymethods]
@@ -4076,7 +4107,7 @@ impl PyMultiEndpointStore {
     /// Get an object from the multi-endpoint store (zero-copy via BytesView)
     fn get<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let data = store
@@ -4099,7 +4130,7 @@ impl PyMultiEndpointStore {
         length: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let data = store
@@ -4135,7 +4166,7 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         guarded_put(py, payload.latch, move || async move {
             store
@@ -4157,7 +4188,7 @@ impl PyMultiEndpointStore {
         recursive: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let objects = store
@@ -4172,7 +4203,7 @@ impl PyMultiEndpointStore {
     /// Delete an object
     fn delete<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             store
@@ -4198,7 +4229,7 @@ impl PyMultiEndpointStore {
         recursive: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let objects = store
@@ -4221,7 +4252,7 @@ impl PyMultiEndpointStore {
         uri: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let data = store
@@ -4252,7 +4283,7 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         guarded_put(py, payload.latch, move || async move {
             store
@@ -4275,7 +4306,7 @@ impl PyMultiEndpointStore {
         uri: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             store
@@ -4307,7 +4338,7 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         guarded_put(py, payload.latch, move || async move {
             store
@@ -4321,7 +4352,7 @@ impl PyMultiEndpointStore {
 
     /// Get per-endpoint statistics
     fn get_endpoint_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let stats = self.store.get_all_stats();
+        let stats = self.store.get()?.get_all_stats();
         let list = PyList::empty(py);
 
         for (uri, stat) in stats {
@@ -4340,7 +4371,7 @@ impl PyMultiEndpointStore {
 
     /// Get total aggregated statistics across all endpoints
     fn get_total_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let total = self.store.get_total_stats();
+        let total = self.store.get()?.get_total_stats();
         let dict = PyDict::new(py);
 
         dict.set_item("total_requests", total.total_requests)?;
@@ -4353,16 +4384,16 @@ impl PyMultiEndpointStore {
     }
 
     /// Get the number of configured endpoints
-    fn endpoint_count(&self) -> usize {
-        self.store.endpoint_count()
+    fn endpoint_count(&self) -> PyResult<usize> {
+        Ok(self.store.get()?.endpoint_count())
     }
 
     /// Get the load balancing strategy
-    fn strategy(&self) -> String {
-        match self.store.strategy() {
+    fn strategy(&self) -> PyResult<String> {
+        Ok(match self.store.get()?.strategy() {
             LoadBalanceStrategy::RoundRobin => "round_robin".to_string(),
             LoadBalanceStrategy::LeastConnections => "least_connections".to_string(),
-        }
+        })
     }
 }
 
@@ -4404,7 +4435,7 @@ fn create_multi_endpoint_store(
         .map_err(|e| py_err(e.context("Failed to create multi-endpoint store")))?;
 
     Ok(PyMultiEndpointStore {
-        store: Arc::new(store),
+        store: crate::fork_guard::Guarded::new(Arc::new(store)),
     })
 }
 
@@ -4509,7 +4540,7 @@ fn create_multi_endpoint_store_from_env(strategy: Option<&str>) -> PyResult<PyMu
         py_err(e.context("Failed to create multi-endpoint store from S3_ENDPOINT_URIS"))
     })?;
     Ok(PyMultiEndpointStore {
-        store: Arc::new(store),
+        store: crate::fork_guard::Guarded::new(Arc::new(store)),
     })
 }
 
@@ -5034,7 +5065,7 @@ mod issue173_store_creation_tests {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
         // Force the slow (creating) path of get_or_create_store.
-        STORE_CACHE.remove(&StoreKey::from_uri(HOST_FORM_URI).expect("valid URI"));
+        store_cache().remove(&StoreKey::from_uri(HOST_FORM_URI).expect("valid URI"));
     }
 
     /// The exact shape of the old `get`/`get_range`/`put_bytes` bodies:
@@ -5206,7 +5237,7 @@ mod issue171_store_cache_routing_tests {
     /// How many cache entries sit under the global-client key (route `None`).
     fn global_route_entries() -> usize {
         let want = StoreKey::from_uri(GLOBAL_BUCKET_URI).expect("valid URI");
-        STORE_CACHE.iter().filter(|e| *e.key() == want).count()
+        store_cache().iter().filter(|e| *e.key() == want).count()
     }
 
     #[test]
@@ -10184,11 +10215,25 @@ mod bounded_puts_tests {
         for step in 0..STEPS {
             gates[step].notify_one();
             until_started(&order, LIMIT + step + 1).await;
-            assert_eq!(
-                started(&order)[LIMIT + step],
-                LIMIT + step,
-                "release {step} did not admit the next item of the list"
-            );
+            // The items admitted so far must become a PREFIX of the list (no item overtakes
+            // another for good). Observed with a short wait, not at one instant: two tasks
+            // admitted back to back may run their first line in either order on a loaded
+            // multi-thread runtime, so the prefix can be momentarily incomplete.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut admitted = started(&order);
+                admitted.sort_unstable();
+                if admitted.len() > LIMIT + step
+                    && admitted == (0..admitted.len()).collect::<Vec<_>>()
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "release {step} did not admit the next item of the list in order: {admitted:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
         }
         for gate in &gates[STEPS..] {
             gate.notify_one();

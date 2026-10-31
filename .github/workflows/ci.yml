@@ -194,6 +194,34 @@ jobs:
           pip install pytest
           python -m pytest -q -rs python/tests/test_exit_daemon_threads_298.py
 
+      # Fork safety (#297): parent states x child entry points, inherited objects, drop/exit,
+      # the warning, fork while parent threads run s3dlio calls, nested fork, a multiprocessing
+      # fork Pool, DataLoader-style workers, fork+exec, and a mock S3 server proving the child
+      # opens its own connection while the parent's survives. Each child has a hang limit.
+      - name: Test (Python - fork safety)
+        run: |
+          pip install pytest
+          python -m pytest -q -rs python/tests/test_fork_297.py
+
+      # The Rust unit tests of the Python extension (everything under `python_api::`: the release
+      # queue, the async bridge, the store cache, ...) only compile with `extension-module`, which
+      # leaves libpython unlinked: link the interpreter's SHARED libpython explicitly. Fails loudly
+      # when the interpreter has none. (After the pyo3 0.29 upgrade, #298, move this to pyo3's
+      # `auto-initialize` for tests and drop the RUSTFLAGS.)
+      - name: Test (Rust unit tests of the Python extension)
+        env:
+          CARGO_TARGET_DIR: target-pyunit
+        run: |
+          LDLIB=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LDLIBRARY"))')
+          LDVER=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LDVERSION"))')
+          LIBDIR=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          case "$LDLIB" in
+            *.so*) ;;
+            *) echo "this interpreter has no shared libpython (LDLIBRARY=$LDLIB): cannot link the extension-module unit tests" >&2; exit 1 ;;
+          esac
+          export RUSTFLAGS="-C link-arg=-L$LIBDIR -C link-arg=-lpython$LDVER -C link-arg=-Wl,-rpath,$LIBDIR"
+          cargo test --lib --offline --features extension-module,backend-azure -- python_api::
+
   # Rust-only integration tests that do not depend on the Python version. They
   # run once per OS, in parallel with the `test` matrix, instead of six times
   # inside it (2 OS x 3 Python versions).
@@ -244,6 +272,26 @@ jobs:
             echo "cargo fetch failed (attempt $i); retrying..."
             sleep $((i * 10))
           done
+
+      # Fork safety (#297): tokio must not be built with its `parking_lot` feature (a fork child
+      # follows dangling pointers in parking_lot's global table of parked threads and aborts),
+      # and dashmap must stay the only user of parking_lot_core. Checked on the RESOLVED graph
+      # for every feature set we ship, because a dependency can switch the feature back on.
+      - name: Guard (tokio parking_lot feature)
+        run: scripts/check_fork_safety_deps.sh
+
+      # The fork-safety unit tests (ForkCell rebuild in a child, claim takeover, panic in init,
+      # recursion, the no-drop rule), and the process-global state (runtime, rayon pool,
+      # data generation) in a fork child; the second one is its own test binary, like the
+      # op-log fork tests, because fork() in a process that runs unrelated tests on other
+      # threads can inherit a lock they hold.
+      - name: Test (Rust - fork safety)
+        run: |
+          cargo test --release --lib --offline fork_guard
+          cargo test --release --offline --test fork_globals_297
+          cargo test --release --offline --test fork_oplog_idle_297
+          cargo test --release --offline --test fork_oplog_fifo_297
+          cargo test --release --offline --test fork_oplog_edges_297
 
       # delete_batch bucket/server grouping (#179).  The integration test runs
       # against an in-process mock S3 endpoint (no network, no credentials).
@@ -414,3 +462,52 @@ jobs:
         # exclusive (compile_error! guards this); defaults include native-backends.
         # Tests/benches are compiled and validated by the Test job above.
         run: cargo clippy --lib --bins --examples --offline -- -D warnings
+
+  # Off-GIL drop oracle (#297). pyo3 normally lets any thread drop a `Py<..>`: it parks the
+  # decref in a process-global mutex, and a parent thread holding that mutex at a fork() left the
+  # child's first Python call waiting for ever. s3dlio removed every such drop. This wheel is
+  # built with `--cfg pyo3_disable_reference_pool`, where dropping a `Py` without the GIL ABORTS
+  # the process, so a regression crashes these tests. The released wheels keep the default pool
+  # (the job above); this wheel is only for the tests below.
+  offgil-oracle:
+    name: Off-GIL drop oracle (abort-mode wheel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry, git deps, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target-oracle
+          # The RUSTFLAGS cfg is part of the key AND the build uses its own target directory, so a
+          # pyo3 built without `--cfg pyo3_disable_reference_pool` can never be reused here (it
+          # would make the oracle pass vacuously).
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-oracle-cfg-pyo3_disable_reference_pool-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build the abort-mode wheel
+        env:
+          RUSTFLAGS: "--cfg pyo3_disable_reference_pool"
+          CARGO_TARGET_DIR: target-oracle
+        run: |
+          pip install maturin
+          maturin build --release --out dist-oracle --features extension-module,backend-azure
+          pip install dist-oracle/*.whl
+
+
+      - name: Test (fork matrix, no off-GIL drop, exit and put-release suites)
+        run: |
+          pip install pytest pytest-asyncio numpy
+          python -m pytest -q -rs python/tests/test_fork_297.py python/tests/test_no_offgil_drop_297.py \
+            tests/test_async_exit_no_segfault.py python/tests/test_put_release_barrier.py

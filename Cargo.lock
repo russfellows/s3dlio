@@ -3209,7 +3209,6 @@ dependencies = [
  "console",
  "number_prefix",
  "portable-atomic",
- "rayon",
  "unicode-width",
  "web-time",
 ]
@@ -5138,7 +5137,6 @@ dependencies = [
  "numpy",
  "object_store",
  "once_cell",
- "parking_lot",
  "parquet",
  "pprof",
  "pyo3",

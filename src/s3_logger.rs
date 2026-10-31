@@ -39,8 +39,25 @@ use zstd::stream::write::Encoder;
 /// would truncate a log another process is still writing).
 enum OpLogState {
     Uninitialized,
+    /// A thread of process `pid` is creating a session's file and writer WITHOUT holding the
+    /// lifecycle lock (the file open can block: a FIFO without a reader, a dead NFS server; a
+    /// blocked open must never keep `fork()` or any other op-log call waiting, #297). Other
+    /// `init_op_logger` callers wait on `OP_LOG_CHANGED`; every other operation sees "no active
+    /// session". Ends as `Active` (success) or as `prior` again (failure).
+    Starting(Starting),
     Active(Session),
     Finalized(Session),
+}
+
+/// See [`OpLogState::Starting`].
+struct Starting {
+    pid: u32,
+    /// The file being created, by its absolute spelling only (no identity yet): what a fork child
+    /// records so that it refuses to truncate that log (see `fork_safety`).
+    file: SessionFile,
+    /// The Finalized session this one replaces (its stats stay readable meanwhile), restored if
+    /// the creation fails.
+    prior: Option<Session>,
 }
 
 /// One op-log session: its logger and the file it writes.
@@ -105,6 +122,7 @@ impl CreatedFile {
 /// `noserverino`, overlayfs without `xino`) can report a DIFFERENT identity for
 /// the same path and make a same-path `init` while Active fail with
 /// `ResourceBusy` instead of being a no-op. The remedy is to `finalize` first.
+#[derive(Clone)]
 struct SessionFile {
     /// What the caller passed to `init` (for messages).
     given: String,
@@ -133,6 +151,19 @@ impl SessionFile {
             id: created.id,
             #[cfg(unix)]
             fd: created.fd,
+        }
+    }
+
+    /// A file that is about to be created: only its absolute spelling is known (a fork child
+    /// recognises it by that spelling only; see `OPERATION_LOGGING.md`).
+    fn placeholder(given: &str, local: &str) -> Self {
+        SessionFile {
+            given: given.to_string(),
+            canonical: std::path::absolute(local).unwrap_or_else(|_| PathBuf::from(local)),
+            #[cfg(unix)]
+            id: None,
+            #[cfg(unix)]
+            fd: -1,
         }
     }
 
@@ -348,13 +379,15 @@ fn check_request_against_active(active: &SessionFile, requested: &str) -> std::i
 /// (after the handlers' own thread-local is gone) must not panic, which would
 /// abort the process; it simply proceeds unprotected.
 ///
-/// A `File::create` that hangs under the lifecycle lock (a dead NFS server, a
-/// FIFO without a reader) therefore also blocks `fork()` in this process for as
-/// long as it hangs; see `docs/supplemental/OPERATION_LOGGING.md`.
+/// No blocking work happens under the lifecycle lock (the file of a new session is created
+/// under the `Starting` state, outside it), so these handlers never wait for a hung open; a file
+/// being created at the fork is recorded by its absolute spelling. See
+/// `docs/supplemental/OPERATION_LOGGING.md`.
 #[cfg(unix)]
 mod fork_safety {
     use super::{
-        lock_state, CreatedFile, OpLogState, Session, SessionFile, GATE_CLOSED, GLOBAL_CLIENT_ID,
+        lock_state, CreatedFile, OpLogState, Session, SessionFile, Starting, GATE_CLOSED,
+        GLOBAL_CLIENT_ID,
     };
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
@@ -416,6 +449,8 @@ mod fork_safety {
             let state = lock_state();
             let spare = match &*state {
                 OpLogState::Uninitialized => None,
+                // A file is being created by another parent thread: protect it too.
+                OpLogState::Starting(_) => Some(Inherited::blank()),
                 OpLogState::Active(_) => Some(Inherited::blank()),
                 // Finalized but still draining: the parent's writer thread is
                 // still writing this file, so it is protected like an Active one.
@@ -459,6 +494,26 @@ mod fork_safety {
         let session = match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
             OpLogState::Uninitialized => return,
             OpLogState::Active(session) | OpLogState::Finalized(session) => session,
+            OpLogState::Starting(Starting { file, prior, .. }) => {
+                // The creating thread does not exist here. A finished prior session has
+                // nothing to protect (forgotten, not dropped: the handler frees nothing); the
+                // file being created is protected by its spelling.
+                if let Some(Session { logger, file: old }) = prior {
+                    logger.shared.gate.fetch_or(GATE_CLOSED, Ordering::AcqRel);
+                    logger.shared.forked.store(true, Ordering::Relaxed);
+                    std::mem::forget(logger);
+                    std::mem::forget(old);
+                }
+                let Some(mut node) = spare else {
+                    std::mem::forget(file);
+                    return;
+                };
+                node.file = file;
+                // SAFETY: as below: nodes come from `Box::into_raw` and are never freed.
+                node.next = unsafe { INHERITED.load(Ordering::Acquire).as_ref() };
+                INHERITED.store(Box::into_raw(node), Ordering::Release);
+                return;
+            }
         };
         let Session { logger, file } = session;
         // No writer exists here: reject everything from now on. The logger is
@@ -686,9 +741,12 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
     OP_LOG_STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Create the file for a new session (create-and-truncate) and start its writer.
-fn new_session(path: &str) -> std::io::Result<OpLogState> {
-    let local = resolve_local_oplog_path(path)?;
+/// Wakes `init_op_logger` callers waiting for a `Starting` session to end.
+static OP_LOG_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Create the file for a new session (create-and-truncate) and start its writer. `local` is
+/// `path` resolved. Called WITHOUT the lifecycle lock: the open may block.
+fn new_session(path: &str, local: &str) -> std::io::Result<OpLogState> {
     // The file is opened WITHOUT truncation, its identity is read from the open
     // descriptor, an inherited (ancestor's) file is refused, and only then is it
     // truncated: a refused request never destroys anything.
@@ -743,12 +801,11 @@ fn new_session(path: &str) -> std::io::Result<OpLogState> {
 ///   protected: the child may initialise it. The fork itself is protected by `pthread_atfork` handlers registered by the
 ///   first call to this function.
 ///
-/// Concurrent calls: the lifecycle lock is held while a file is created, so with
-/// the same file exactly one call creates it and the rest are no-ops; with
-/// different files exactly one wins and every other call gets the error. The
-/// same lock makes `fork()` wait: a `File::create` that hangs (a dead NFS
-/// server, a FIFO with no reader) also blocks `fork` in this process until it
-/// returns.
+/// Concurrent calls: the state is `Starting` while a file is created (WITHOUT the lifecycle
+/// lock held), so with the same file exactly one call creates it and the rest wait and are
+/// then no-ops; with different files exactly one wins and every other call gets the error. A
+/// `File::create` that hangs (a dead NFS server, a FIFO with no reader) blocks only that call:
+/// neither `fork()` nor any other op-log function waits for it (#297).
 ///
 /// Identity caveat: two paths are the same file if they have the same
 /// `(device, inode)` (Unix). On a filesystem without stable inode numbers (FUSE
@@ -767,31 +824,97 @@ fn new_session(path: &str) -> std::io::Result<OpLogState> {
 pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
     let path = path.as_ref();
     fork_safety::register();
+    let local = resolve_local_oplog_path(path)?;
+    let me = std::process::id();
     loop {
-        let previous = {
-            let mut state = lock_state();
-            match &*state {
-                OpLogState::Active(active) => {
-                    return check_request_against_active(&active.file, path)
-                }
-                OpLogState::Finalized(previous) if !previous.logger.is_drained() => {
-                    previous.logger.clone()
-                }
-                OpLogState::Uninitialized | OpLogState::Finalized(_) => {
-                    // Nothing is writing (never started, or the previous writer has
-                    // finished). Created while the lifecycle lock is held, so
-                    // concurrent inits cannot both create a file.
-                    *state = new_session(path)?;
-                    break;
+        let mut state = lock_state();
+        match &*state {
+            OpLogState::Active(active) => {
+                // The comparison `stat`s the requested path (which can block): not under the lock.
+                let active = active.file.clone();
+                drop(state);
+                return check_request_against_active(&active, path);
+            }
+            OpLogState::Starting(s) if s.pid == me => {
+                // Another thread of this process is creating the session: wait for it, then
+                // look again (the same file is a no-op, another file an error, a failure is
+                // ours to retry).
+                drop(
+                    OP_LOG_CHANGED
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                continue;
+            }
+            OpLogState::Finalized(previous) if !previous.logger.is_drained() => {
+                // The previous session's writer may still be draining (finalize released
+                // the lock before its shutdown finished). Wait for it with the lock
+                // released: `shutdown` is idempotent and blocks until the first caller
+                // has finished. Then look at the state again.
+                let previous = previous.logger.clone();
+                drop(state);
+                previous.shutdown();
+                continue;
+            }
+            _ => {}
+        }
+        // Uninitialized, Finalized with a drained writer (or, impossible after the child
+        // handler, a Starting of another process): this call creates the session. Concurrent
+        // inits cannot both create a file: the state says `Starting` until this call is done.
+        let prior = match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
+            OpLogState::Finalized(previous) => Some(previous),
+            _ => None,
+        };
+        *state = OpLogState::Starting(Starting {
+            pid: me,
+            file: SessionFile::placeholder(path, local),
+            prior,
+        });
+        drop(state);
+
+        // Ends the Starting state on EVERY exit, a panic included.
+        struct EndStarting(bool);
+        impl EndStarting {
+            fn finish(&mut self, outcome: std::io::Result<OpLogState>) -> std::io::Result<()> {
+                self.0 = true;
+                let mut state = lock_state();
+                let prior = match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
+                    OpLogState::Starting(s) => s.prior,
+                    other => {
+                        *state = other;
+                        None
+                    }
+                };
+                let result = match outcome {
+                    Ok(active) => {
+                        *state = active;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // A failed init leaves the op-log as it was.
+                        if matches!(&*state, OpLogState::Uninitialized) {
+                            *state = prior.map_or(OpLogState::Uninitialized, OpLogState::Finalized);
+                        }
+                        Err(e)
+                    }
+                };
+                drop(state);
+                OP_LOG_CHANGED.notify_all();
+                result
+            }
+        }
+        impl Drop for EndStarting {
+            fn drop(&mut self) {
+                if !self.0 {
+                    let _ = self.finish(Err(std::io::Error::other("op-log init panicked")));
                 }
             }
-        };
-        // The previous session's writer may still be draining (finalize released
-        // the lock before its shutdown finished). Wait for it with the lock
-        // released: `shutdown` is idempotent and blocks until the first caller
-        // has finished. Then look at the state again: another thread may have
-        // initialised (or the drain may still be in progress after a panic).
-        previous.shutdown();
+        }
+        let mut end = EndStarting(false);
+        // The file is opened, checked, truncated and its writer started with NO lock held.
+        let outcome = new_session(path, local);
+        end.finish(outcome)?;
+        break;
     }
 
     // Logged after the lifecycle lock is released: a tracing subscriber may be
@@ -811,9 +934,12 @@ pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
 /// clone, but its entries are rejected (`LogOutcome::Closed`) once finalize runs,
 /// and stay rejected after a later re-init: it never writes into a newer session.
 pub fn global_logger() -> Option<Logger> {
+    // Taken by every store lookup, so the fork handlers must exist before the first fork even
+    // if no session is ever started (an atomic load once registered; #297).
+    fork_safety::register();
     match &*lock_state() {
         OpLogState::Active(session) => Some(session.logger.clone()),
-        OpLogState::Uninitialized | OpLogState::Finalized(_) => None,
+        OpLogState::Uninitialized | OpLogState::Starting(_) | OpLogState::Finalized(_) => None,
     }
 }
 
@@ -1156,6 +1282,7 @@ pub fn op_log_stats() -> Option<OpLogStats> {
         OpLogState::Active(session) | OpLogState::Finalized(session) => {
             Some(session.logger.stats())
         }
+        OpLogState::Starting(s) => s.prior.as_ref().map(|p| p.logger.stats()),
         OpLogState::Uninitialized => None,
     }
 }
@@ -1204,16 +1331,18 @@ pub fn get_clock_offset() -> std::io::Result<i64> {
 fn with_active_logger<T>(what: &str, f: impl FnOnce(&Logger) -> T) -> std::io::Result<T> {
     match &*lock_state() {
         OpLogState::Active(session) => Ok(f(&session.logger)),
-        OpLogState::Uninitialized => Err(std::io::Error::new(
+        OpLogState::Starting(Starting { prior: Some(_), .. }) | OpLogState::Finalized(_) => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "{what}: the op-log was finalized, so there is no active logger \
+                     (call init_op_logger() to start a new session)"
+                ),
+            ))
+        }
+        OpLogState::Uninitialized | OpLogState::Starting(_) => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("{what}: Logger not initialized - call init_op_logger() first"),
-        )),
-        OpLogState::Finalized(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "{what}: the op-log was finalized, so there is no active logger \
-                 (call init_op_logger() to start a new session)"
-            ),
         )),
     }
 }
@@ -1270,14 +1399,30 @@ pub fn get_client_id() -> String {
 /// returns; it only ever closes the session that was current when it took the
 /// lifecycle lock.
 pub fn finalize_op_logger() {
-    let logger = {
+    let logger = loop {
         let mut state = lock_state();
+        if let OpLogState::Starting(s) = &*state {
+            if s.pid == std::process::id() {
+                // A session is being created by another thread: wait (the lock is released
+                // while waiting) for it to be published, then finish THAT session; if the
+                // creation fails the restored state is handled below (a Finalized prior is a
+                // no-op). Finalize must not be lost (#297 round 3).
+                drop(
+                    OP_LOG_CHANGED
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                continue;
+            }
+            return;
+        }
         match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
+            OpLogState::Starting(_) => unreachable!("handled above"),
             OpLogState::Uninitialized => return,
             OpLogState::Active(session) | OpLogState::Finalized(session) => {
                 let logger = session.logger.clone();
                 *state = OpLogState::Finalized(session);
-                logger
+                break logger;
             }
         }
     };

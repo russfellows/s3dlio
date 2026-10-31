@@ -745,13 +745,20 @@ fn build_client_certificate(_env: EnvLookup<'_>) -> Result<Arc<dyn TokenCredenti
 
 /// One credential per mode per process. Nothing is cached when building fails, so a later call
 /// retries.
-static CREDENTIALS: std::sync::LazyLock<Mutex<HashMap<CredentialMode, Arc<dyn TokenCredential>>>> =
-    std::sync::LazyLock::new(Default::default);
+///
+/// Fork-aware (#297): a credential owns token caches and, for managed identity, an HTTP client;
+/// a fork child builds its own.
+static CREDENTIALS: crate::fork_guard::ForkCell<
+    Mutex<HashMap<CredentialMode, Arc<dyn TokenCredential>>>,
+> = crate::fork_guard::ForkCell::new();
 
 /// The process-wide credential for a concrete bearer-token `mode`, built on first use.
 pub fn credential_for(mode: CredentialMode) -> Result<Arc<dyn TokenCredential>> {
     crate::dotenv::apply();
-    let mut credentials = CREDENTIALS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut credentials = CREDENTIALS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(credential) = credentials.get(&mode) {
         return Ok(Arc::clone(credential));
     }

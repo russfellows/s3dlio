@@ -75,11 +75,13 @@ use std::time::Duration;
 use crate::google_gcs_client::{parse_gcs_uri, GcsClient, GcsObjectMetadata};
 
 #[cfg(feature = "backend-gcs")]
-static GLOBAL_GCS_CLIENT: OnceCell<GcsClient> = OnceCell::const_new();
+static GLOBAL_GCS_CLIENT: crate::fork_guard::ForkCell<OnceCell<GcsClient>> =
+    crate::fork_guard::ForkCell::new();
 
 #[cfg(feature = "backend-gcs")]
 async fn get_global_gcs_client() -> Result<GcsClient> {
     let client = GLOBAL_GCS_CLIENT
+        .get_or_init(OnceCell::new)
         .get_or_try_init(|| async { GcsClient::new().await })
         .await?;
     Ok(client.clone())

@@ -355,10 +355,14 @@ writer and never creates or truncates `path`:
   session (nothing was created or changed)`.
   A destination that cannot be resolved at all (`s3://...`, `file://`) is an error
   as usual (`InvalidInput`).
-- **Concurrent inits** are serialised by the lifecycle lock, which is held while the
-  file is created: with the same file exactly one call creates it and the rest
-  return `Ok`; with different files exactly one wins and every other call gets
-  the error.
+- **Concurrent inits** are serialised by a `Starting` state (since #297): the call that finds the
+  op-log Uninitialized or Finalized (with a drained writer) marks it `Starting`, creates the file
+  and starts the writer WITHOUT holding the lifecycle lock, then publishes `Active` under a short
+  critical section; the other callers wait for it and then evaluate against the result. With the
+  same file exactly one call creates it and the rest return `Ok`; with different files exactly one
+  wins and every other call gets the error; if the creation fails the op-log is left as it was
+  and a waiting caller retries. While `Starting`, `global_logger()` is `None`, `op_log_stats()`
+  shows the previous (finalized) session if there was one, and `finalize_op_log()` waits (without the lock) for the session to be published and then finishes it.
 
 ### Many threads, fork and exit (#294, round 2)
 
@@ -461,10 +465,18 @@ it. s3dlio registers `pthread_atfork` handlers on the first `init_op_logger` (Un
   thread-local is destroyed. The handlers use `try_with` and do nothing in that case
   (that fork is unprotected: the child keeps the inherited session, which cannot make progress,
   and its file is not recorded) instead of panicking, which would abort the process.
-- **A `File::create` that hangs blocks `fork()` in the process.** The lifecycle lock
-  is held while a session's file is opened (a dead NFS server, a FIFO with no
-  reader), and `prepare` needs that lock, so `fork()` waits until the open returns.
-  Open op-log destinations on healthy local storage.
+- **A blocked open no longer blocks `fork()` (#297).** No blocking work happens under the
+  lifecycle lock: the file is opened, checked and truncated and the writer is started outside it
+  (state `Starting`), `finalize` joins/flushes after releasing it, and the request comparison of an
+  Active `init` `stat`s the requested path after releasing it. Every other holder only reads or
+  clones state. A thread blocked opening a FIFO without a reader (or on a dead NFS server) therefore
+  stalls neither `fork()` nor other op-log calls (test `tests/fork_oplog_fifo_297.rs`). Residuals:
+  (1) the blocked `init` itself stays blocked in the parent (it is that call's own wait);
+  (2) a child forked while a file is being created refuses that path by its ABSOLUTE spelling only
+  (the identity is not known yet), so a different spelling of the same file through a symlink is not
+  recognised and a child that initialises it could truncate the parent's log; (3) the handlers are
+  registered by the first store lookup or `init_op_logger`, so a fork before either runs unprotected
+  by design (there is nothing to protect).
 - Non-Unix targets have no `fork`; the handlers and the inherited set compile away
   (checked by compiling the crate with the Unix code configured out; a real Windows
   target could not be built on the development host, which has no MinGW toolchain).

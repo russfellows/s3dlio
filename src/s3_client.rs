@@ -116,8 +116,48 @@ pub fn set_s3_endpoint_override(url: &str) {
 // -----------------------------------------------------------------------------
 // Global runtime + S3 client (lazy, thread-safe)
 // -----------------------------------------------------------------------------
-static RT_HANDLE: once_cell::sync::OnceCell<Handle> = once_cell::sync::OnceCell::new();
-static CLIENT: OnceCell<Client> = OnceCell::const_new();
+static RT_HANDLE: crate::fork_guard::ForkCell<Handle> = crate::fork_guard::ForkCell::new();
+static CLIENT: crate::fork_guard::ForkCell<OnceCell<Client>> = crate::fork_guard::ForkCell::new();
+/// Worker threads of the pyo3 (decode / async-API) runtime, set by configure_thread_pools.
+#[cfg(feature = "extension-module")]
+pub(crate) static DECODE_THREADS: AtomicUsize = AtomicUsize::new(0);
+static RAYON_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// s3dlio's own rayon pool. It is NOT rayon's global pool and it is not built at import: it is
+/// built on first use (a process that never generates data never pays for its threads) and
+/// rebuilt in a fork child, because the worker threads of an inherited pool do not exist there
+/// and any parallel iterator would wait for them for ever (#297).
+///
+/// Every parallel iterator in s3dlio runs as `with_rayon_pool(|| ...)`, i.e. inside
+/// `rayon_pool().install(..)`, so the work never touches rayon's global pool (which would be
+/// built by rayon itself, on first use, with no knowledge of forks).
+pub(crate) fn rayon_pool() -> &'static rayon::ThreadPool {
+    RAYON_POOL.get_or_init(|| {
+        let n = RAYON_THREADS.load(Ordering::Relaxed);
+        let mut b = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("s3dlio-rayon-{i}"));
+        if n > 0 {
+            b = b.num_threads(n);
+        }
+        b.build().expect("failed to build the s3dlio rayon pool")
+    })
+}
+
+static RAYON_POOL: crate::fork_guard::ForkCell<rayon::ThreadPool> =
+    crate::fork_guard::ForkCell::new();
+
+/// Worker threads of s3dlio's rayon pool (builds the pool if it does not exist yet).
+#[doc(hidden)]
+pub fn rayon_pool_threads() -> usize {
+    rayon_pool().current_num_threads()
+}
+
+/// Run `f` inside s3dlio's rayon pool: any `par_iter`/`par_chunks_mut` it uses runs on the
+/// pool's threads. The one way s3dlio uses rayon (and the way to run your own parallel work on
+/// a pool that survives a `fork()`: see `fork_guard`).
+#[doc(hidden)]
+pub fn with_rayon_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    rayon_pool().install(f)
+}
 
 /// Concurrency hint set by [`configure_for_concurrency`].
 /// Zero means "not set" — `get_runtime_threads` uses the CPU-based default.
@@ -154,9 +194,10 @@ pub fn configure_for_concurrency(n: usize) {
     CONCURRENCY_HINT.store(n, Ordering::Relaxed);
 }
 
-/// Auto-configure every process-wide thread pool s3dlio owns: the global
-/// s3dlio Tokio runtime, the `pyo3_async_runtimes` Tokio runtime (Python
-/// extension builds only), and Rayon's global pool.
+/// Record the size of every process-wide thread pool s3dlio owns: the global
+/// s3dlio Tokio runtime, the decode/async-API Tokio runtime (Python
+/// extension builds only), and s3dlio's own rayon pool. NO pool is built here: each is built
+/// lazily on first use (and rebuilt in a fork child, #297), with the size recorded last.
 ///
 /// `threads = 0` means "auto-detect from MPI/distributed-training env vars"
 /// (see [`crate::constants::mpi_aware_thread_budget`]); a positive value is
@@ -172,14 +213,11 @@ pub fn configure_for_concurrency(n: usize) {
 /// future call site — any data format, reading or writing, Python or
 /// pure-Rust — gets a correctly-sized pool without needing to opt in.
 ///
-/// Idempotent / safe to call more than once: the global s3dlio Tokio runtime
-/// (`RT_HANDLE`) and Rayon's global pool are each backed by a `OnceLock`-style
-/// cell that only takes effect on first build, and `pyo3_async_runtimes::
-/// tokio::init()` merely stores the pending builder in a mutex — it does not
-/// build the runtime until first use — so a later explicit
+/// Idempotent / safe to call more than once: only sizes are stored, and a pool takes the
+/// size that is stored when it is first built, so a later explicit
 /// `configure_tokio_threads(n)` call from Python still fully overrides an
 /// earlier automatic call, as long as it happens before the first actual S3
-/// operation / `create_async_loader` call, exactly as already documented.
+/// operation / `create_async_loader` / data-generation call, exactly as already documented.
 pub fn configure_thread_pools(threads: usize) {
     // The MPI world-size variables sized below, and the pools built, come after the policy.
     crate::dotenv::apply();
@@ -191,23 +229,19 @@ pub fn configure_thread_pools(threads: usize) {
 
     // Global s3dlio Tokio runtime (blocking/sync + Python callers).
     RT_THREADS_LIMIT.store(threads, Ordering::Relaxed);
+    RAYON_THREADS.store(threads, Ordering::Relaxed);
 
     // pyo3-async-runtimes Tokio runtime (create_async_loader / Arrow decode
     // streaming pipeline) -- only present in Python extension builds.
     #[cfg(feature = "extension-module")]
     {
-        pyo3_async_runtimes::tokio::init(decode_runtime_builder(threads));
+        // Only the size is recorded here: the runtime itself is built lazily by
+        // `pyo3_runtime()` (and rebuilt in a fork child).
+        DECODE_THREADS.store(threads, Ordering::Relaxed);
     }
 
-    // Rayon global pool (NPZ/data-gen par_chunks_mut hot paths). Ignore the
-    // Err case: it just means the pool was already built (e.g. by a prior
-    // call to this function, or by Rayon's own lazy default racing ahead of
-    // us) -- there is no way to resize an already-built global pool, and
-    // that's fine, since whichever call won still sized it correctly.
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|i| format!("s3dlio-rayon-{i}"))
-        .build_global();
+    // s3dlio's rayon pool (NPZ/data-gen par_chunks_mut hot paths) is built lazily, on the first
+    // parallel call, with the size stored above (#297: no thread pool is built at import).
 }
 
 /// The builder of the pyo3-async-runtimes Tokio runtime (Arrow decode streaming, the async Python
@@ -219,6 +253,28 @@ pub(crate) fn decode_runtime_builder(threads: usize) -> TokioBuilder {
     builder.enable_all();
     builder.thread_name("s3dlio-decode");
     builder
+}
+
+/// The Tokio runtime behind the Python async entry points and the data loaders (what
+/// `pyo3_async_runtimes::tokio::get_runtime()` was). Owned here so that a fork child builds
+/// its own instead of using the parent's threadless copy (#297).
+#[cfg(feature = "extension-module")]
+pub(crate) fn pyo3_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: crate::fork_guard::ForkCell<tokio::runtime::Runtime> =
+        crate::fork_guard::ForkCell::new();
+    RT.get_or_init(|| {
+        let threads = DECODE_THREADS.load(Ordering::Relaxed);
+        let mut b = if threads > 0 {
+            decode_runtime_builder(threads)
+        } else {
+            let mut b = crate::runtime_support::marked_multi_thread_builder();
+            b.enable_all();
+            b.thread_name("s3dlio-decode");
+            b
+        };
+        b.build()
+            .expect("failed to build the s3dlio decode runtime")
+    })
 }
 
 /// Returns `true` when `S3DLIO_UNSIGNED_PAYLOAD=1` (or `true`/`yes`/`on`/`enable`).
@@ -507,6 +563,7 @@ pub fn aws_s3_client() -> Result<Client> {
 /// Safe to call from any async context; initializes once without blocking.
 pub async fn aws_s3_client_async() -> Result<Client> {
     let client_ref = CLIENT
+        .get_or_init(OnceCell::new)
         .get_or_try_init(|| async {
             crate::dotenv::apply();
 
@@ -847,10 +904,10 @@ mod mpi_aware_runtime_sizing_tests {
 
     #[test]
     fn configure_thread_pools_is_idempotent_does_not_panic_on_repeat_calls() {
-        // Rayon's global pool can only be *built* once per process; calling
+        // s3dlio's rayon pool is built lazily, on first use; calling
         // this twice (e.g. an automatic call at import followed by an
-        // explicit user override) must not panic even though the second
-        // build_global() call is necessarily a no-op.
+        // explicit user override) must not panic, and the last call wins as long as
+        // the pool does not exist yet.
         with_clean_state(|| {
             configure_thread_pools(2);
             configure_thread_pools(4);
