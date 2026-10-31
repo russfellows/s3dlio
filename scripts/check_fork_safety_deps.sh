@@ -24,7 +24,7 @@ sets=(
 for entry in "${sets[@]}"; do
   name="${entry%%|*}"; args="${entry#*|}"
   # shellcheck disable=SC2086
-  feats="$(cargo tree -e features -i tokio $args 2>&1)" || { echo "cargo tree failed for [$name]:"; echo "$feats"; exit 2; }
+  feats="$(cargo tree --color never -e features -i tokio $args 2>&1)" || { echo "cargo tree failed for [$name]:"; echo "$feats"; exit 2; }
   if grep -E 'tokio feature "(parking_lot|full)"' <<<"$feats" >/dev/null; then
     echo "FAIL [$name]: tokio is built with a feature that enables parking_lot (first matches):"
     grep -E 'tokio feature "(parking_lot|full)"' <<<"$feats" | sed -n '1,3p'
@@ -34,7 +34,7 @@ for entry in "${sets[@]}"; do
   fi
   case "$name" in arrow-backend) continue ;; esac   # object_store (arrow backend) itself uses parking_lot
   # shellcheck disable=SC2086
-  users="$(cargo tree -e normal -i parking_lot_core --depth 1 $args 2>&1 | sed -n '2,$p' | sed -E 's/^[^a-zA-Z]*//; s/ v.*//' | sort -u | tr '\n' ' ')"
+  users="$(cargo tree --color never -e normal -i parking_lot_core --depth 1 $args 2>&1 | sed -n '2,$p' | sed -E 's/^[^a-zA-Z]*//; s/ v.*//' | sort -u | tr '\n' ' ')"
   if [ "${users// /}" != "dashmap" ]; then
     echo "FAIL [$name]: parking_lot_core is used by: ${users:-<error>} (allowed: dashmap only)"
     fail=1

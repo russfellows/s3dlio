@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Plain logs: no ANSI color in cargo output (dtolnay/rust-toolchain only turns it on when unset),
+# so logs read cleanly and scripts that parse cargo output (check_fork_safety_deps.sh) see plain text.
+env:
+  CARGO_TERM_COLOR: never
+
 jobs:
   linux:
     runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
