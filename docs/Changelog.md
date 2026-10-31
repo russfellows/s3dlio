@@ -58,6 +58,14 @@ in `Runtime::drop`.
   by `init_op_logger`: a parent that never used the op-log left it locked in the child. They are now registered by
   `global_logger()` too. CI builds a wheel with `--cfg pyo3_disable_reference_pool` (an off-GIL drop aborts) and runs the
   fork, async-exit and put-release tests with it; released wheels keep the default pool.
+- **No blocking work under the op-log lifecycle lock (#297).** Registering the fork handlers in `global_logger()` made
+  every `fork()` of a process that touched a store wait for the lifecycle lock, so an `init_op_logger` blocked opening
+  its file (a FIFO without a reader, a dead NFS server) would have stalled every fork: a hang. The file is now opened,
+  checked and truncated and the writer started outside the lock, under a `Starting` state that other inits wait on;
+  a failed creation leaves the op-log as it was; `finalize` already joined after releasing the lock, and the Active-init
+  path comparison now `stat`s outside it. #294 semantics (restart after finalize, stale handles rejected, one file wins)
+  are unchanged. Test: `tests/fork_oplog_fifo_297.rs` (a thread blocked on a FIFO does not stall a concurrent fork or
+  a child's op-log calls; RED before, GREEN after).
 - **The lock rule.** Every process-global lock of s3dlio lives in a `ForkCell`, except `OP_LOG_STATE` (and the client-id
   lock), which the #294 atfork handlers hold across the fork.
 - **Known limits (none observed as a hang).** (1) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware
@@ -124,8 +132,8 @@ listed under 0.10.0.
   (the logger is closed), even if a new session has started by the time it completes, and it is not counted in the
   new session's `op_log_stats()`; the call itself is unaffected.
 - **Limitations.** On filesystems without stable inode numbers (FUSE without `use_ino`, CIFS with `noserverino`,
-  overlayfs without `xino`), an init of the same path while Active can fail with `ResourceBusy`. A `File::create` that
-  hangs (for example on a dead network mount) holds the lifecycle lock, so it also blocks `fork()` in that process.
+  overlayfs without `xino`), an init of the same path while Active can fail with `ResourceBusy`. (Before #297 a `File::create`
+  that hung, for example on a dead network mount, held the lifecycle lock and so also blocked `fork()`; see the #297 round 2 entry.)
 - **Tests:** the Python permutation matrix `tests/test_oplog_lifecycle_permutations_294.py` (single thread, 16 threads
   racing init and finalize, workers running through 50 cycles, asyncio, fork and spawn, exit, lossy and lossless; the
   opt-in bind-mount case uses `S3DLIO_TEST_BIND_MOUNT_DIR`, see `docs/Environment_Variables.md`),

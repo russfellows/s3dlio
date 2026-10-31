@@ -850,3 +850,50 @@ mod tests {
         assert_eq!(deliveries().in_flight(), before);
     }
 }
+
+#[cfg(test)]
+mod gilref_tests {
+    use super::*;
+    use pyo3::types::PyDict;
+    use std::sync::atomic::Ordering;
+
+    /// A `GilRef` that is NOT consumed under the GIL (a task dropped at runtime shutdown, a
+    /// delivery refused by the closed gate) and is dropped on a thread without the GIL does not
+    /// touch Python (no decref there, nothing registered in pyo3's reference pool): it is queued
+    /// for a GIL holder and counted; a consumed one is not counted (#297).
+    #[test]
+    fn an_unconsumed_gilref_is_queued_not_dropped_and_a_consumed_one_is_not_counted() {
+        Python::initialize();
+        Python::attach(|py| {
+            let obj: Py<PyAny> = PyDict::new(py).into_any().unbind();
+            let refcnt = || unsafe { pyo3::ffi::Py_REFCNT(obj.as_ptr()) };
+            assert_eq!(refcnt(), 1);
+
+            // Consumed under the GIL: no fallback, count restored by the Bound's own drop.
+            let counted = super::super::put_payload::ASYNC_GILREF_DEFERRED.load(Ordering::Relaxed);
+            let consumed = GilRef::new(obj.clone_ref(py));
+            assert_eq!(refcnt(), 2);
+            drop(consumed.into_bound(py));
+            assert_eq!(refcnt(), 1);
+            assert_eq!(
+                super::super::put_payload::ASYNC_GILREF_DEFERRED.load(Ordering::Relaxed),
+                counted
+            );
+
+            // Dropped un-consumed on a thread that does not hold the GIL (we hold it here for
+            // the whole test, so nothing can drain the queue meanwhile).
+            let stray = GilRef::new(obj.clone_ref(py));
+            assert_eq!(refcnt(), 2);
+            std::thread::spawn(move || drop(stray))
+                .join()
+                .expect("dropping thread");
+            assert!(
+                super::super::put_payload::ASYNC_GILREF_DEFERRED.load(Ordering::Relaxed) > counted,
+                "the fallback is counted"
+            );
+            assert_eq!(refcnt(), 2, "not released by the dropping thread");
+            super::super::put_payload::drain_pending_exports(py);
+            assert_eq!(refcnt(), 1, "released exactly once by the GIL holder");
+        });
+    }
+}

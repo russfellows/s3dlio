@@ -1404,7 +1404,12 @@ impl Drop for PyBytesOwner {
 /// safe on any thread, with or without the GIL, and never takes pyo3's reference-pool mutex.
 pub(crate) fn defer_decref(raw: *mut ffi::PyObject) {
     // SAFETY: always safe to call.
-    if unsafe { ffi::Py_IsInitialized() } == 0 {
+    defer_decref_in(unsafe { ffi::Py_IsInitialized() } != 0, raw);
+}
+
+/// [`defer_decref`] with the interpreter state given (so the finalized case can be tested).
+fn defer_decref_in(interpreter_alive: bool, raw: *mut ffi::PyObject) {
+    if !interpreter_alive {
         return; // the interpreter is gone: nothing to release into
     }
     if let Some(raw) = std::ptr::NonNull::new(raw) {
@@ -3557,5 +3562,84 @@ mod tests {
             assert!(v.iter().all(|&b| b == 9), "writes lost");
             assert!(resizable(ba.as_any()));
         });
+    }
+}
+
+#[cfg(test)]
+mod offgil_decref_tests {
+    use super::*;
+    use pyo3::types::PyBytes;
+
+    /// `Send` wrapper for a raw owned reference (it is only released under the GIL).
+    struct Raw(*mut ffi::PyObject);
+    // SAFETY: the pointer is only handed to `defer_decref`, which never dereferences it.
+    unsafe impl Send for Raw {}
+
+    /// An owned reference handed to `defer_decref` from a thread WITHOUT the GIL is not touched
+    /// there, stays queued while the GIL is held elsewhere, and a GIL holder that drains the
+    /// queue decrements the reference count exactly once (#297).
+    #[test]
+    fn a_deferred_decref_is_released_once_by_a_gil_holder() {
+        Python::initialize();
+        Python::attach(|py| {
+            let obj = PyBytes::new(py, b"deferred-decref-test")
+                .into_any()
+                .unbind();
+            let raw = Raw(obj.clone_ref(py).into_ptr()); // an owned reference: count is 2
+                                                         // SAFETY: `obj` is alive and we hold the GIL.
+            assert_eq!(unsafe { ffi::Py_REFCNT(obj.as_ptr()) }, 2);
+            let counted = export_stats().deferred_decrefs;
+            // We hold the GIL for the whole test, so neither the releaser thread nor any other
+            // test can drain the queue between the push and our own drain.
+            let queued_before = export_stats().queued;
+            std::thread::spawn(move || {
+                let raw = raw;
+                defer_decref(raw.0)
+            })
+            .join()
+            .expect("the pushing thread");
+            assert!(
+                export_stats().deferred_decrefs > counted,
+                "the counter ticks"
+            );
+            assert!(
+                export_stats().queued > queued_before,
+                "the reference is queued"
+            );
+            // SAFETY: as above. Not released by the thread that pushed it.
+            assert_eq!(unsafe { ffi::Py_REFCNT(obj.as_ptr()) }, 2);
+            drain_pending_exports(py);
+            // SAFETY: as above.
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(obj.as_ptr()) },
+                1,
+                "released exactly once"
+            );
+            drain_pending_exports(py);
+            // SAFETY: as above.
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(obj.as_ptr()) },
+                1,
+                "a second drain does nothing"
+            );
+        });
+    }
+
+    /// After interpreter finalization nothing is queued (there is nothing to release into) and
+    /// nothing is counted or touched.
+    #[test]
+    fn a_decref_after_finalization_is_dropped_on_the_floor() {
+        let counted = DEFERRED_DECREFS.load(Ordering::Relaxed);
+        // Never dereferenced: the finalized path returns before looking at it.
+        defer_decref_in(false, 0x10 as *mut ffi::PyObject);
+        assert_eq!(DEFERRED_DECREFS.load(Ordering::Relaxed), counted);
+    }
+
+    /// A null pointer is ignored.
+    #[test]
+    fn a_null_decref_is_ignored() {
+        let counted = DEFERRED_DECREFS.load(Ordering::Relaxed);
+        defer_decref_in(true, std::ptr::null_mut());
+        assert_eq!(DEFERRED_DECREFS.load(Ordering::Relaxed), counted);
     }
 }
