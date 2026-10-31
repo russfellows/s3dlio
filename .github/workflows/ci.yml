@@ -178,6 +178,25 @@ jobs:
           pip install pytest
           python -m pytest -q -rs python/tests/test_fork_297.py
 
+      # The Rust unit tests of the Python extension (everything under `python_api::`: the release
+      # queue, the async bridge, the store cache, ...) only compile with `extension-module`, which
+      # leaves libpython unlinked: link the interpreter's SHARED libpython explicitly. Fails loudly
+      # when the interpreter has none. (After the pyo3 0.29 upgrade, #298, move this to pyo3's
+      # `auto-initialize` for tests and drop the RUSTFLAGS.)
+      - name: Test (Rust unit tests of the Python extension)
+        env:
+          CARGO_TARGET_DIR: target-pyunit
+        run: |
+          LDLIB=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LDLIBRARY"))')
+          LDVER=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LDVERSION"))')
+          LIBDIR=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          case "$LDLIB" in
+            *.so*) ;;
+            *) echo "this interpreter has no shared libpython (LDLIBRARY=$LDLIB): cannot link the extension-module unit tests" >&2; exit 1 ;;
+          esac
+          export RUSTFLAGS="-C link-arg=-L$LIBDIR -C link-arg=-lpython$LDVER -C link-arg=-Wl,-rpath,$LIBDIR"
+          cargo test --lib --offline --features extension-module,backend-azure -- python_api::
+
   # Rust-only integration tests that do not depend on the Python version. They
   # run once per OS, in parallel with the `test` matrix, instead of six times
   # inside it (2 OS x 3 Python versions).
@@ -247,6 +266,7 @@ jobs:
           cargo test --release --offline --test fork_globals_297
           cargo test --release --offline --test fork_oplog_idle_297
           cargo test --release --offline --test fork_oplog_fifo_297
+          cargo test --release --offline --test fork_oplog_edges_297
 
       # delete_batch bucket/server grouping (#179).  The integration test runs
       # against an in-process mock S3 endpoint (no network, no credentials).

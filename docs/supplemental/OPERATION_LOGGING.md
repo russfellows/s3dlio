@@ -362,7 +362,7 @@ writer and never creates or truncates `path`:
   same file exactly one call creates it and the rest return `Ok`; with different files exactly one
   wins and every other call gets the error; if the creation fails the op-log is left as it was
   and a waiting caller retries. While `Starting`, `global_logger()` is `None`, `op_log_stats()`
-  shows the previous (finalized) session if there was one, and `finalize_op_log()` is a no-op.
+  shows the previous (finalized) session if there was one, and `finalize_op_log()` waits (without the lock) for the session to be published and then finishes it.
 
 ### Many threads, fork and exit (#294, round 2)
 

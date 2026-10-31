@@ -65,7 +65,8 @@ in `Runtime::drop`.
   a failed creation leaves the op-log as it was; `finalize` already joined after releasing the lock, and the Active-init
   path comparison now `stat`s outside it. #294 semantics (restart after finalize, stale handles rejected, one file wins)
   are unchanged. Test: `tests/fork_oplog_fifo_297.rs` (a thread blocked on a FIFO does not stall a concurrent fork or
-  a child's op-log calls; RED before, GREEN after).
+  a child's op-log calls; RED before, GREEN after). A `finalize_op_logger()` that races an init still creating its file
+  waits for it and finishes the session that was published (it is not lost; `tests/fork_oplog_edges_297.rs`).
 - **The lock rule.** Every process-global lock of s3dlio lives in a `ForkCell`, except `OP_LOG_STATE` (and the client-id
   lock), which the #294 atfork handlers hold across the fork.
 - **Known limits (none observed as a hang).** (1) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware

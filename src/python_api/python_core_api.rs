@@ -10111,11 +10111,25 @@ mod bounded_puts_tests {
         for step in 0..STEPS {
             gates[step].notify_one();
             until_started(&order, LIMIT + step + 1).await;
-            assert_eq!(
-                started(&order)[LIMIT + step],
-                LIMIT + step,
-                "release {step} did not admit the next item of the list"
-            );
+            // The items admitted so far must become a PREFIX of the list (no item overtakes
+            // another for good). Observed with a short wait, not at one instant: two tasks
+            // admitted back to back may run their first line in either order on a loaded
+            // multi-thread runtime, so the prefix can be momentarily incomplete.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut admitted = started(&order);
+                admitted.sort_unstable();
+                if admitted.len() > LIMIT + step
+                    && admitted == (0..admitted.len()).collect::<Vec<_>>()
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "release {step} did not admit the next item of the list in order: {admitted:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
         }
         for gate in &gates[STEPS..] {
             gate.notify_one();

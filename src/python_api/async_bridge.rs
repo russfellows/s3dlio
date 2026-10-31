@@ -863,6 +863,7 @@ mod gilref_tests {
     /// for a GIL holder and counted; a consumed one is not counted (#297).
     #[test]
     fn an_unconsumed_gilref_is_queued_not_dropped_and_a_consumed_one_is_not_counted() {
+        let _serial = super::super::put_payload::test_serial_guard();
         Python::initialize();
         Python::attach(|py| {
             let obj: Py<PyAny> = PyDict::new(py).into_any().unbind();

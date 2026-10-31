@@ -154,7 +154,8 @@ impl SessionFile {
         }
     }
 
-    /// A file that is about to be created: only its absolute spelling is known.
+    /// A file that is about to be created: only its absolute spelling is known (a fork child
+    /// recognises it by that spelling only; see `OPERATION_LOGGING.md`).
     fn placeholder(given: &str, local: &str) -> Self {
         SessionFile {
             given: given.to_string(),
@@ -1364,20 +1365,30 @@ pub fn get_client_id() -> String {
 /// returns; it only ever closes the session that was current when it took the
 /// lifecycle lock.
 pub fn finalize_op_logger() {
-    let logger = {
+    let logger = loop {
         let mut state = lock_state();
-        if matches!(&*state, OpLogState::Starting(_)) {
-            // A session is only being created: there is nothing to finish yet (the state
-            // before this call was Uninitialized or Finalized, whose finalize is a no-op).
+        if let OpLogState::Starting(s) = &*state {
+            if s.pid == std::process::id() {
+                // A session is being created by another thread: wait (the lock is released
+                // while waiting) for it to be published, then finish THAT session; if the
+                // creation fails the restored state is handled below (a Finalized prior is a
+                // no-op). Finalize must not be lost (#297 round 3).
+                drop(
+                    OP_LOG_CHANGED
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                continue;
+            }
             return;
         }
         match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
-            OpLogState::Starting(_) => unreachable!("checked above"),
+            OpLogState::Starting(_) => unreachable!("handled above"),
             OpLogState::Uninitialized => return,
             OpLogState::Active(session) | OpLogState::Finalized(session) => {
                 let logger = session.logger.clone();
                 *state = OpLogState::Finalized(session);
-                logger
+                break logger;
             }
         }
     };
