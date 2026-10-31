@@ -194,6 +194,13 @@ jobs:
           pip install pytest
           python -m pytest -q -rs python/tests/test_exit_daemon_threads_298.py
 
+      # #303: an unfinished multipart writer at interpreter exit (or garbage-collected) must have
+      # its AbortMultipartUpload delivered before the process ends (in-process S3 mock).
+      - name: Test (Python - multipart abort delivered at exit, #303)
+        run: |
+          pip install pytest
+          python -m pytest -q -rs tests/test_abort_at_exit_303.py
+
       # Fork safety (#297): parent states x child entry points, inherited objects, drop/exit,
       # the warning, fork while parent threads run s3dlio calls, nested fork, a multiprocessing
       # fork Pool, DataLoader-style workers, fork+exec, and a mock S3 server proving the child
@@ -292,6 +299,7 @@ jobs:
           cargo test --release --offline --test fork_oplog_idle_297
           cargo test --release --offline --test fork_oplog_fifo_297
           cargo test --release --offline --test fork_oplog_edges_297
+          cargo test --release --offline --test fork_io_runtime_303
 
       # delete_batch bucket/server grouping (#179).  The integration test runs
       # against an in-process mock S3 endpoint (no network, no credentials).
@@ -409,6 +417,21 @@ jobs:
 
       - name: Test (Rust - panic=abort LocalSet run_on_global_rt, #300)
         run: scripts/test_panic_abort_300.sh
+
+      # #303: pooled connections belong to s3dlio's I/O runtime, so a blocked or idle caller
+      # runtime (current-thread, LocalSet, a second runtime, blocked global workers) never stalls a
+      # later request; a dropped multipart sink's abort is delivered. Every case runs in its own
+      # child process against an in-process mock or emulator (S3, Azure, GCS).
+      - name: Test (Rust - pooled connections on the I/O runtime, #303)
+        run: |
+          cargo test --release --offline --test pooled_connection_runtime_303
+          cargo test --release --offline --features backend-azure --test pooled_connection_runtime_303_azure
+          cargo test --release --offline --features backend-gcs --test pooled_connection_runtime_303_gcs
+
+      # #302: no future body attaches to Python (and #304: Python calls from Rust in async entry
+      # points hold an exit-gate scope). A source scan of src/, std only.
+      - name: Test (Rust - async future bodies never attach to Python, #302 #304)
+        run: cargo test --release --offline --test python_future_bodies_no_attach_302
 
   lint:
     name: Lint

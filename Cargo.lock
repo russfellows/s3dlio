@@ -5172,7 +5172,7 @@ dependencies = [
 
 [[package]]
 name = "s3dlio-oplog"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
