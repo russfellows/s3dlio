@@ -47,12 +47,14 @@ use crate::s3_client::run_on_global_rt;
 use crate::s3_utils::{list_buckets_at, s3_server_of_first_segment, BucketInfo, S3Server};
 
 #[cfg(feature = "backend-gcs")]
-static GCS_OFFICIAL_LIST_CLIENT: OnceCell<Arc<crate::google_gcs_client::GcsClient>> =
-    OnceCell::const_new();
+static GCS_OFFICIAL_LIST_CLIENT: crate::fork_guard::ForkCell<
+    OnceCell<Arc<crate::google_gcs_client::GcsClient>>,
+> = crate::fork_guard::ForkCell::new();
 
 #[cfg(feature = "backend-gcs")]
 async fn get_list_gcs_official_client() -> Result<Arc<crate::google_gcs_client::GcsClient>> {
     let client = GCS_OFFICIAL_LIST_CLIENT
+        .get_or_init(OnceCell::new)
         .get_or_try_init(|| async {
             let gcs = crate::google_gcs_client::GcsClient::new()
                 .await

@@ -64,7 +64,9 @@ pip install s3dlio
 
 ### Requirements
 
-- Python 3.11+ (release validation targets CPython 3.11–3.13)
+- Python 3.11+ (release validation targets CPython 3.11–3.13). Exit with daemon threads inside s3dlio calls is
+  fixed since the PyO3 0.29.3 upgrade (#298) plus the #302 and #304 fixes for async calls; see
+  [Interpreter exit with daemon threads](#interpreter-exit-with-daemon-threads-298)
 - Rust 1.94.1+ (for building from source)
 - Optional: PyTorch, JAX, or TensorFlow for ML integration
 
@@ -253,6 +255,31 @@ export S3DLIO_WORKER_THREADS=16
 ```
 
 ---
+
+### Interpreter exit with daemon threads (#298)
+
+If the main thread returns while daemon threads are inside s3dlio calls (sync calls, a streaming writer, or
+`get_into_async` on a daemon thread's event loop), the interpreter finalizes and the daemon threads are abandoned: the
+process exits with code 0 and `atexit` handlers run. A daemon thread that returns from its blocking call after
+finalization began is parked forever; it never runs again, so its remaining Python code and Rust destructors do not run.
+
+- **Before the fix** (wheels built with PyO3 0.27 or older, including `s3dlio==0.10.0`): on CPython **before 3.13.8**
+  (3.11, 3.12 and 3.13.0 to 3.13.7) this was a SIGABRT (exit code 134, often `FATAL: exception not rethrown`). Python
+  3.13.8+ and 3.14 were never affected. Workarounds for such a wheel: use Python 3.13.8+, or signal your workers to stop
+  and `join()` them (for example in a `try/finally` around `main()`) before the main thread returns.
+- **Now** (PyO3 0.29.3 or later 0.29.x, with the #302 and #304 fixes): fixed for daemon threads in sync calls and in every
+  async call the changelog lists, on Python 3.11 to 3.13 (all patch levels) and 3.14. Two later fixes are part of that
+  claim: [#302](https://github.com/russfellows/s3dlio/issues/302) (CPython 3.14: a daemon loop with `get_async` and the
+  other awaitables in flight at exit crashed) and [#304](https://github.com/russfellows/s3dlio/issues/304) (Python before
+  3.13.8: an async call that was STARTING while the interpreter shut down aborted, about 3 to 6% of runs for
+  `put_bytes_async`). Wheels from before those fixes still have those two crashes. An async call made after s3dlio's exit
+  drain (from an `atexit` handler registered before `import s3dlio`) raises `RuntimeError` ("the interpreter is exiting").
+  A residual window remains (a call still starting when the 2 s drain timeout expires; Python code that Rust runs outside
+  the async machinery, such as a user-defined `__bytes__` / `__buffer__`, argument extraction from user objects, `__del__`
+  of released user buffers); see the changelog entry for #304.
+- Non-daemon threads are unaffected: Python waits for them before finalizing.
+- Parking a thread is not a clean shutdown. Work a daemon thread had in flight is lost; stop and join your workers (and
+  call `finalize_op_log()`) if you need it to complete.
 
 ## Core Storage Operations
 
@@ -535,12 +562,71 @@ s3dlio.object_capabilities("az://account/container/key")
   on) or the GCS generation.
 - On `s3://` and `gs://`, `head_async` also returns `None` for a missing bucket: the provider
   cannot tell it from a missing object. A missing Azure container raises.
-- Supported: S3 and S3-compatible endpoints, Azure Blob, and native GCS in builds with the GCS
-  backend (the PyPI wheels have S3 and Azure). Not supported: `file://`, `direct://`.
+- Supported: S3 and S3-compatible endpoints, Azure Blob, native GCS in builds with the GCS
+  backend (the PyPI wheels have S3 and Azure), and the local `file://` and `direct://` stores in
+  every build (unreleased, #295, #267; see "Local files" below).
 - Once native work has started, the op-log writes one GET row per `get_into_async` and one HEAD
   row per `head_async`, with the real outcome (also after an error or cancellation). A call
   refused up front writes no row.
 - A call still running when the interpreter exits is not waited for.
+
+**Local files: `file://` and `direct://`.** Both calls work with the same contract as the network
+stores, with these local specifics:
+- `get_into_async` on `file://` is a `pread` straight into `dst`; no other buffer of the object's size
+  is allocated. On `direct://` a destination whose **address** is a multiple of the store alignment
+  (the page size, 4096) is read with O_DIRECT straight into `dst`, with no copy: an aligned NumPy
+  array, an `mmap`, a page-aligned ctypes buffer. The last, sub-alignment part of an object whose
+  size is not a multiple of the alignment, and every byte of a destination at an unaligned address
+  (a `bytearray`, or a NumPy slice at an odd offset), is read through the shared bounce pool: the
+  kernel fills an aligned bounce buffer and the bytes are copied once into `dst`. That copy cannot be
+  avoided (O_DIRECT forbids unaligned memory); it is bounded by the pool's own buffers, never by the
+  size of the object. A file smaller than the store's minimum direct size, and a filesystem that
+  refuses O_DIRECT, are read with ordinary positional reads (still straight into `dst`).
+- A Python `bytearray` (and `bytes`-like buffers from `bytearray(n)`) is only 16-byte aligned, so on `direct://` it
+  ALWAYS takes the bounce copy. To read with no copy, give `get_into_async` page-aligned memory: an anonymous `mmap`
+  (`buf = mmap.mmap(-1, n)`), or a NumPy view cut at a page boundary:
+  ```python
+  raw = np.empty(n + 4096, dtype=np.uint8)
+  dst = raw[(-raw.ctypes.data) % 4096:][:n]      # dst.ctypes.data % 4096 == 0
+  ```
+  `n` need not be a multiple of 4096 (the last, sub-page part is bounced). The bounce pool is shared by every unaligned
+  `direct://` transfer and is tuned by `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE` and
+  `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY`; `get_into_async` ignores `S3DLIO_DIRECT_IO_GET_MODE` (its `direct` mode allocates
+  a buffer of the object's size, which a caller-buffer GET must not do).
+- The size is checked first: a file whose size is not `expected_len` raises `LengthMismatchError`
+  (`.actual` is the file's size) and nothing is written to `dst`. The read is also re-checked at the
+  end, so a file that changed size during the read is an error too (`LengthMismatchError` with the size it has now).
+- A file modified in place while it is read, with its size unchanged (a same-size overwrite, truncate-then-regrow, a
+  replacement by `rename`, a deletion), raises `RuntimeError` ("version changed"), never a successful read of mixed
+  data: the open file's modification and status-change times are compared before and after the read. A metadata-only
+  change (`chmod`, `chown`, a hard link) moves the status-change time and is reported too; retry. Limits: a write
+  in the same kernel timestamp tick (1-10 ms on ext4) as the last change before the read opened the file goes unseen;
+  filesystems with 1-2 s timestamps widen that window; a write through a shared `mmap` is stamped only at write-back.
+  The check cannot protect against a writer that is still writing when the read ends successfully.
+  **Network and cluster filesystems (NFS, Lustre, GPFS, BeeGFS, CephFS, SMB):** the timestamps are the ones the
+  client has cached. Attribute caching (`actimeo`, the revalidation interval), server-to-client clock or mtime lag and
+  coarse timestamp granularity mean a same-size overwrite made by ANOTHER node can go unseen for seconds, so the
+  version check is best effort there (the size check is only as current as the client's cached size). If another
+  node may rewrite a file you are reading, coordinate with a lock or a handshake, or use an object store.
+- A missing file (or a path below a regular file) raises `ObjectNotFoundError`; `head_async` returns `None`.
+  A directory raises `RuntimeError` from both. A file you may not read raises `RuntimeError` naming the
+  permission error (`head_async`, which only needs `stat`, still succeeds).
+- `head_async` is a `stat`: `size`, `etag` = `file-<size>-<mtime seconds>` (the identity
+  `ObjectStore.stat` reports; it is not a content hash) and `version_id` = `None`. The etag has second
+  granularity (a historical format, unchanged): two same-size rewrites within one second share it. The
+  read-time version check above uses nanoseconds and is not affected.
+- Embedding in Rust? The file stores hand a runtime worker off around each read chunk only on threads marked with
+  `s3dlio::runtime_support::mark_tokio_worker_thread` (s3dlio's own runtimes, including everything the Python
+  module starts, are marked); an unmarked embedder runtime runs `direct://` / `file://` reads, writes, fsyncs and
+  finalize inline on the polling worker (the remedy is that one `on_thread_start` line; a marked `spawn_blocking`
+  thread that drives a `LocalSet`, on any runtime, needs `inline_blocking_io()`). See the Rust section of the
+  changelog and the `runtime_support` rustdoc.
+- Cost of the hand-off, for the runtimes s3dlio starts for Python (1 GiB `get_into_async`, warm page cache, one reader;
+  3 repetitions, noisy, 2-socket box): `file://` 3.8-6.9 GiB/s against 5.6-7.7 GiB/s without the hand-off,
+  `direct://` 4.4-4.8 against 4.9-5.5. In exchange a neighbouring task stalls about 2 ms instead of about 10 ms
+  (4 readers on 4 workers). Both are far above the allocating `get` (1.5-2.0 GiB/s).
+- The read runs without the GIL, in chunks of at most 16 MiB. Cancelling the awaitable stops it at the next
+  chunk boundary; as everywhere, the awaitable ends only after the last write into `dst`.
 
 ### list() — List Objects
 
@@ -741,7 +827,7 @@ themselves is outside s3dlio.
 | 1 | **Network / SDK chunk into the destination.** Each chunk the transport hands up is copied once into its final place (the buffer `get()` returns, a window of the range-engine buffer, or your buffer in `get_into_async`) | Every read from `s3://`, `az://`, `gs://`. This is the one unavoidable copy: the chunk belongs to the transport. s3dlio makes it exactly once per byte and never again | Cannot be avoided. `get_into_async` makes it straight into memory you own |
 | 1a | The same, for an S3 response **without `Content-Length`** (chunked body): the chunks are kept and joined once, so the peak is 2x the body | Rare (S3 sends `Content-Length` on every GET) | Nothing to do; a body with a `Content-Length` peaks at 1x |
 | 2 | **Transforms.** zstd compression when writing a shard or stream with a compression option; zstd decoding of a `.zst` checkpoint shard; the little-endian `float32` decode of `read_npz` (the stored member is sliced out of the archive in place and CRC-checked, then each element is decoded into the aligned array NumPy takes over, because the member's bytes are only 1-byte aligned inside the archive); inflating a compressed NPZ member | Only when you use compression or `read_npz` | Write checkpoints uncompressed to skip the encoder and decoder. The zstd decoder pre-sizes its output when the frame header records the size (frames written with a known size); frames from the streaming encoder carry no size, so their output grows as it is read |
-| 3 | **O_DIRECT bounce for unaligned memory.** `direct://` cannot use unaligned memory with `O_DIRECT`, so (a) a PUT from a source whose address is not page-aligned is copied once through a reused aligned bounce buffer, and the last partial block is always bounced; (b) a range-engine read of a large `direct://` object copies each range once from the aligned read buffer into its window of the (unaligned) result; (c) a `direct://` `get_range` served from the shared bounce pool is copied out once, because the pool buffer is reused | `direct://` with O_DIRECT (what `direct://` uses unless configured otherwise) | Use page-aligned memory for PUTs (a `BytesView` from `s3dlio.get("direct://...")` is aligned). A `get_range` whose read buffer is private to the call is returned as a slice with no copy. Buffered `direct://` (O_DIRECT off) has none of these |
+| 3 | **O_DIRECT bounce for unaligned memory.** `direct://` cannot use unaligned memory with `O_DIRECT`, so (a) a PUT from a source whose address is not page-aligned is copied once through a reused aligned bounce buffer, and the last partial block is always bounced; (a2) a `get_into_async` into an unaligned destination (an odd address, or the sub-alignment tail of an object whose size is not a multiple of the alignment) is read through the bounce pool and copied once into your buffer; an aligned destination is read straight into it; (b) a range-engine read of a large `direct://` object copies each range once from the aligned read buffer into its window of the (unaligned) result; (c) a `direct://` `get_range` served from the shared bounce pool is copied out once, because the pool buffer is reused | `direct://` with O_DIRECT (what `direct://` uses unless configured otherwise) | Use page-aligned memory for PUTs and for `get_into_async` destinations (a `BytesView` from `s3dlio.get("direct://...")` is aligned; a NumPy array whose `ctypes.data` is a multiple of 4096 is too). A `get_range` whose read buffer is private to the call is returned as a slice with no copy. Buffered `direct://` (O_DIRECT off) has none of these |
 | 4 | **Non-contiguous source.** A strided, reversed or transposed array/view must be gathered into logical order | Any write that is given such an array | Pass a C-contiguous array (make it contiguous once, up front, with `np.ascontiguousarray`) |
 | 5 | **Object with only `__bytes__()`.** Python builds one `bytes` for it | A payload that is neither a buffer nor `bytes` | Expose the buffer protocol (or pass a `bytes`/`BytesView`) |
 | 6 | **`bytes`-returning compatibility APIs.** A Python `bytes` owns its memory, so building one from a fetched buffer is one copy: `load_checkpoint_with_validation` (returns `bytes`), `bytes(item)` / `bytes(view)`, `ObjectStoreMapDataset(return_type="bytes")`, and `read()` of the file-like reader of `return_type="reader"` (it returns `bytes` slices, as file objects do; the reader itself holds the fetched buffer without copying it) | Only when you call them | `load_checkpoint_with_validation_view` (a `BytesView`), `memoryview(item)` / `np.frombuffer(item)` / `item.data`, `return_type="tensor"` |
@@ -1961,16 +2047,49 @@ destinations (`s3://`, `gs://`, `az://`, `direct://`, etc.) are not supported. A
 string like `s3:bucket/key` (no `//`) is not a URI here: it is treated as a literal
 local file name.
 
-A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
-`init_op_log` while already active is a no-op; after `finalize_op_log` it raises
-`RuntimeError` and touches no file. `finalize_op_log` is safe to repeat. The
+A process runs **one op-log session at a time**: `init_op_log` -> `finalize_op_log`,
+and after `finalize_op_log` a new `init_op_log` starts a new session (issue #294),
+any number of times. `init_op_log` while already active is a no-op when it names the
+file being written (any spelling: `x`, `./x`, an absolute path, `file:///abs/x`,
+`dir/../x`, a symlink or hard link to it) and raises `RuntimeError` for any other file:
+the message names the file being written and the requested path and says to call
+`finalize_op_log()` first; the requested file is not created or truncated and the
+session carries on. Of several threads calling `init_op_log` at once exactly one
+creates the file (same file: every call returns; different files: the rest raise). After
+`os.fork()` the child does not share the parent's session (its writer thread is not
+copied): `is_op_log_active()` is `False` in the child, which can start its own session,
+but never on a file an ancestor process was still writing at the fork, however often
+the child starts and finishes sessions of its own (a `RuntimeError`: initialising it
+would truncate a live log; a log the ancestor had already finalized is not protected
+and may be initialised). Stores
+created before the fork stay silent in the child (one line on stderr says why; see
+"Fork safety" below for everything else a forked child can do). If the
+active file was renamed or deleted behind the session's back (log rotation), a request
+for the old name is a `RuntimeError` saying the session is writing a file that was
+renamed or deleted (it keeps writing the open file); a request that is a directory,
+`/dev/null`, a FIFO or a dangling symlink is described as such. Files are compared by
+`(device, inode)`: on a filesystem without stable inode numbers (FUSE without `use_ino`,
+CIFS `noserverino`, overlayfs without `xino`) the same path can look like another file
+and raise while active; finalize first. A re-init waits
+for the previous session's writer to finish (with the GIL released), then creates
+its file exactly as a first init does: the same path replaces the old log, a
+different path leaves it untouched. `finalize_op_log` is safe to repeat. The
 module-level functions (`get`, `put_bytes`, `stat`, `list`, `delete`, `get_async`,
 ...) check the op-log on every call: a call made while it is active is recorded
 once, a call made before `init_op_log` or after `finalize_op_log` is not,
-whichever call first used the scheme. Objects you construct yourself (stores,
-readers, writers) capture the logger at construction: those created before
+whichever call first used the scheme.
+An `*_async` call is checked when it is made, not when the event loop first runs it: an
+awaitable created in one session never writes into a later one. Datasets and loaders over
+`s3://` (`create_dataset`, `create_async_loader`, ...) and `MultiEndpointStore` objects
+(`create_multi_endpoint_store*`) follow the rule for objects you construct: they capture the logger when they are constructed and use it for every fetch,
+so one built before `init_op_log` is never logged and one built in session 1 never writes
+into session 2. The synchronous `get_many` on `s3://` takes the logger once, at entry.
+Objects you construct yourself (stores, readers, writers) capture the logger at construction: those created before
 `init_op_log` are never logged, and those created before `finalize_op_log` stop
-recording when it runs.
+recording when it runs and stay silent after a later `init_op_log` (they never
+write into the new session). A call that is still running when `finalize_op_log` runs writes
+no row, even if a new session has started by the time it completes, and it is not
+counted in the new session's `op_log_stats()`; the call itself is unaffected.
 
 The op-log is **lossy by default**: if the writer cannot keep up and the queue
 (`S3DLIO_OPLOG_BUF`, default 8192 entries) fills, entries are dropped rather than
@@ -2027,7 +2146,8 @@ completion, not durability (there is no fsync). The stats do **not** cover:
 Calls made after `finalize_op_log()` began (a store created before finalize that
 a worker still uses) are counted as `rejected_closed` and are **not in the file**;
 they are not part of "complete", but a program should finalize only after its
-workers stop and check `rejected_closed == 0` too.
+workers stop and check `rejected_closed == 0` too. Such stores stay rejected after a
+re-init: their calls never reach the new session's file.
 
 `op_log_stats()` works while logging is active and after `finalize_op_log()`
 (while active, `accepted > written` is normal). `finalize_op_log()` prints one
@@ -2036,6 +2156,66 @@ exact number of queue-full drops included). In the default mode the first
 queue-full drop also prints one stderr note per session; later drops are only
 counted. To avoid queue-full drops set `S3DLIO_OPLOG_LOSSLESS=1` (callers wait
 instead of dropping) and/or raise `S3DLIO_OPLOG_BUF`.
+
+### Fork safety (`os.fork`, `multiprocessing`, `DataLoader` workers)
+
+`fork()` copies only the calling thread. Before the fix for issue #297 a forked child that called s3dlio after
+its parent had used it waited for ever on runtime threads that do not exist (issue #297). Now a
+child **works**: it notices the fork and builds its own runtimes, thread pools, store cache and
+clients on first use, and prints ONE line on stderr the first time it abandons inherited state:
+
+```
+s3dlio: this process was forked after s3dlio had already been used; the inherited runtime, ...
+```
+
+Set `S3DLIO_FORK_WARN=0` to silence it. A child whose parent never used s3dlio prints nothing.
+
+What works in a child, whatever the parent did: every function (`get`, `put_bytes`, `list`, `stat`,
+`get_many`, `get_async`, `get_into_async`, ..., `init_op_log`, `generate_data`,
+`generate_data_with_threads`, `generate_into_buffer`, `generate_npz_bytes`), and every object the
+**child itself creates** (`PyCheckpointStore`, writers, `MultiEndpointStore`, datasets, loaders,
+`Generator`). The child never reuses a connection of the parent, and the parent is not affected by
+what the child does.
+
+What does **not** work: an object **created in the parent** that owns a runtime and/or
+connections, used in the child. It raises a catchable `RuntimeError` ("created before fork();
+create it in the child process"), it never hangs and never raises `PanicException`:
+
+```python
+store = s3dlio.PyCheckpointStore("s3://bucket/ckpt")      # parent
+pid = os.fork()
+if pid == 0:
+    store.save(...)                                        # RuntimeError: created before fork()
+    store = s3dlio.PyCheckpointStore("s3://bucket/ckpt")   # create it in the child instead
+```
+
+This covers the checkpoint objects, `create_*_writer` / `MultipartUploadWriter`,
+`MultiEndpointStore`, datasets, loaders and their iterators, parquet stream objects and `Generator`.
+Deleting such an object, garbage collection and interpreter exit in the child are safe: its state
+is leaked, never dropped (dropping would join threads that do not exist, or abort the parent's
+multipart upload).
+
+Practical advice:
+
+- PyTorch `DataLoader(num_workers>0)` and `multiprocessing.Pool` (fork) work. Create s3dlio
+  objects inside the worker (the dataset's `__getitem__` or `worker_init_fn`), not in the main process.
+- `spawn` and `forkserver` remain the most robust start methods (they never inherit anything, so
+  they never print the line above); Python 3.14 makes `forkserver` the default on Linux.
+- Each forked process builds its own pools. On a many-core machine set `S3DLIO_RT_THREADS`
+  (and `configure_tokio_threads(n)`) so N workers do not each start one thread per core.
+- A process that execs after fork (`subprocess`, `os.execv`) is a new program: nothing applies.
+
+Known limits (none observed as a hang):
+
+- s3dlio never drops a Python reference without the GIL and its op-log lock is protected by fork
+  handlers, so a busy parent can fork safely: measured 0 hangs in several thousand forked children
+  with 4 and 8 parent threads calling s3dlio in a tight loop (see the Changelog). Earlier
+  builds hung 1 to 9% of such children; that was s3dlio's own off-GIL drops, not a PyO3 limit.
+- A streaming `Generator` created in a child whose ancestor already created one runs with one
+  thread (dgen-data's pool is not fork-aware): correct, slower.
+- Fork from inside a thread-local destructor is not protected; one-time `OnceLock`/`Lazy`
+  initialisation that is running on another thread at the fork, and third-party tables (dashmap,
+  tracing), are theoretical windows.
 
 ### Python Convenience Helpers
 
@@ -2093,7 +2273,7 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | Name | Description |
 |------|-------------|
 | `ObjectMetadata` | Frozen value returned by `head_async`: `size`, `etag` (opaque, not an MD5), `version_id` (S3 or Azure version ID when versioning is on, the GCS generation) |
-| `ObjectNotFoundError` | `FileNotFoundError` subclass: `get_into_async` on a missing object |
+| `ObjectNotFoundError` | `FileNotFoundError` subclass: `get_into_async` on a missing object (or a missing `file://` / `direct://` file) |
 | `LengthMismatchError` | `ValueError` subclass with `.expected` and `.actual` (`None` when unknown): the object's size is not `expected_len` |
 | `UnsupportedOperationError` | `NotImplementedError` subclass: the build or provider lacks the operation (no fallback download is attempted) |
 | `ExportStillReferencedError` | A backend still references your buffer after `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`; the buffer stays pinned |
@@ -2195,8 +2375,8 @@ snapshot).
 | Function | Description |
 |----------|-------------|
 | `init_logging(level)` | Set log level: trace, debug, info, warn, error |
-| `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089); `RuntimeError` after finalize |
-| `finalize_op_log()` | Write all accepted records (unless the writer fails: an I/O error or a writer-thread panic) and close the log; **call it before the process exits, nothing does it for you**; releases the GIL while draining; terminal and idempotent |
+| `init_op_log(path)` | Start an op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089). Allowed again after `finalize_op_log()` (new session, fresh `op_log_stats()`; the same path is truncated, #294); while a session is active: a no-op for the same file, `RuntimeError` for another file |
+| `finalize_op_log()` | Write all accepted records (unless the writer fails: an I/O error or a writer-thread panic) and close the log; **call it before the process exits, nothing does it for you**; releases the GIL while draining; idempotent; ends the session, `init_op_log` can start a new one (#294) |
 | `is_op_log_active()` | True between init and finalize only |
 | `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `written` / `dropped_full` / `rejected_closed` / `writer_failed` / `writer_error` / `lossless` / `rejected_unformattable` / `rejected_unsafe_field` / `normalized_error_text`, available while active and after finalize, to detect lost records (complete = `accepted == written`, no drops, no refusals, `writer_error is None`, `rejected_unformattable == 0`, `rejected_unsafe_field == 0`; `normalized_error_text` is a disclosure, not a loss) |
 

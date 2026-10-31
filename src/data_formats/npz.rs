@@ -375,13 +375,16 @@ pub fn generate_npz_bytes_raw(
     // x.npy random data -- Rayon writes directly into output buffer (no copy)
     // Each 2 MiB chunk gets a unique seed; page faults distributed across all cores.
     const CHUNK: usize = 2 * 1024 * 1024;
-    buf[off_x_data..off_x_data + x_data_size]
-        .par_chunks_mut(CHUNK)
-        .enumerate()
-        .for_each(|(i, chunk)| {
-            let mut rng = Xoshiro256PlusPlus::seed_from_u64(i as u64);
-            rng.fill_bytes(chunk);
-        });
+    // Runs inside s3dlio's own, fork-aware rayon pool, never rayon's global one (#297).
+    crate::s3_client::with_rayon_pool(|| {
+        buf[off_x_data..off_x_data + x_data_size]
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(i, chunk)| {
+                let mut rng = Xoshiro256PlusPlus::seed_from_u64(i as u64);
+                rng.fill_bytes(chunk);
+            });
+    });
 
     // CRC32 over x.npy content -- pages already hot, fast L3/RAM read
     let crc_x = crc32fast::hash(&buf[off_x_npy_hdr..off_x_npy_hdr + x_npy_size]);

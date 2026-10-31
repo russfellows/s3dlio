@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Plain logs: no ANSI color in cargo output (dtolnay/rust-toolchain only turns it on when unset),
+# so logs read cleanly and scripts that parse cargo output (check_fork_safety_deps.sh) see plain text.
+env:
+  CARGO_TERM_COLOR: never
+
 jobs:
   linux:
     runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
@@ -30,7 +35,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --interpreter python3.11 python3.12 python3.13 --features extension-module,backend-azure
+          args: --release --out dist --interpreter python3.11 python3.12 python3.13 python3.14 --features extension-module,backend-azure
           sccache: 'true'
           manylinux: auto
           before-script-linux: |
@@ -75,6 +80,29 @@ jobs:
       
       - name: List artifacts
         run: ls -lah dist/
+
+      # The `test-hooks` feature (s3dlio._hold_async_runtime(), which freezes the async runtime, and
+      # s3dlio._test_close_exit_gate_after_next_spawn(), which refuses every later async call) must never
+      # reach PyPI: no compiled module in any wheel may contain either symbol.
+      - name: Assert the wheels contain no test hooks
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          hooks = (b"_hold_async_runtime", b"_test_close_exit_gate_after_next_spawn")
+          bad = []
+          wheels = sorted(glob.glob("dist/*.whl"))
+          if not wheels:
+              sys.exit("no wheels in dist/")
+          for w in wheels:
+              with zipfile.ZipFile(w) as z:
+                  for n in z.namelist():
+                      if n.endswith((".so", ".pyd", ".dylib")):
+                          data = z.read(n)
+                          bad += [f"{w}: {n}: {h.decode()}" for h in hooks if h in data]
+          if bad:
+              sys.exit("test hook found in a release wheel:\n" + "\n".join(bad))
+          print("ok: no test hooks in", len(wheels), "wheels")
+          PY
       
       - name: Publish to PyPI
         uses: PyO3/maturin-action@v1

@@ -165,7 +165,7 @@ def test_pending_never_completing_task_does_not_hang_exit(child_env):
         import asyncio, socket, s3dlio
         srv = socket.socket()
         srv.bind(("127.0.0.1", 0))
-        srv.listen(8)
+        srv.listen(128)
         port = srv.getsockname()[1]
         async def main():
             pending = s3dlio.get_async(f"s3://127.0.0.1:{port}/b/k")
@@ -206,7 +206,7 @@ def test_late_delivery_after_exit_drain_never_enters_python(child_env):
         import asyncio, s3dlio
         srv = socket.socket()
         srv.bind(("127.0.0.1", 0))
-        srv.listen(8)
+        srv.listen(128)
         port = srv.getsockname()[1]
         def serve():
             conn, _ = srv.accept()

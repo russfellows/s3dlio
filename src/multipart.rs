@@ -279,7 +279,7 @@ pub struct MultipartUploadSink {
     /// Coordinator task handle; awaited in finish_blocking().
     coordinator: Option<JoinHandle<Result<MultipartCompleteInfo>>>,
     /// Signaled on Drop / abort() to stop the coordinator BEFORE it can
-    /// reach CompleteMultipartUpload. See `cancel_coordinator_and_maybe_abort`
+    /// reach CompleteMultipartUpload. See `cancel_coordinator`
     /// (audit #151 findings f11/f12 — issue #148 CLAUDE.md bug class:
     /// dropping `part_tx` alone is not enough, because dropping a
     /// `JoinHandle` detaches rather than cancels the task it points to).
@@ -326,7 +326,123 @@ impl Drop for MultipartUploadSink {
         // reach CompleteMultipartUpload for a sink that was dropped
         // without finish() (audit #151 f12 — locked contract, see
         // docs/implementation-plans/v0.9.109-audit-fix-plan.md bug A2).
-        self.cancel_coordinator_and_maybe_abort(self.cfg.abort_on_drop);
+        //
+        // The Abort is SPAWNED on the global runtime and Drop returns at once (#303): a Drop
+        // that waited for it blocked the dropping thread, and on a current-thread runtime (the
+        // only thread that could drive the connection) it stalled for the whole operation
+        // timeout and leaked the upload. The outcome is logged. The request is counted in
+        // `PENDING_ABORTS`, so a program that is about to exit can wait for it with
+        // [`flush_pending_aborts`] (the Python `atexit` hook and the CLI do); without that call
+        // an upload whose abort has not been delivered when the process exits stays on the
+        // server.
+        if let Some(req) = self.cancel_coordinator(self.cfg.abort_on_drop) {
+            let ticket = PendingAbort::enter();
+            spawn_on_global_rt(async move {
+                let _ticket = ticket;
+                let what = req.describe();
+                match req.send().await {
+                    Ok(()) => debug!("s3dlio MPU: dropped sink aborted {what}"),
+                    Err(e) => warn_abort_failed(&what, &e),
+                }
+            });
+        }
+    }
+}
+
+/// `AbortMultipartUpload` requests spawned by `Drop` (or by `abort()`) that have not finished.
+/// A `ForkCell` (#297): a fork child starts from a fresh count and lock, never the parent's (whose
+/// aborts it does not own, and whose mutex another parent thread may hold at the fork).
+static PENDING_ABORTS: crate::fork_guard::ForkCell<(std::sync::Mutex<usize>, std::sync::Condvar)> =
+    crate::fork_guard::ForkCell::new();
+
+/// This process's [`PENDING_ABORTS`]. Silent: `flush_pending_aborts` runs on exit paths, and a
+/// child that never used s3dlio must not warn merely because it exits.
+fn pending_aborts() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
+    PENDING_ABORTS.get_or_init_silent(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
+}
+
+/// One entry of [`PENDING_ABORTS`]; released when dropped (also if the task panics or is
+/// cancelled).
+struct PendingAbort;
+
+impl PendingAbort {
+    fn enter() -> Self {
+        *pending_aborts().0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        PendingAbort
+    }
+}
+
+impl Drop for PendingAbort {
+    fn drop(&mut self) {
+        let mut n = pending_aborts().0.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            pending_aborts().1.notify_all();
+        }
+    }
+}
+
+/// Wait, for at most `timeout`, until every `AbortMultipartUpload` that a dropped
+/// [`MultipartUploadSink`] spawned has finished. Returns how many are STILL pending (0 = all
+/// delivered or failed and logged).
+///
+/// `Drop` does not wait for its abort (that blocked the dropping thread, #303). A program that
+/// may end with an unfinished sink (an early `?` out of `main`, a panic caught at the top) should
+/// call this once before it exits, otherwise the process can end before the request is sent and
+/// the multipart upload stays on the server (storage cost until a lifecycle rule removes it).
+/// `abort().await` / `abort_blocking()` are the explicit, certain way. The s3dlio CLI and the
+/// Python `atexit` hook call this with a 2 s bound. Safe to call from any thread, including a
+/// runtime thread (it blocks that thread for at most `timeout`; the aborts run on s3dlio's own
+/// runtimes, so waiting does not hold them up).
+pub fn flush_pending_aborts(timeout: std::time::Duration) -> usize {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut n = pending_aborts().0.lock().unwrap_or_else(|e| e.into_inner());
+    while *n > 0 {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        n = pending_aborts()
+            .1
+            .wait_timeout(n, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    *n
+}
+
+fn warn_abort_failed(what: &str, e: &anyhow::Error) {
+    warn!(
+        "s3dlio MPU: best-effort AbortMultipartUpload failed for {what}: {e} — \
+         the in-progress upload may need manual cleanup"
+    );
+}
+
+/// One best-effort `AbortMultipartUpload`, detached from the sink so it can run anywhere.
+struct AbortRequest {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+}
+
+impl AbortRequest {
+    fn describe(&self) -> String {
+        format!(
+            "s3://{}/{} upload_id={}",
+            self.bucket, self.key, self.upload_id
+        )
+    }
+
+    async fn send(&self) -> Result<()> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("AbortMultipartUpload failed: {e}"))
     }
 }
 
@@ -849,22 +965,80 @@ impl MultipartUploadSink {
     /// this is an explicit user action, so the S3-side Abort always
     /// fires regardless of `abort_on_drop` (that flag only gates
     /// *implicit* cleanup-on-drop).
+    ///
+    /// Blocks the calling thread until the Abort was attempted; use [`MultipartUploadSink::abort`]
+    /// from async code.
     pub fn abort_blocking(&mut self) -> Result<()> {
-        self.cancel_coordinator_and_maybe_abort(true);
+        if let Some(req) = self.cancel_coordinator(true) {
+            let outcome = run_on_global_rt(async move {
+                let what = req.describe();
+                Ok::<_, anyhow::Error>((what, req.send().await))
+            });
+            match outcome {
+                Ok((_, Ok(()))) => {}
+                Ok((what, Err(e))) => warn_abort_failed(&what, &e),
+                Err(e) => warn_abort_failed(
+                    &format!(
+                        "s3://{}/{} upload_id={}",
+                        self.bucket, self.key, self.upload_id
+                    ),
+                    &e,
+                ),
+            }
+        }
         Ok(())
+    }
+
+    /// Explicitly abort the upload from async code (#303).
+    ///
+    /// The coordinator is cancelled first (it can never reach CompleteMultipartUpload after this
+    /// call), then `AbortMultipartUpload` is awaited. It runs on s3dlio's own runtimes, so it
+    /// completes even when the calling runtime is a current-thread one. It fires regardless of
+    /// `abort_on_drop`. UNLIKE [`MultipartUploadSink::abort_blocking`] (whose locked contract is
+    /// "always `Ok(())`", for Python's `__exit__`), this returns the REAL outcome: `Err` when
+    /// the Abort request failed, so the caller learns that the upload may still exist on the
+    /// server (its id is in the error and in a `warn!`). The sink is cancelled and finished
+    /// either way. Calling it again, or after `finish()`, does nothing and returns `Ok(())`. If
+    /// the returned future is dropped before it completes the Abort still runs (the cancellation
+    /// has already happened and the request is spawned), but its outcome is only logged.
+    pub async fn abort(&mut self) -> Result<()> {
+        let Some(req) = self.cancel_coordinator(true) else {
+            return Ok(());
+        };
+        let what = req.describe();
+        // Spawned (not awaited inline) so that dropping this future cannot cancel the cleanup
+        // half-way and leak the upload.
+        let ticket = PendingAbort::enter();
+        let task = spawn_on_global_rt(async move {
+            let _ticket = ticket;
+            req.send().await
+        });
+        let outcome = match task.await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("abort task failed: {e}")),
+        };
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn_abort_failed(&what, &e);
+                Err(e.context(format!(
+                    "the multipart upload {what} may still exist on the server"
+                )))
+            }
+        }
     }
 
     // ── internal ─────────────────────────────────────────────────────────────
 
-    /// Shared by `Drop::drop` and `abort_blocking()`: stop the coordinator
-    /// before it can reach Complete, then optionally fire a best-effort
-    /// `AbortMultipartUpload`. `fire_abort=false` is used only from Drop
-    /// when `abort_on_drop=false` — the operator explicitly opted into
-    /// leaving the upload dangling rather than paying for the extra
-    /// request, per the locked A2 contract.
-    fn cancel_coordinator_and_maybe_abort(&mut self, fire_abort: bool) {
+    /// Stop the coordinator before it can reach Complete (shared by `Drop::drop`,
+    /// `abort_blocking()` and `abort()`). Returns the best-effort `AbortMultipartUpload` request
+    /// to run, or `None` when none is wanted (`fire_abort == false`, or the sink is already
+    /// finished or aborted). `fire_abort=false` is used only from Drop when `abort_on_drop=false`
+    /// — the operator explicitly opted into leaving the upload dangling rather than paying for
+    /// the extra request, per the locked A2 contract.
+    fn cancel_coordinator(&mut self, fire_abort: bool) -> Option<AbortRequest> {
         if self.finished {
-            return;
+            return None;
         }
         self.finished = true;
 
@@ -876,34 +1050,12 @@ impl MultipartUploadSink {
         // channel state.
         self.cancel.cancel();
 
-        if !fire_abort {
-            return;
-        }
-
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key = self.key.clone();
-        let upload_id = self.upload_id.clone();
-
-        let abort_result = run_on_global_rt(async move {
-            client
-                .abort_multipart_upload()
-                .bucket(&bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("AbortMultipartUpload failed: {e}"))
-        });
-
-        if let Err(e) = abort_result {
-            warn!(
-                "s3dlio MPU: best-effort AbortMultipartUpload failed for s3://{}/{} \
-                 upload_id={}: {e} — the in-progress upload may need manual cleanup",
-                self.bucket, self.key, self.upload_id
-            );
-        }
+        fire_abort.then(|| AbortRequest {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            upload_id: self.upload_id.clone(),
+        })
     }
 
     /// Enqueue a complete part for upload via the coordinator channel.

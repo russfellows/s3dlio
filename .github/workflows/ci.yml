@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+# Plain logs: no ANSI color in cargo output (dtolnay/rust-toolchain only turns it on when unset),
+# so logs read cleanly and scripts that parse cargo output (check_fork_safety_deps.sh) see plain text.
+env:
+  CARGO_TERM_COLOR: never
+
 jobs:
   test:
     name: Test on ${{ matrix.os }}
@@ -18,7 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
-        python-version: ['3.11', '3.12', '3.13']
+        # 3.14 (#302): the cp314 wheel is built by the same `maturin build` step below (PyO3 0.29 supports it);
+        # the exit test file is what exercises the CPython 3.14 thread-state race. Written without being able
+        # to run GitHub Actions; the build and the exit file were run locally on CPython 3.14.10.
+        python-version: ['3.11', '3.12', '3.13', '3.14']
     
     steps:
       - uses: actions/checkout@v4
@@ -77,8 +85,16 @@ jobs:
       - name: Build (Rust)
         run: cargo build --release --offline
 
+      # S3DLIO_TEST_DIR is a directory on the runner's disk (ext4, supports O_DIRECT and caches
+      # pages); S3DLIO_REQUIRE_ODIRECT_TESTS=1 turns a test that would SKIP (scratch filesystem
+      # without O_DIRECT, tmpfs where the page-cache hint cannot be observed) into a failure.
       - name: Test (Rust)
-        run: cargo test --release --lib --offline
+        env:
+          S3DLIO_REQUIRE_ODIRECT_TESTS: "1"
+        run: |
+          export S3DLIO_TEST_DIR="$GITHUB_WORKSPACE/target/odirect-scratch"
+          mkdir -p "$S3DLIO_TEST_DIR"
+          cargo test --release --lib --offline
 
       # The slower Rust-only integration steps (delete_batch grouping, the
       # GCS/Azure feature build, the op-log lifecycle binaries) run once per OS
@@ -107,7 +123,10 @@ jobs:
       - name: Build (Python)
         run: |
           pip install maturin
-          maturin build --release --out dist --features extension-module,backend-azure
+          # `test-hooks` adds the hidden s3dlio._hold_async_runtime() (deterministic op-log tests, #294) and
+          # s3dlio._test_close_exit_gate_after_next_spawn() (#304 test). This wheel is a TEST wheel: it is not the one published (publish-pypi.yml builds without it
+          # and asserts both symbols are absent).
+          maturin build --release --out dist --features extension-module,backend-azure,test-hooks
           pip install dist/*.whl
       
       - name: Test (Python - Basic)
@@ -139,10 +158,87 @@ jobs:
       # runs in a fresh interpreter; they need the zstd CLI installed earlier.
       # NOTE: written without being able to run GitHub Actions; see the commit
       # message for what was and was not verified locally.
+      # S3DLIO_REQUIRE_TEST_HOOKS=1: the deterministic call-time tests (#294) FAIL, not skip, on a wheel
+      # built without the `test-hooks` feature.
       - name: Test (Python - op-log)
+        env:
+          S3DLIO_REQUIRE_TEST_HOOKS: "1"
         run: |
           pip install pytest
-          python -m pytest -q tests/test_oplog_lifecycle.py tests/test_python_oplog.py
+          python -m pytest -q tests/test_oplog_lifecycle.py tests/test_python_oplog.py \
+            tests/test_oplog_store_cache.py tests/test_oplog_lifecycle_permutations_294.py \
+            tests/test_oplog_async_call_time_294.py
+
+      # Caller-buffer get_into / typed head / object_capabilities for file:// and direct://
+      # (#295, #267) and the S3 caller-buffer tests, against the wheel installed above. The
+      # scratch directory is on the runner's disk (O_DIRECT works there); with
+      # S3DLIO_REQUIRE_ODIRECT_TESTS=1 python/tests/conftest.py turns EVERY skip in these files
+      # (no O_DIRECT, numpy or pytest-asyncio missing, a wheel without the native S3 path) into a
+      # failure.
+      - name: Test (Python - get_into file:// direct:// and S3 caller-buffer)
+        env:
+          S3DLIO_REQUIRE_ODIRECT_TESTS: "1"
+        run: |
+          export S3DLIO_TEST_DIR="$GITHUB_WORKSPACE/odirect-scratch"
+          mkdir -p "$S3DLIO_TEST_DIR"
+          pip install pytest pytest-asyncio numpy
+          python -m pytest -q -rs python/tests/test_get_into_file_direct_295.py \
+            python/tests/test_caller_buffer_get_into.py python/tests/test_conftest_fail_on_skip_295.py
+
+      # Interpreter exit with daemon threads inside s3dlio calls (#298): every scenario runs in a
+      # fresh subprocess and must exit 0 with no FATAL on stderr. RED on CPython < 3.13.8 (the 3.11
+      # and 3.12 matrix cells) with PyO3 < 0.29.3; the `>=0.29.3, <0.30` requirement in Cargo.toml keeps it green.
+      # #302 (CPython 3.14: a Tokio worker attaching to Python) and #304 (Python < 3.13.8: an async call
+      # starting during shutdown) are probabilistic crashes (1/30 to 30/30 runs depending on the call), so
+      # this step repeats each scenario S3DLIO_EXIT_ATTEMPTS times instead of the local default of 3.
+      - name: Test (Python - exit with daemon threads, #298 #302 #304)
+        env:
+          S3DLIO_EXIT_ATTEMPTS: "8"
+          S3DLIO_REQUIRE_TEST_HOOKS: "1"   # the #304 close-after-spawn test FAILS, not skips, without the hook
+        run: |
+          pip install pytest
+          python -m pytest -q -rs python/tests/test_exit_daemon_threads_298.py
+
+      # #303: an unfinished multipart writer at interpreter exit (or garbage-collected) must have
+      # its AbortMultipartUpload delivered before the process ends (in-process S3 mock).
+      - name: Test (Python - multipart abort delivered at exit, #303)
+        run: |
+          pip install pytest
+          python -m pytest -q -rs tests/test_abort_at_exit_303.py
+
+      # Fork safety (#297): parent states x child entry points, inherited objects, drop/exit,
+      # the warning, fork while parent threads run s3dlio calls, nested fork, a multiprocessing
+      # fork Pool, DataLoader-style workers, fork+exec, and a mock S3 server proving the child
+      # opens its own connection while the parent's survives. Each child has a hang limit.
+      - name: Test (Python - fork safety)
+        run: |
+          pip install pytest
+          python -m pytest -q -rs python/tests/test_fork_297.py
+
+      # The Rust unit tests of the Python extension (everything under `python_api::`: the release
+      # queue, the async bridge, the store cache, ...) only compile with `extension-module`, which
+      # leaves libpython unlinked: link the interpreter's SHARED libpython explicitly. Fails loudly
+      # when the interpreter has none. (Could later move to pyo3's
+      # `auto-initialize` for tests and drop the RUSTFLAGS.)
+      - name: Test (Rust unit tests of the Python extension)
+        env:
+          CARGO_TARGET_DIR: target-pyunit
+        run: |
+          LDLIB=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LDLIBRARY"))')
+          LDVER=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LDVERSION"))')
+          LIBDIR=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          case "$LDLIB" in
+            *.so*) ;;
+            *) echo "this interpreter has no shared libpython (LDLIBRARY=$LDLIB): cannot link the extension-module unit tests" >&2; exit 1 ;;
+          esac
+          export RUSTFLAGS="-C link-arg=-L$LIBDIR -C link-arg=-lpython$LDVER -C link-arg=-Wl,-rpath,$LIBDIR"
+          # caller_buffer_tests need CPython >= 3.12 (PEP 688 `__buffer__`) and fail by design on
+          # 3.11: the 3.11 cells skip that one module.
+          SKIP=""
+          if [ "$(python -c 'import sys; print(sys.version_info >= (3, 12))')" = "False" ]; then
+            SKIP="--skip python_api::python_core_api::caller_buffer_tests"
+          fi
+          cargo test --lib --offline --features extension-module,backend-azure -- python_api:: $SKIP
 
   # Rust-only integration tests that do not depend on the Python version. They
   # run once per OS, in parallel with the `test` matrix, instead of six times
@@ -194,6 +290,27 @@ jobs:
             echo "cargo fetch failed (attempt $i); retrying..."
             sleep $((i * 10))
           done
+
+      # Fork safety (#297): tokio must not be built with its `parking_lot` feature (a fork child
+      # follows dangling pointers in parking_lot's global table of parked threads and aborts),
+      # and dashmap must stay the only user of parking_lot_core. Checked on the RESOLVED graph
+      # for every feature set we ship, because a dependency can switch the feature back on.
+      - name: Guard (tokio parking_lot feature)
+        run: scripts/check_fork_safety_deps.sh
+
+      # The fork-safety unit tests (ForkCell rebuild in a child, claim takeover, panic in init,
+      # recursion, the no-drop rule), and the process-global state (runtime, rayon pool,
+      # data generation) in a fork child; the second one is its own test binary, like the
+      # op-log fork tests, because fork() in a process that runs unrelated tests on other
+      # threads can inherit a lock they hold.
+      - name: Test (Rust - fork safety)
+        run: |
+          cargo test --release --lib --offline fork_guard
+          cargo test --release --offline --test fork_globals_297
+          cargo test --release --offline --test fork_oplog_idle_297
+          cargo test --release --offline --test fork_oplog_fifo_297
+          cargo test --release --offline --test fork_oplog_edges_297
+          cargo test --release --offline --test fork_io_runtime_303
 
       # delete_batch bucket/server grouping (#179).  The integration test runs
       # against an in-process mock S3 endpoint (no network, no credentials).
@@ -267,6 +384,66 @@ jobs:
             fi
           done
 
+      # #295 / #267: caller-buffer GET and typed HEAD for file:// and direct://. Every
+      # tests/*_295.rs is its own binary (its own process: some set process-wide state such as a
+      # panic hook or a tiny bounce pool), run by name. The scratch directory is on the runner's
+      # disk and S3DLIO_REQUIRE_ODIRECT_TESTS=1 makes a test that would skip (no O_DIRECT, root
+      # ignoring permissions) FAIL. direct_get_into_no_odirect_fs_295 stays opt-in: it needs a
+      # ramfs mount (S3DLIO_TEST_NO_ODIRECT_DIR, see docs/Environment_Variables.md) and reports
+      # SKIPPED here by design.
+      - name: Test (Rust - file:// direct:// get_into, #295)
+        env:
+          S3DLIO_REQUIRE_ODIRECT_TESTS: "1"
+        run: |
+          set -euo pipefail
+          export S3DLIO_TEST_DIR="$GITHUB_WORKSPACE/target/odirect-scratch"
+          mkdir -p "$S3DLIO_TEST_DIR"
+          shopt -s nullglob
+          files=(tests/*_295.rs)
+          if [ "${#files[@]}" -lt 10 ]; then
+            echo "expected the tests/*_295.rs binaries, found ${#files[@]}" >&2
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            name="$(basename "$f" .rs)"
+            echo "::group::$name"
+            status=0
+            cargo test --release --offline --test "$name" || status=$?
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              exit "$status"
+            fi
+          done
+
+      # The same file stores in a binary built with panic = "abort" (a downstream crate's release
+      # profile): a LocalSet read must work and must not abort. Builds the `abort-test` profile
+      # (Cargo.toml), which recompiles the dependencies once.
+      - name: Test (Rust - panic=abort LocalSet read/write, #295)
+        run: scripts/test_panic_abort_295.sh
+
+      # #300: run_on_global_rt and the sync wrappers inside a tokio LocalSet (the context matrix,
+      # the unmarked-runtime hang case, hand-off accounting), then in a panic = "abort" build.
+      - name: Test (Rust - sync wrappers in every tokio context, #300)
+        run: cargo test --release --offline --test run_on_global_rt_contexts_300 -- --test-threads=1
+
+      - name: Test (Rust - panic=abort LocalSet run_on_global_rt, #300)
+        run: scripts/test_panic_abort_300.sh
+
+      # #303: pooled connections belong to s3dlio's I/O runtime, so a blocked or idle caller
+      # runtime (current-thread, LocalSet, a second runtime, blocked global workers) never stalls a
+      # later request; a dropped multipart sink's abort is delivered. Every case runs in its own
+      # child process against an in-process mock or emulator (S3, Azure, GCS).
+      - name: Test (Rust - pooled connections on the I/O runtime, #303)
+        run: |
+          cargo test --release --offline --test pooled_connection_runtime_303
+          cargo test --release --offline --features backend-azure --test pooled_connection_runtime_303_azure
+          cargo test --release --offline --features backend-gcs --test pooled_connection_runtime_303_gcs
+
+      # #302: no future body attaches to Python (and #304: Python calls from Rust in async entry
+      # points hold an exit-gate scope). A source scan of src/, std only.
+      - name: Test (Rust - async future bodies never attach to Python, #302 #304)
+        run: cargo test --release --offline --test python_future_bodies_no_attach_302
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -319,3 +496,52 @@ jobs:
         # exclusive (compile_error! guards this); defaults include native-backends.
         # Tests/benches are compiled and validated by the Test job above.
         run: cargo clippy --lib --bins --examples --offline -- -D warnings
+
+  # Off-GIL drop oracle (#297). pyo3 normally lets any thread drop a `Py<..>`: it parks the
+  # decref in a process-global mutex, and a parent thread holding that mutex at a fork() left the
+  # child's first Python call waiting for ever. s3dlio removed every such drop. This wheel is
+  # built with `--cfg pyo3_disable_reference_pool`, where dropping a `Py` without the GIL ABORTS
+  # the process, so a regression crashes these tests. The released wheels keep the default pool
+  # (the job above); this wheel is only for the tests below.
+  offgil-oracle:
+    name: Off-GIL drop oracle (abort-mode wheel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry, git deps, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target-oracle
+          # The RUSTFLAGS cfg is part of the key AND the build uses its own target directory, so a
+          # pyo3 built without `--cfg pyo3_disable_reference_pool` can never be reused here (it
+          # would make the oracle pass vacuously).
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-oracle-cfg-pyo3_disable_reference_pool-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build the abort-mode wheel
+        env:
+          RUSTFLAGS: "--cfg pyo3_disable_reference_pool"
+          CARGO_TARGET_DIR: target-oracle
+        run: |
+          pip install maturin
+          maturin build --release --out dist-oracle --features extension-module,backend-azure
+          pip install dist-oracle/*.whl
+
+
+      - name: Test (fork matrix, no off-GIL drop, exit and put-release suites)
+        run: |
+          pip install pytest pytest-asyncio numpy
+          python -m pytest -q -rs python/tests/test_fork_297.py python/tests/test_no_offgil_drop_297.py \
+            tests/test_async_exit_no_segfault.py python/tests/test_put_release_barrier.py

@@ -121,34 +121,68 @@ WORKLOAD = """
 """
 
 
-def test_reinit_after_finalize_raises_runtime_error_and_creates_no_file(tmp_path):
+def test_reinit_after_finalize_starts_a_new_session_issue_294(tmp_path):
+    """Keith's repro (#294): init, ops, finalize, init with another file, ops, finalize."""
     first = tmp_path / "first.tsv.zst"
     second = tmp_path / "second.tsv.zst"
-    existing = tmp_path / "existing.tsv.zst"
-    existing.write_bytes(b"known bytes")
+    work = tmp_path / "work"
+    work.mkdir()
     proc = run_scenario(
         """
-        first, second, existing = sys.argv[1:4]
+        first, second, work = sys.argv[1:4]
+        a, b = "file://" + work + "/a.bin", "file://" + work + "/b.bin"
         s3dlio.init_op_log(first)
+        s3dlio.put_bytes(a, b"aaaa")
+        assert bytes(s3dlio.get(a)) == b"aaaa"
         s3dlio.finalize_op_log()
-        size = os.path.getsize(first)
-        for path in (second, existing, first):
-            try:
-                s3dlio.init_op_log(path)
-            except RuntimeError as e:
-                assert "finalized" in str(e), str(e)
-            else:
-                raise SystemExit("init after finalize did not raise RuntimeError")
-        assert os.path.getsize(first) == size, "first log was truncated"
+        assert s3dlio.is_op_log_active() is False
+        assert s3dlio.op_log_stats()["accepted"] == 2
+
+        s3dlio.init_op_log(second)          # used to raise RuntimeError
+        assert s3dlio.is_op_log_active() is True
+        assert s3dlio.op_log_stats()["accepted"] == 0   # the new session's stats
+        s3dlio.put_bytes(b, b"bbbbbb")
+        assert bytes(s3dlio.get(b)) == b"bbbbbb"
+        s3dlio.stat(b)
+        s3dlio.finalize_op_log()
+        assert s3dlio.is_op_log_active() is False
+        stats = s3dlio.op_log_stats()
+        assert stats["accepted"] == 3 and stats["written"] == 3, stats
         """,
         str(first),
         str(second),
-        str(existing),
+        str(work),
     )
     assert_ok(proc)
-    assert not second.exists()
-    assert existing.read_bytes() == b"known bytes"
-    assert_complete_zstd_stream(first)
+    rows1 = read_rows(first)
+    rows2 = read_rows(second)
+    assert [r["op"] for r in rows1] == ["PUT", "GET"], rows1
+    assert [r["op"] for r in rows2] == ["PUT", "GET", "HEAD"], rows2
+    assert all(r["file"].endswith("a.bin") for r in rows1), rows1
+    assert all(r["file"].endswith("b.bin") for r in rows2), rows2
+
+
+def test_reinit_after_finalize_with_the_same_path_replaces_the_log(tmp_path):
+    log = tmp_path / "ops.tsv.zst"
+    work = tmp_path / "work"
+    work.mkdir()
+    proc = run_scenario(
+        """
+        log, work = sys.argv[1:3]
+        a = "file://" + work + "/a.bin"
+        s3dlio.init_op_log(log)
+        s3dlio.put_bytes(a, b"aaaa")
+        s3dlio.get(a)
+        s3dlio.finalize_op_log()
+        s3dlio.init_op_log(log)   # same path: create-and-truncate, like a first init
+        s3dlio.get(a)
+        s3dlio.finalize_op_log()
+        """,
+        str(log),
+        str(work),
+    )
+    assert_ok(proc)
+    assert [r["op"] for r in read_rows(log)] == ["GET"]
 
 
 def test_is_op_log_active_false_after_finalize(tmp_path):

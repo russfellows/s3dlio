@@ -295,6 +295,9 @@ impl PyReservedBuffer {
 #[pyclass(name = "MultipartUploadWriter", module = "s3dlio")]
 pub struct PyMultipartUploadWriter {
     inner: Option<MultipartUploadSink>,
+    /// The process that created the writer: in a fork child it is refused and its sink is
+    /// never dropped (the sink's drop aborts the multipart upload: the PARENT's) (#297).
+    stamp: crate::fork_guard::ForkStamp,
     /// The reservation between `reserve()` and `commit()`: the writer's OWN reference to the
     /// allocation behind the memoryview that `reserve()` returned. The memoryview's exporter
     /// ([`PyReservedBuffer`]) holds another one, and `commit()` hands the upload a third (a
@@ -306,6 +309,24 @@ pub struct PyMultipartUploadWriter {
     /// the parts still reference the caller's memory until they are uploaded, so `close()` /
     /// `abort()` / `__exit__` wait on every latch (bounded) before they return.
     held: HeldExports,
+}
+
+impl Drop for PyMultipartUploadWriter {
+    /// A writer that is garbage-collected (or still alive at interpreter shutdown) with an
+    /// unfinished upload drops its sink, which SPAWNS the abort (#303). Wait for it here, bounded,
+    /// so the abort is delivered before the object (or the process) goes away, as it was when
+    /// the sink's `Drop` blocked. The abort needs neither this thread nor the GIL. A writer
+    /// inherited by a fork child is leaked instead (#297): its sink belongs to the parent.
+    fn drop(&mut self) {
+        if let Some(sink) = self.inner.take() {
+            if self.stamp.is_inherited() {
+                std::mem::forget(sink);
+            } else {
+                drop(sink);
+                crate::multipart::flush_pending_aborts(std::time::Duration::from_secs(2));
+            }
+        }
+    }
 }
 
 impl PyMultipartUploadWriter {
@@ -389,6 +410,7 @@ impl PyMultipartUploadWriter {
             .map_err(|e| py_err(e.context("Multipart init failed")))?;
         Ok(Self {
             inner: Some(inner),
+            stamp: crate::fork_guard::ForkStamp::new(),
             pending_reservation: None,
             held: HeldExports::new(),
         })
@@ -434,6 +456,7 @@ impl PyMultipartUploadWriter {
             .map_err(|e| py_err(e.context("Multipart init failed")))?;
         Ok(Self {
             inner: Some(inner),
+            stamp: crate::fork_guard::ForkStamp::new(),
             pending_reservation: None,
             held: HeldExports::new(),
         })
@@ -506,6 +529,7 @@ impl PyMultipartUploadWriter {
         data: &Bound<'py, PyAny>,
         copy: bool,
     ) -> PyResult<usize> {
+        self.stamp.check()?;
         let inner = self
             .inner
             .as_mut()
@@ -618,6 +642,7 @@ impl PyMultipartUploadWriter {
     ///     memoryview: writable view into the reserved buffer
     #[pyo3(text_signature = "(self, size, /)")]
     fn reserve(&mut self, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {
+        self.stamp.check()?;
         // Disallow overlapping reserves
         if self.pending_reservation.is_some() {
             return Err(PyRuntimeError::new_err(
@@ -638,7 +663,7 @@ impl PyMultipartUploadWriter {
             return Err(PyErr::fetch(py));
         }
         // SAFETY: `raw` is a non-null owned reference.
-        let mv = unsafe { Py::<PyAny>::from_owned_ptr(py, raw) };
+        let mv = unsafe { Bound::<PyAny>::from_owned_ptr(py, raw).unbind() };
         self.pending_reservation = Some(block);
         Ok(mv)
     }
@@ -660,6 +685,7 @@ impl PyMultipartUploadWriter {
     /// with a valid length).
     #[pyo3(text_signature = "(self, nbytes, /)")]
     fn commit(&mut self, py: Python<'_>, nbytes: usize) -> PyResult<()> {
+        self.stamp.check()?;
         let inner = self
             .inner
             .as_mut()
@@ -688,6 +714,7 @@ impl PyMultipartUploadWriter {
     /// Typically not required; `close()` will upload any tail automatically.
     #[pyo3(text_signature = "(self)")]
     fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.stamp.check()?;
         let inner = self
             .inner
             .as_mut()
@@ -715,6 +742,7 @@ impl PyMultipartUploadWriter {
     ///     }
     #[pyo3(text_signature = "(self)")]
     fn close(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.stamp.check()?;
         // Drop the writer's reference to an outstanding reserve() allocation. A memoryview
         // the caller still holds keeps the memory alive through its exporter.
         self.clear_pending_reservation();
@@ -768,6 +796,7 @@ impl PyMultipartUploadWriter {
     /// After abort, the writer is unusable.
     #[pyo3(text_signature = "(self)")]
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.stamp.check()?;
         // Drop the writer's reference to an outstanding reserve() allocation. A memoryview
         // the caller still holds keeps the memory alive through its exporter.
         self.clear_pending_reservation();
@@ -808,7 +837,7 @@ impl PyMultipartUploadWriter {
     /// `abort_blocking()` is infallible by contract (bug A3, this session):
     /// it always cancels the coordinator and always returns `Ok(())`, even
     /// when the underlying `AbortMultipartUpload` request itself fails.
-    /// That failure is not lost — `cancel_coordinator_and_maybe_abort`
+    /// That failure is not lost — `cancel_coordinator`
     /// (shared by `abort_blocking()` and `Drop`) emits a `tracing::warn!`
     /// naming the bucket/key/upload_id right where the failure occurs, so
     /// there is nothing left for `__exit__` to swallow. See
@@ -823,6 +852,7 @@ impl PyMultipartUploadWriter {
         _v: Py<PyAny>,
         _tb: Py<PyAny>,
     ) -> PyResult<()> {
+        self.stamp.check()?;
         // Drop the writer's reference to an outstanding reserve() allocation. A memoryview
         // the caller still holds keeps the memory alive through its exporter.
         self.clear_pending_reservation();
@@ -904,6 +934,7 @@ mod writer_tests {
         let (sink, guard) = MultipartUploadSink::for_writer_test(part_size, coalesce_below);
         let w = PyMultipartUploadWriter {
             inner: Some(sink),
+            stamp: crate::fork_guard::ForkStamp::new(),
             pending_reservation: None,
             held: HeldExports::new(),
         };

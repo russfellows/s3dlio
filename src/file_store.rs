@@ -22,7 +22,8 @@ use tokio::fs;
 
 use crate::constants::DEFAULT_FILE_RANGE_ENGINE_THRESHOLD;
 use crate::object_store::{
-    CompressionConfig, ObjectMetadata, ObjectProperties, ObjectStore, ObjectWriter,
+    CompressionConfig, HeadMetadata, ObjectMetadata, ObjectProperties, ObjectStore, ObjectWriter,
+    ReceiveProgress,
 };
 
 /// A file modification time as an RFC 3339 UTC string (#263), the form `ObjectMetadata::last_modified`
@@ -173,17 +174,13 @@ pub(crate) fn write_all_std(file: &std::fs::File, data: &[u8]) -> std::io::Resul
 /// Write a BORROWED slice completely to `file` without copying it (Rule #1).
 ///
 /// A borrowed `&[u8]` cannot be moved into `spawn_blocking` without a copy, so the write runs on
-/// the calling task's thread: on the multi-thread runtime `block_in_place` hands the worker's
-/// other tasks to a fresh thread first (the same off-loading `spawn_blocking` gives); a
-/// current-thread runtime has no other thread to hand them to (and `block_in_place` would panic
-/// there), so the write simply runs inline. Owned data should use `spawn_blocking` instead.
+/// the calling task's thread: on a marked worker of a multi-thread runtime `block_in_place`
+/// hands the worker's other tasks to a fresh thread first (the same off-loading
+/// `spawn_blocking` gives); everywhere else (a current-thread runtime, a `LocalSet`, a thread
+/// without the worker marker) the write runs inline, because `block_in_place` would panic or
+/// do nothing there (see [`crate::runtime_support`]). Owned data should use `spawn_blocking`.
 pub(crate) fn write_borrowed_blocking(file: &std::fs::File, data: &[u8]) -> std::io::Result<()> {
-    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-            tokio::task::block_in_place(|| write_all_std(file, data))
-        }
-        _ => write_all_std(file, data),
-    }
+    crate::runtime_support::blocking_io(|| write_all_std(file, data))
 }
 
 /// Streaming writer for filesystem operations
@@ -501,16 +498,7 @@ impl FileSystemObjectStore {
         // Create ObjectMetadata compatible with S3ObjectStat
         let last_modified = metadata.modified().ok().and_then(modified_time_rfc3339);
 
-        let file_hash = format!(
-            "file-{}-{}",
-            metadata.len(),
-            metadata
-                .modified()
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        );
+        let file_hash = crate::file_get_into::stat_etag(metadata.len(), metadata.modified().ok());
 
         Ok(ObjectMetadata {
             size: metadata.len(),
@@ -721,6 +709,37 @@ impl ObjectStore for FileSystemObjectStore {
             uri
         );
         self.get_simple(uri, file_size).await
+    }
+
+    /// Caller-buffer GET: `pread` straight into `dst` (#295, #267); see
+    /// `crate::file_get_into` for the contract, the zero-copy and the cancellation story.
+    async fn get_into(&self, uri: &str, dst: &mut [u8], progress: &ReceiveProgress) -> Result<()> {
+        if !uri.starts_with("file://") {
+            bail!("FileSystemObjectStore expected file:// URI");
+        }
+        let path = Self::uri_to_path(uri)?;
+        debug!(
+            "FileSystemObjectStore::get_into uri='{}', expected_len={}",
+            uri,
+            dst.len()
+        );
+        let spec = crate::file_get_into::LocalRead {
+            path: &path,
+            provider: "file",
+            direct: None,
+            page_cache: Some(self.config.page_cache_mode.unwrap_or(PageCacheMode::Auto)),
+        };
+        crate::file_get_into::get_into(&spec, dst, progress).await
+    }
+
+    /// Typed HEAD from `stat`: `Ok(None)` for a missing file, an error for a directory.
+    async fn head(&self, uri: &str) -> Result<Option<HeadMetadata>> {
+        if !uri.starts_with("file://") {
+            bail!("FileSystemObjectStore expected file:// URI");
+        }
+        let path = Self::uri_to_path(uri)?;
+        debug!("FileSystemObjectStore::head uri='{}'", uri);
+        crate::file_get_into::head(&path, "file").await
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {

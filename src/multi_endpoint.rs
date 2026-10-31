@@ -331,6 +331,12 @@ pub struct MultiEndpointStore {
     /// Normalized endpoint prefixes for URI matching (with trailing slash).
     /// Used to extract path components from full URIs for rewriting.
     endpoint_prefixes: Vec<String>,
+
+    /// The op-log logger of the session that was Active when the store was CONSTRUCTED (`None`: the
+    /// op-log was off). The bucket-form S3 endpoints write their GET/PUT helper rows through it for
+    /// every operation, never to a session that is Active later (issue #294: stores capture the
+    /// logger at construction).
+    logger: Option<crate::s3_logger::Logger>,
 }
 
 impl MultiEndpointStore {
@@ -469,6 +475,7 @@ impl MultiEndpointStore {
             strategy: config.strategy,
             next_index: AtomicUsize::new(0),
             endpoint_prefixes,
+            logger: crate::s3_logger::global_logger(),
         })
     }
 
@@ -671,62 +678,65 @@ impl MultiEndpointStore {
     /// A merged, deduplicated list of URIs from all endpoints. URIs are returned in their
     /// original form as reported by each endpoint's store.
     pub async fn list_all_endpoints(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {
-        use futures::future::join_all;
-        use std::collections::HashSet;
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            use futures::future::join_all;
+            use std::collections::HashSet;
 
-        // Query all endpoints in parallel
-        let futures: Vec<_> = self
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                let effective_prefix = self.rewrite_uri_for_endpoint(prefix, endpoint);
-                async move {
-                    endpoint
-                        .stats
-                        .total_requests
-                        .fetch_add(1, Ordering::Relaxed);
-                    endpoint
-                        .stats
-                        .active_requests
-                        .fetch_add(1, Ordering::AcqRel);
+            // Query all endpoints in parallel
+            let futures: Vec<_> = self
+                .endpoints
+                .iter()
+                .map(|endpoint| {
+                    let effective_prefix = self.rewrite_uri_for_endpoint(prefix, endpoint);
+                    async move {
+                        endpoint
+                            .stats
+                            .total_requests
+                            .fetch_add(1, Ordering::Relaxed);
+                        endpoint
+                            .stats
+                            .active_requests
+                            .fetch_add(1, Ordering::AcqRel);
 
-                    let result = endpoint.store.list(&effective_prefix, recursive).await;
+                        let result = endpoint.store.list(&effective_prefix, recursive).await;
 
-                    endpoint
-                        .stats
-                        .active_requests
-                        .fetch_sub(1, Ordering::AcqRel);
+                        endpoint
+                            .stats
+                            .active_requests
+                            .fetch_sub(1, Ordering::AcqRel);
 
-                    if result.is_err() {
-                        endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                        if result.is_err() {
+                            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        result
                     }
+                })
+                .collect();
 
-                    result
-                }
-            })
-            .collect();
+            let results = join_all(futures).await;
 
-        let results = join_all(futures).await;
-
-        // Merge and deduplicate results
-        // For relative paths, each endpoint returns URIs with its own prefix.
-        // We return them as-is since callers may need the full URIs.
-        let mut all_uris: HashSet<String> = HashSet::new();
-        for result in results {
-            match result {
-                Ok(uris) => {
-                    all_uris.extend(uris);
-                }
-                Err(e) => {
-                    // Log but continue - some endpoints might fail while others succeed
-                    tracing::warn!("Failed to list from one endpoint: {}", e);
+            // Merge and deduplicate results
+            // For relative paths, each endpoint returns URIs with its own prefix.
+            // We return them as-is since callers may need the full URIs.
+            let mut all_uris: HashSet<String> = HashSet::new();
+            for result in results {
+                match result {
+                    Ok(uris) => {
+                        all_uris.extend(uris);
+                    }
+                    Err(e) => {
+                        // Log but continue - some endpoints might fail while others succeed
+                        tracing::warn!("Failed to list from one endpoint: {}", e);
+                    }
                 }
             }
-        }
 
-        let mut uris: Vec<String> = all_uris.into_iter().collect();
-        uris.sort(); // Consistent ordering
-        Ok(uris)
+            let mut uris: Vec<String> = all_uris.into_iter().collect();
+            uris.sort(); // Consistent ordering
+            Ok(uris)
+        })
+        .await
     }
 
     /// Get an object from a specific configured endpoint, bypassing load balancing
@@ -737,37 +747,40 @@ impl MultiEndpointStore {
     /// # Errors
     /// Returns an error if `index >= self.endpoint_count()`.
     pub async fn get_from_endpoint(&self, index: usize, uri: &str) -> Result<Bytes> {
-        let endpoint = self.endpoint_at(index)?;
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.endpoint_at(index)?;
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.get(&effective_uri).await;
+            let result = endpoint.store.get(&effective_uri).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        match &result {
-            Ok(data) => {
-                endpoint
-                    .stats
-                    .bytes_read
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+            match &result {
+                Ok(data) => {
+                    endpoint
+                        .stats
+                        .bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(_) => {
-                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
 
-        result
+            result
+        })
+        .await
     }
 
     /// Put an object to a specific configured endpoint, bypassing load balancing
@@ -776,38 +789,41 @@ impl MultiEndpointStore {
     /// # Errors
     /// Returns an error if `index >= self.endpoint_count()`.
     pub async fn put_to_endpoint(&self, index: usize, uri: &str, data: Bytes) -> Result<()> {
-        let endpoint = self.endpoint_at(index)?;
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        let len = data.len() as u64;
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.endpoint_at(index)?;
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            let len = data.len() as u64;
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.put(&effective_uri, data).await;
+            let result = endpoint.store.put(&effective_uri, data).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        match &result {
-            Ok(()) => {
-                endpoint
-                    .stats
-                    .bytes_written
-                    .fetch_add(len, Ordering::Relaxed);
+            match &result {
+                Ok(()) => {
+                    endpoint
+                        .stats
+                        .bytes_written
+                        .fetch_add(len, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(_) => {
-                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
 
-        result
+            result
+        })
+        .await
     }
 
     /// Delete an object from a specific configured endpoint, bypassing load
@@ -817,29 +833,32 @@ impl MultiEndpointStore {
     /// # Errors
     /// Returns an error if `index >= self.endpoint_count()`.
     pub async fn delete_from_endpoint(&self, index: usize, uri: &str) -> Result<()> {
-        let endpoint = self.endpoint_at(index)?;
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.endpoint_at(index)?;
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.delete(&effective_uri).await;
+            let result = endpoint.store.delete(&effective_uri).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     /// Put the same object to every configured endpoint (fan-out write), for
@@ -852,161 +871,173 @@ impl MultiEndpointStore {
     /// possible -- some endpoints may have received the write before a later one
     /// failed; this is not transactional).
     pub async fn put_all_endpoints(&self, uri: &str, data: Bytes) -> Result<()> {
-        use futures::future::join_all;
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            use futures::future::join_all;
 
-        let futures: Vec<_> = self
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-                let data = data.clone();
-                let len = data.len() as u64;
-                async move {
-                    endpoint
-                        .stats
-                        .total_requests
-                        .fetch_add(1, Ordering::Relaxed);
-                    endpoint
-                        .stats
-                        .active_requests
-                        .fetch_add(1, Ordering::AcqRel);
+            let futures: Vec<_> = self
+                .endpoints
+                .iter()
+                .map(|endpoint| {
+                    let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+                    let data = data.clone();
+                    let len = data.len() as u64;
+                    async move {
+                        endpoint
+                            .stats
+                            .total_requests
+                            .fetch_add(1, Ordering::Relaxed);
+                        endpoint
+                            .stats
+                            .active_requests
+                            .fetch_add(1, Ordering::AcqRel);
 
-                    let result = endpoint.store.put(&effective_uri, data).await;
+                        let result = endpoint.store.put(&effective_uri, data).await;
 
-                    endpoint
-                        .stats
-                        .active_requests
-                        .fetch_sub(1, Ordering::AcqRel);
+                        endpoint
+                            .stats
+                            .active_requests
+                            .fetch_sub(1, Ordering::AcqRel);
 
-                    match &result {
-                        Ok(()) => {
-                            endpoint
-                                .stats
-                                .bytes_written
-                                .fetch_add(len, Ordering::Relaxed);
+                        match &result {
+                            Ok(()) => {
+                                endpoint
+                                    .stats
+                                    .bytes_written
+                                    .fetch_add(len, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                        Err(_) => {
-                            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-                        }
+
+                        result
                     }
+                })
+                .collect();
 
-                    result
-                }
-            })
-            .collect();
-
-        for result in join_all(futures).await {
-            result?;
-        }
-        Ok(())
+            for result in join_all(futures).await {
+                result?;
+            }
+            Ok(())
+        })
+        .await
     }
 }
 
 #[async_trait]
 impl ObjectStore for MultiEndpointStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.get(&effective_uri).await;
+            let result = endpoint.store.get(&effective_uri).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        match &result {
-            Ok(data) => {
-                endpoint
-                    .stats
-                    .bytes_read
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+            match &result {
+                Ok(data) => {
+                    endpoint
+                        .stats
+                        .bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(_) => {
-                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint
-            .store
-            .get_range(&effective_uri, offset, length)
-            .await;
+            let result = endpoint
+                .store
+                .get_range(&effective_uri, offset, length)
+                .await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        match &result {
-            Ok(data) => {
-                endpoint
-                    .stats
-                    .bytes_read
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+            match &result {
+                Ok(data) => {
+                    endpoint
+                        .stats
+                        .bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(_) => {
-                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.get_optimized(&effective_uri).await;
+            let result = endpoint.store.get_optimized(&effective_uri).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        match &result {
-            Ok(data) => {
-                endpoint
-                    .stats
-                    .bytes_read
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+            match &result {
+                Ok(data) => {
+                    endpoint
+                        .stats
+                        .bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(_) => {
-                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn get_range_optimized(
@@ -1017,158 +1048,173 @@ impl ObjectStore for MultiEndpointStore {
         chunk_size: Option<usize>,
         max_concurrency: Option<usize>,
     ) -> Result<Bytes> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint
-            .store
-            .get_range_optimized(&effective_uri, offset, length, chunk_size, max_concurrency)
-            .await;
+            let result = endpoint
+                .store
+                .get_range_optimized(&effective_uri, offset, length, chunk_size, max_concurrency)
+                .await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        match &result {
-            Ok(data) => {
-                endpoint
-                    .stats
-                    .bytes_read
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+            match &result {
+                Ok(data) => {
+                    endpoint
+                        .stats
+                        .bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(_) => {
-                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let data_len = data.len() as u64;
-        // Bytes is zero-copy (reference counted, can be cloned cheaply)
-        let result = endpoint.store.put(&effective_uri, data).await;
+            let data_len = data.len() as u64;
+            // Bytes is zero-copy (reference counted, can be cloned cheaply)
+            let result = endpoint.store.put(&effective_uri, data).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        match &result {
-            Ok(_) => {
-                endpoint
-                    .stats
-                    .bytes_written
-                    .fetch_add(data_len, Ordering::Relaxed);
+            match &result {
+                Ok(_) => {
+                    endpoint
+                        .stats
+                        .bytes_written
+                        .fetch_add(data_len, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(_) => {
-                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.delete(&effective_uri).await;
+            let result = endpoint.store.delete(&effective_uri).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
-        let endpoint = self.select_endpoint();
-        // Rewrite all URIs in the batch
-        let effective_uris: Vec<String> = uris
-            .iter()
-            .map(|u| self.rewrite_uri_for_endpoint(u, endpoint))
-            .collect();
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(uris.len() as u64, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            // Rewrite all URIs in the batch
+            let effective_uris: Vec<String> = uris
+                .iter()
+                .map(|u| self.rewrite_uri_for_endpoint(u, endpoint))
+                .collect();
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(uris.len() as u64, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.delete_batch(&effective_uris).await;
+            let result = endpoint.store.delete_batch(&effective_uris).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn list(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {
-        let endpoint = self.select_endpoint();
-        let effective_prefix = self.rewrite_uri_for_endpoint(prefix, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_prefix = self.rewrite_uri_for_endpoint(prefix, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.list(&effective_prefix, recursive).await;
+            let result = endpoint.store.list(&effective_prefix, recursive).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     fn list_stream<'a>(
@@ -1192,215 +1238,239 @@ impl ObjectStore for MultiEndpointStore {
     }
 
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.stat(&effective_uri).await;
+            let result = endpoint.store.stat(&effective_uri).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let data_len = data.len() as u64;
-        // Bytes is zero-copy (reference counted, can be cloned cheaply)
-        let result = endpoint
-            .store
-            .put_multipart(&effective_uri, data, part_size)
-            .await;
+            let data_len = data.len() as u64;
+            // Bytes is zero-copy (reference counted, can be cloned cheaply)
+            let result = endpoint
+                .store
+                .put_multipart(&effective_uri, data, part_size)
+                .await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        match &result {
-            Ok(_) => {
-                endpoint
-                    .stats
-                    .bytes_written
-                    .fetch_add(data_len, Ordering::Relaxed);
+            match &result {
+                Ok(_) => {
+                    endpoint
+                        .stats
+                        .bytes_written
+                        .fetch_add(data_len, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(_) => {
-                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
-        let endpoint = self.select_endpoint();
-        let effective_prefix = self.rewrite_uri_for_endpoint(uri_prefix, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_prefix = self.rewrite_uri_for_endpoint(uri_prefix, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.delete_prefix(&effective_prefix).await;
+            let result = endpoint.store.delete_prefix(&effective_prefix).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
-        // Container names are typically not full URIs, pass through unchanged
-        let endpoint = self.select_endpoint();
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            // Container names are typically not full URIs, pass through unchanged
+            let endpoint = self.select_endpoint();
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.create_container(name).await;
+            let result = endpoint.store.create_container(name).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn delete_container(&self, name: &str) -> Result<()> {
-        // Container names are typically not full URIs, pass through unchanged
-        let endpoint = self.select_endpoint();
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            // Container names are typically not full URIs, pass through unchanged
+            let endpoint = self.select_endpoint();
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.delete_container(name).await;
+            let result = endpoint.store.delete_container(name).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn crate::object_store::ObjectWriter>> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
 
-        let result = endpoint.store.get_writer(&effective_uri).await;
+            let result = endpoint.store.get_writer(&effective_uri).await;
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn mkdir(&self, uri: &str) -> Result<()> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.mkdir(&effective_uri).await;
+            let result = endpoint.store.mkdir(&effective_uri).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 
     async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
-        let endpoint = self.select_endpoint();
-        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
-        endpoint
-            .stats
-            .total_requests
-            .fetch_add(1, Ordering::Relaxed);
-        endpoint
-            .stats
-            .active_requests
-            .fetch_add(1, Ordering::AcqRel);
+        crate::s3_logger::scope_call_logger(self.logger.clone(), async move {
+            let endpoint = self.select_endpoint();
+            let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+            endpoint
+                .stats
+                .total_requests
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_add(1, Ordering::AcqRel);
 
-        let result = endpoint.store.rmdir(&effective_uri, recursive).await;
+            let result = endpoint.store.rmdir(&effective_uri, recursive).await;
 
-        endpoint
-            .stats
-            .active_requests
-            .fetch_sub(1, Ordering::AcqRel);
+            endpoint
+                .stats
+                .active_requests
+                .fetch_sub(1, Ordering::AcqRel);
 
-        if result.is_err() {
-            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
-        }
+            if result.is_err() {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
 
-        result
+            result
+        })
+        .await
     }
 }
 

@@ -17,8 +17,10 @@ use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::{env, thread, time::Duration};
-use tokio::runtime::{Builder as TokioBuilder, Handle};
-use tokio::sync::{oneshot, OnceCell};
+#[cfg(feature = "extension-module")]
+use tokio::runtime::Builder as TokioBuilder;
+use tokio::runtime::Handle;
+use tokio::sync::OnceCell;
 use tracing::{debug, info}; // For logging
 
 // -----------------------------------------------------------------------------
@@ -114,8 +116,48 @@ pub fn set_s3_endpoint_override(url: &str) {
 // -----------------------------------------------------------------------------
 // Global runtime + S3 client (lazy, thread-safe)
 // -----------------------------------------------------------------------------
-static RT_HANDLE: once_cell::sync::OnceCell<Handle> = once_cell::sync::OnceCell::new();
-static CLIENT: OnceCell<Client> = OnceCell::const_new();
+static RT_HANDLE: crate::fork_guard::ForkCell<Handle> = crate::fork_guard::ForkCell::new();
+static CLIENT: crate::fork_guard::ForkCell<OnceCell<Client>> = crate::fork_guard::ForkCell::new();
+/// Worker threads of the pyo3 (decode / async-API) runtime, set by configure_thread_pools.
+#[cfg(feature = "extension-module")]
+pub(crate) static DECODE_THREADS: AtomicUsize = AtomicUsize::new(0);
+static RAYON_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// s3dlio's own rayon pool. It is NOT rayon's global pool and it is not built at import: it is
+/// built on first use (a process that never generates data never pays for its threads) and
+/// rebuilt in a fork child, because the worker threads of an inherited pool do not exist there
+/// and any parallel iterator would wait for them for ever (#297).
+///
+/// Every parallel iterator in s3dlio runs as `with_rayon_pool(|| ...)`, i.e. inside
+/// `rayon_pool().install(..)`, so the work never touches rayon's global pool (which would be
+/// built by rayon itself, on first use, with no knowledge of forks).
+pub(crate) fn rayon_pool() -> &'static rayon::ThreadPool {
+    RAYON_POOL.get_or_init(|| {
+        let n = RAYON_THREADS.load(Ordering::Relaxed);
+        let mut b = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("s3dlio-rayon-{i}"));
+        if n > 0 {
+            b = b.num_threads(n);
+        }
+        b.build().expect("failed to build the s3dlio rayon pool")
+    })
+}
+
+static RAYON_POOL: crate::fork_guard::ForkCell<rayon::ThreadPool> =
+    crate::fork_guard::ForkCell::new();
+
+/// Worker threads of s3dlio's rayon pool (builds the pool if it does not exist yet).
+#[doc(hidden)]
+pub fn rayon_pool_threads() -> usize {
+    rayon_pool().current_num_threads()
+}
+
+/// Run `f` inside s3dlio's rayon pool: any `par_iter`/`par_chunks_mut` it uses runs on the
+/// pool's threads. The one way s3dlio uses rayon (and the way to run your own parallel work on
+/// a pool that survives a `fork()`: see `fork_guard`).
+#[doc(hidden)]
+pub fn with_rayon_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    rayon_pool().install(f)
+}
 
 /// Concurrency hint set by [`configure_for_concurrency`].
 /// Zero means "not set" — `get_runtime_threads` uses the CPU-based default.
@@ -152,9 +194,10 @@ pub fn configure_for_concurrency(n: usize) {
     CONCURRENCY_HINT.store(n, Ordering::Relaxed);
 }
 
-/// Auto-configure every process-wide thread pool s3dlio owns: the global
-/// s3dlio Tokio runtime, the `pyo3_async_runtimes` Tokio runtime (Python
-/// extension builds only), and Rayon's global pool.
+/// Record the size of every process-wide thread pool s3dlio owns: the global
+/// s3dlio Tokio runtime, the decode/async-API Tokio runtime (Python
+/// extension builds only), and s3dlio's own rayon pool. NO pool is built here: each is built
+/// lazily on first use (and rebuilt in a fork child, #297), with the size recorded last.
 ///
 /// `threads = 0` means "auto-detect from MPI/distributed-training env vars"
 /// (see [`crate::constants::mpi_aware_thread_budget`]); a positive value is
@@ -170,14 +213,11 @@ pub fn configure_for_concurrency(n: usize) {
 /// future call site — any data format, reading or writing, Python or
 /// pure-Rust — gets a correctly-sized pool without needing to opt in.
 ///
-/// Idempotent / safe to call more than once: the global s3dlio Tokio runtime
-/// (`RT_HANDLE`) and Rayon's global pool are each backed by a `OnceLock`-style
-/// cell that only takes effect on first build, and `pyo3_async_runtimes::
-/// tokio::init()` merely stores the pending builder in a mutex — it does not
-/// build the runtime until first use — so a later explicit
+/// Idempotent / safe to call more than once: only sizes are stored, and a pool takes the
+/// size that is stored when it is first built, so a later explicit
 /// `configure_tokio_threads(n)` call from Python still fully overrides an
 /// earlier automatic call, as long as it happens before the first actual S3
-/// operation / `create_async_loader` call, exactly as already documented.
+/// operation / `create_async_loader` / data-generation call, exactly as already documented.
 pub fn configure_thread_pools(threads: usize) {
     // The MPI world-size variables sized below, and the pools built, come after the policy.
     crate::dotenv::apply();
@@ -189,27 +229,52 @@ pub fn configure_thread_pools(threads: usize) {
 
     // Global s3dlio Tokio runtime (blocking/sync + Python callers).
     RT_THREADS_LIMIT.store(threads, Ordering::Relaxed);
+    RAYON_THREADS.store(threads, Ordering::Relaxed);
 
     // pyo3-async-runtimes Tokio runtime (create_async_loader / Arrow decode
     // streaming pipeline) -- only present in Python extension builds.
     #[cfg(feature = "extension-module")]
     {
-        let mut builder = TokioBuilder::new_multi_thread();
-        builder.worker_threads(threads);
-        builder.enable_all();
-        builder.thread_name("s3dlio-decode");
-        pyo3_async_runtimes::tokio::init(builder);
+        // Only the size is recorded here: the runtime itself is built lazily by
+        // `pyo3_runtime()` (and rebuilt in a fork child).
+        DECODE_THREADS.store(threads, Ordering::Relaxed);
     }
 
-    // Rayon global pool (NPZ/data-gen par_chunks_mut hot paths). Ignore the
-    // Err case: it just means the pool was already built (e.g. by a prior
-    // call to this function, or by Rayon's own lazy default racing ahead of
-    // us) -- there is no way to resize an already-built global pool, and
-    // that's fine, since whichever call won still sized it correctly.
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|i| format!("s3dlio-rayon-{i}"))
-        .build_global();
+    // s3dlio's rayon pool (NPZ/data-gen par_chunks_mut hot paths) is built lazily, on the first
+    // parallel call, with the size stored above (#297: no thread pool is built at import).
+}
+
+/// The builder of the pyo3-async-runtimes Tokio runtime (Arrow decode streaming, the async Python
+/// entry points). A function so a test can build it and look at its threads.
+#[cfg(feature = "extension-module")]
+pub(crate) fn decode_runtime_builder(threads: usize) -> TokioBuilder {
+    let mut builder = crate::runtime_support::marked_multi_thread_builder();
+    builder.worker_threads(threads);
+    builder.enable_all();
+    builder.thread_name("s3dlio-decode");
+    builder
+}
+
+/// The Tokio runtime behind the Python async entry points and the data loaders (what
+/// `pyo3_async_runtimes::tokio::get_runtime()` was). Owned here so that a fork child builds
+/// its own instead of using the parent's threadless copy (#297).
+#[cfg(feature = "extension-module")]
+pub(crate) fn pyo3_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: crate::fork_guard::ForkCell<tokio::runtime::Runtime> =
+        crate::fork_guard::ForkCell::new();
+    RT.get_or_init(|| {
+        let threads = DECODE_THREADS.load(Ordering::Relaxed);
+        let mut b = if threads > 0 {
+            decode_runtime_builder(threads)
+        } else {
+            let mut b = crate::runtime_support::marked_multi_thread_builder();
+            b.enable_all();
+            b.thread_name("s3dlio-decode");
+            b
+        };
+        b.build()
+            .expect("failed to build the s3dlio decode runtime")
+    })
 }
 
 /// Returns `true` when `S3DLIO_UNSIGNED_PAYLOAD=1` (or `true`/`yes`/`on`/`enable`).
@@ -267,7 +332,7 @@ pub(crate) fn global_rt_handle() -> &'static Handle {
                 let threads = get_runtime_threads();
                 debug!("Creating Tokio runtime with {} worker threads", threads);
 
-                let rt = TokioBuilder::new_multi_thread()
+                let rt = crate::runtime_support::marked_multi_thread_builder()
                     .enable_io()
                     .enable_time()
                     .worker_threads(threads)
@@ -372,14 +437,16 @@ fn get_runtime_threads() -> usize {
     let threads = if hint > base {
         std::cmp::min(hint, cores * 4)
     } else {
-        base
+        // Floor 2: this runtime runs user and s3dlio work futures, and with ONE worker a single
+        // blocking task starves everything else (MPI-aware sizing can compute 1).
+        base.max(2)
     };
 
     // Hard upper bound set by configure_tokio_threads() — enforces MPI-aware
     // per-process thread budget so NP processes don't all claim all cores.
     let limit = RT_THREADS_LIMIT.load(Ordering::Relaxed);
     if limit > 0 {
-        std::cmp::min(threads, limit).max(1)
+        std::cmp::min(threads, limit).max(2)
     } else {
         threads
     }
@@ -400,85 +467,214 @@ fn get_runtime_threads() -> usize {
 /// is parked in `recv()`) or `block_in_place`.  The spawned task therefore
 /// never ran, regardless of the worker count.
 ///
-/// The fix, by calling context:
-/// * **No runtime on this thread** -- plain OS thread: spawn and wait, as
-///   before.
-/// * **Multi-thread runtime** (the global runtime always is one) -- wait
-///   inside [`tokio::task::block_in_place`].  That hands the worker's core,
-///   including its LIFO slot, to another worker *before* we block, and the
-///   spawn performed inside the closure goes through the injection queue, so
-///   `fut` is always runnable by some other worker.  This also keeps a
-///   foreign multi-thread runtime's capacity intact while we wait.
-///   `block_in_place` was chosen over "await the nested future directly"
-///   because this function is synchronous and returns `T`, not a future:
-///   the nested future cannot be awaited from here without changing the
-///   signature of ~40 sync callers.
-/// * **Current-thread runtime** -- `block_in_place` panics there, so it is
-///   not used.  The global runtime is always multi-thread and is a different
-///   runtime, so a plain blocking wait can only stall the caller's own
-///   (single-thread) runtime, never deadlock against the global one; `fut`
-///   still executes on the global runtime.  This is the pre-existing
-///   behaviour that e.g. `#[tokio::test]` callers rely on.
+/// The rule, by calling context (#173, #300). The wait is [`crate::runtime_support`]'s
+/// `blocking_wait`; in order:
+/// 1. inside an [`crate::runtime_support::inline_blocking_io`] scope: a plain blocking wait;
+/// 2. the thread carries the worker marker (the global runtime's workers, s3dlio's other
+///    runtimes, any runtime built with [`crate::runtime_support::mark_tokio_worker_thread`]) and
+///    the current runtime is multi-thread: the wait is inside [`tokio::task::block_in_place`].
+///    That hands the worker's core, including its LIFO slot, to another worker *before* we
+///    block, and the spawn performed inside the closure goes through the injection queue, so
+///    `fut` is always runnable by some other worker (#173);
+/// 3. not marked, multi-thread runtime, inside a task, and the thread bears tokio's default worker
+///    thread name: `block_in_place` as in 2. This keeps the hand-off for an embedder's own
+///    `#[tokio::main]` or `#[tokio::test(flavor = "multi_thread")]` runtime, where `fut` (or what
+///    it needs, such as an in-process server) may depend on that same runtime making progress;
+/// 4. everything else: a plain blocking wait. That is no runtime, a current-thread runtime, the
+///    main thread of `Runtime::block_on`, a `LocalSet` driven by a non-worker thread
+///    (`run_until`, `block_on`, `spawn_local`), `Handle::block_on`, a `spawn_blocking` thread, and
+///    an unmarked runtime whose threads have custom names. `block_in_place` is never called
+///    there: it panics inside a `LocalSet` that a non-worker thread drives (#300). `fut` runs on
+///    the global runtime, which is never the caller's runtime here, and every pooled connection
+///    belongs to the I/O runtime (#303, `in_io_ctx`), so the wait cannot stall on a connection
+///    the blocked caller's runtime opened.
 ///
-/// Recorded limit: a thread that is a multi-thread runtime handle's
-/// `enter()` guard *inside* a current-thread `block_on` is not detectable
-/// from `Handle::runtime_flavor()` and would make `block_in_place` panic.
+/// Recorded limits (see `runtime_support` for the details and the remedies):
+/// (a) a worker of an unmarked runtime with CUSTOM thread names takes rule 4: no panic, but it gets
+/// no hand-off (every call parks a worker for its whole duration, and it HANGS if the awaited work
+/// needs that same runtime, such as an in-process server: the error after the operation timeout
+/// names that cause, #303); call
+/// `Builder::on_thread_start(mark_tokio_worker_thread)`, or use the async API;
+/// (b) PANIC on any thread that carries the default tokio worker name or the s3dlio marker and
+/// drives a `LocalSet` with the call inside a task: a `spawn_blocking` thread (even without
+/// `spawn_local`: the blocking task's id persists inside `Handle::block_on`) or a thread
+/// hand-named like tokio's default. Wrap the closure in
+/// [`crate::runtime_support::inline_blocking_io`].
 pub fn run_on_global_rt<F, T>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::runtime::Handle::try_current() {
-        Ok(current) => {
-            let spawn_and_wait = move || {
-                let handle = global_rt_handle().clone();
-                let (tx, rx) = std::sync::mpsc::channel();
+    let spawn_and_wait = move || {
+        let handle = global_rt_handle().clone();
+        let (tx, rx) = std::sync::mpsc::channel();
 
-                handle.spawn(async move {
-                    let result = fut.await;
-                    let _ = tx.send(result);
-                });
+        handle.spawn(async move {
+            let result = fut.await;
+            let _ = tx.send(result);
+        });
 
-                rx.recv()
-                    .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
-            };
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
+    };
 
-            match current.runtime_flavor() {
-                tokio::runtime::RuntimeFlavor::MultiThread => {
-                    tokio::task::block_in_place(spawn_and_wait)
-                }
-                // Current-thread (or any future flavor): block_in_place is
-                // invalid here; see the doc comment above.
-                _ => spawn_and_wait(),
-            }
+    // Hand the worker's core off ONLY where `runtime_support` knows that is valid (a marked
+    // worker of a multi-thread runtime, outside an `inline_blocking_io` scope); a plain
+    // blocking wait everywhere else. No runtime state is probed by provoking a panic.
+    //
+    // A wait that ends in the SDK's operation-timeout error, after (about) the whole operation
+    // timeout, on a thread that belongs to a tokio runtime, is named for what it can be (#303):
+    // the one way left for this wait to stall is awaited work that needs THIS runtime, such as
+    // an in-process server task, which cannot run while the thread is blocked here. (A pooled
+    // connection of the caller's runtime no longer can: all network I/O runs on the I/O runtime.)
+    // Nothing else gets the text: not a long call that fails for another reason, not a disabled
+    // (0) timeout, not an error long before or long after the timeout.
+    let on_runtime_thread = tokio::runtime::Handle::try_current().is_ok();
+    let started = std::time::Instant::now();
+    let result = crate::runtime_support::blocking_wait(spawn_and_wait);
+    match result {
+        Err(e) if on_runtime_thread && is_blocked_runtime_timeout(&e, started.elapsed()) => {
+            Err(e.context(BLOCKED_RUNTIME_HINT))
         }
-        Err(_) => {
-            // Not in a runtime, use our original approach with oneshot
-            let handle = global_rt_handle().clone();
-            let (tx, rx) = oneshot::channel();
-
-            handle.spawn(async move {
-                let _ = tx.send(fut.await);
-            });
-
-            // Block this plain OS thread until the async result arrives.
-            rx.blocking_recv()
-                .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
-        }
+        other => other,
     }
 }
+
+/// The operation-timeout error text of `s3_utils` (kept in one place so the hint can test it).
+pub(crate) const OPERATION_TIMEOUT_TEXT: &str = "request timed out after";
+
+/// True when `e` IS the SDK operation timeout and `elapsed` is within a window around the
+/// configured timeout (never when the timeout is 0 / disabled).
+pub(crate) fn is_blocked_runtime_timeout(e: &anyhow::Error, elapsed: Duration) -> bool {
+    let timeout = get_operation_timeout();
+    if timeout.is_zero() {
+        return false;
+    }
+    let in_window =
+        elapsed + Duration::from_secs(1) >= timeout && elapsed <= timeout + Duration::from_secs(5);
+    in_window && format!("{e:#}").contains(OPERATION_TIMEOUT_TEXT)
+}
+
+/// Context added to a synchronous wrapper's error that took the whole operation timeout on a
+/// thread of a tokio runtime (see [`run_on_global_rt`]).
+const BLOCKED_RUNTIME_HINT: &str =
+    "this synchronous s3dlio call blocked a thread that belongs to a tokio runtime for the whole \
+operation timeout; if the endpoint is served by a task on that same runtime (an in-process \
+server), that task cannot run while this thread is blocked: use the async API, or call the \
+synchronous API from spawn_blocking or a plain thread (if the endpoint is not served by this \
+process, this is an ordinary network timeout)";
 
 /// Spawn a task on the global runtime without blocking (non-blocking spawn).
 /// Returns a JoinHandle immediately that can be awaited later.
 ///
 /// This is more efficient than `run_on_global_rt` when you just want to
 /// kick off async work and poll it later, avoiding the channel overhead.
+///
+/// The future must NOT block a thread (no `std::thread::sleep`, no blocking I/O or locks held
+/// for long, no CPU-bound loop): it runs on a global-runtime worker, and the synchronous
+/// wrappers and every task they run share those workers. (Network I/O does not depend on them:
+/// connections belong to the separate I/O runtime, #303.)
 pub fn spawn_on_global_rt<F, T>(fut: F) -> tokio::task::JoinHandle<T>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
     global_rt_handle().spawn(fut)
+}
+
+/// The handle of s3dlio's dedicated I/O-owner runtime (#303 round 1).
+///
+/// A small multi-thread runtime (2 threads, see [`io_threads`]) that exists ONLY to own the sockets, timers
+/// and connection tasks of every pooled HTTP/gRPC connection. It never runs s3dlio's work
+/// futures or a caller's: `spawn_on_global_rt`, the sync-wrapper waits, `block_in_place`
+/// hand-offs and every user task live on the global runtime or the caller's own, so blocking
+/// all of those cannot stall an in-flight or idle connection. (Round 0 bound connections to the
+/// global runtime itself; with every global worker blocked by user code, even an async-only
+/// caller's requests then timed out.) Like the global runtime it lives on a parked thread for
+/// the life of the process; created lazily; keep it behind the same fork-awareness as
+/// `RT_HANDLE`: a `ForkCell`, rebuilt per fork epoch (#297), so a fork child never enters the
+/// parent's dead runtime.
+static IO_RT_HANDLE: crate::fork_guard::ForkCell<Handle> = crate::fork_guard::ForkCell::new();
+
+/// Worker threads of the I/O-owner runtime: `S3DLIO_IO_THREADS` (>= 1), else 2. Measured on
+/// Loki-4 (7 paired rounds, 256 MiB `get_into` best GB/s, median): 2 threads 5.2, 4 threads
+/// 4.1, 8 threads 4.6, 16 threads 3.9; parallel-stream throughput (range-engine GET, 64-way
+/// HEAD) is the same for all four. More threads let a connection task migrate away from the
+/// thread that consumes its data. Raise it only if very large aggregates (many parallel TLS
+/// streams, more than a few GB/s) saturate the two threads.
+fn io_threads() -> usize {
+    std::env::var("S3DLIO_IO_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(2)
+}
+
+pub(crate) fn io_rt_handle() -> &'static Handle {
+    IO_RT_HANDLE.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("s3dlio-io".to_string())
+            .spawn(move || {
+                let rt = crate::runtime_support::marked_multi_thread_builder()
+                    .enable_all()
+                    .worker_threads(io_threads())
+                    .thread_name("s3dlio-io-worker")
+                    .build()
+                    .expect("failed to build the s3dlio I/O runtime");
+                tx.send(rt.handle().clone())
+                    .expect("send I/O runtime handle");
+                rt.block_on(async { std::future::pending::<()>().await });
+            })
+            .expect("failed to spawn the s3dlio I/O runtime thread");
+        rx.recv().expect("receive I/O runtime handle")
+    })
+}
+
+/// Poll `fut` with the I/O-owner runtime entered as the tokio context, from any runtime (#303).
+///
+/// A pooled HTTP connection belongs to the runtime that creates it: its socket is registered
+/// with that runtime's I/O driver, its timers with that runtime's time driver, and the task that
+/// drives it is spawned onto that runtime (`tokio::spawn` and every `Handle::current()` use the
+/// runtime context of the thread that polls the creating future). Created while a caller's
+/// current-thread runtime was polling, a connection stalled every later request that reused it
+/// for the whole operation timeout whenever that runtime was alive but blocked (a sync s3dlio
+/// call waiting on its only thread).
+///
+/// Entering the I/O runtime's context around every poll of the HTTP futures
+/// ([`tokio::runtime::Handle::enter`], documented for exactly this) makes every socket, timer and
+/// connection task they create belong to the I/O runtime, which no caller and no s3dlio work
+/// future can block. The future itself keeps being polled by the caller's task: there is no
+/// spawn, no `'static` bound, no extra thread hop, and dropping the returned future drops `fut`,
+/// exactly as before. Buffers the future borrows (the caller-buffer `get_into` paths) are
+/// untouched, so Rule #1 (zero copy) holds with no change to those paths.
+///
+/// Anything `fut` spawns or registers while it is polled lands on the I/O runtime, so `fut`
+/// must be network I/O only. Work done when a connection or body is DROPPED outside a poll is
+/// not covered (a drop only releases resources; it creates no connection and no connection
+/// task). The caller's own runtime still needs its time driver (the SDK's timeouts) .
+pub(crate) async fn in_io_ctx<F: std::future::Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let handle = io_rt_handle();
+    std::future::poll_fn(move |cx| {
+        let _entered = handle.enter();
+        fut.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// [`in_io_ctx`] for a stream: every poll runs with the I/O runtime entered.
+#[cfg(feature = "backend-gcs")]
+pub(crate) fn in_io_ctx_stream<S>(stream: S) -> impl futures::Stream<Item = S::Item> + Unpin
+where
+    S: futures::Stream + Unpin,
+{
+    let handle = io_rt_handle();
+    let mut stream = stream;
+    futures::stream::poll_fn(move |cx| {
+        let _entered = handle.enter();
+        std::pin::Pin::new(&mut stream).poll_next(cx)
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -511,6 +707,7 @@ pub fn aws_s3_client() -> Result<Client> {
 /// Safe to call from any async context; initializes once without blocking.
 pub async fn aws_s3_client_async() -> Result<Client> {
     let client_ref = CLIENT
+        .get_or_init(OnceCell::new)
         .get_or_try_init(|| async {
             crate::dotenv::apply();
 
@@ -787,7 +984,9 @@ mod mpi_aware_runtime_sizing_tests {
         with_clean_state(|| {
             std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
             let cpus = num_cpus::get();
-            let expected = (cpus / 4).max(1);
+            // The global runtime keeps at least 2 workers (#303 round 1): on a 4-CPU host
+            // (GitHub runners) the per-rank share 4 / 4 = 1 is raised to 2.
+            let expected = (cpus / 4).max(2);
             assert_eq!(
                 get_runtime_threads(),
                 expected,
@@ -825,7 +1024,9 @@ mod mpi_aware_runtime_sizing_tests {
         with_clean_state(|| {
             std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
             RT_THREADS_LIMIT.store(1, Ordering::Relaxed);
-            assert_eq!(get_runtime_threads(), 1);
+            // The limit still caps the MPI default, down to the floor of 2 workers that the
+            // runtime running work futures keeps (#303 round 1).
+            assert_eq!(get_runtime_threads(), 2);
         });
     }
 
@@ -851,10 +1052,10 @@ mod mpi_aware_runtime_sizing_tests {
 
     #[test]
     fn configure_thread_pools_is_idempotent_does_not_panic_on_repeat_calls() {
-        // Rayon's global pool can only be *built* once per process; calling
+        // s3dlio's rayon pool is built lazily, on first use; calling
         // this twice (e.g. an automatic call at import followed by an
-        // explicit user override) must not panic even though the second
-        // build_global() call is necessarily a no-op.
+        // explicit user override) must not panic, and the last call wins as long as
+        // the pool does not exist yet.
         with_clean_state(|| {
             configure_thread_pools(2);
             configure_thread_pools(4);
@@ -1144,6 +1345,56 @@ pub(crate) mod issue173_worker_reentrancy_tests {
     }
 }
 
+/// Every production runtime must carry the worker marker (#295): the global runtime (the one the
+/// Python entry points and `run_on_global_rt` use) and, under `extension-module`, the decode runtime.
+#[cfg(test)]
+mod runtime_marker_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A real `file://` `get_into` on the global runtime hands the worker off.
+    #[test]
+    fn global_runtime_hands_off_file_get_into() {
+        use crate::object_store::store_for_uri;
+        let dir = std::env::temp_dir().join(format!("s3dlio-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("obj.bin");
+        std::fs::write(&path, vec![7u8; 1 << 20]).unwrap();
+        let uri = format!("file://{}", path.display());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let before = crate::runtime_support::handoff_count();
+        global_rt_handle().spawn(async move {
+            let on_marked = crate::runtime_support::would_hand_off();
+            let store = store_for_uri(&uri).expect("store");
+            let mut buf = vec![0u8; 1 << 20];
+            let progress = crate::object_store::ReceiveProgress::new();
+            let n = store.get_into(&uri, &mut buf[..], &progress).await;
+            let _ = tx.send((on_marked, n.is_ok(), buf[0]));
+        });
+        let (on_marked, ok, b0) = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("read finished");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(on_marked, "a global-runtime worker is not marked");
+        assert!(ok && b0 == 7);
+        assert!(
+            crate::runtime_support::handoff_count() > before,
+            "get_into on the global runtime did not hand the worker off"
+        );
+    }
+
+    #[cfg(feature = "extension-module")]
+    #[test]
+    fn decode_runtime_workers_are_marked() {
+        let rt = decode_runtime_builder(2).build().unwrap();
+        assert!(rt.block_on(async {
+            tokio::spawn(async { crate::runtime_support::would_hand_off() })
+                .await
+                .unwrap()
+        }));
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Tests -- issue #183: AWS_ENDPOINT_URL_S3 takes precedence over AWS_ENDPOINT_URL
 // -----------------------------------------------------------------------------
@@ -1183,5 +1434,82 @@ mod endpoint_override_precedence_tests {
     fn nothing_set_or_only_empty_values_is_no_override() {
         assert_eq!(resolve(None, None), None);
         assert_eq!(resolve(Some(""), Some("")), None);
+    }
+}
+
+#[cfg(test)]
+mod blocked_runtime_hint_tests {
+    use super::*;
+
+    const VARS: [&str; 1] = ["S3DLIO_OPERATION_TIMEOUT_SECS"];
+
+    fn timeout_error(secs: u64) -> anyhow::Error {
+        anyhow::anyhow!(
+            "HEAD for s3://b/k failed: {OPERATION_TIMEOUT_TEXT} {secs}s — check network connectivity"
+        )
+    }
+
+    /// #303 round 1: the self-deadlock text is attached only to the operation-timeout error,
+    /// in a window around the timeout, and never when the timeout is 0 (disabled).
+    #[test]
+    fn the_hint_needs_the_timeout_error_inside_the_window() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&VARS);
+        std::env::set_var("S3DLIO_OPERATION_TIMEOUT_SECS", "60");
+        let secs = Duration::from_secs;
+        // the timeout error at about the timeout: yes
+        assert!(is_blocked_runtime_timeout(&timeout_error(60), secs(60)));
+        assert!(is_blocked_runtime_timeout(&timeout_error(60), secs(59)));
+        assert!(is_blocked_runtime_timeout(&timeout_error(60), secs(64)));
+        // a long call that fails for another reason: no
+        let other = anyhow::anyhow!("PUT failed: AccessDenied");
+        assert!(!is_blocked_runtime_timeout(&other, secs(60)));
+        assert!(!is_blocked_runtime_timeout(&other, secs(600)));
+        // the timeout error far from the timeout (a retry loop, a different cause): no
+        assert!(!is_blocked_runtime_timeout(&timeout_error(60), secs(5)));
+        assert!(!is_blocked_runtime_timeout(&timeout_error(60), secs(600)));
+        // a disabled timeout never gets the text
+        std::env::set_var("S3DLIO_OPERATION_TIMEOUT_SECS", "0");
+        assert!(!is_blocked_runtime_timeout(&timeout_error(0), secs(0)));
+        assert!(!is_blocked_runtime_timeout(&timeout_error(0), secs(3)));
+    }
+
+    /// Round 1: MPI-aware sizing can compute 1 worker; the runtime that runs work futures
+    /// keeps a floor of 2 (one blocking task must not starve everything else).
+    #[test]
+    fn the_work_runtime_never_gets_fewer_than_two_workers_from_sizing() {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&[
+            "S3DLIO_RT_THREADS",
+            "S3DLIO_RT_THREADS_UNSAFE",
+            "OMPI_COMM_WORLD_SIZE",
+            "PMI_SIZE",
+            "WORLD_SIZE",
+        ]);
+        let _hint = crate::test_env::AtomicRestore::capture(&CONCURRENCY_HINT);
+        let _limit = crate::test_env::AtomicRestore::capture(&RT_THREADS_LIMIT);
+        std::env::remove_var("S3DLIO_RT_THREADS");
+        std::env::remove_var("S3DLIO_RT_THREADS_UNSAFE");
+        CONCURRENCY_HINT.store(0, Ordering::Relaxed);
+        RT_THREADS_LIMIT.store(1, Ordering::Relaxed);
+        assert!(get_runtime_threads() >= 2);
+        RT_THREADS_LIMIT.store(0, Ordering::Relaxed);
+        std::env::set_var("OMPI_COMM_WORLD_SIZE", "4096");
+        assert!(get_runtime_threads() >= 2);
+    }
+
+    /// The I/O-owner runtime exists, is separate from the global runtime, and has its own threads.
+    #[test]
+    fn the_io_runtime_is_a_separate_runtime() {
+        let io = io_rt_handle();
+        assert_ne!(io.id(), global_rt_handle().id());
+        let worker = std::sync::mpsc::channel();
+        let tx = worker.0;
+        io.spawn(async move {
+            tx.send(std::thread::current().name().map(str::to_string))
+                .ok();
+        });
+        let n = worker.1.recv_timeout(Duration::from_secs(5)).expect("ran");
+        assert_eq!(n.as_deref(), Some("s3dlio-io-worker"));
     }
 }

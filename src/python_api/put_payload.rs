@@ -94,8 +94,15 @@
 //!   ([`EXPORT_RELEASE_GRACE`]) that normally lets the callers above get there first, so it
 //!   finds nothing to do and never contends for the GIL on the hot path.
 //!
-//! Exact `bytes` are held as a `Py<PyBytes>`: dropping it off the GIL defers the decref
-//! (pyo3's reference pool), also without blocking.
+//! Exact `bytes` are held by [`PyBytesOwner`] as a raw owned reference that is NEVER dropped as a
+//! `Py` off the GIL: the last clone of the `Bytes` dies on whatever thread the store finishes
+//! with it (a Tokio worker, a thread inside `py.detach`), and the owner queues the reference on
+//! the release queue for a thread that holds the GIL (the `put_bytes` / checkpoint-save caller
+//! drains it, else the releaser thread). A `Py` dropped without the GIL would instead be
+//! registered in pyo3's process-global reference pool, a mutex that a parent thread can hold at
+//! a `fork()`, leaving the child's first Python call waiting for ever (#297). Rule for all of
+//! s3dlio: no `Py<..>` is ever dropped without the GIL; CI builds a wheel with
+//! `--cfg pyo3_disable_reference_pool`, where such a drop aborts, to enforce it.
 //!
 //! # Interpreter shutdown
 //!
@@ -154,7 +161,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::constants::{
@@ -543,19 +550,41 @@ pub(crate) struct ExportStats {
     pub(crate) releaser_attaches: usize,
     /// Test hook: times the releaser parked at the armed point.
     pub(crate) test_releaser_parked: u64,
+    /// Owned Python references queued for a GIL holder instead of being dropped without the GIL
+    /// (#297): one per exact-`bytes` payload whose last clone died, plus `async_gilref_deferred`.
+    pub(crate) deferred_decrefs: u64,
+    /// Async-bridge references that were NOT consumed under the GIL and fell back to the queue
+    /// (a task dropped at runtime shutdown, a delivery refused by the closed gate). Zero in normal
+    /// operation: the tests assert it stays zero.
+    pub(crate) async_gilref_deferred: u64,
 }
+
+/// The lock every unit test that touches the process-global release queue holds for its whole
+/// duration (see `tests::init`).
+#[cfg(test)]
+pub(crate) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// See [`ExportStats::deferred_decrefs`].
+static DEFERRED_DECREFS: AtomicU64 = AtomicU64::new(0);
+/// See [`ExportStats::async_gilref_deferred`].
+pub(crate) static ASYNC_GILREF_DEFERRED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn export_stats() -> ExportStats {
     ExportStats {
         quiesce_timeouts: QUIESCE_TIMEOUTS.load(Ordering::Relaxed),
         queued: QUEUE.get().map_or(0, |q| q.count.load(Ordering::Acquire)),
         internal_errors: BARRIER_INTERNAL_ERRORS.load(Ordering::Relaxed),
-        shutdown_attach_waits: GATE.waits.load(Ordering::Relaxed),
-        shutdown_attach_wait_timeouts: GATE.wait_timeouts.load(Ordering::Relaxed),
+        shutdown_attach_waits: gate().waits.load(Ordering::Relaxed),
+        shutdown_attach_wait_timeouts: gate().wait_timeouts.load(Ordering::Relaxed),
         releaser_attaches: QUEUE
             .get()
             .map_or(0, |q| q.attaches.load(Ordering::Relaxed)),
         test_releaser_parked: TEST_RELEASER_PARKED.load(Ordering::SeqCst),
+        deferred_decrefs: DEFERRED_DECREFS.load(Ordering::Relaxed),
+        async_gilref_deferred: ASYNC_GILREF_DEFERRED.load(Ordering::Relaxed),
     }
 }
 
@@ -725,9 +754,33 @@ impl RawExport {
     }
 }
 
+/// What waits in the [`ReleaseQueue`] for a thread that holds the GIL: a buffer export to
+/// release, or one owned reference to a Python object (an exact `bytes` payload) to decref.
+/// The second exists so that NO `Py<..>` of s3dlio is ever dropped without the GIL: pyo3 would
+/// push such a drop onto its global reference pool (a mutex that another thread may hold at a
+/// `fork()`, which wedges the child's first Python call, #297).
+enum Deferred {
+    Export(RawExport),
+    Decref(std::ptr::NonNull<ffi::PyObject>),
+}
+
+// SAFETY: `RawExport` is `Send` (see above); the pointer is an OWNED reference that is only
+// released by a thread holding the GIL.
+unsafe impl Send for Deferred {}
+
+impl Deferred {
+    fn release(self, py: Python<'_>) {
+        match self {
+            Deferred::Export(e) => e.release(py),
+            // SAFETY: `py` proves the GIL is held; the pointer is an owned reference.
+            Deferred::Decref(p) => unsafe { ffi::Py_DECREF(p.as_ptr()) },
+        }
+    }
+}
+
 /// Queue of exports waiting for a thread that holds the GIL to release them.
 struct ReleaseQueue {
-    pending: Mutex<Vec<RawExport>>,
+    pending: Mutex<Vec<Deferred>>,
     wake: Condvar,
     count: AtomicUsize,
     /// The autonomous attach gate (closed at interpreter exit): the releaser enters it before
@@ -742,7 +795,15 @@ struct ReleaseQueue {
 }
 
 /// The process-wide gate, closed once by the atexit callback; see [`begin_shutdown`].
-static GATE: AttachGate = AttachGate::new();
+///
+/// Fork-aware (#297): the in-flight count belongs to threads of the process that made it, and the
+/// gate's lock may have been held by one of them at a fork. A fork child starts with a fresh,
+/// open gate (the inherited one is leaked, never used).
+static GATE_CELL: crate::fork_guard::ForkCell<AttachGate> = crate::fork_guard::ForkCell::new();
+
+fn gate() -> &'static AttachGate {
+    GATE_CELL.get_or_init(AttachGate::new)
+}
 
 /// Gate for the releaser thread's autonomous attachments to the interpreter.
 ///
@@ -854,13 +915,22 @@ fn park_releaser_for_test() {
 }
 
 impl ReleaseQueue {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<RawExport>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Deferred>> {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn push(&self, export: RawExport) {
+        self.push_item(Deferred::Export(export));
+    }
+
+    /// Queue one owned reference to a Python object for a GIL holder to decref.
+    fn push_decref(&self, obj: std::ptr::NonNull<ffi::PyObject>) {
+        self.push_item(Deferred::Decref(obj));
+    }
+
+    fn push_item(&self, item: Deferred) {
         let mut pending = self.lock();
-        pending.push(export);
+        pending.push(item);
         self.count.store(pending.len(), Ordering::Release);
         drop(pending);
         self.wake.notify_one();
@@ -874,7 +944,7 @@ impl ReleaseQueue {
             return;
         }
         thread_local! {
-            static SCRATCH: RefCell<Vec<RawExport>> = const { RefCell::new(Vec::new()) };
+            static SCRATCH: RefCell<Vec<Deferred>> = const { RefCell::new(Vec::new()) };
         }
         let mut batch = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
         {
@@ -882,8 +952,8 @@ impl ReleaseQueue {
             std::mem::swap(&mut *pending, &mut batch);
             self.count.store(0, Ordering::Release);
         }
-        for export in batch.drain(..) {
-            export.release(py);
+        for item in batch.drain(..) {
+            item.release(py);
         }
         SCRATCH.with(|s| *s.borrow_mut() = batch);
     }
@@ -915,6 +985,7 @@ impl ReleaseQueue {
                 continue; // a caller drained it during the grace period
             }
             park_releaser_for_test();
+            // exit-gate: allowed (the buffer-export releaser: its own attach gate is closed and drained at exit, #238)
             let attached = Python::try_attach(|py| {
                 self.attaches.fetch_add(1, Ordering::Relaxed);
                 self.drain(py);
@@ -956,12 +1027,13 @@ impl ReleaseQueue {
 
 /// The process-wide queue and its releaser thread (started on the first export that had to be
 /// handed off).
-static QUEUE: OnceLock<&'static ReleaseQueue> = OnceLock::new();
+static QUEUE: crate::fork_guard::ForkCell<&'static ReleaseQueue> =
+    crate::fork_guard::ForkCell::new();
 
 fn global_queue() -> &'static ReleaseQueue {
     QUEUE.get_or_init(|| {
         // After shutdown no releaser thread is started (it could only attach to a dying interpreter).
-        ReleaseQueue::start(EXPORT_RELEASE_GRACE, &GATE, !GATE.is_closed())
+        ReleaseQueue::start(EXPORT_RELEASE_GRACE, gate(), !gate().is_closed())
     })
 }
 
@@ -985,7 +1057,9 @@ pub(crate) fn exports_pending() -> bool {
 /// good. After this the releaser never attaches again. This replaces relying on pyo3's
 /// `Py_IsFinalizing` check, which only exists when built for Python 3.13 or newer.
 pub(crate) fn begin_shutdown(py: Python<'_>) {
-    py.detach(|| GATE.close_and_wait(RELEASER_ATTACH_DRAIN_TIMEOUT));
+    // Silent: a child that never used s3dlio must not warn merely because it exits.
+    let gate = GATE_CELL.get_or_init_silent(AttachGate::new);
+    py.detach(|| gate.close_and_wait(RELEASER_ATTACH_DRAIN_TIMEOUT));
     drain_pending_exports(py);
 }
 
@@ -1302,14 +1376,56 @@ pub(crate) fn acquire_writable(
 
 /// Exact `bytes` (or the `bytes` Python made for a gather / `__bytes__`) as the owner of a `Bytes`.
 struct PyBytesOwner {
-    _keep: Py<PyBytes>,
+    keep: std::mem::ManuallyDrop<Py<PyBytes>>,
     ptr: *const u8,
     len: usize,
 }
 
-// SAFETY: `bytes` objects are immutable and `_keep` pins the allocation; dropping a `Py`
-// off the GIL defers the decref (pyo3 reference pool), it never waits for the GIL.
+// SAFETY: `bytes` objects are immutable and `keep` pins the allocation; the reference is only
+// released through the release queue (below), by a thread that holds the GIL.
 unsafe impl Send for PyBytesOwner {}
+
+impl PyBytesOwner {
+    fn new(keep: Py<PyBytes>, ptr: *const u8, len: usize) -> Self {
+        Self {
+            keep: std::mem::ManuallyDrop::new(keep),
+            ptr,
+            len,
+        }
+    }
+}
+
+impl Drop for PyBytesOwner {
+    /// The last clone of the `Bytes` dies wherever the store finishes with it: a Tokio worker, a
+    /// thread inside `py.detach`. None of them may drop a `Py` (pyo3 would register the decref in
+    /// its global reference pool, whose mutex a fork can leave locked for ever in the child, #297),
+    /// so the reference is queued for a thread that holds the GIL, like a buffer export.
+    fn drop(&mut self) {
+        // SAFETY: dropped exactly once, here.
+        let keep = unsafe { std::mem::ManuallyDrop::take(&mut self.keep) };
+        let raw = keep.into_ptr();
+        defer_decref(raw);
+    }
+}
+
+/// Queue one OWNED reference to a Python object for a thread that holds the GIL to decref (the
+/// release queue's releaser thread, or whoever drains it). Never touches Python itself, so it is
+/// safe on any thread, with or without the GIL, and never takes pyo3's reference-pool mutex.
+pub(crate) fn defer_decref(raw: *mut ffi::PyObject) {
+    // SAFETY: always safe to call.
+    defer_decref_in(unsafe { ffi::Py_IsInitialized() } != 0, raw);
+}
+
+/// [`defer_decref`] with the interpreter state given (so the finalized case can be tested).
+fn defer_decref_in(interpreter_alive: bool, raw: *mut ffi::PyObject) {
+    if !interpreter_alive {
+        return; // the interpreter is gone: nothing to release into
+    }
+    if let Some(raw) = std::ptr::NonNull::new(raw) {
+        DEFERRED_DECREFS.fetch_add(1, Ordering::Relaxed);
+        global_queue().push_decref(raw);
+    }
+}
 
 impl AsRef<[u8]> for PyBytesOwner {
     fn as_ref(&self) -> &[u8] {
@@ -1323,11 +1439,11 @@ fn bytes_from_pybytes(b: &Bound<'_, PyBytes>) -> Bytes {
     if slice.is_empty() {
         return Bytes::new();
     }
-    Bytes::from_owner(PyBytesOwner {
-        ptr: slice.as_ptr(),
-        len: slice.len(),
-        _keep: b.clone().unbind(),
-    })
+    Bytes::from_owner(PyBytesOwner::new(
+        b.clone().unbind(),
+        slice.as_ptr(),
+        slice.len(),
+    ))
 }
 
 /// One copy of `src` for `put_bytes_async` (default): with the GIL held below
@@ -1519,11 +1635,11 @@ fn immutable_export_bytes(data: &Bound<'_, PyAny>, export: &RawExport) -> Option
     if ptr < start || ptr.checked_add(len)? > end {
         return None;
     }
-    Some(Bytes::from_owner(PyBytesOwner {
-        ptr: ptr as *const u8,
+    Some(Bytes::from_owner(PyBytesOwner::new(
+        base.unbind(),
+        ptr as *const u8,
         len,
-        _keep: base.unbind(),
-    }))
+    )))
 }
 
 fn payload_parts(py: Python<'_>, data: &Bound<'_, PyAny>, usage: PayloadUse) -> PyResult<Parts> {
@@ -1616,6 +1732,8 @@ fn payload_parts_in(
     // 5. Last resort: `__bytes__()` only; Python's fresh `bytes` is wrapped (one copy). There is
     //    NO `bytes(obj)` fallback (issue #261): it would turn an int or a bool into that many
     //    zero bytes and accept any iterable of ints, which every writer must refuse.
+    // The user's own bytecode, run from Rust: exit-gate scope (#304), refused before anything is spawned.
+    let _scope = super::async_bridge::python_call_scope()?;
     match data.call_method0("__bytes__") {
         Ok(bytes_obj) => match bytes_obj.cast_exact::<PyBytes>() {
             Ok(b) => Ok(plain(bytes_from_pybytes(b))),
@@ -1639,8 +1757,13 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    fn init() {
+    /// Serialises the tests of this module: they queue exports on the PROCESS-GLOBAL release queue
+    /// and assert "not released yet", which any other test thread that holds the GIL and drains
+    /// the queue (or the global releaser thread) would invalidate. Held for the whole test.
+    fn init() -> std::sync::MutexGuard<'static, ()> {
+        let guard = test_serial_guard();
         Python::initialize();
+        guard
     }
 
     const BOTH: [PayloadUse; 3] = [
@@ -1670,7 +1793,7 @@ mod tests {
     /// #238: a BytesView is reused as-is (same memory), in every mode.
     #[test]
     fn bytesview_is_reused_without_copy() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let original = Bytes::from(vec![7u8; 1 << 20]);
             let original_ptr = original.as_ptr();
@@ -1690,7 +1813,7 @@ mod tests {
     /// A BytesView that is mutably borrowed is an error, never a panic.
     #[test]
     fn mutably_borrowed_bytesview_is_an_error_not_a_panic() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let view = Bound::new(py, PyBytesView::new(Bytes::from_static(b"abc"))).unwrap();
             let _guard = view.borrow_mut();
@@ -1701,7 +1824,7 @@ mod tests {
     /// A blocking (or borrowed) put reads any contiguous exporter in place.
     #[test]
     fn contiguous_exporters_are_not_copied() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[3u8; 1 << 20]);
             let src = exported_ptr(ba.as_any());
@@ -1722,7 +1845,7 @@ mod tests {
     /// Round 2, item 1: ANY item type, not just uint8/'B'.
     #[test]
     fn every_item_type_is_zero_copy() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -1769,7 +1892,7 @@ mod tests {
     /// released, inline because this thread holds the GIL, when the last clone is dropped.
     #[test]
     fn borrowed_buffer_is_held_until_bytes_dropped() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let got = put_payload_from_py(py, ba.as_any(), PayloadUse::Blocking).unwrap();
@@ -1792,7 +1915,7 @@ mod tests {
     /// next holds the GIL.
     #[test]
     fn dropping_the_last_clone_without_the_gil_never_blocks() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let got = put_payload_from_py(py, ba.as_any(), PayloadUse::Blocking).unwrap();
@@ -1814,7 +1937,7 @@ mod tests {
     /// The dedicated releaser thread frees a queued export without any help from the caller.
     #[test]
     fn releaser_thread_frees_queued_exports() {
-        init();
+        let _serial = init();
         let ba = Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let got = put_payload_from_py(py, ba.as_any(), PayloadUse::Blocking).unwrap();
@@ -1835,14 +1958,14 @@ mod tests {
     /// Exact `bytes` is immutable: never copied, in any mode, and not exported.
     #[test]
     fn exact_bytes_is_never_copied() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let b = PyBytes::new(py, &[9u8; 4096]);
             let src = b.as_bytes().as_ptr();
             for mode in BOTH {
                 let got = put_payload_from_py(py, b.as_any(), mode).unwrap();
                 assert_eq!(got.as_ptr(), src, "bytes was copied ({mode:?})");
-                // dropping off the GIL defers the decref instead of blocking
+                // dropped off the GIL: the owner queues the decref, it never blocks
                 py.detach(move || drop(got));
             }
         });
@@ -1852,7 +1975,7 @@ mod tests {
     /// are neither blocked by nor visible to the pending write.
     #[test]
     fn snapshot_of_mutable_exporter_is_independent() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[5u8; 4096]);
             let src = exported_ptr(ba.as_any());
@@ -1871,7 +1994,7 @@ mod tests {
     /// reference instead), and the bytes stay valid after the Python names are dropped.
     #[test]
     fn snapshot_does_not_copy_an_immutable_source() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -1921,7 +2044,7 @@ mod tests {
     /// bytearray (or of anything else that can change) keeps the documented snapshot copy.
     #[test]
     fn snapshot_still_copies_a_readonly_view_of_a_mutable_source() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -1949,7 +2072,7 @@ mod tests {
     /// batch are all released.
     #[test]
     fn batch_latch_covers_every_export_of_the_batch() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -1988,7 +2111,7 @@ mod tests {
     /// A sealed batch with no export is ready at once; a snapshot item adds nothing.
     #[test]
     fn empty_batch_latch_is_ready_when_sealed() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let batch = Latch::new_batch();
             assert!(!latch_ready(py, &batch), "an open batch is never ready");
@@ -2006,7 +2129,7 @@ mod tests {
     /// made is the owner), for any item type.
     #[test]
     fn non_contiguous_view_is_gathered_in_logical_order() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -2034,7 +2157,7 @@ mod tests {
     /// Last resort: `__bytes__()` results are wrapped, not copied a second time.
     #[test]
     fn dunder_bytes_result_is_wrapped_not_copied() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -2054,7 +2177,7 @@ mod tests {
 
     #[test]
     fn empty_buffer_is_empty_and_releases_its_export() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             for mode in BOTH {
                 let empty = PyByteArray::new(py, &[]);
@@ -2073,7 +2196,7 @@ mod tests {
     /// inline path, so a wrong guess about the GIL cannot release without it.
     #[test]
     fn dropping_with_the_gil_held_still_only_queues() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let got = put_payload_from_py(py, ba.as_any(), PayloadUse::Blocking).unwrap();
@@ -2138,7 +2261,7 @@ mod tests {
     /// a `put_bytes` finishing during exit - can release it.
     #[test]
     fn after_shutdown_the_releaser_never_attaches_but_a_token_holder_still_releases() {
-        init();
+        let _serial = init();
         let flag = leak_gate(true);
         let queue = ReleaseQueue::start(Duration::from_millis(5), flag, true);
         Python::attach(|py| {
@@ -2167,7 +2290,7 @@ mod tests {
     /// The global queue is not even given a releaser thread once shutdown has begun.
     #[test]
     fn queue_started_after_shutdown_has_no_releaser_thread() {
-        init();
+        let _serial = init();
         let flag = leak_gate(true);
         let queue = ReleaseQueue::start(Duration::from_millis(1), flag, false);
         Python::attach(|py| {
@@ -2187,7 +2310,7 @@ mod tests {
     /// it never takes the GIL.
     #[test]
     fn caller_draining_within_the_grace_period_means_no_releaser_gil_traffic() {
-        init();
+        let _serial = init();
         let queue = ReleaseQueue::start(Duration::from_millis(300), leak_gate(false), true);
         Python::attach(|py| {
             for _ in 0..20 {
@@ -2211,7 +2334,7 @@ mod tests {
     /// And with nobody draining, the releaser does release (after the grace period).
     #[test]
     fn releaser_releases_after_the_grace_period_when_nobody_drains() {
-        init();
+        let _serial = init();
         let queue = ReleaseQueue::start(Duration::from_millis(20), leak_gate(false), true);
         let ba = Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
@@ -2232,7 +2355,7 @@ mod tests {
     /// Item 4: the queue keeps its capacity across drains (no reallocation per push).
     #[test]
     fn queue_keeps_its_capacity_across_drains() {
-        init();
+        let _serial = init();
         let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
         Python::attach(|py| {
             for round in 0..4 {
@@ -2257,7 +2380,7 @@ mod tests {
     /// for formats.
     #[test]
     fn buffers_of_objects_or_pointers_are_refused() {
-        init();
+        let _serial = init();
         assert!(format_has_pointers("O"));
         assert!(format_has_pointers("<P"));
         assert!(format_has_pointers("T{<i:x:<P:p:}"));
@@ -2303,7 +2426,7 @@ mod tests {
     /// a read destination refuses them with the destination wording.
     #[test]
     fn every_pointer_bearing_ctypes_buffer_is_refused() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -2453,7 +2576,7 @@ mod tests {
     /// stays exported.
     #[test]
     fn pointer_format_refusal_wording_depends_on_the_direction() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -2496,7 +2619,7 @@ mod tests {
     /// retain a clone forever.
     #[test]
     fn release_retained_disarms_a_pending_arming() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(py, c_str!("buf = bytearray(b'abcdefgh')"));
             let buf = l.get_item("buf").unwrap().unwrap();
@@ -2530,7 +2653,7 @@ mod tests {
     /// its wording must not name `put_bytes_async`.
     #[test]
     fn snapshot_memory_error_wording_is_generic() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let e = snapshot_allocation_error(12345);
             assert!(e.is_instance_of::<pyo3::exceptions::PyMemoryError>(py));
@@ -2545,7 +2668,7 @@ mod tests {
     /// Both are correct and independent of the source.
     #[test]
     fn snapshot_sizes_around_the_detach_threshold() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             for len in [
                 1,
@@ -2573,19 +2696,24 @@ mod tests {
     /// export is released only by a thread holding a real GIL token.
     #[test]
     fn last_clone_dropping_signals_the_latch_and_a_token_holder_releases() {
-        init();
+        let _serial = init();
+        // A PRIVATE queue (hour-long grace, so its releaser thread never runs): the process-global
+        // queue can be drained by any other thread that holds the GIL between the detached drop
+        // and the "not released yet" assertions.
+        let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
-            let p = borrowed(py, &ba);
-            let latch = p.latch.clone().unwrap();
-            let clone = p.bytes.clone();
-            drop(p);
+            let export = RawExport::acquire(ba.as_any()).unwrap().unwrap();
+            let (owner, latch) = ExportOwner::with_queue(export, queue);
+            let bytes = Bytes::from_owner(owner);
+            let clone = bytes.clone();
+            drop(bytes);
             assert!(!latch.is_dropped(), "a live clone is still a native reader");
             py.detach(move || drop(clone)); // last clone dies on a non-GIL thread
             assert!(latch.is_dropped());
             assert!(!latch.is_released(), "release needs a py token");
             assert!(!resizable(ba.as_any()));
-            drain_pending_exports(py);
+            queue.drain(py);
             assert!(latch.is_released());
             assert!(resizable(ba.as_any()));
         });
@@ -2595,7 +2723,7 @@ mod tests {
     /// completion does not return before that clone is gone, and the export is then released.
     #[test]
     fn quiesce_blocks_while_a_backend_retains_a_clone_then_releases() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[3u8; 4096]);
             let p = borrowed(py, &ba);
@@ -2625,7 +2753,7 @@ mod tests {
     /// still fails), the timeout is counted, and the export is released once the clone dies.
     #[test]
     fn quiesce_timeout_keeps_the_buffer_pinned_and_counts() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[3u8; 4096]);
             let p = borrowed(py, &ba);
@@ -2651,7 +2779,7 @@ mod tests {
     /// dropped before its first poll). The barrier is satisfied immediately.
     #[test]
     fn dropping_the_payload_unread_satisfies_the_barrier() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[3u8; 4096]);
             let p = borrowed(py, &ba);
@@ -2666,7 +2794,7 @@ mod tests {
     /// The async wait (cancellation path) returns exactly when the last clone dies.
     #[tokio::test]
     async fn async_wait_follows_the_last_clone() {
-        init();
+        let _serial = init();
         let (latch, clone, ba) = Python::attach(|py| {
             let ba = PyByteArray::new(py, &[3u8; 4096]);
             let p = borrowed(py, &ba);
@@ -2695,7 +2823,7 @@ mod tests {
     /// only queue. Skipped (with a message) where `_interpreters` is unavailable.
     #[test]
     fn detached_drop_after_a_subinterpreter_was_created_only_queues() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let created = py.run(
                 c_str!(
@@ -2725,7 +2853,7 @@ mod tests {
     /// bytes) and an arbitrary iterable are refused; `__bytes__()` objects and buffers are fine.
     #[test]
     fn strict_hold_refuses_ints_and_iterables_but_accepts_bytes_likes() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -2771,7 +2899,7 @@ mod tests {
     /// The direct release of a held buffer does not touch the release queue.
     #[test]
     fn direct_release_does_not_use_the_queue() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let before = export_stats().queued;
             let ba = PyByteArray::new(py, &[7u8; 64]);
@@ -2783,7 +2911,7 @@ mod tests {
     /// `latch_ready` is a non-waiting check that releases with the held GIL.
     #[test]
     fn latch_ready_is_false_while_a_clone_lives_and_true_after() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[3u8; 4096]);
             let p = borrowed(py, &ba);
@@ -2800,7 +2928,7 @@ mod tests {
     /// dropped. Here the owner is dropped into a queue that the global drain does not touch.
     #[test]
     fn latch_ready_requires_released_as_well_as_dropped() {
-        init();
+        let _serial = init();
         let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[3u8; 4096]);
@@ -2839,15 +2967,17 @@ mod tests {
 
     #[test]
     fn blocking_quiesce_waits_for_the_actual_release_owned_by_another_drainer() {
-        init();
+        let _serial = init();
         let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
         let (latch, ba) = dropped_but_unreleased(queue);
+        // Taken BEFORE the drainer's 300 ms sleep starts (a loaded host can delay this thread
+        // between the spawn and its first attach, which made the lower bound below flaky).
+        let started = Instant::now();
         let other_drainer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             Python::attach(|py| queue.drain(py)); // needs the GIL: the waiter must not hold it
         });
         Python::attach(|py| {
-            let started = Instant::now();
             quiesce_blocking(py, &latch).expect("the other drainer releases it");
             assert!(
                 started.elapsed() >= Duration::from_millis(290),
@@ -2865,7 +2995,7 @@ mod tests {
     /// and the guard re-checks; it must not depend on the releaser thread.
     #[tokio::test]
     async fn first_already_dropped_step_returns_after_a_short_slice_without_a_timeout() {
-        init();
+        let _serial = init();
         let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
         let (latch, ba) = dropped_but_unreleased(queue);
         let before = export_stats().quiesce_timeouts;
@@ -2896,7 +3026,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_quiesce_waits_for_the_actual_release_after_the_owner_dropped() {
-        init();
+        let _serial = init();
         let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
         let (latch, ba) = dropped_but_unreleased(queue);
         let other_drainer = std::thread::spawn(move || {
@@ -2926,7 +3056,7 @@ mod tests {
     /// `BytesView` are still not copied.
     #[test]
     fn snapshot_for_call_copies_mutable_exporters_but_never_immutable_bytes() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &vec![5u8; 1 << 20]);
             let src = exported_ptr(ba.as_any());
@@ -3006,7 +3136,7 @@ mod tests {
     /// latch is the one that is marked.
     #[test]
     fn writable_export_accepts_writable_byte_buffers_and_writes_in_place() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let count = writable_objects(py).len();
             for idx in 0..count {
@@ -3053,7 +3183,7 @@ mod tests {
     /// `expected_len` beyond the exporter's length is refused (ValueError), nothing stays held.
     #[test]
     fn writable_export_refuses_expected_len_beyond_the_buffer() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[0u8; 16]);
             let latch = Latch::new();
@@ -3074,7 +3204,7 @@ mod tests {
     /// refused with the right exception class, and nothing stays exported.
     #[test]
     fn writable_export_refuses_unsuitable_exporters_and_releases() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             use pyo3::exceptions::{PyBufferError, PyTypeError};
             // Third element of every case: a probe that raises (BufferError) if a hold on the
@@ -3161,7 +3291,7 @@ mod tests {
     /// was taken: the plain `bytearray` behind it is resizable again at once.
     #[test]
     fn writable_export_refusal_after_acquisition_releases_the_export() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let l = ns(
                 py,
@@ -3182,7 +3312,7 @@ mod tests {
     /// exporter's pointer (which may be null) when the length is 0.
     #[test]
     fn writable_export_zero_length_gives_an_empty_slice() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             // an empty exporter
             let empty = PyByteArray::new(py, &[]);
@@ -3224,7 +3354,7 @@ mod tests {
     /// Data with a null address is refused by the checks; a negative reported length too.
     #[test]
     fn writable_view_checks_refuse_null_data_and_bad_lengths() {
-        init();
+        let _serial = init();
         // SAFETY: an all-zero Py_buffer is a valid empty value.
         let mut view: Box<ffi::Py_buffer> = Box::new(unsafe { std::mem::zeroed() });
         view.itemsize = 1;
@@ -3246,7 +3376,7 @@ mod tests {
     #[test]
     fn writable_view_checks_refuse_readonly_suboffsets_and_non_contiguous_views() {
         use pyo3::exceptions::PyBufferError;
-        init();
+        let _serial = init();
         let mut mem = [0u8; 4];
         let mut shape1: [ffi::Py_ssize_t; 1] = [4];
         let mut stride_gap: [ffi::Py_ssize_t; 1] = [2];
@@ -3337,7 +3467,7 @@ mod tests {
     #[test]
     fn writable_view_checks_format_accepts_one_byte_order_prefix_with_byte_codes() {
         use pyo3::exceptions::PyTypeError;
-        init();
+        let _serial = init();
         let mut mem = [0u8; 4];
         let mut shape1: [ffi::Py_ssize_t; 1] = [4];
         let mut view_with = |format: &'static std::ffi::CStr| -> Box<ffi::Py_buffer> {
@@ -3382,7 +3512,7 @@ mod tests {
     /// resizable immediately (a live export would make `extend` raise BufferError).
     #[test]
     fn writable_export_release_is_direct_and_immediate() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let latch = Latch::new();
@@ -3402,7 +3532,7 @@ mod tests {
     /// latch released.
     #[test]
     fn writable_export_drop_queues_then_drain_releases() {
-        init();
+        let _serial = init();
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let latch = Latch::new();
@@ -3427,7 +3557,7 @@ mod tests {
     /// releaser thread (or any drainer) releases it afterwards.
     #[test]
     fn writable_export_dropped_without_the_gil_is_released_by_the_releaser() {
-        init();
+        let _serial = init();
         let (ba, latch) = Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let latch = Latch::new();
@@ -3455,5 +3585,87 @@ mod tests {
             assert!(v.iter().all(|&b| b == 9), "writes lost");
             assert!(resizable(ba.as_any()));
         });
+    }
+}
+
+#[cfg(test)]
+mod offgil_decref_tests {
+    use super::*;
+    use pyo3::types::PyBytes;
+
+    /// `Send` wrapper for a raw owned reference (it is only released under the GIL).
+    struct Raw(*mut ffi::PyObject);
+    // SAFETY: the pointer is only handed to `defer_decref`, which never dereferences it.
+    unsafe impl Send for Raw {}
+
+    /// An owned reference handed to `defer_decref` from a thread WITHOUT the GIL is not touched
+    /// there, stays queued while the GIL is held elsewhere, and a GIL holder that drains the
+    /// queue decrements the reference count exactly once (#297).
+    #[test]
+    fn a_deferred_decref_is_released_once_by_a_gil_holder() {
+        let _serial = test_serial_guard();
+        Python::initialize();
+        Python::attach(|py| {
+            let obj = PyBytes::new(py, b"deferred-decref-test")
+                .into_any()
+                .unbind();
+            let raw = Raw(obj.clone_ref(py).into_ptr()); // an owned reference: count is 2
+                                                         // SAFETY: `obj` is alive and we hold the GIL.
+            assert_eq!(unsafe { ffi::Py_REFCNT(obj.as_ptr()) }, 2);
+            let counted = export_stats().deferred_decrefs;
+            // We hold the GIL for the whole test, so neither the releaser thread nor any other
+            // test can drain the queue between the push and our own drain.
+            let queued_before = export_stats().queued;
+            std::thread::spawn(move || {
+                let raw = raw;
+                defer_decref(raw.0)
+            })
+            .join()
+            .expect("the pushing thread");
+            assert!(
+                export_stats().deferred_decrefs > counted,
+                "the counter ticks"
+            );
+            assert!(
+                export_stats().queued > queued_before,
+                "the reference is queued"
+            );
+            // SAFETY: as above. Not released by the thread that pushed it.
+            assert_eq!(unsafe { ffi::Py_REFCNT(obj.as_ptr()) }, 2);
+            drain_pending_exports(py);
+            // SAFETY: as above.
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(obj.as_ptr()) },
+                1,
+                "released exactly once"
+            );
+            drain_pending_exports(py);
+            // SAFETY: as above.
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(obj.as_ptr()) },
+                1,
+                "a second drain does nothing"
+            );
+        });
+    }
+
+    /// After interpreter finalization nothing is queued (there is nothing to release into) and
+    /// nothing is counted or touched.
+    #[test]
+    fn a_decref_after_finalization_is_dropped_on_the_floor() {
+        let _serial = test_serial_guard();
+        let counted = DEFERRED_DECREFS.load(Ordering::Relaxed);
+        // Never dereferenced: the finalized path returns before looking at it.
+        defer_decref_in(false, 0x10 as *mut ffi::PyObject);
+        assert_eq!(DEFERRED_DECREFS.load(Ordering::Relaxed), counted);
+    }
+
+    /// A null pointer is ignored.
+    #[test]
+    fn a_null_decref_is_ignored() {
+        let _serial = test_serial_guard();
+        let counted = DEFERRED_DECREFS.load(Ordering::Relaxed);
+        defer_decref_in(true, std::ptr::null_mut());
+        assert_eq!(DEFERRED_DECREFS.load(Ordering::Relaxed), counted);
     }
 }

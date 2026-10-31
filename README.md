@@ -1,12 +1,12 @@
 # s3dlio - Universal Storage I/O Library
 
 [![CI](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-1893-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.10.0-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-2030-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.10.1-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94.1%2B-orange)](https://www.rust-lang.org)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
@@ -14,6 +14,7 @@ Full-backend builds support the stable Azure Blob Storage Rust SDK 1.x API (1.1)
 
 ## Recent Releases
 
+- **v0.10.1** — Bug fixes: fork safety, Python exit crashes/aborts, stalled pooled connections, `LocalSet` sync wrappers, op-log restart, `get_into`/`head` for `file://` and `direct://` (#294, #295, #267, #276, #297, #298, #300, #302, #303, #304) — [PR #308](https://github.com/russfellows/s3dlio/pull/308)
 - **v0.10.0** — Caller-buffer GET, typed HEAD; zero copy everywhere; official GCS only — [PR #293](https://github.com/russfellows/s3dlio/pull/293)
 - **v0.9.128** — Zero-copy writes, opt-in `.env`, Azure credentials — [PR #262](https://github.com/russfellows/s3dlio/pull/262)
 - **v0.9.126** — Exact URI selection; routing, upload fixes — [PR #237](https://github.com/russfellows/s3dlio/pull/237)
@@ -42,6 +43,13 @@ uv pip install s3dlio
 # If using pip without uv:
 pip install s3dlio
 ```
+
+> **Interpreter exit with daemon threads (#298).** Before this fix a process could die with SIGABRT (exit 134) when the
+> main thread returned while a daemon thread was inside an s3dlio call, on CPython before 3.13.8 (3.11, 3.12, 3.13.0 to
+> 3.13.7). It is fixed by the PyO3 0.29.3 upgrade: the process now exits with code 0. On an older wheel, use Python
+> 3.13.8+ or `join()` your worker threads before exit. Two later fixes cover async calls on a daemon thread's event
+> loop: #302 (CPython 3.14, `get_async` and friends crashed at exit) and #304 (Python before 3.13.8, an async call starting
+> during shutdown aborted; such a call now raises `RuntimeError`). See [docs/Changelog.md](docs/Changelog.md).
 
 ### Python Backend Profiles (PyPI vs Full Build)
 
@@ -457,8 +465,45 @@ async def read(uri):
 data = asyncio.run(read("s3://bucket/key"))
 s3dlio.object_capabilities("s3://bucket/key")  # {"provider": "s3", "get_into": True, "head": True}
 ```
+The same calls work on `file://` and `direct://` (#295): `file://` reads with `pread` straight into
+`buf`; `direct://` reads with O_DIRECT straight into a page-aligned `buf` and copies once, through a
+bounded bounce pool, into an unaligned one (a NumPy slice at an odd address, for example), with no
+whole-object allocation either way. `head_async` returns the size from `stat` and `None` for a missing file.
 Do not touch `buf` until the `await` returns; a size other than `expected_len` raises
-`LengthMismatchError`. See the [Python API guide](docs/PYTHON_API_GUIDE.md#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100).
+`LengthMismatchError`, and a local file modified while it is read (same size, new timestamps) raises
+`RuntimeError` ("version changed") instead of returning mixed data. A `bytearray` is only 16-byte aligned, so on
+`direct://` it takes the bounce copy: use an `mmap` or a page-aligned NumPy view for the zero-copy path (see the guide).
+Rust embedders that build their own multi-thread tokio runtime can opt in to the worker hand-off around each read chunk with
+`.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)` (s3dlio's own runtimes already do; without it `direct://`
+and `file://` reads and writes, fsyncs and finalize all run inline on the polling worker and never panic, a single reader is
+up to about 2x faster and neighbouring tasks can wait up to 16 MiB of read time; a marked `spawn_blocking` thread that
+drives a `LocalSet` needs `inline_blocking_io()`; details in `s3dlio::runtime_support`). Tests: `S3DLIO_TEST_DIR` names a real-filesystem scratch directory,
+`S3DLIO_REQUIRE_ODIRECT_TESTS=1` turns skips into failures (CI), and the opt-in
+`tests/direct_get_into_no_odirect_fs_295.rs` needs a ramfs (`S3DLIO_TEST_NO_ODIRECT_DIR`); see
+[docs/Environment_Variables.md](docs/Environment_Variables.md). See the [Python API guide](docs/PYTHON_API_GUIDE.md#get_into_async--head_async--read-into-your-own-buffer--new-in-v0100).
+
+**Sync wrappers inside a tokio `LocalSet` (#300):** `run_on_global_rt` and the blocking wrappers built on it (for example
+`s3_utils::stat_object_uri`) work from `rt.block_on(local.run_until(..))`, `LocalSet::block_on` and `spawn_local` tasks, with
+`panic = "abort"` too; they used to panic. They hand the worker off (`block_in_place`) on s3dlio's own runtimes and on an
+embedder's runtime whose workers have tokio's default thread name, and wait plainly elsewhere. If your runtime sets custom
+thread names, add `.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)` so a worker is never parked without
+a hand-off; a `spawn_blocking` closure (or a thread hand-named like tokio's default worker) that drives a `LocalSet` with the call inside needs `inline_blocking_io()`, else it panics; a runtime with custom thread names and no marker gets no hand-off (a hang if the awaited work needs that same runtime, such as an in-process server; the timeout error names the cause since #303). `MultipartUploadSink`'s blocking
+methods are a separate bug (#301), not covered. Details in `s3dlio::runtime_support` and `docs/Changelog.md`.
+
+**Connections belong to s3dlio's own I/O runtime (#303):** every HTTP request, for S3, Azure and GCS, is polled with s3dlio's
+small I/O-owner runtime as the tokio context, so a pooled connection never belongs to YOUR runtime and never depends on the
+global runtime's workers being free. Before, a connection opened while a current-thread runtime was polling stalled every later
+request that reused it, for the whole operation timeout (60 s) and then failed with "check network connectivity", as soon as
+that runtime was blocked: any async s3dlio call followed by any sync one (`stat_object_uri`, `MultipartUploadSink::new`, ...) on a
+current-thread runtime or in a `LocalSet`, two live current-thread runtimes, and the custom-named unmarked runtime of #300. No
+change is needed in your code, and the async paths cost nothing measurable (no extra thread hop, no copy; `get_into` still writes
+straight into your buffer; `S3DLIO_IO_THREADS` sizes the I/O runtime). A `MultipartUploadSink` dropped unfinished no longer
+blocks: `Drop` spawns the `AbortMultipartUpload` and returns; call `sink.abort().await` (new, returns the real error) when the
+abort must be delivered before you continue, and `s3dlio::flush_pending_aborts(Duration)` once before the process exits (the CLI
+and the Python `atexit` hook do), or an abort that is still in flight when the process ends leaves the upload on the server.
+`spawn_on_global_rt` must not be given blocking work: sync wrappers share the global workers. A sync wrapper that blocks the
+thread of a runtime serving its own endpoint (an in-process server) still cannot finish; its operation-timeout error now names
+that cause. Details in `docs/Changelog.md`.
 
 **Writes borrow your buffer (v0.10.0):** async writes read your buffer in place until the `await` finishes; pass
 `borrow=False` for a copy.
@@ -657,7 +702,12 @@ import s3dlio
 s3dlio.init_op_log("operations.tsv.zst")
 # All operations automatically logged
 s3dlio.finalize_op_log()
+# A new session can start in the same process (repeated tests, notebooks): #294
+s3dlio.init_op_log("operations2.tsv.zst")
+s3dlio.finalize_op_log()
 ```
+
+`init_op_log()` after `finalize_op_log()` starts a fresh session with its own file and stats (it waits for the previous session to finish draining); calling it while a session is active is a no-op for the same file and a `RuntimeError` (naming the file being written and the requested one, asking you to finalize first) for any other file. After `os.fork()` a child does not share the parent's session: it sees the op-log as not initialised and may start its own, but never on a file an ancestor process is still writing (a `RuntimeError`; a log the ancestor had already finalized is not protected). Forking is safe in general (#297): a forked child rebuilds s3dlio's runtimes, pools and clients on first use and prints one stderr line (`S3DLIO_FORK_WARN=0` silences it); an object created in the parent (checkpoint store, writer, loader, `MultiEndpointStore`, `Generator`) raises a catchable `RuntimeError` in the child, so create it in the child. See "Fork safety" in the [Python API guide](docs/PYTHON_API_GUIDE.md); `spawn` and `forkserver` stay the most robust start methods. A session whose file was renamed or deleted behind its back says so in the error (it keeps writing the open file); see [Operation Logging](docs/supplemental/OPERATION_LOGGING.md). Run the op-log Python tests with `uv run -q --no-project --isolated --python 3.12 --with <wheel> --with pytest python -m pytest tests/test_oplog_lifecycle_permutations_294.py` (needs the `zstd` command-line tool).
 
 See [S3DLIO OpLog Implementation](docs/S3DLIO_OPLOG_IMPLEMENTATION_SUMMARY.md) for detailed usage.
 

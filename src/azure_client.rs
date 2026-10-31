@@ -145,9 +145,16 @@ impl ServiceClientCache {
     }
 }
 
-static SERVICE_CLIENTS: std::sync::LazyLock<ServiceClientCache> = std::sync::LazyLock::new(|| {
-    ServiceClientCache::new(crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX)
-});
+/// Fork-aware (#297): the cached clients own connection pools whose tasks ran on the parent's
+/// runtime, and the map's lock may have been held by a parent thread at the fork. A fork child
+/// builds its own cache.
+static SERVICE_CLIENTS_CELL: crate::fork_guard::ForkCell<ServiceClientCache> =
+    crate::fork_guard::ForkCell::new();
+
+fn service_clients() -> &'static ServiceClientCache {
+    SERVICE_CLIENTS_CELL
+        .get_or_init(|| ServiceClientCache::new(crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX))
+}
 
 /// An Azure SDK error with a message that names the credential mode (for a 401/403) and has any
 /// SAS token removed, while the typed SDK error stays available to callers that classify errors
@@ -454,7 +461,7 @@ fn service_client_for_url(account_url: &str) -> Result<(Arc<BlobServiceClient>, 
         service_url.set_query(Some(&token));
     }
 
-    SERVICE_CLIENTS.get_or_build(key, || {
+    service_clients().get_or_build(key, || {
         let credential = if mode.uses_bearer_token() {
             if !https {
                 bail!(
@@ -476,12 +483,52 @@ fn service_client_for_url(account_url: &str) -> Result<(Arc<BlobServiceClient>, 
             BlobServiceClient::new(
                 service_url,
                 credential,
-                Some(BlobServiceClientOptions::default()),
+                Some(BlobServiceClientOptions {
+                    client_options: global_rt_client_options(),
+                    ..Default::default()
+                }),
             )
             .map_err(|e| anyhow!(azure_credential::redact_sas(&e.to_string())))?,
         );
         Ok((client, mode))
     })
+}
+
+/// The Azure HTTP transport that runs every request with the I/O-owner runtime as the tokio context
+/// (#303).
+///
+/// A pooled connection belongs to the runtime whose context is entered when it is created, and
+/// the service client (and the credential clients) are process-wide. The wrapped client is
+/// azure_core's own default (reqwest) client; `execute_request` is polled inside
+/// [`crate::s3_client::in_io_ctx`], so every socket, timer and connection task it creates
+/// belongs to the I/O runtime. The response body is still streamed to the caller's task (the
+/// `get_into` paths copy chunks straight into the caller's buffer, no extra copy).
+#[derive(Debug)]
+pub(crate) struct GlobalRtHttpClient {
+    inner: Arc<dyn azure_core::http::HttpClient>,
+}
+
+#[async_trait::async_trait]
+impl azure_core::http::HttpClient for GlobalRtHttpClient {
+    async fn execute_request(
+        &self,
+        request: &azure_core::http::Request,
+    ) -> azure_core::Result<azure_core::http::AsyncRawResponse> {
+        crate::s3_client::in_io_ctx(self.inner.execute_request(request)).await
+    }
+}
+
+/// `ClientOptions` whose transport is [`GlobalRtHttpClient`]: used for the service client and
+/// for every credential that talks HTTP.
+pub(crate) fn global_rt_client_options() -> azure_core::http::ClientOptions {
+    azure_core::http::ClientOptions {
+        transport: Some(azure_core::http::Transport::new(Arc::new(
+            GlobalRtHttpClient {
+                inner: azure_core::http::new_http_client(None),
+            },
+        ))),
+        ..Default::default()
+    }
 }
 
 /// Test hook: the URL of every `BlobServiceClient` this module built (as opposed to served

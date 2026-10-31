@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 rust-version = "1.94.1"
 authors = ["Russ Fellows"]
@@ -58,7 +58,7 @@ tracing-subscriber = { version = "^0.3", features = ["env-filter", "fmt"] }  # S
 tracing-log = "^0.2"  # Bridge to capture log crate messages from dependencies
 
 # --- async / net stack ----------------------------------------------------
-tokio   = { version = "^1", features = ["full"] }
+tokio   = { version = "^1", default-features = false, features = ["fs","io-util","io-std","macros","net","process","rt","rt-multi-thread","signal","sync","time"] }
 tokio-stream = { version = "^0.1", features = ["sync"] }
 tokio-util = "^0.7"  # For CancellationToken and other utilities
 async-stream = "^0.3"  # For stream! macro in list_stream implementations
@@ -78,7 +78,7 @@ dotenvy     = "^0.15"
 anyhow      = "^1"
 thiserror   = "1.0"
 clap        = { version = "4", features = ["derive"] }
-indicatif   = { version = "0.17", features = ["rayon"] }
+indicatif   = { version = "0.17" }
 serde       = { version = "^1.0", features = ["derive"] }
 serde_json  = "^1.0"
 regex       = "1.11"
@@ -104,9 +104,15 @@ hdf5-metno = { version = "^0.12", optional = true }
 hdf5-metno-sys = { version = "^0.11", optional = true }
 
 # -------- Python bindings ----------
-pyo3           = { version = "^0.27", features = ["extension-module"], optional = true }
-pyo3-async-runtimes = { version = "^0.27", features = ["tokio-runtime"], optional = true }
-numpy        = "^0.27"
+# pyo3 must be >= 0.29.3 (issue #298): 0.29.0-0.29.2 carry the PyEval_RestoreThread guard
+# (PyO3 #6085) but not the follow-up fix (#6404); together they make a daemon thread that re-takes
+# the GIL during interpreter shutdown hang instead of aborting the process on CPython < 3.13.8.
+# Do not lower the lower bound. It is a range, not an exact pin, so crates that depend on s3dlio
+# as a library can still unify on a later 0.29.x. Cargo.lock resolves 0.29.3.
+# pyo3-async-runtimes and numpy track the same minor.
+pyo3           = { version = ">=0.29.3, <0.30", features = ["extension-module"], optional = true }
+pyo3-async-runtimes = { version = "^0.29", features = ["tokio-runtime"], optional = true }
+numpy        = "^0.29"
 ndarray      = "^0.17"
 # ndarray-npy removed - we use custom NPY/NPZ implementation for better performance and zero-copy
 
@@ -127,7 +133,6 @@ glob        = "^0.3"
 # Performance monitoring
 hdrhistogram = "^7.5"    # High Dynamic Range histograms for detailed analysis
 metrics     = "^0.23"    # Metrics collection framework with histogram support
-parking_lot = "^0.12"    # High-performance RwLock for metrics
 dashmap     = "^6.1"     # Lock-free concurrent HashMap for Python client caching
 
 async-trait  = "^0.1"
@@ -229,6 +234,11 @@ hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys"]  # HDF5 data format support - re
 profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always available
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 
+# TEST BUILDS ONLY (issue #294): registers `s3dlio._hold_async_runtime()`, which freezes every worker of the
+# async runtime so a test can run code between "the call was made" and "its first poll". Never in `default`, never
+# in the PyPI wheels; the publish workflow asserts the released wheels do not contain it.
+test-hooks = []
+
 test-npy-09 = []                     # Test ndarray-npy 0.9 API compatibility (temporary for testing)
 
 [[bench]]
@@ -262,3 +272,9 @@ opt-level = 3
 #
 # Development: path = "../google-cloud-rust/src/..."
 # Released:    git  = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2"
+
+# Test-only profile (#295): the dev profile with `panic = "abort"`, to prove the crate does not
+# rely on catching a panic (see scripts/test_panic_abort_295.sh). Not used by any release build.
+[profile.abort-test]
+inherits = "dev"
+panic = "abort"

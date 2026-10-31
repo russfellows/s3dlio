@@ -459,11 +459,22 @@ impl PerformanceReport {
 /// Global metrics instance for convenience
 use std::sync::{Mutex, OnceLock};
 
-static GLOBAL_METRICS: OnceLock<Mutex<EnhancedMetricsCollector>> = OnceLock::new();
+/// Fork-aware (#297): a fork child counts its own operations in a fresh collector (built from
+/// the same [`MetricsConfig`]), and never touches the parent's lock, which a parent thread may
+/// have held at the fork.
+static GLOBAL_METRICS: crate::fork_guard::ForkCell<Mutex<EnhancedMetricsCollector>> =
+    crate::fork_guard::ForkCell::new();
+/// The configuration the first `init_global_metrics` call chose (plain data, kept across forks).
+static GLOBAL_METRICS_CONFIG: OnceLock<MetricsConfig> = OnceLock::new();
 
 /// Initialize global metrics collector
 pub fn init_global_metrics(config: MetricsConfig) {
-    let _ = GLOBAL_METRICS.set(Mutex::new(EnhancedMetricsCollector::new(config)));
+    let _ = GLOBAL_METRICS_CONFIG.set(config);
+    GLOBAL_METRICS.get_or_init(|| {
+        Mutex::new(EnhancedMetricsCollector::new(
+            GLOBAL_METRICS_CONFIG.get().cloned().unwrap_or_default(),
+        ))
+    });
 }
 
 /// Record operation using global metrics collector

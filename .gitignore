@@ -1,6 +1,9 @@
 # Rust #
 ###########
 /target
+# CI-local target dirs: the extension-module unit tests (#297) and the off-GIL oracle wheel
+/target-pyunit
+/target-oracle
 src/*.save
 src/bin/*.save
 

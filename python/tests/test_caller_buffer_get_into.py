@@ -5,7 +5,7 @@ also the #250 reproduction check and the #233 / mkdir_async exit-safety checks).
 What this module needs
 ----------------------
 Nothing from the network and no environment variable.  The pure parts (capabilities,
-synchronous rejections, file:// and direct:// refusals, the #250 check) run in the pytest
+synchronous rejections, unknown-scheme refusals, the #250 check) run in the pytest
 process.  Everything that reads an object runs in a FRESH child interpreter (this same file,
 executed as a script) because s3dlio latches its S3 client and range settings once per
 process: the child is started with AWS_ENDPOINT_URL pointing at a small S3-compatible server
@@ -51,6 +51,9 @@ import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+# The default listen backlog of these stand-in servers is 5; concurrent connects beyond it wait for a SYN
+# retransmit (1, 2, 4 s). A bigger backlog removes that source of flakiness (issue #304 round 2).
+ThreadingHTTPServer.request_queue_size = 512
 
 import pytest
 import s3dlio
@@ -519,8 +522,11 @@ def test_object_capabilities_shape_and_provider(uri, provider):
     assert set(caps) == {"provider", "get_into", "head"}
     assert caps["provider"] == provider
     assert isinstance(caps["get_into"], bool) and isinstance(caps["head"], bool)
-    if provider in ("file", "direct", "unknown"):
+    if provider == "unknown":
         assert caps["get_into"] is False and caps["head"] is False
+    if provider in ("file", "direct"):
+        # #295 / #267: the local file stores implement both operations.
+        assert caps["get_into"] is True and caps["head"] is True
     if provider == "s3":
         assert caps["get_into"] is True and caps["head"] is True
 
@@ -555,10 +561,8 @@ def test_malformed_uri_is_a_value_error_before_anything_else(uri):
     assert resizable(buf)
 
 
-@pytest.mark.parametrize(
-    "uri", ["file:///tmp/cb-unsupported", "direct:///tmp/cb-unsupported"]
-)
-def test_file_and_direct_are_unsupported_synchronously(uri):
+@pytest.mark.parametrize("uri", ["nosuchscheme://bucket/cb-unsupported"])
+def test_an_unknown_scheme_is_unsupported_synchronously(uri):
     """Raised by the call itself: no event loop is running, so nothing was awaited."""
     buf = bytearray(8)
     with pytest.raises(s3dlio.UnsupportedOperationError) as info:
@@ -571,10 +575,8 @@ def test_file_and_direct_are_unsupported_synchronously(uri):
 
 @needs_asyncio_plugin
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "uri", ["file:///tmp/cb-unsupported", "direct:///tmp/cb-unsupported"]
-)
-async def test_file_and_direct_are_unsupported_inside_a_running_loop_too(uri):
+@pytest.mark.parametrize("uri", ["nosuchscheme://bucket/cb-unsupported"])
+async def test_an_unknown_scheme_is_unsupported_inside_a_running_loop_too(uri):
     buf = bytearray(8)
     with pytest.raises(s3dlio.UnsupportedOperationError):
         s3dlio.get_into_async(uri, buf, expected_len=8)
@@ -855,9 +857,14 @@ async def test_issue_250_reproduction_check_async_calls_under_pytest_asyncio(tmp
         reproduced.append(("mkdir_async", str(exc)))
         made = None
     assert made is None
-    # the new entry points refuse file:// by raising, not by needing a loop
-    with pytest.raises(s3dlio.UnsupportedOperationError):
-        s3dlio.get_into_async(f"file://{tmp_path}/x.bin", bytearray(4), expected_len=4)
+    # the new entry points work on file:// inside the running loop (#295)
+    (tmp_path / "x.bin").write_bytes(b"abcd")
+    got = bytearray(4)
+    assert (
+        await s3dlio.get_into_async(f"file://{tmp_path}/x.bin", got, expected_len=4)
+        == 4
+    )
+    assert got == b"abcd"
     observed = [item for item in reproduced if "no running event loop" in item[1]]
     print(
         f"\n#250 observed 'no running event loop': {observed or 'no (does not reproduce)'}"

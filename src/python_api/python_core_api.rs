@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use super::async_bridge::future_into_py;
+#[cfg(feature = "test-hooks")]
+use super::async_bridge::arm_close_gate_after_next_spawn;
+use super::async_bridge::{after_spawn_hook, future_into_py, python_call_scope, PythonCallScope};
 use super::put_payload::{
     acquire_writable, deadline_warning_text, export_stats, hold_for_call, latch_ready,
     note_internal_error, put_payload, put_payload_in_batch, quiesce_async, quiesce_blocking,
@@ -78,7 +80,6 @@ use crate::object_store::{
 // ---------------------------------------------------------------------------
 
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use std::sync::Arc;
 
 /// Cache key: uniquely identifies an ObjectStore configuration
@@ -132,10 +133,11 @@ struct StoreSlot {
 }
 
 /// Take a slot's build lock. Uncontended, this is a plain `try_lock`. When another caller is
-/// building and this one is on a multi-thread Tokio runtime (the async entry points run on
-/// the pyo3 runtime), the wait is wrapped in `block_in_place` so the runtime can run other
-/// tasks on a replacement worker instead of losing this one for the whole cold start. Any
-/// other thread just waits. A poisoned lock (a build that panicked) guards no data and is
+/// building and this one is a worker of a multi-thread Tokio runtime (the async entry points run
+/// on the pyo3 runtime), the wait is wrapped in `block_in_place` so the runtime can run other
+/// tasks on a replacement worker instead of losing this one for the whole cold start. The
+/// choice is `runtime_support::blocking_wait`'s rule (#300): any other thread, including a
+/// `LocalSet` driven by a non-worker thread, just waits. A poisoned lock (a build that panicked) guards no data and is
 /// recovered.
 fn lock_build(build: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
     match build.try_lock() {
@@ -143,14 +145,7 @@ fn lock_build(build: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
         Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {}
     }
-    let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
-        .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-        .unwrap_or(false);
-    if on_multi_thread_runtime {
-        tokio::task::block_in_place(|| build.lock().unwrap_or_else(|e| e.into_inner()))
-    } else {
-        build.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    crate::runtime_support::blocking_wait(|| build.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 impl StoreSlot {
@@ -202,7 +197,14 @@ impl StoreSlot {
 /// per key and the slot makes the build happen once.
 ///
 /// Performance: <100ns per lookup (DashMap sharded locking)
-static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<StoreSlot>>> = Lazy::new(DashMap::new);
+static STORE_CACHE_CELL: crate::fork_guard::ForkCell<DashMap<StoreKey, Arc<StoreSlot>>> =
+    crate::fork_guard::ForkCell::new();
+
+/// The store cache of THIS process: a fork child starts with an empty one (the inherited
+/// stores own connection pools whose tasks ran on the parent's runtime, #297).
+fn store_cache() -> &'static DashMap<StoreKey, Arc<StoreSlot>> {
+    STORE_CACHE_CELL.get_or_init(DashMap::new)
+}
 
 /// Test hook: the URI of every store `get_or_create_store` built (not served from the
 /// cache), in order.  Lets a test count the builds for one URI.
@@ -249,11 +251,11 @@ fn get_or_create_store(
     let key = StoreKey::from_uri(uri)?;
 
     // Fast path: the slot exists (cache hit >99% in typical workloads).
-    let existing = STORE_CACHE.get(&key).map(|slot| Arc::clone(slot.value()));
+    let existing = store_cache().get(&key).map(|slot| Arc::clone(slot.value()));
     let slot = match existing {
         Some(slot) => slot,
         None => Arc::clone(
-            STORE_CACHE
+            store_cache()
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(StoreSlot::new()))
                 .value(),
@@ -734,6 +736,7 @@ pub fn mp_get(
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    // exit-gate: allowed (sync pyfunction on the calling Python thread, already attached)
     Python::attach(|py| {
         // Parse S3 URI
         let (bucket, key_prefix) = parse_s3_uri_for_global_client(uri).map_err(py_err)?;
@@ -844,7 +847,8 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 
 /// Enable operation logging to a local zstd-compressed TSV file.
 ///
-/// A process supports exactly ONE op-log session (init -> finalize, no restart).
+/// One op-log session runs at a time. After finalize_op_log() a new session can be
+/// started with another init_op_log() call (issue #294), any number of times.
 ///
 /// Args:
 ///     path: Local filesystem path (e.g. "/tmp/ops.tsv.zst") or a file://
@@ -861,28 +865,62 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 ///     - First call: creates the file and starts logging. A call that fails
 ///       (bad path, unsupported scheme) leaves logging uninitialized, so a
 ///       corrected call can succeed.
-///     - Call while logging is already active: returns without effect; the new
-///       path is not created or truncated.
-///     - Call after finalize_op_log(): raises RuntimeError and touches no file.
+///     - Call while logging is already active with the SAME file (any
+///       spelling: "x", "./x", "/abs/x", "file:///abs/x", "dir/../x", a symlink
+///       or hard link to it): returns without effect; nothing is created or
+///       truncated and the session continues.
+///     - Call while logging is already active with a DIFFERENT file: raises
+///       RuntimeError naming the file being written and the requested path and
+///       saying to call finalize_op_log() first. The requested path is not
+///       created or truncated and the session carries on unaffected. A path
+///       that cannot be used (unsupported scheme, empty "file://") raises too.
+///       Exactly one of several threads calling at once wins (same file: all
+///       return, one creates it; different files: the others raise).
+///     - In a child process created by os.fork() the parent's session does not
+///       exist (its writer thread is not copied): is_op_log_active() is False
+///       there and the child may start its OWN session, but not on the
+///       file an ancestor is still writing (RuntimeError: it would truncate a
+///       live log); a log the parent had already finalized may be initialised.
+///       This covers the op-log only: a forked child must not use s3dlio I/O
+///       once the parent has (the parent's runtime threads are not copied by
+///       fork, so the child's first call can hang); use the "spawn" or
+///       "forkserver" start method, or fork before the first s3dlio call.
+///     - Call after finalize_op_log(): starts a NEW session. If the previous
+///       session's writer is still draining (finalize running on another
+///       thread), it waits for that first. The file is created like a first
+///       init (create-and-truncate: the same path REPLACES the previous log, a
+///       different path leaves it untouched); op_log_stats() restarts from zero
+///       for the new session and the process client ID carries over. A failed
+///       call leaves logging finalized, so a corrected call can succeed.
 ///
 /// The module-level functions (get, put_bytes, stat, list, delete, get_async,
-/// ...) look the op-log up on every call: a call made while logging is active is
-/// recorded once, and a call made before init_op_log() or after
-/// finalize_op_log() is not, whichever call first used a given scheme. Objects
-/// you construct yourself (stores, readers, writers) capture the logger when
-/// they are constructed: those created before init_op_log() are never logged;
-/// those created before finalize_op_log() stop recording when it runs.
+/// ...) look the op-log up when the call is made: a call made while logging is
+/// active is recorded once, and a call made before init_op_log() or after
+/// finalize_op_log() is not, whichever call first used a given scheme. For an
+/// *_async call that moment is the call itself, not the first run of its
+/// awaitable on the event loop. Objects you construct yourself (stores such as
+/// MultiEndpointStore, readers, writers, and datasets and loaders over s3://)
+/// capture the logger when they are constructed: those created before
+/// init_op_log() are never logged; those created before finalize_op_log() stop
+/// recording when it runs, and stay silent after a later init_op_log() (they
+/// never write into the new session). A call still running when
+/// finalize_op_log() runs writes no row, even if a new session has started by
+/// the time it completes, and is not counted in the new session's
+/// op_log_stats(); the call itself is unaffected.
 #[pyfunction]
-pub fn init_op_log(path: &str) -> PyResult<()> {
-    init_op_logger(path).map_err(py_err)
+pub fn init_op_log(py: Python<'_>, path: &str) -> PyResult<()> {
+    // A re-init may wait for the previous session to drain (#294): release the GIL
+    // meanwhile, as finalize_op_log does.
+    py.detach(|| init_op_logger(path)).map_err(py_err)
 }
 
 /// Finish operation logging: write every accepted record (unless the writer
 /// fails: an I/O error or a panic in the writer thread, see op_log_stats()),
 /// close the zstd stream and wait until the writer has finished and signalled
 /// completion. Call it before the process exits: nothing does it for you (no
-/// atexit hook), and without it queued records and the zstd frame end are lost. Terminal for this process (see
-/// init_op_log). Safe to call repeatedly, or before init_op_log() (no effect).
+/// atexit hook), and without it queued records and the zstd frame end are lost. It
+/// ends the current session; init_op_log() can start a new one (see init_op_log).
+/// Safe to call repeatedly, or before init_op_log() (no effect).
 /// After it returns is_op_log_active() is False and operations on objects
 /// created earlier are no longer recorded. The GIL is released while the
 /// pending records are drained, so other Python threads keep running.
@@ -892,7 +930,8 @@ pub fn finalize_op_log(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-/// True only between a successful init_op_log() and finalize_op_log().
+/// True only between a successful init_op_log() and the next finalize_op_log()
+/// (and again after a re-init).
 #[pyfunction]
 pub fn is_op_log_active() -> PyResult<bool> {
     Ok(global_logger().is_some())
@@ -902,7 +941,10 @@ pub fn is_op_log_active() -> PyResult<bool> {
 /// init_op_log() and finalize_op_log(), so you can detect most ways records are
 /// lost.
 ///
-/// Returns None before init_op_log(); otherwise a dict (available while
+/// The counts are those of the CURRENT session: a new init_op_log() after
+/// finalize_op_log() starts again from zero (read them before re-initialising).
+///
+/// Returns None before the first init_op_log(); otherwise a dict (available while
 /// logging is active AND after finalize_op_log()):
 ///
 ///     accepted         entries queued for the writer
@@ -1205,16 +1247,24 @@ pub(crate) fn put_async_py<'p>(
         .with_chunk_size(chunk_size);
 
     let prefix = prefix.to_string();
+    // The op-log session is bound NOW, when the call is made, not when the runtime first polls
+    // the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
         task::spawn_blocking(move || {
             if should_create_bucket {
                 create_put_bucket(&prefix).map_err(py_err)?;
             }
-            put_objects_with_random_data_and_type(&uris, sz, jobs, config).map_err(py_err)
+            crate::s3_utils::put_objects_with_random_data_and_type_logged(
+                &uris, sz, jobs, config, None, logger,
+            )
+            .map_err(py_err)
         })
         .await
         .map_err(py_err)??;
-        Python::attach(|py| Ok(py.None()))
+        // Python `None`, converted inside the exit-safe delivery (issue #302): a tokio worker must
+        // never attach to Python itself.
+        Ok(None::<()>)
     })
 }
 
@@ -1282,7 +1332,7 @@ pub fn configure_s3(
     }
     // Clear the store cache so subsequent operations create fresh stores
     // with the updated configuration rather than reusing stale ones.
-    STORE_CACHE.clear();
+    store_cache().clear();
     Ok(())
 }
 
@@ -1356,10 +1406,8 @@ fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAn
 
     future_into_py(py, async move {
         let os = store.stat(&uri).await.map_err(py_err)?;
-        Python::attach(|py| {
-            let obj: Py<PyAny> = stat_to_pydict(py, os)?.unbind().into();
-            Ok::<Py<PyAny>, PyErr>(obj)
-        })
+        // The dict is built inside the exit-safe delivery (issue #302), not on this worker.
+        Ok(StatDict(os))
     })
 }
 
@@ -1367,15 +1415,25 @@ fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAn
 fn stat_many_async<'py>(py: Python<'py>, uris: Vec<String>) -> PyResult<pyo3::Bound<'py, PyAny>> {
     future_into_py(py, async move {
         let metas = stat_object_many_async(uris).await.map_err(py_err)?;
-        Python::attach(|py| {
-            let list = PyList::empty(py);
-            for os in metas {
-                // append accepts any IntoPyObject<'py>; Bound<'py, PyDict> works directly
-                list.append(stat_to_pydict(py, os)?)?;
-            }
-            Ok::<Py<PyAny>, PyErr>(list.unbind().into())
-        })
+        // The list of dicts is built inside the exit-safe delivery (issue #302).
+        Ok(metas.into_iter().map(StatDict).collect::<Vec<_>>())
     })
+}
+
+/// An object's metadata on its way to Python as a `dict`.
+///
+/// Lets the async stat futures return a plain Rust value: the `dict` is built by `IntoPyObject`
+/// inside the exit-safe result delivery (issue #302), never by a tokio worker attaching to Python.
+struct StatDict(crate::s3_utils::ObjectStat);
+
+impl<'py> IntoPyObject<'py> for StatDict {
+    type Target = PyDict;
+    type Output = Bound<'py, PyDict>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        stat_to_pydict(py, self.0)
+    }
 }
 
 /// Helper function to map Rust to Python for stat call
@@ -1551,6 +1609,9 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move { put_verified_with_retry(store.as_ref(), &uri, data_owned).await })
     });
+    // The payload (exact `bytes`) may have been released into the queue by a thread without the
+    // GIL: release it here, with this thread's GIL (#297).
+    super::put_payload::drain_pending_exports(py);
     // The put is over (it succeeded, failed, or the store gave up), but a backend may still hold
     // a clone of the payload (an SDK/hyper task, a detached writer). Wait until the LAST clone is
     // gone (the owner's drop), then release the export with this thread's real GIL token: the
@@ -1663,9 +1724,11 @@ fn put_bytes_async<'py>(
     let payload = put_payload(py, data, usage)?;
     let latch = payload.latch;
     let data_owned = payload.bytes;
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
 
     guarded_put(py, latch, move || async move {
-        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri, logger).map_err(py_err)?;
         put_verified_with_retry(store.as_ref(), &uri, data_owned)
             .await
             .map_err(py_err)?;
@@ -1693,12 +1756,31 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = PyResult<Option<()>>> + Send + 'static,
 {
+    // ONE exit-gate scope for the whole start (#304): a refusal is only possible here, before the
+    // guard is prepared and before anything is spawned; every later step runs under this scope (the
+    // inner scopes of `prepare_guard`, `future_into_py`, `instantiate` and the cancel calls nest and
+    // cannot be refused), so the cancel of a failure path is never skipped.
+    let scope = match python_call_scope() {
+        Ok(scope) => scope,
+        Err(e) => {
+            drop(make); // nothing was prepared or spawned: release the (queued) exports
+            if let Some(latch) = &latch {
+                if quiesce_blocking(py, latch).is_err() {
+                    return Err(still_referenced_error(&format!(
+                        "the put could not be started: {e}"
+                    )));
+                }
+            }
+            return Err(e);
+        }
+    };
     let guard = match &latch {
         None => None,
         Some(latch) => match prepare_guard(py, latch.clone()) {
             Ok(g) => Some(g),
             Err(e) => {
                 drop(make); // nothing was spawned: this releases the (queued) exports...
+                drop(scope); // ...and the wait below must not hold the exit gate
                 if quiesce_blocking(py, latch).is_err() {
                     return Err(still_referenced_error(&format!(
                         "the put could not be started: {e}"
@@ -1710,6 +1792,7 @@ where
     };
 
     let inner = future_into_py(py, make());
+    after_spawn_hook();
     // On EVERY error path from here the barrier is kept: the blocking wait + drain below.
     let fail = |py: Python<'py>, latch: &Option<std::sync::Arc<Latch>>, e: PyErr| -> PyErr {
         if let Some(latch) = latch {
@@ -1721,10 +1804,13 @@ where
     };
     let inner = match inner {
         Ok(i) => i,
-        Err(e) => return Err(fail(py, &latch, e)),
+        Err(e) => {
+            drop(scope);
+            return Err(fail(py, &latch, e));
+        }
     };
     match (guard, &latch) {
-        (Some(g), Some(latch)) => wrap_in_guard(py, g, inner, latch),
+        (Some(g), Some(latch)) => wrap_in_guard(py, g, inner, latch, scope),
         _ => Ok(inner),
     }
 }
@@ -1745,11 +1831,13 @@ fn wrap_in_guard<'py>(
     guard: PreparedGuard<'py>,
     inner: Bound<'py, PyAny>,
     latch: &std::sync::Arc<Latch>,
+    scope: PythonCallScope,
 ) -> PyResult<Bound<'py, PyAny>> {
     match guard.instantiate(py, inner.clone()) {
         Ok(f) => Ok(f),
         Err(e) => {
-            let _ = inner.call_method0("cancel");
+            cancel_ignoring_errors(&inner);
+            drop(scope); // the blocking wait below must not hold the exit gate
             if quiesce_blocking(py, latch).is_err() {
                 return Err(still_referenced_error(&format!(
                     "the put could not be started: {e}"
@@ -1911,6 +1999,8 @@ impl<'py> PreparedGuard<'py> {
     /// Wrap the `inner` put future (cannot fail for lack of resources prepared above).
     fn instantiate(self, py: Python<'py>, inner: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let _ = py;
+        // Runs the `GuardedFuture` constructor (Python bytecode) from Rust: exit-gate scope (#304).
+        let _scope = python_call_scope()?;
         self.class.call1((
             inner,
             self.latch_ready,
@@ -1926,6 +2016,9 @@ fn prepare_guard<'py>(
     py: Python<'py>,
     latch: std::sync::Arc<Latch>,
 ) -> PyResult<PreparedGuard<'py>> {
+    // The first call compiles and imports the guard module (`asyncio`, `warnings`: Python
+    // bytecode run from Rust): exit-gate scope (#304), refused once the interpreter is exiting.
+    let _scope = python_call_scope()?;
     static GUARD: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
     let class = match GUARD.get() {
         Some(g) => g.bind(py).clone(),
@@ -2010,7 +2103,8 @@ fn prepare_guard<'py>(
 
 /// Counters of the buffer-export barrier (diagnostics and tests):
 /// `{"quiesce_timeouts", "queued", "internal_errors", "shutdown_attach_waits",
-/// "shutdown_attach_wait_timeouts", "releaser_attaches", "test_releaser_parked"}`.
+/// "shutdown_attach_wait_timeouts", "releaser_attaches", "test_releaser_parked", "deferred_decrefs",
+/// "async_gilref_deferred"}`.
 #[pyfunction]
 fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let s = export_stats();
@@ -2025,6 +2119,8 @@ fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     )?;
     d.set_item("releaser_attaches", s.releaser_attaches)?;
     d.set_item("test_releaser_parked", s.test_releaser_parked)?;
+    d.set_item("deferred_decrefs", s.deferred_decrefs)?;
+    d.set_item("async_gilref_deferred", s.async_gilref_deferred)?;
     Ok(d)
 }
 
@@ -2088,7 +2184,7 @@ create_exception!(
 /// The result of `head_async` for an object that exists: its size and opaque identity.
 ///
 /// Frozen: the fields cannot be assigned, and equal values hash equal.
-#[pyclass(name = "ObjectMetadata", frozen, eq, hash)]
+#[pyclass(name = "ObjectMetadata", frozen, eq, hash, from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PyHeadMetadata {
     /// The object size in bytes (never negative).
@@ -2293,6 +2389,15 @@ impl StartSeams for LiveSeams {
 /// paths of starting an awaitable, where the original error is what the caller must see and
 /// nothing may wait on the outcome of the cancellation.
 fn cancel_ignoring_errors(future: &Bound<'_, PyAny>) {
+    // `cancel()` schedules callbacks on the loop (Python bytecode run from Rust): exit-gate scope
+    // (#304). A refusal means the interpreter is exiting; there is nothing left to cancel for.
+    let _scope = match python_call_scope() {
+        Ok(scope) => scope,
+        Err(e) => {
+            debug!("s3dlio: not cancelling an awaitable: {e}");
+            return;
+        }
+    };
     if let Err(e) = future.call_method0("cancel") {
         debug!("s3dlio: ignoring an error cancelling an awaitable that failed to start: {e}");
     }
@@ -2378,6 +2483,9 @@ fn get_into_with_store<'py, S: StartSeams>(
     expected_len: usize,
     latch: Arc<Latch>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // ONE exit-gate scope for the whole start (#304), refused only here, before anything is acquired or
+    // spawned; the inner scopes nest and cannot be refused, so no cancel below is ever skipped.
+    let _scope = python_call_scope()?;
     let guard = prepare_guard(py, latch.clone())?;
     let owner = acquire_writable(py, dst, expected_len, &latch)?;
 
@@ -2499,6 +2607,8 @@ fn head_with_store<'py, S: StartSeams>(
     uri: String,
     latch: Arc<Latch>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // ONE exit-gate scope for the whole start (#304); see `get_into_with_store`.
+    let _scope = python_call_scope()?;
     let guard = prepare_guard(py, latch.clone())?;
 
     let (tx, rx) = oneshot::channel::<()>();
@@ -2568,6 +2678,16 @@ fn object_capabilities_py<'py>(py: Python<'py>, uri: &str) -> PyResult<Bound<'py
     Ok(result)
 }
 
+/// Test hook (hidden; registered only in a `test-hooks` build): the NEXT guarded put closes the exit gate right after it spawned its native
+/// work, to prove the rest of the start cannot be refused half-way (#304). The gate never reopens:
+/// use it only in a throw-away process.
+#[cfg(feature = "test-hooks")]
+#[pyfunction]
+#[pyo3(name = "_test_close_exit_gate_after_next_spawn")]
+fn test_close_exit_gate_after_next_spawn_py() {
+    arm_close_gate_after_next_spawn();
+}
+
 // ---------------------------------------------------------------------------
 // mkdir() - Create directory/prefix for any backend
 // ---------------------------------------------------------------------------
@@ -2617,9 +2737,11 @@ pub fn mkdir(py: Python<'_>, uri: &str) -> PyResult<()> {
 #[pyfunction]
 fn mkdir_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
 
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri, logger).map_err(py_err)?;
         store.mkdir(&uri).await.map_err(py_err)?;
         // Python `None` (the Rust unit would reach Python as `()`, an empty tuple; issue #233).
         // `Option<()>` converts to `None` INSIDE the exit-safe delivery (issue #192). This body
@@ -2652,16 +2774,20 @@ pub fn get_many_stats_async<'p>(
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
         let (count, total) = task::spawn_blocking(move || {
-            let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
+            let res = crate::s3_utils::get_objects_parallel_logged(&uris, max_in_flight, logger)
+                .map_err(py_err)?;
             let bytes = res.iter().map(|(_, b)| b.len()).sum::<usize>();
             Ok::<(usize, usize), PyErr>((res.len(), bytes))
         })
         .await
         .map_err(py_err)??;
 
-        Python::attach(|py| (count, total).into_py_any(py))
+        // A `(count, total)` tuple, converted inside the exit-safe delivery (issue #302).
+        Ok((count, total))
     })
 }
 
@@ -2673,21 +2799,23 @@ pub(crate) fn get_many_async_py<'p>(
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     require_max_in_flight("max_in_flight", max_in_flight)?;
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
         // get_objects_parallel returns Vec<(String, Bytes)> - keep as Bytes for zero-copy
         let pairs: Vec<(String, Bytes)> = task::spawn_blocking(move || {
-            get_objects_parallel(&uris, max_in_flight).map_err(py_err)
+            crate::s3_utils::get_objects_parallel_logged(&uris, max_in_flight, logger)
+                .map_err(py_err)
         })
         .await
         .map_err(py_err)??;
 
-        Python::attach(|_py| {
-            let out = pairs
-                .into_iter()
-                .map(|(u, b)| (u, PyBytesView::new(b)))
-                .collect::<Vec<_>>();
-            Ok(out)
-        })
+        // `PyBytesView` wraps the same `Bytes` (no copy); the Python objects are created inside the
+        // exit-safe delivery (issue #302), not on this worker.
+        Ok(pairs
+            .into_iter()
+            .map(|(u, b)| (u, PyBytesView::new(b)))
+            .collect::<Vec<_>>())
     })
 }
 
@@ -2751,10 +2879,14 @@ pub fn get_range_py(
 #[pyo3(signature = (uri))]
 pub fn get_async_py<'p>(py: Python<'p>, uri: &str) -> PyResult<Bound<'p, PyAny>> {
     let uri_owned = uri.to_owned();
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri_owned, logger).map_err(py_err)?;
         let bytes = store.get(&uri_owned).await.map_err(py_err)?;
-        Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
+        // Zero-copy `BytesView` over the same `Bytes`; the Python object is created inside the
+        // exit-safe delivery (issue #302): this worker never attaches to Python.
+        Ok(PyBytesView::new(bytes))
     })
 }
 
@@ -2768,13 +2900,17 @@ pub fn get_range_async_py<'p>(
     length: Option<u64>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let uri_owned = uri.to_owned();
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        let store = get_or_create_store(&uri_owned, logger).map_err(py_err)?;
         let bytes = store
             .get_range(&uri_owned, offset, length)
             .await
             .map_err(py_err)?;
-        Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
+        // Zero-copy `BytesView` over the same `Bytes`; the Python object is created inside the
+        // exit-safe delivery (issue #302): this worker never attaches to Python.
+        Ok(PyBytesView::new(bytes))
     })
 }
 
@@ -3554,11 +3690,17 @@ pub fn put_many_async<'py>(
         latch,
     } = batch_payloads(py, items, usage)?;
 
+    // Bound to the op-log session active NOW, not at the first poll of the future (#294).
+    let logger = global_logger();
+
     guarded_put(py, latch, move || async move {
-        let puts = owned_items.into_iter().map(|(uri, data)| async move {
-            let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
-            store.put(&uri, data).await.map_err(py_err)?;
-            Ok::<(), PyErr>(())
+        let puts = owned_items.into_iter().map(|(uri, data)| {
+            let logger = logger.clone();
+            async move {
+                let store = get_or_create_store(&uri, logger).map_err(py_err)?;
+                store.put(&uri, data).await.map_err(py_err)?;
+                Ok::<(), PyErr>(())
+            }
         });
         run_bounded_puts(puts.collect(), max_in_flight, py_err).await?;
         // Python `None`, converted inside the exit-safe delivery (issue #271; see `mkdir_async`).
@@ -3650,6 +3792,19 @@ fn lock_ignoring_poison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard
 pub struct PyObjectWriter {
     inner: std::sync::Mutex<Option<Box<dyn ObjectWriter>>>,
     stats: std::sync::Mutex<WriterStats>,
+    /// The process that created the writer. In a fork child the writer is refused and never
+    /// dropped (a multipart writer's drop would abort the PARENT's upload) (#297).
+    stamp: crate::fork_guard::ForkStamp,
+}
+
+impl Drop for PyObjectWriter {
+    fn drop(&mut self) {
+        let writer = match self.inner.get_mut() {
+            Ok(slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        self.stamp.leak_on_drop(writer);
+    }
 }
 
 impl PyObjectWriter {
@@ -3658,6 +3813,7 @@ impl PyObjectWriter {
         Self {
             inner: std::sync::Mutex::new(Some(writer)),
             stats: std::sync::Mutex::new(stats),
+            stamp: crate::fork_guard::ForkStamp::new(),
         }
     }
 
@@ -3677,7 +3833,7 @@ impl PyObjectWriter {
         data: &[u8],
     ) -> PyResult<()> {
         let writer = writer.as_mut().ok_or_else(Self::finalized_error)?;
-        let result = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+        let result = crate::s3_client::pyo3_runtime().block_on(async {
             writer
                 .write_chunk(data)
                 .await
@@ -3691,6 +3847,7 @@ impl PyObjectWriter {
     /// call without the GIL: an exported buffer the caller promised not to modify, or an
     /// immutable `bytes`.
     fn write_detached(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        self.stamp.check()?;
         py.detach(|| {
             let mut guard = lock_ignoring_poison(&self.inner);
             self.write_locked(&mut guard, data)
@@ -3724,6 +3881,7 @@ impl PyObjectWriter {
     ///
     /// Calls on one writer from several threads run one after another.
     fn write_chunk(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.stamp.check()?;
         // Strict: bytes-like or `__bytes__()` only (never an int or an arbitrary iterable).
         let held = hold_for_call(py, data)?;
         let result = self.write_detached(py, held.as_slice());
@@ -3767,6 +3925,7 @@ impl PyObjectWriter {
 
     /// Finalize the writer and complete the upload
     fn finalize(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        self.stamp.check()?;
         py.detach(|| {
             let mut guard = lock_ignoring_poison(&self.inner);
             let writer = guard
@@ -3938,7 +4097,9 @@ fn endpoint_payload(
 /// Python wrapper for MultiEndpointStore
 #[pyclass(name = "MultiEndpointStore")]
 struct PyMultiEndpointStore {
-    store: Arc<MultiEndpointStore>,
+    /// Owns clients and connection pools of the creating process: refused in a fork child and
+    /// leaked, never dropped, there (#297).
+    store: crate::fork_guard::Guarded<Arc<MultiEndpointStore>>,
 }
 
 #[pymethods]
@@ -3946,7 +4107,7 @@ impl PyMultiEndpointStore {
     /// Get an object from the multi-endpoint store (zero-copy via BytesView)
     fn get<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let data = store
@@ -3954,7 +4115,8 @@ impl PyMultiEndpointStore {
                 .await
                 .map_err(|e| py_err(e.context("Get failed")))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            // The `BytesView` is created inside the exit-safe delivery (issue #302).
+            Ok(PyBytesView::new(data))
         })
     }
 
@@ -3968,7 +4130,7 @@ impl PyMultiEndpointStore {
         length: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let data = store
@@ -3976,7 +4138,8 @@ impl PyMultiEndpointStore {
                 .await
                 .map_err(|e| py_err(e.context("Get range failed")))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            // The `BytesView` is created inside the exit-safe delivery (issue #302).
+            Ok(PyBytesView::new(data))
         })
     }
 
@@ -4003,7 +4166,7 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         guarded_put(py, payload.latch, move || async move {
             store
@@ -4025,7 +4188,7 @@ impl PyMultiEndpointStore {
         recursive: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let objects = store
@@ -4040,7 +4203,7 @@ impl PyMultiEndpointStore {
     /// Delete an object
     fn delete<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             store
@@ -4066,7 +4229,7 @@ impl PyMultiEndpointStore {
         recursive: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let objects = store
@@ -4089,14 +4252,15 @@ impl PyMultiEndpointStore {
         uri: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             let data = store
                 .get_from_endpoint(index, &uri)
                 .await
                 .map_err(|e| py_err(e.context("Get from endpoint failed")))?;
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            // The `BytesView` is created inside the exit-safe delivery (issue #302).
+            Ok(PyBytesView::new(data))
         })
     }
 
@@ -4119,7 +4283,7 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         guarded_put(py, payload.latch, move || async move {
             store
@@ -4142,7 +4306,7 @@ impl PyMultiEndpointStore {
         uri: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         future_into_py(py, async move {
             store
@@ -4174,7 +4338,7 @@ impl PyMultiEndpointStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let payload = endpoint_payload(py, data, borrow, &uri)?;
-        let store = self.store.clone();
+        let store = self.store.get()?.clone();
 
         guarded_put(py, payload.latch, move || async move {
             store
@@ -4188,7 +4352,7 @@ impl PyMultiEndpointStore {
 
     /// Get per-endpoint statistics
     fn get_endpoint_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let stats = self.store.get_all_stats();
+        let stats = self.store.get()?.get_all_stats();
         let list = PyList::empty(py);
 
         for (uri, stat) in stats {
@@ -4207,7 +4371,7 @@ impl PyMultiEndpointStore {
 
     /// Get total aggregated statistics across all endpoints
     fn get_total_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let total = self.store.get_total_stats();
+        let total = self.store.get()?.get_total_stats();
         let dict = PyDict::new(py);
 
         dict.set_item("total_requests", total.total_requests)?;
@@ -4220,16 +4384,16 @@ impl PyMultiEndpointStore {
     }
 
     /// Get the number of configured endpoints
-    fn endpoint_count(&self) -> usize {
-        self.store.endpoint_count()
+    fn endpoint_count(&self) -> PyResult<usize> {
+        Ok(self.store.get()?.endpoint_count())
     }
 
     /// Get the load balancing strategy
-    fn strategy(&self) -> String {
-        match self.store.strategy() {
+    fn strategy(&self) -> PyResult<String> {
+        Ok(match self.store.get()?.strategy() {
             LoadBalanceStrategy::RoundRobin => "round_robin".to_string(),
             LoadBalanceStrategy::LeastConnections => "least_connections".to_string(),
-        }
+        })
     }
 }
 
@@ -4271,7 +4435,7 @@ fn create_multi_endpoint_store(
         .map_err(|e| py_err(e.context("Failed to create multi-endpoint store")))?;
 
     Ok(PyMultiEndpointStore {
-        store: Arc::new(store),
+        store: crate::fork_guard::Guarded::new(Arc::new(store)),
     })
 }
 
@@ -4376,7 +4540,7 @@ fn create_multi_endpoint_store_from_env(strategy: Option<&str>) -> PyResult<PyMu
         py_err(e.context("Failed to create multi-endpoint store from S3_ENDPOINT_URIS"))
     })?;
     Ok(PyMultiEndpointStore {
-        store: Arc::new(store),
+        store: crate::fork_guard::Guarded::new(Arc::new(store)),
     })
 }
 
@@ -4582,6 +4746,11 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     // Caller-buffer GET, typed HEAD and pure capabilities (#264)
     m.add_function(wrap_pyfunction!(object_capabilities_py, m)?)?;
+    #[cfg(feature = "test-hooks")]
+    m.add_function(wrap_pyfunction!(
+        test_close_exit_gate_after_next_spawn_py,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(get_into_async, m)?)?;
     m.add_function(wrap_pyfunction!(head_async, m)?)?;
     m.add_class::<PyHeadMetadata>()?;
@@ -4896,7 +5065,7 @@ mod issue173_store_creation_tests {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
         // Force the slow (creating) path of get_or_create_store.
-        STORE_CACHE.remove(&StoreKey::from_uri(HOST_FORM_URI).expect("valid URI"));
+        store_cache().remove(&StoreKey::from_uri(HOST_FORM_URI).expect("valid URI"));
     }
 
     /// The exact shape of the old `get`/`get_range`/`put_bytes` bodies:
@@ -5068,7 +5237,7 @@ mod issue171_store_cache_routing_tests {
     /// How many cache entries sit under the global-client key (route `None`).
     fn global_route_entries() -> usize {
         let want = StoreKey::from_uri(GLOBAL_BUCKET_URI).expect("valid URI");
-        STORE_CACHE.iter().filter(|e| *e.key() == want).count()
+        store_cache().iter().filter(|e| *e.key() == want).count()
     }
 
     #[test]
@@ -5566,7 +5735,9 @@ mod borrowed_put_guard_tests {
             let latch = Latch::new();
             latch.mark_dropped();
             latch.mark_released(); // no native reader: the fallback wait returns at once
-            let err = wrap_in_guard(py, guard, inner.clone(), &latch).expect_err("must fail");
+            let scope = python_call_scope().expect("gate open");
+            let err =
+                wrap_in_guard(py, guard, inner.clone(), &latch, scope).expect_err("must fail");
             assert!(err.to_string().contains("boom"), "{err}");
             let cancelled: bool = inner.call_method0("cancelled").unwrap().extract().unwrap();
             assert!(cancelled, "the already-spawned put was not cancelled");
@@ -6518,7 +6689,10 @@ async def scn_error_then_settle(start):
     }
 
     /// A Python callable `() -> bool` over a Rust closure.
-    fn bool_fn<'py>(py: Python<'py>, f: impl Fn() -> bool + Send + 'static) -> Bound<'py, PyAny> {
+    fn bool_fn<'py>(
+        py: Python<'py>,
+        f: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Bound<'py, PyAny> {
         pyo3::types::PyCFunction::new_closure(
             py,
             None,
@@ -6532,7 +6706,7 @@ async def scn_error_then_settle(start):
     }
 
     /// A Python callable `()` that runs a Rust closure and returns `None`.
-    fn action_fn<'py>(py: Python<'py>, f: impl Fn() + Send + 'static) -> Bound<'py, PyAny> {
+    fn action_fn<'py>(py: Python<'py>, f: impl Fn() + Send + Sync + 'static) -> Bound<'py, PyAny> {
         pyo3::types::PyCFunction::new_closure(
             py,
             None,
@@ -6580,8 +6754,9 @@ async def scn_error_then_settle(start):
                 (provider, get_into, head)
             };
             assert_eq!(get("s3://bucket/key"), ("s3".to_string(), native, native));
-            assert_eq!(get("file:///tmp/x"), ("file".to_string(), false, false));
-            assert_eq!(get("direct:///tmp/x"), ("direct".to_string(), false, false));
+            // #295: the local file stores implement both operations in every build.
+            assert_eq!(get("file:///tmp/x"), ("file".to_string(), true, true));
+            assert_eq!(get("direct:///tmp/x"), ("direct".to_string(), true, true));
             assert_eq!(get("ftp://host/x"), ("unknown".to_string(), false, false));
         });
     }
@@ -6617,9 +6792,10 @@ async def scn_error_then_settle(start):
         Python::attach(|py| {
             let driver = Driver::new(py);
             let n = 4i32.into_pyobject(py).unwrap().into_any();
+            // file:// and direct:// are supported since #295; an unknown scheme is not.
             for uri in [
-                "file:///tmp/s3dlio-b3b-unsupported",
-                "direct:///tmp/s3dlio-b3b-x",
+                "ftp://host/s3dlio-b3b-unsupported",
+                "nosuchscheme://s3dlio-b3b-x",
             ] {
                 let ex = driver.exporter(16);
                 let err = get_into_async(py, uri, &ex, &n).expect_err("unsupported");
@@ -8135,20 +8311,20 @@ def metadata_is_immutable_and_hashable(a, b, c):
 def capabilities_dict(core):
     d = core.object_capabilities('file:///x')
     assert type(d) is dict, type(d)
-    assert d == {'provider': 'file', 'get_into': False, 'head': False}, d
+    assert d == {'provider': 'file', 'get_into': True, 'head': True}, d
     return True
 
 def unsupported_is_raised_synchronously(core):
     buf = bytearray(1)
     try:
-        core.get_into_async('file:///x', buf, expected_len=1)
+        core.get_into_async('ftp://host/x', buf, expected_len=1)
     except core.UnsupportedOperationError as e:
         assert isinstance(e, NotImplementedError)
     else:
         raise AssertionError('get_into_async did not raise UnsupportedOperationError')
     buf.append(0)  # nothing was exported
     try:
-        core.head_async('file:///x')
+        core.head_async('ftp://host/x')
     except core.UnsupportedOperationError:
         pass
     else:
@@ -8254,7 +8430,7 @@ def unsupported_is_raised_synchronously(core):
             checks
                 .getattr("unsupported_is_raised_synchronously")
                 .and_then(|f| f.call1((&core,)))
-                .expect("a file:// URI raises UnsupportedOperationError at the call");
+                .expect("an unknown-scheme URI raises UnsupportedOperationError at the call");
         });
     }
 
@@ -10042,11 +10218,25 @@ mod bounded_puts_tests {
         for step in 0..STEPS {
             gates[step].notify_one();
             until_started(&order, LIMIT + step + 1).await;
-            assert_eq!(
-                started(&order)[LIMIT + step],
-                LIMIT + step,
-                "release {step} did not admit the next item of the list"
-            );
+            // The items admitted so far must become a PREFIX of the list (no item overtakes
+            // another for good). Observed with a short wait, not at one instant: two tasks
+            // admitted back to back may run their first line in either order on a loaded
+            // multi-thread runtime, so the prefix can be momentarily incomplete.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut admitted = started(&order);
+                admitted.sort_unstable();
+                if admitted.len() > LIMIT + step
+                    && admitted == (0..admitted.len()).collect::<Vec<_>>()
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "release {step} did not admit the next item of the list in order: {admitted:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
         }
         for gate in &gates[STEPS..] {
             gate.notify_one();

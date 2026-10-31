@@ -29,6 +29,8 @@ pub mod constants;
 pub mod data_formats;
 pub mod dotenv; // `.env` handling: the one S3DLIO_LOAD_DOTENV switch (#243)
 pub mod download;
+pub mod fork_guard; // #297: fork-aware process-global state (ForkCell, Guarded, ForkStamp)
+
 pub mod memory;
 pub mod object_size_cache; // v0.9.10: Pre-stat size caching for benchmarking
 pub mod progress;
@@ -90,10 +92,12 @@ pub mod data_gen;
 pub mod data_gen_alt; // Alternative data generation with ChaCha20
 pub mod data_loader;
 pub mod direct_bounce;
+mod file_get_into; // shared caller-buffer GET + typed HEAD of the file stores (#295)
 pub mod file_store;
 pub mod file_store_direct;
 pub mod object_store_logger; // Op-log support for all backends
 pub mod page_cache;
+pub mod runtime_support; // tokio worker marker + the blocking-I/O rule of the file stores (#295)
 pub mod streaming_writer;
 pub mod tfrecord_index;
 
@@ -260,7 +264,9 @@ pub use crate::s3_utils::{
 };
 
 // Re-export the multipart public types
-pub use crate::multipart::{MultipartCompleteInfo, MultipartUploadConfig, MultipartUploadSink};
+pub use crate::multipart::{
+    flush_pending_aborts, MultipartCompleteInfo, MultipartUploadConfig, MultipartUploadSink,
+};
 
 // types:
 pub use crate::config::ObjectType;
@@ -284,7 +290,9 @@ mod test_env;
 // PyO3 module init -----------------------------------------------------------
 // ---------------------------------------------------------------------------
 #[cfg(feature = "extension-module")]
-#[pymodule]
+// `gil_used = true`: PyO3 0.28 made free-threaded support the default; s3dlio has not been audited
+// for it, so keep the 0.27 behaviour (a free-threaded interpreter re-enables the GIL on import).
+#[pymodule(gil_used = true)]
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     Python::initialize();
 
@@ -293,6 +301,7 @@ pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     // does at import, and `s3dlio/torch.py` imports this module before `torch`; but
     // anything the host imported or started before `import s3dlio` is outside our reach.
     dotenv::apply();
+    fork_guard::register();
 
     // Auto-size every process-wide thread pool (global Tokio runtime,
     // pyo3-async-runtimes runtime, Rayon global pool) from MPI/distributed-

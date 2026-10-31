@@ -603,7 +603,7 @@ fn build(mode: CredentialMode, env: EnvLookup<'_>) -> Result<Arc<dyn TokenCreden
             azure_identity::ManagedIdentityCredential::new(Some(
                 azure_identity::ManagedIdentityCredentialOptions {
                     user_assigned_id,
-                    ..Default::default()
+                    client_options: crate::azure_client::global_rt_client_options(),
                 },
             ))
             .map_err(ctx)?
@@ -612,7 +612,9 @@ fn build(mode: CredentialMode, env: EnvLookup<'_>) -> Result<Arc<dyn TokenCreden
             &required(env, ENV_AZURE_TENANT_ID, mode)?,
             required(env, ENV_AZURE_CLIENT_ID, mode)?,
             Secret::new(required(env, ENV_AZURE_CLIENT_SECRET, mode)?),
-            None,
+            Some(azure_identity::ClientSecretCredentialOptions {
+                client_options: crate::azure_client::global_rt_client_options(),
+            }),
         )
         .map_err(ctx)?,
         CredentialMode::WorkloadIdentity => {
@@ -625,7 +627,15 @@ fn build(mode: CredentialMode, env: EnvLookup<'_>) -> Result<Arc<dyn TokenCreden
             ] {
                 required(env, name, mode)?;
             }
-            azure_identity::WorkloadIdentityCredential::new(None).map_err(ctx)?
+            azure_identity::WorkloadIdentityCredential::new(Some(
+                azure_identity::WorkloadIdentityCredentialOptions {
+                    credential_options: azure_identity::ClientAssertionCredentialOptions {
+                        client_options: crate::azure_client::global_rt_client_options(),
+                    },
+                    ..Default::default()
+                },
+            ))
+            .map_err(ctx)?
         }
         CredentialMode::ClientCertificate => build_client_certificate(env)?,
         CredentialMode::Auto => Arc::new(AutoCredential::production()),
@@ -677,6 +687,7 @@ impl LazyCertificateCredential {
             SecretBytes::new(bytes),
             Some(azure_identity::ClientCertificateCredentialOptions {
                 password: password.map(Secret::new),
+                client_options: crate::azure_client::global_rt_client_options(),
                 ..Default::default()
             }),
         )
@@ -745,13 +756,20 @@ fn build_client_certificate(_env: EnvLookup<'_>) -> Result<Arc<dyn TokenCredenti
 
 /// One credential per mode per process. Nothing is cached when building fails, so a later call
 /// retries.
-static CREDENTIALS: std::sync::LazyLock<Mutex<HashMap<CredentialMode, Arc<dyn TokenCredential>>>> =
-    std::sync::LazyLock::new(Default::default);
+///
+/// Fork-aware (#297): a credential owns token caches and, for managed identity, an HTTP client;
+/// a fork child builds its own.
+static CREDENTIALS: crate::fork_guard::ForkCell<
+    Mutex<HashMap<CredentialMode, Arc<dyn TokenCredential>>>,
+> = crate::fork_guard::ForkCell::new();
 
 /// The process-wide credential for a concrete bearer-token `mode`, built on first use.
 pub fn credential_for(mode: CredentialMode) -> Result<Arc<dyn TokenCredential>> {
     crate::dotenv::apply();
-    let mut credentials = CREDENTIALS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut credentials = CREDENTIALS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(credential) = credentials.get(&mode) {
         return Ok(Arc::clone(credential));
     }

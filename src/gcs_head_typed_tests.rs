@@ -248,7 +248,8 @@ fn the_rapid_head_route_uses_the_descriptor_without_a_data_range() {
     let rapid = &src[at..];
     let describe = &rapid[rapid.find("async fn describe").expect("describe")..];
     let describe = &describe[..describe.find("\n        }\n").expect("end of describe")];
-    assert!(describe.contains(".send().await"), "{describe}");
+    // The request is sent with `send()` (inside the global-runtime context since #303).
+    assert!(describe.contains("builder.send()"), "{describe}");
     assert!(!describe.contains("send_and_read"), "{describe}");
     assert!(!describe.contains("ReadRange"), "{describe}");
 

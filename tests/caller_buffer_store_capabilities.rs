@@ -138,7 +138,7 @@ async fn gcs_capability_matches_the_store() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn file_and_direct_are_unsupported_in_both_places() {
+async fn file_and_direct_are_supported_in_both_places() {
     prepare();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("object.bin");
@@ -146,8 +146,16 @@ async fn file_and_direct_are_unsupported_in_both_places() {
     for scheme in ["file", "direct"] {
         let uri = format!("{scheme}://{}", path.display());
         let caps = object_capabilities(&uri).expect("caps");
-        assert!(!caps.get_into && !caps.head, "{uri}: {caps:?}");
+        assert!(caps.get_into && caps.head, "{uri}: {caps:?}");
+        // `assert_agree` reads 4 bytes into a 4-byte destination: the file is exactly that.
         assert_agree(&uri).await;
+        let mut dst = [0u8; 4];
+        store_for_uri(&uri)
+            .expect("store")
+            .get_into(&uri, &mut dst, &ReceiveProgress::new())
+            .await
+            .unwrap_or_else(|e| panic!("{uri}: {e:#}"));
+        assert_eq!(dst, [1u8; 4]);
     }
 }
 

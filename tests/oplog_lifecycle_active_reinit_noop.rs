@@ -10,11 +10,15 @@
 // tests/ is a separate binary and therefore a separate process, so test
 // ordering cannot hide a defect.
 
-// Scenario: init while Active is a documented no-op returning Ok. It does NOT
-// create or truncate the second path and the session keeps writing to the first.
+// Scenario (issue #294, round 2): init while Active.
+//  - with the SAME file: a documented no-op returning Ok. Nothing is created or
+//    truncated; rows logged before and after the call land in the one file.
+//  - with a DIFFERENT file: an error that names the file being written and the
+//    requested path and says to finalize first. The requested path is not
+//    created or truncated and the session carries on unaffected.
 
 use s3dlio::s3_logger::{LogEntry, LogOutcome};
-use s3dlio::{finalize_op_logger, global_logger, init_op_logger};
+use s3dlio::{finalize_op_logger, global_logger, init_op_logger, op_log_stats};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -63,7 +67,7 @@ fn logged_tags(path: &Path) -> Vec<String> {
 }
 
 #[test]
-fn init_while_active_is_a_noop() {
+fn init_while_active_same_file_is_a_noop_and_different_file_is_an_error() {
     // Do not depend on the caller's environment: the default queue (8192) and
     // non-lossless mode are what this scenario is written for.
     #[allow(deprecated)]
@@ -75,15 +79,46 @@ fn init_while_active_is_a_noop() {
     let first = dir.path().join("first.tsv.zst");
     let second = dir.path().join("second.tsv.zst");
     init_op_logger(first.to_str().unwrap()).unwrap();
-    init_op_logger(second.to_str().unwrap()).expect("init while Active returns Ok");
-    assert!(
-        !second.exists(),
-        "init while Active must not create the new path"
-    );
-
     let logger = global_logger().unwrap();
-    assert_eq!(logger.try_log(entry("only")), LogOutcome::Accepted);
+    assert_eq!(logger.try_log(entry("before")), LogOutcome::Accepted);
+
+    // Same file: no-op, no truncation, same session (the stats keep counting).
+    init_op_logger(first.to_str().unwrap()).expect("init with the active file is a no-op");
+    assert_eq!(logger.try_log(entry("after")), LogOutcome::Accepted);
+    assert_eq!(op_log_stats().unwrap().accepted, 2, "same session");
+
+    // Different file: an error that names both files and says what to do.
+    let err = init_op_logger(second.to_str().unwrap())
+        .expect_err("init with a different file while Active must fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::ResourceBusy);
+    let msg = err.to_string();
+    assert!(
+        msg.contains(first.to_str().unwrap()),
+        "must name the file being written: {msg}"
+    );
+    assert!(
+        msg.contains(second.to_str().unwrap()),
+        "must name the requested file: {msg}"
+    );
+    assert!(
+        msg.contains("finalize"),
+        "must say to finalize first: {msg}"
+    );
+    assert!(!second.exists(), "the requested path must not be created");
+
+    // The session is unaffected and still the same one.
+    assert!(global_logger().is_some());
+    assert_eq!(logger.try_log(entry("last")), LogOutcome::Accepted);
+    assert_eq!(op_log_stats().unwrap().accepted, 3, "same session");
+    drop(logger);
     finalize_op_logger();
-    assert_eq!(logged_tags(&first), vec!["only".to_string()]);
+    assert_eq!(
+        logged_tags(&first),
+        vec![
+            "before".to_string(),
+            "after".to_string(),
+            "last".to_string()
+        ]
+    );
     assert!(!second.exists());
 }
