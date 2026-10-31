@@ -25,7 +25,7 @@ fn a_finalize_during_starting_is_not_lost() {
     let fs = fifo.to_str().unwrap().to_string();
     let starter = std::thread::spawn(move || s3dlio::s3_logger::init_op_logger(&fs));
     std::thread::sleep(Duration::from_millis(300));
-    let fin = std::thread::spawn(|| s3dlio::s3_logger::finalize_op_logger());
+    let fin = std::thread::spawn(s3dlio::s3_logger::finalize_op_logger);
     std::thread::sleep(Duration::from_millis(300));
     let fin_returned_while_starting = fin.is_finished();
     let _reader = std::fs::File::open(&fifo);
