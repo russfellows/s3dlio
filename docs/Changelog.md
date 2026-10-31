@@ -234,7 +234,8 @@ affected. No API change.
   read or write is spawned. This only happens during interpreter exit: an `atexit` handler registered BEFORE
   `import s3dlio` runs after the drain and now gets the `RuntimeError` instead of an awaitable that never resolves;
   handlers registered after the import run before the drain and are unaffected. There is no behaviour change while the
-  interpreter is not exiting.
+  interpreter is not exiting. The scope around a user object's `__bytes__()` is also reached by the synchronous `put_bytes` /
+  `put_many`, so those are refused with the same `RuntimeError` after the exit drain too.
 - **Remaining window.** (1) A call still inside its scope when the 2 s drain timeout expires (a thread starved of the GIL
   for 2 s, or a user event loop whose `create_future` blocks) can still be ended by `pthread_exit`; the drain logs the
   timeout. (2) Python code that Rust runs outside the async machinery is not gated: a user object's `__bytes__()` (the

@@ -416,18 +416,21 @@ fn scope_in(tracker: &'static DeliveryTracker) -> PyResult<PythonCallScope> {
     })
 }
 
-/// Test hook (hidden `_test_close_exit_gate_after_next_spawn`): arm it, and the NEXT guarded
+/// Test hook (hidden `_test_close_exit_gate_after_next_spawn`, only in a `test-hooks` build): arm it, and the NEXT guarded
 /// entry point closes the exit gate right after it spawned its native work (see
 /// `guarded_put`). The gate never reopens; use it only in a throw-away process.
+#[cfg(feature = "test-hooks")]
 static CLOSE_GATE_AFTER_NEXT_SPAWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(feature = "test-hooks")]
 pub(crate) fn arm_close_gate_after_next_spawn() {
     CLOSE_GATE_AFTER_NEXT_SPAWN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Called by the guarded entry points right after the native work was spawned.
 pub(crate) fn after_spawn_hook() {
+    #[cfg(feature = "test-hooks")]
     if CLOSE_GATE_AFTER_NEXT_SPAWN.swap(false, std::sync::atomic::Ordering::SeqCst) {
         DELIVERIES.close();
     }
@@ -435,7 +438,7 @@ pub(crate) fn after_spawn_hook() {
 
 /// The message of the `RuntimeError` raised for a call refused because the interpreter is exiting.
 pub(crate) const EXITING_MESSAGE: &str =
-    "s3dlio: the interpreter is exiting; the async call was refused (issue #304)";
+    "s3dlio: the interpreter is exiting; the call was refused (issue #304)";
 
 /// Drop-in replacement for `pyo3_async_runtimes::tokio::future_into_py` whose
 /// result deliveries are visible to the exit drain (see the module docs).

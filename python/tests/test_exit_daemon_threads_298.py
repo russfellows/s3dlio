@@ -397,6 +397,13 @@ CLOSE_AFTER_SPAWN_SCRIPT = textwrap.dedent('''
 
 
 def test_gate_closing_after_the_spawn_does_not_refuse_the_rest_of_the_start():
+    # The hook exists only in a wheel built with the `test-hooks` cargo feature (never in a release wheel).
+    probe = subprocess.run([sys.executable, "-c", "import s3dlio,sys; sys.exit(0 if getattr(s3dlio, '_test_close_exit_gate_after_next_spawn', None) else 3)"])
+    if probe.returncode != 0:
+        msg = "this wheel was built without the `test-hooks` cargo feature (no s3dlio._test_close_exit_gate_after_next_spawn)"
+        if os.environ.get("S3DLIO_REQUIRE_TEST_HOOKS") == "1":
+            pytest.fail(msg + "; S3DLIO_REQUIRE_TEST_HOOKS=1 forbids skipping")
+        pytest.skip(msg)
     r = subprocess.run([sys.executable, "-c", CLOSE_AFTER_SPAWN_SCRIPT], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, "exit code %r\nstdout:\n%s\nstderr:\n%s" % (r.returncode, r.stdout, r.stderr[-2000:])
     assert "RETURNED" in r.stdout and "DONE" in r.stdout, (r.stdout, r.stderr[-2000:])

@@ -118,7 +118,8 @@ jobs:
       - name: Build (Python)
         run: |
           pip install maturin
-          maturin build --release --out dist --features extension-module,backend-azure
+          # `test-hooks` adds the hidden s3dlio._test_close_exit_gate_after_next_spawn() (#304 test); a release wheel never has it.
+          maturin build --release --out dist --features extension-module,backend-azure,test-hooks
           pip install dist/*.whl
       
       - name: Test (Python - Basic)
@@ -181,6 +182,7 @@ jobs:
       - name: Test (Python - exit with daemon threads, #298 #302 #304)
         env:
           S3DLIO_EXIT_ATTEMPTS: "8"
+          S3DLIO_REQUIRE_TEST_HOOKS: "1"   # the #304 close-after-spawn test FAILS, not skips, without the hook
         run: |
           pip install pytest
           python -m pytest -q -rs python/tests/test_exit_daemon_threads_298.py

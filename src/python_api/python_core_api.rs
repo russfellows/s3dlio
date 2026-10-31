@@ -3,10 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use super::async_bridge::{
-    after_spawn_hook, arm_close_gate_after_next_spawn, future_into_py, python_call_scope,
-    PythonCallScope,
-};
+#[cfg(feature = "test-hooks")]
+use super::async_bridge::arm_close_gate_after_next_spawn;
+use super::async_bridge::{after_spawn_hook, future_into_py, python_call_scope, PythonCallScope};
 use super::put_payload::{
     acquire_writable, deadline_warning_text, export_stats, hold_for_call, latch_ready,
     note_internal_error, put_payload, put_payload_in_batch, quiesce_async, quiesce_blocking,
@@ -2662,9 +2661,10 @@ fn object_capabilities_py<'py>(py: Python<'py>, uri: &str) -> PyResult<Bound<'py
     Ok(result)
 }
 
-/// Test hook (hidden): the NEXT guarded put closes the exit gate right after it spawned its native
+/// Test hook (hidden; registered only in a `test-hooks` build): the NEXT guarded put closes the exit gate right after it spawned its native
 /// work, to prove the rest of the start cannot be refused half-way (#304). The gate never reopens:
 /// use it only in a throw-away process.
+#[cfg(feature = "test-hooks")]
 #[pyfunction]
 #[pyo3(name = "_test_close_exit_gate_after_next_spawn")]
 fn test_close_exit_gate_after_next_spawn_py() {
@@ -4692,6 +4692,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     // Caller-buffer GET, typed HEAD and pure capabilities (#264)
     m.add_function(wrap_pyfunction!(object_capabilities_py, m)?)?;
+    #[cfg(feature = "test-hooks")]
     m.add_function(wrap_pyfunction!(
         test_close_exit_gate_after_next_spawn_py,
         m
