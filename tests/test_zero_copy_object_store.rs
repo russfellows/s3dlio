@@ -5,23 +5,17 @@
 //
 // Stage G (zero copy everywhere, RULE #1), object-store side: the proofs for
 //
-//   * R2  an S3 `get` / `get_range` through a per-endpoint client receives the body into ONE
-//         pre-sized buffer (it used to `collect()` every chunk and then `into_bytes()` them
-//         into a second buffer: 2x the object live at once);
 //   * W4  the buffered writers hand the buffer they accumulated to the store as `Bytes`
 //         without another copy, and `write_owned_bytes` moves an owned `Vec` into an empty
 //         writer instead of copying it;
 //   * R3  the range engine receives every range straight into its disjoint segment of the
 //         master buffer (no per-range `Bytes` that is copied into the master afterwards).
 //
-// How the S3 read is measured: a counting global allocator keeps, for the flagged thread only,
-// the live bytes and their peak.  The test runtime is a current-thread runtime, so the client
-// side of a read (request future, transport tasks, every body chunk) runs on the flagged
-// thread, while the in-process mock server runs on its own threads and is not counted.  A read
-// that keeps all chunks and then copies them has a peak of about 2x the object; one that copies
-// each chunk into a pre-sized buffer as it arrives peaks at about 1x.  A positive control reads
-// the same object through the SDK's own `collect().into_bytes()`: it must show the 2x peak, or
-// the counter would be blind.
+// How a read is measured: a counting global allocator keeps, for the flagged thread only, the
+// live bytes, their peak and the large allocations.  R2 (an S3 `get` / `get_range` receives into
+// ONE pre-sized buffer) is in `tests/test_zero_copy_s3_receive.rs`: since #303 an S3 read's
+// transport runs on s3dlio's I/O-owner runtime, not on the caller's thread, so it counts every
+// thread of its own process instead.
 //
 // Own process: it installs a global allocator.
 
@@ -32,9 +26,6 @@ use std::cell::Cell;
 #[cfg(feature = "backend-azure")]
 #[path = "common/azure_fake.rs"]
 mod azure_fake;
-
-#[allow(dead_code)] // shared helpers; each test binary uses a subset
-mod s3_get_into_support;
 
 struct Counting;
 
@@ -106,7 +97,9 @@ const MIB: usize = 1024 * 1024;
 /// What a measured future allocated on this thread.
 #[derive(Debug, Clone, Copy)]
 struct Measure {
-    /// The most bytes live at once, above what was live when the window opened.
+    /// The most bytes live at once, above what was live when the window opened (read by the
+    /// Azure tests only).
+    #[cfg_attr(not(feature = "backend-azure"), allow(dead_code))]
     peak: usize,
     /// Total size of the allocations of 1 MiB or more made in the window.
     large: usize,
@@ -123,105 +116,6 @@ async fn measured<T>(fut: impl std::future::Future<Output = T>) -> (T, Measure) 
     let peak = usize::try_from(PEAK.with(Cell::get)).unwrap_or(0);
     let large = LARGE.with(Cell::get);
     (out, Measure { peak, large })
-}
-
-// ───────────────────────────── R2: S3 get / get_range ─────────────────────────────
-
-mod r2 {
-    use super::*;
-    use s3_get_into_support::mock::MockObject;
-    use s3_get_into_support::{init, key, pattern, BUCKET};
-    use s3dlio::object_store::{ObjectStore, S3ObjectStore};
-
-    async fn store_and_object(tag: &str, len: usize) -> (S3ObjectStore, String, Vec<u8>) {
-        let (port, state) = init(&[]);
-        let store = S3ObjectStore::for_endpoint(&format!("http://127.0.0.1:{port}"))
-            .await
-            .expect("a per-endpoint store for the mock");
-        let key = key(tag);
-        let data = pattern(len, 7);
-        state.put_object(BUCKET, &key, MockObject::new(data.clone()));
-        let uri = format!("s3://{BUCKET}/{key}");
-        (store, uri, data)
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_per_endpoint_get_receives_into_one_presized_buffer() {
-        let n = 32 * MIB;
-        let (store, uri, data) = store_and_object("r2-get", n).await;
-        // Warm-up: connection state and the first request are not what is measured.
-        let (warm_store, warm_uri, _) = store_and_object("r2-get-warm", 1024).await;
-        warm_store.get(&warm_uri).await.expect("warm-up read");
-
-        let (got, m) = measured(async { store.get(&uri).await.expect("get") }).await;
-        assert_eq!(got.len(), n);
-        assert!(got[..] == data[..], "wrong content");
-        assert!(
-            m.peak < n + n / 2,
-            "RED: a {n}-byte get had {} bytes live at once (the chunks AND the buffer they were \
-             copied into)",
-            m.peak
-        );
-
-        // Positive control: the SDK's own collect().into_bytes() shows the 2x peak.
-        let (port, _) = init(&[]);
-        let client = s3_get_into_support::client_for(port).await;
-        let key_only = uri
-            .trim_start_matches(&format!("s3://{BUCKET}/"))
-            .to_string();
-        let (len, control) = measured(async {
-            let resp = client
-                .get_object()
-                .bucket(BUCKET)
-                .key(&key_only)
-                .send()
-                .await
-                .expect("send");
-            resp.body
-                .collect()
-                .await
-                .expect("collect")
-                .into_bytes()
-                .len()
-        })
-        .await;
-        assert_eq!(len, n);
-        assert!(
-            control.peak >= n + n / 2,
-            "the control read peaked at only {} bytes: the counter cannot see the extra copy",
-            control.peak
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_per_endpoint_get_range_receives_into_one_presized_buffer() {
-        let n = 32 * MIB;
-        let (store, uri, data) = store_and_object("r2-range", n).await;
-        let (warm_store, warm_uri, _) = store_and_object("r2-range-warm", 1024).await;
-        warm_store.get(&warm_uri).await.expect("warm-up read");
-
-        let offset = 3 * MIB as u64 + 5;
-        let len = 24 * MIB as u64;
-        let (got, m) = measured(async {
-            store
-                .get_range(&uri, offset, Some(len))
-                .await
-                .expect("get_range")
-        })
-        .await;
-        let start = offset as usize;
-        assert_eq!(got.len(), len as usize);
-        assert!(
-            got[..] == data[start..start + len as usize],
-            "wrong content"
-        );
-        let bound = len as usize + len as usize / 2;
-        assert!(
-            m.peak < bound,
-            "RED: a {len}-byte get_range had {} bytes live at once",
-            m.peak
-        );
-    }
 }
 
 // ───────────────────────────── W4: buffered writers ─────────────────────────────
