@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use super::async_bridge::future_into_py;
+use super::async_bridge::{future_into_py, python_call_scope};
 use super::put_payload::{
     acquire_writable, deadline_warning_text, export_stats, hold_for_call, latch_ready,
     note_internal_error, put_payload, put_payload_in_batch, quiesce_async, quiesce_blocking,
@@ -734,6 +734,7 @@ pub fn mp_get(
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    // exit-gate: allowed (sync pyfunction on the calling Python thread, already attached)
     Python::attach(|py| {
         // Parse S3 URI
         let (bucket, key_prefix) = parse_s3_uri_for_global_client(uri).map_err(py_err)?;
@@ -1795,7 +1796,7 @@ fn wrap_in_guard<'py>(
     match guard.instantiate(py, inner.clone()) {
         Ok(f) => Ok(f),
         Err(e) => {
-            let _ = inner.call_method0("cancel");
+            cancel_ignoring_errors(&inner);
             if quiesce_blocking(py, latch).is_err() {
                 return Err(still_referenced_error(&format!(
                     "the put could not be started: {e}"
@@ -1957,6 +1958,8 @@ impl<'py> PreparedGuard<'py> {
     /// Wrap the `inner` put future (cannot fail for lack of resources prepared above).
     fn instantiate(self, py: Python<'py>, inner: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let _ = py;
+        // Runs the `GuardedFuture` constructor (Python bytecode) from Rust: exit-gate scope (#304).
+        let _scope = python_call_scope()?;
         self.class.call1((
             inner,
             self.latch_ready,
@@ -1972,6 +1975,9 @@ fn prepare_guard<'py>(
     py: Python<'py>,
     latch: std::sync::Arc<Latch>,
 ) -> PyResult<PreparedGuard<'py>> {
+    // The first call compiles and imports the guard module (`asyncio`, `warnings`: Python
+    // bytecode run from Rust): exit-gate scope (#304), refused once the interpreter is exiting.
+    let _scope = python_call_scope()?;
     static GUARD: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
     let class = match GUARD.get() {
         Some(g) => g.bind(py).clone(),
@@ -2339,6 +2345,15 @@ impl StartSeams for LiveSeams {
 /// paths of starting an awaitable, where the original error is what the caller must see and
 /// nothing may wait on the outcome of the cancellation.
 fn cancel_ignoring_errors(future: &Bound<'_, PyAny>) {
+    // `cancel()` schedules callbacks on the loop (Python bytecode run from Rust): exit-gate scope
+    // (#304). A refusal means the interpreter is exiting; there is nothing left to cancel for.
+    let _scope = match python_call_scope() {
+        Ok(scope) => scope,
+        Err(e) => {
+            debug!("s3dlio: not cancelling an awaitable: {e}");
+            return;
+        }
+    };
     if let Err(e) = future.call_method0("cancel") {
         debug!("s3dlio: ignoring an error cancelling an awaitable that failed to start: {e}");
     }

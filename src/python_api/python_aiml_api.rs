@@ -1712,6 +1712,7 @@ impl PyCheckpointStore {
         .map_err(|e| py_err(e.context("Load failed")))
         .map(|opt_data| {
             opt_data
+                // exit-gate: allowed (sync pymethod: runs on the calling Python thread, which is already attached)
                 .map(|data| Python::attach(|py| PyBytesView::new(data).into_py_any(py).unwrap()))
         })
     }

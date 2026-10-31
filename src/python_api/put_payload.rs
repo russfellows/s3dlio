@@ -915,6 +915,7 @@ impl ReleaseQueue {
                 continue; // a caller drained it during the grace period
             }
             park_releaser_for_test();
+            // exit-gate: allowed (the buffer-export releaser: its own attach gate is closed and drained at exit, #238)
             let attached = Python::try_attach(|py| {
                 self.attaches.fetch_add(1, Ordering::Relaxed);
                 self.drain(py);

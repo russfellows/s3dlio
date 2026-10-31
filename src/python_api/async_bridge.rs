@@ -99,6 +99,42 @@
 //!   run before the drain and are unaffected.
 //! * This is a targeted shutdown fix for the observed crash, not a guarantee
 //!   covering every teardown pattern.
+//!
+//! # Python calls made from Rust (issue #304) and the residual window
+//!
+//! The delivery gate above protects threads that ATTACH. A second exit hazard exists on CPython
+//! <= 3.13.7: an async entry point runs on the caller's (possibly daemon) Python thread, and from
+//! inside Rust frames it calls Python code (`loop.create_future()` inside
+//! `pyo3_async_runtimes::generic::future_into_py`, the `GuardedFuture` constructor and `cancel()`
+//! of the guarded puts, the first-use `PyModule::from_code` of the guard). If finalization begins
+//! while the thread is in that Python code, CPython's eval loop re-takes the GIL, `take_gil` ends
+//! the thread with `pthread_exit`, and the forced unwind aborts the process at the first Rust frame
+//! (SIGABRT, no message). 3.13.8+ and 3.14 park the thread instead, and PyO3 0.29.3 parks a thread
+//! whose re-take is started by Rust (`PyEval_RestoreThread`, `PyGILState_Ensure`), so only this
+//! path is open.
+//!
+//! The same exit gate closes it: [`python_call_scope`] takes a ticket around each such call
+//! ([`future_into_py`], `prepare_guard`, `PreparedGuard::instantiate`, the cancel calls of the
+//! failure paths). The drain closes the gate first, so a call that starts later is refused with a
+//! `RuntimeError` ([`EXITING_MESSAGE`]) before it touches Python, and it then waits with the GIL
+//! released for the calls already inside. Everything that can fail is refused BEFORE a native put
+//! or read is spawned, and the existing failure paths (which release the buffer export, cancel
+//! what exists and raise the original error) handle a refusal that comes mid-way.
+//!
+//! What remains, precisely:
+//! * A scope that is still open when [`crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT`] (2 s) expires:
+//!   the drain gives up, finalization begins, and a thread still inside the Python call can be
+//!   ended by `pthread_exit` and abort (3.11, 3.12, 3.13.0 to 3.13.7). The scopes are short
+//!   (microseconds to a few milliseconds: creating a future, instantiating the guard) so this needs a
+//!   thread that is starved of the GIL for 2 s or a user event loop whose `create_future` blocks.
+//!   The timeout is logged by the drain.
+//! * Python code that Rust runs for other reasons than the awaitable machinery: the buffer
+//!   protocol of a user-defined object that implements `__buffer__` in Python (3.12+), `dict`
+//!   subclass options of the loaders, and in general any sync `#[pyfunction]` that calls back into
+//!   Python bytecode. They are not async entry points and are not gated.
+//! * Calls made from an `atexit` handler registered BEFORE `import s3dlio` run after the drain
+//!   and are now refused with a `RuntimeError` (before: the awaitable never resolved). Handlers
+//!   registered after the import run before the drain and are unaffected.
 
 use std::cell::OnceCell;
 use std::future::Future;
@@ -265,6 +301,7 @@ where
             // Drain and deliver in ONE attach scope (the delivery closure re-enters it cheaply).
             if super::put_payload::exports_pending() {
                 let mut f = Some(f);
+                // exit-gate: allowed (inside the gated delivery: the ticket is held and the exit drain waits for it)
                 let _ = Python::try_attach(|py| {
                     super::put_payload::drain_pending_exports(py);
                     if let Some(f) = f.take() {
@@ -308,6 +345,44 @@ impl ContextExt for S3dlioRuntime {
     }
 }
 
+/// RAII proof that the calling Python thread is inside a Python call made FROM RUST (issue #304).
+///
+/// On CPython <= 3.13.7 (3.11, 3.12, 3.13.0 to 3.13.7) a daemon thread that re-takes the GIL
+/// after interpreter finalization has begun is ended with `pthread_exit` (a glibc forced
+/// unwind). If that happens inside the eval loop, in Python code that Rust called
+/// (`loop.create_future()`, the `GuardedFuture` constructor, `Future.cancel()`), the unwind
+/// reaches a Rust frame, Rust's personality routine refuses a foreign forced unwind there, and
+/// the process aborts with SIGABRT and no message. PyO3's park guard covers only GIL
+/// re-acquisitions that Rust itself starts, not this one.
+///
+/// The scope holds a [`DeliveryTicket`] of the #192 exit gate for the duration of the call. The
+/// `atexit` drain closes the gate, then releases the GIL and waits (bounded) until no ticket is
+/// out, so no thread is inside such a call when finalization starts, and a call that begins after
+/// the close is refused with a catchable `RuntimeError` instead of entering Python at all.
+/// See the module docs ("The residual window") for what remains.
+pub(crate) struct PythonCallScope {
+    _ticket: DeliveryTicket,
+}
+
+/// Open a [`PythonCallScope`] on the process-wide gate, or raise `RuntimeError` when the
+/// interpreter is exiting. Hold the scope across every call into Python that an async entry point
+/// makes from Rust, and release it (drop it) before any long wait.
+pub(crate) fn python_call_scope() -> PyResult<PythonCallScope> {
+    scope_in(&DELIVERIES)
+}
+
+/// [`python_call_scope`] on an explicit tracker (tests).
+fn scope_in(tracker: &'static DeliveryTracker) -> PyResult<PythonCallScope> {
+    match tracker.enter() {
+        Some(_ticket) => Ok(PythonCallScope { _ticket }),
+        None => Err(pyo3::exceptions::PyRuntimeError::new_err(EXITING_MESSAGE)),
+    }
+}
+
+/// The message of the `RuntimeError` raised for a call refused because the interpreter is exiting.
+pub(crate) const EXITING_MESSAGE: &str =
+    "s3dlio: the interpreter is exiting; the async call was refused (issue #304)";
+
 /// Drop-in replacement for `pyo3_async_runtimes::tokio::future_into_py` whose
 /// result deliveries are visible to the exit drain (see the module docs).
 pub(crate) fn future_into_py<F, T>(py: Python<'_>, fut: F) -> PyResult<Bound<'_, PyAny>>
@@ -319,6 +394,10 @@ where
     // finished (see `body_finished_hook`). Absent from the shipped extension.
     #[cfg(test)]
     let fut = body_finished_hook::observe(fut);
+    // `generic::future_into_py` calls `loop.create_future()` (Python bytecode) on THIS thread from
+    // inside Rust frames: hold an exit-gate scope for it (issue #304).
+    let _scope = python_call_scope()?;
+    // exit-gate: allowed (the bridge itself: S3dlioRuntime gates the delivery, python_call_scope gates this call)
     generic::future_into_py::<S3dlioRuntime, _, T>(py, fut)
 }
 

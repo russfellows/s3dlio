@@ -19,6 +19,7 @@ corrupts it (SIGSEGV/SIGABRT, "PyInterpreterState_Delete: remaining threads").  
 Do NOT rely on the "FATAL" check alone: release builds can abort silently inside pthread_exit;
 the exit code is the load-bearing assertion.
 """
+import os
 import subprocess
 import sys
 import textwrap
@@ -28,7 +29,7 @@ import pytest
 NWORKERS = 8
 
 SCRIPT = textwrap.dedent('''
-    import asyncio, atexit, http.server, os, socket, socketserver, sys, threading, time
+    import asyncio, atexit, os, socket, sys, threading, time
     import s3dlio
 
     mode, d = sys.argv[1], sys.argv[2]
@@ -50,41 +51,17 @@ SCRIPT = textwrap.dedent('''
             held.append(srv.accept()[0])
     threading.Thread(target=accept_forever, daemon=True).start()
 
-    # The "many" calls are S3-only (they use the process-wide S3 client), so those scenarios talk to a tiny
-    # in-process S3 stand-in that serves one 1 MiB object for any key (HEAD, GET and ranged GET).
-    S3_URI = "s3://bkt/obj.bin"
-    DATA = os.urandom(1 << 20)
-    class FakeS3(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-        def log_message(self, *a):
-            pass
-        def _head(self, code, n, extra=None):
-            self.send_response(code)
-            for k, v in {"Content-Length": str(n), "ETag": '"abc"', "Accept-Ranges": "bytes",
-                         "Last-Modified": "Wed, 21 Oct 2015 07:28:00 GMT",
-                         "Content-Type": "application/octet-stream", **(extra or {})}.items():
-                self.send_header(k, v)
-            self.end_headers()
-        def do_HEAD(self):
-            self._head(200, len(DATA))
-        def do_GET(self):
-            r = self.headers.get("Range")
-            if r and r.startswith("bytes="):
-                a, _, b = r[6:].partition("-")
-                a = int(a)
-                b = min(int(b) if b else len(DATA) - 1, len(DATA) - 1)
-                body = DATA[a:b + 1]
-                self._head(206, len(body), {"Content-Range": "bytes %d-%d/%d" % (a, b, len(DATA))})
-            else:
-                body = DATA
-                self._head(200, len(body))
-            self.wfile.write(body)
-    class FakeS3Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
-        daemon_threads = True
-    if mode in ("async_get_many", "async_get_many_stats", "async_stat_many"):
-        fake = FakeS3Server(("127.0.0.1", 0), FakeS3)
-        threading.Thread(target=fake.serve_forever, daemon=True).start()
-        os.environ["AWS_ENDPOINT_URL"] = "http://127.0.0.1:%d" % fake.server_address[1]
+    # The S3-only calls (the "many" calls, the S3 loader) talk to a tiny S3 stand-in that runs in its
+    # OWN process (the S3 loader's constructor blocks while holding the GIL, so an in-thread server
+    # would starve). It serves 3 objects of 1 MiB under s3://bkt/p/ (HEAD, GET, ranged GET, list) and
+    # exits when its stdin closes, i.e. when this process dies.
+    S3_URI = "s3://bkt/p/o0.bin"
+    S3_PREFIX = "s3://bkt/p/"
+    if mode in ("async_get_many", "async_get_many_stats", "async_stat_many", "async_s3_loader"):
+        import subprocess
+        fake = subprocess.Popen([sys.executable, os.path.join(d, "fake_s3.py")], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE)
+        os.environ["AWS_ENDPOINT_URL"] = "http://127.0.0.1:%d" % int(fake.stdout.readline())
 
     # ---- fixtures for the #302 entry points ---------------------------------------------------
     if mode.startswith("mes_"):
@@ -101,6 +78,21 @@ SCRIPT = textwrap.dedent('''
                 f.write(os.urandom(256 << 10))
         dsuri = "file://" + d + "/ds/"
         ds = s3dlio.create_dataset(dsuri)
+
+    async def numeric_loader_once():
+        n = 0
+        async for _ in s3dlio.PyAsyncDataLoader(s3dlio.PyVecDataset(list(range(200))), {"batch_size": 10}):
+            n += 1
+            if n >= 3:
+                break
+
+    async def s3_loader_once():
+        # `s3dlio.PyS3AsyncDataLoader` is the deprecated shim (PyS3AsyncDataLoaderCompat): its __aiter__
+        # returns a PyBytesAsyncDataLoader, which is not itself an async iterator, so `async for` over the
+        # shim raises TypeError (pre-existing). Its real iterator is one __aiter__ further.
+        it = s3dlio.PyS3AsyncDataLoader(S3_PREFIX, {"batch_size": 2}).__aiter__().__aiter__()
+        for _ in range(2):
+            await it.__anext__()
 
     async def loader_once():
         n = 0
@@ -165,6 +157,8 @@ SCRIPT = textwrap.dedent('''
         "mes_get_from_endpoint": lambda: mes.get_from_endpoint(1, eps[1] + "obj.bin"),
         "ds_get_item": lambda: ds.get_item(3),
         "async_loader": lambda: loader_once(),
+        "async_numeric_loader": lambda: numeric_loader_once(),
+        "async_s3_loader": lambda: s3_loader_once(),
     }
     BLOCKS = {"sync_blackhole", "async_pending"}   # never complete a call
 
@@ -221,8 +215,15 @@ SCRIPT = textwrap.dedent('''
     deadline = time.time() + 30
     while len(started) < NW and time.time() < deadline:
         time.sleep(0.02)
+    # Give the slowest scenario (an S3 listing through a stand-in server) time to finish one call on a
+    # loaded machine, then let the workers run for 1 s before the main thread returns.
+    deadline = time.time() + 20
+    while mode not in BLOCKS and completed[0] == 0 and not errors and time.time() < deadline:
+        time.sleep(0.02)
     time.sleep(1)
     if errors or len(started) < NW or (mode not in BLOCKS and completed[0] == 0):
+        import faulthandler
+        faulthandler.dump_traceback(all_threads=True)      # what were the workers waiting for?
         print("SCENARIO NOT EXERCISED: started=%d completed=%d errors=%r"
               % (len(started), completed[0], errors[:3]), file=sys.stderr, flush=True)
         os._exit(3)
@@ -232,23 +233,77 @@ SCRIPT = textwrap.dedent('''
     # main returns here: interpreter finalization starts with the daemons inside s3dlio calls
 ''')
 
+# Stand-in S3 service for the scenarios that need a completing S3 call (run as its own process).
+FAKE_S3 = textwrap.dedent('''
+    import http.server, os, socketserver, sys, threading
+    DATA = os.urandom(1 << 20)
+    LIST = ('<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            '<Name>bkt</Name><Prefix>p/</Prefix><KeyCount>3</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>'
+            + "".join('<Contents><Key>p/o%d.bin</Key><LastModified>2015-10-21T07:28:00.000Z</LastModified>'
+                      '<ETag>"abc"</ETag><Size>%d</Size><StorageClass>STANDARD</StorageClass></Contents>' % (i, len(DATA))
+                      for i in range(3))
+            + '</ListBucketResult>').encode()
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a):
+            pass
+        def _head(self, code, n, extra=None):
+            self.send_response(code)
+            for k, v in {"Content-Length": str(n), "ETag": '"abc"', "Accept-Ranges": "bytes",
+                         "Last-Modified": "Wed, 21 Oct 2015 07:28:00 GMT",
+                         "Content-Type": "application/octet-stream", **(extra or {})}.items():
+                self.send_header(k, v)
+            self.end_headers()
+        def do_HEAD(self):
+            self._head(200, len(DATA))
+        def do_GET(self):
+            if "list-type" in self.path:
+                self._head(200, len(LIST), {"Content-Type": "application/xml"})
+                self.wfile.write(LIST)
+                return
+            r = self.headers.get("Range")
+            if r and r.startswith("bytes="):
+                a, _, b = r[6:].partition("-")
+                a = int(a)
+                b = min(int(b) if b else len(DATA) - 1, len(DATA) - 1)
+                body = DATA[a:b + 1]
+                self._head(206, len(body), {"Content-Range": "bytes %d-%d/%d" % (a, b, len(DATA))})
+            else:
+                body = DATA
+                self._head(200, len(body))
+            self.wfile.write(body)
+    class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+    srv = S(("127.0.0.1", 0), H)
+    print(srv.server_address[1], flush=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    sys.stdin.read()          # parent gone (stdin closed): exit
+    os._exit(0)
+''')
+
+# Attempts per scenario. A crash at exit is probabilistic (1/30 to 30/30 depending on the call), so CI
+# raises this with S3DLIO_EXIT_ATTEMPTS; the default keeps a local run short.
+ATTEMPTS = int(os.environ.get("S3DLIO_EXIT_ATTEMPTS", "3"))
+
 DAEMON_MODES = [
     "get", "put_bytes", "list", "stat", "get_many", "get_range", "writer", "sync_blackhole",
     "async_get", "async_put_bytes", "async_pending", "get_into_async",
     "async_get_range", "async_get_many", "async_get_many_stats", "async_stat", "async_stat_many", "async_put",
     "mes_get", "mes_get_range", "mes_get_from_endpoint", "ds_get_item", "async_loader",
+    "async_numeric_loader", "async_s3_loader",
     "oplog_get", "oplog_put", "atexit_get", "atexit_oplog_finalize",
 ]
 
 
 def _run(mode, tmp_path):
+    (tmp_path / "fake_s3.py").write_text(FAKE_S3)
     return subprocess.run(
         [sys.executable, "-c", SCRIPT, mode, str(tmp_path), str(NWORKERS)],
         capture_output=True, text=True, timeout=60,
     )
 
 
-@pytest.mark.parametrize("attempt", range(3))
+@pytest.mark.parametrize("attempt", range(ATTEMPTS))
 @pytest.mark.parametrize("mode", DAEMON_MODES)
 def test_exit_with_daemon_threads_in_s3dlio_calls(mode, attempt, tmp_path):
     r = _run(mode, tmp_path)
@@ -258,10 +313,51 @@ def test_exit_with_daemon_threads_in_s3dlio_calls(mode, attempt, tmp_path):
     assert "READY" in r.stdout, "scenario was not exercised:\n%s\n%s" % (r.stdout[-500:], r.stderr[-1000:])
 
 
-@pytest.mark.parametrize("attempt", range(3))
+@pytest.mark.parametrize("attempt", range(ATTEMPTS))
 def test_exit_with_non_daemon_threads_still_waits_and_exits_cleanly(attempt, tmp_path):
     """Non-daemon threads are joined by Python before finalization: no abort, all work completes."""
     r = _run("nondaemon", tmp_path)
     assert r.returncode == 0, "exit code %r\nstderr:\n%s" % (r.returncode, r.stderr[-2000:])
     assert "FATAL" not in r.stderr, r.stderr[-2000:]
     assert "DONE %d" % NWORKERS in r.stdout, r.stdout[-500:]
+
+
+# Issue #304: once the exit gate has closed (the s3dlio atexit drain ran), an async entry point is
+# REFUSED with a catchable RuntimeError before it calls into Python, instead of entering Python while
+# the interpreter finalizes (an abort on CPython < 3.13.8). An atexit handler registered BEFORE
+# `import s3dlio` runs after the drain, so it sees the closed gate.
+REFUSAL_SCRIPT = textwrap.dedent('''
+    import atexit, asyncio, os, sys, tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "o.bin")
+    open(p, "wb").write(b"x" * 4096)
+
+    def late():
+        async def go():
+            calls = {
+                "get_async": lambda: s3dlio.get_async("file://" + p),
+                "put_bytes_async": lambda: s3dlio.put_bytes_async("file://" + d + "/w.bin", b"y" * 1024),
+                "put_bytes_async_bytearray": lambda: s3dlio.put_bytes_async("file://" + d + "/w2.bin", bytearray(1024)),
+                "get_into_async": lambda: s3dlio.get_into_async("file://" + p, bytearray(4096), expected_len=4096),
+                "stat_async": lambda: s3dlio.stat_async("file://" + p),
+            }
+            for name, call in calls.items():
+                try:
+                    call()
+                    print("NOT-REFUSED", name, flush=True)
+                except RuntimeError as e:
+                    print("REFUSED", name, "exiting" in str(e), flush=True)
+        asyncio.run(go())
+
+    atexit.register(late)           # BEFORE the import: runs after s3dlio's drain
+    import s3dlio
+    print("READY", flush=True)
+''')
+
+
+def test_async_calls_after_the_exit_gate_closed_raise_runtime_error():
+    r = subprocess.run([sys.executable, "-c", REFUSAL_SCRIPT], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, "exit code %r\nstdout:\n%s\nstderr:\n%s" % (r.returncode, r.stdout, r.stderr[-2000:])
+    assert "NOT-REFUSED" not in r.stdout, r.stdout
+    for name in ("get_async", "put_bytes_async", "put_bytes_async_bytearray", "get_into_async", "stat_async"):
+        assert "REFUSED %s True" % name in r.stdout, (name, r.stdout, r.stderr[-1000:])
