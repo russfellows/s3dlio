@@ -308,6 +308,19 @@ pub struct PyMultipartUploadWriter {
     held: HeldExports,
 }
 
+impl Drop for PyMultipartUploadWriter {
+    /// A writer that is garbage-collected (or still alive at interpreter shutdown) with an
+    /// unfinished upload drops its sink, which SPAWNS the abort (#303). Wait for it here, bounded,
+    /// so the abort is delivered before the object (or the process) goes away, as it was when
+    /// the sink's `Drop` blocked. The abort needs neither this thread nor the GIL.
+    fn drop(&mut self) {
+        if let Some(sink) = self.inner.take() {
+            drop(sink);
+            crate::multipart::flush_pending_aborts(std::time::Duration::from_secs(2));
+        }
+    }
+}
+
 impl PyMultipartUploadWriter {
     /// Drop the writer's reference to a pending `reserve()` allocation. Idempotent. Only the
     /// WRITER's reference goes: a memoryview (or slice of one) the caller still holds keeps the

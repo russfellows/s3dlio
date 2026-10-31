@@ -16,48 +16,61 @@ runtimes (async on A, then async on B), current-thread then multi-thread, and an
 that had made an earlier async s3dlio call (the #300 residual). An unfinished `MultipartUploadSink` dropped on a
 current-thread runtime stalled 60 s and then LEAKED the upload on the server. Python was not affected.
 
-Fix: all of s3dlio's network I/O now belongs to its own global runtime, whatever runtime the caller is on, so every pooled
-connection belongs to a runtime no caller can block (`s3_client::in_global_ctx`). The HTTP futures are still polled by the
-caller's task, but with the global runtime entered as the tokio context (`Handle::enter`, per poll), so every socket,
-timer and connection task they create is registered with, and spawned onto, the global runtime. There is no spawn, no
-`'static` bound, no thread hop and no extra copy: the caller-buffer `get_into` paths keep writing straight into the
-caller's buffer (Rule #1), and dropping a future still cancels the request exactly as before. Where it is applied:
+Fix: every pooled connection now belongs to s3dlio's own small I/O-owner runtime (`s3_client::io_rt_handle`, 2 threads,
+`S3DLIO_IO_THREADS` overrides), a runtime that exists only to own sockets, timers and connection tasks and never
+runs s3dlio work futures, `spawn_on_global_rt` tasks, sync-wrapper waits or user code. No caller can block it, and blocking
+every worker of the global runtime cannot stall it either (an earlier design that used the global runtime itself did, and an
+async-only application with its own runtime then timed out). The HTTP futures are still polled by the caller's task, but with
+the I/O runtime entered as the tokio context (`s3_client::in_io_ctx`, `Handle::enter`, per poll), so every socket, timer
+and connection task they create is registered with, and spawned onto, the I/O runtime. There is no spawn, no `'static`
+bound, no thread hop and no extra copy: the caller-buffer `get_into` paths keep writing straight into the caller's buffer
+(Rule #1), and dropping a future still cancels the request exactly as before. The caller's own runtime still needs its time
+driver (the SDK's timeouts run there). Where it is applied:
 
 | Backend | Chokepoint | Covers |
 |---|---|---|
-| S3 | `reqwest_client::ReqwestHttpConnector::call` (`send_on_global_rt`) | every request of the aws-sdk client: every async fn of `s3_utils`, the S3 `ObjectStore`, `get_into`/head/range engines, list streams, multipart (`new_async`, coordinator, abort), delete batches, per-endpoint clients, credential providers, `warmup_connection_pool` |
+| S3 | `reqwest_client::ReqwestHttpConnector::call` (`send_on_global_rt`, both attempts of the h2c-auto fallback) and `warmup_connection_pool`; the TLS certificate probe of the redirect wrapper | every request of the aws-sdk client: every async fn of `s3_utils`, the S3 `ObjectStore`, `get_into`/head/range engines, list streams, multipart (`new_async`, coordinator, abort), delete batches, per-endpoint clients, credential providers, https/ALPN, h2c |
 | Azure | `azure_client::GlobalRtHttpClient` (the transport of the service client and of the credential clients) | every blob and credential request |
-| GCS | `google_gcs_client::on_global` around every `GcsClient` operation, the client build, the storage-layout probe, the opener `open`/`describe` of `get_into`, and the list stream | HTTP/1.1 and HTTP/2 connections, tonic channel workers, background readers |
+| GCS | `google_gcs_client::on_global` around every `GcsClient` operation, the client build, the storage-layout probe, the opener `open`/`describe` AND every chunk poll of the `get_into` readers, and the list stream | HTTP/1.1 and HTTP/2 connections, tonic channel workers, background readers |
 
 `MultipartUploadSink`:
-- `Drop` no longer waits for `AbortMultipartUpload`: it SPAWNS the abort on the global runtime and returns at once (best
-  effort; the outcome is logged, `debug!` on success and `warn!` with the upload id on failure). If the process exits before
-  the request is delivered the upload may remain on the server; call `abort()` when delivery must be certain.
-- New `pub async fn abort(&mut self) -> Result<()>`, the async twin of `abort_blocking`: cancels the coordinator first,
-  awaits a best-effort `AbortMultipartUpload`, logs a failure of that cleanup request and returns `Ok(())`, fires regardless
-  of `abort_on_drop`, and does nothing when called again or after `finish()`. The abort runs on the global runtime, so it
-  completes on a current-thread runtime.
+- `Drop` no longer waits for `AbortMultipartUpload`: it SPAWNS the abort on the global runtime and returns at once (the
+  outcome is logged, `debug!` on success and `warn!` with the upload id on failure) and counts it as pending. New
+  `s3dlio::flush_pending_aborts(timeout) -> usize` waits (bounded) for the aborts that dropped sinks spawned and returns how
+  many are still pending. A program that may end with an unfinished sink (an early `?` out of `main`) should call it once
+  before exiting, otherwise the process can end before the request is sent and the upload stays on the server. The s3dlio
+  CLI calls it (2 s) when a command ends, the Python `atexit` hook calls it (2 s, GIL released, before the exit gate
+  closes), and the Python `MultipartUploadWriter` waits (2 s) when it is dropped with an unfinished upload.
+- New `pub async fn abort(&mut self) -> Result<()>`, the async twin of `abort_blocking`: cancels the coordinator first, then
+  awaits `AbortMultipartUpload` and returns its REAL outcome (`Err`, naming the upload id, when the request failed; the sink
+  is cancelled either way), fires regardless of `abort_on_drop`, and does nothing when called again or after `finish()`.
+  (`abort_blocking` keeps its locked contract: always `Ok(())`, failure only logged.) The abort runs on s3dlio's runtimes, so
+  it completes on a current-thread runtime.
+
+Sizing: the global runtime keeps at least 2 workers when MPI-aware sizing would compute 1 (one blocking task would
+otherwise starve everything else; an explicit `S3DLIO_RT_THREADS` is still honoured as given). `spawn_on_global_rt`
+must be given futures that do not block a thread: a blocking task occupies a global worker, and the sync wrappers (and the
+tasks they run) share those workers.
 
 Hang diagnostics: one way remains for a synchronous wrapper to wait for ever: the awaited work needs the very runtime whose
-thread the wrapper blocks (an in-process server task on a current-thread runtime). No connection ownership can fix that.
-A wrapper that ends in an error after (about) the whole operation timeout on a thread that belongs to a tokio runtime now
-says so: the error carries "this synchronous s3dlio call blocked a thread that belongs to a tokio runtime for the whole
-operation timeout; if the endpoint is served by a task on that same runtime ... use the async API, or call the synchronous
-API from spawn_blocking or a plain thread".
+thread the wrapper blocks (an in-process server task on a current-thread runtime). No connection ownership can fix that. A
+wrapper that ends in the SDK's operation-timeout error ("request timed out after ...") within a window around the timeout
+(never when the timeout is 0) on a thread that belongs to a tokio runtime now says so: the error carries "this synchronous
+s3dlio call blocked a thread that belongs to a tokio runtime for the whole operation timeout; if the endpoint is served by a
+task on that same runtime ... use the async API, or call the synchronous API from spawn_blocking or a plain thread". Any
+other error of a long call gets no such text.
 
-Overhead (Loki-4, loopback keep-alive mock, 3 alternating rounds, medians; the box was loaded): sequential small
-`stat`/`get` latency on a current-thread or multi-thread runtime unchanged within noise (HEAD 159 vs 163 us multi-thread,
-150 vs 156 us current-thread); 64-way parallel HEAD 21.7k vs 23.3k req/s; 256 MiB `get_object_uri_async` 1.55 vs 1.66 GB/s;
-256 MiB caller-buffer `get_into` 4.4 vs 4.7 GB/s (run-to-run spread larger than the difference); a sync-only `stat` loop 436 vs 427 us; Python (release cp312 wheels, 3 rounds) `stat` 231 vs 215 us, `get` 1 KiB 292 vs 318 us, `stat_async` 305 vs 281 us, 256 MiB `get_into_async` 4.0 vs 4.3 GB/s, all within the box's run-to-run noise. A per-request
-`spawn_on_global_rt` hop, measured first and rejected, cost +80 to +110 us per small request and about 20 % of `get_into`
-throughput.
+Overhead (Loki-4, loopback keep-alive mock, 9 interleaved rounds, medians; see docs in the build report): multi-thread callers unchanged within noise (sequential HEAD median 225 us vs 219 base, GET 1 KiB 225 vs 229, 64-way HEAD 20.4k vs 20.5k req/s, 256 MiB `get_object_uri_async` 1.6 vs 1.6 GB/s, 256 MiB caller-buffer `get_into` 5.6 vs 5.2 GB/s); a current-thread caller pays roughly 50 to 90 us more per small request (the connection task now runs on another thread instead of the caller's, GET 1 KiB 238 vs 146 us, HEAD 196 vs 164 us), a sync wrapper called alone is faster (223-263 vs 440 us, fewer threads to wake); the earlier design that used the global runtime for connections was +90 us on current-thread GETs too and slower for sync calls (418-457 us). The round-0 per-request `spawn_on_global_rt` hop was +80..110 us for everyone and -20 % on `get_into`
 
 Tests: `tests/pooled_connection_runtime_303.rs` (every case in its own child process against an in-process keep-alive
 mock with `S3DLIO_OPERATION_TIMEOUT_SECS=5`: current-thread async then sync stat/get/delete/`MultipartUploadSink::new`, a
 `LocalSet`, two current-thread runtimes, current-thread then multi-thread, the unmarked one-worker custom-named runtime,
-h2c, a whole multipart upload, the unfinished-sink Drop against a slow abort, `abort()`, the sync-then-async and
-multi-thread controls, and the self-deadlock error text), plus `tests/pooled_connection_runtime_303_azure.rs` and
-`tests/pooled_connection_runtime_303_gcs.rs` (`--features backend-azure` / `backend-gcs`).
+h2c, `S3DLIO_H2C=auto` against an HTTP/1.1-only server (the fallback retry), https with ALPN and a CA bundle, the
+redirect-following wrapper, `warmup_connection_pool` without a runtime, a whole multipart upload, the unfinished-sink Drop
+against a slow abort, a sink dropped right before exit plus `flush_pending_aborts`, `abort()` and its real error, every
+global worker blocked, the sync-then-async and multi-thread controls, the self-deadlock error text and its absence on other
+errors), plus `tests/pooled_connection_runtime_303_azure.rs` and `tests/pooled_connection_runtime_303_gcs.rs` (including a
+body cut mid-stream and repaired) with `--features backend-azure` / `backend-gcs`.
 
 ### Fixed — sync wrappers inside a tokio `LocalSet` (#300)
 
@@ -79,7 +92,7 @@ elsewhere, decided in this order (`runtime_support::blocking_wait`; no panic is 
 4. everything else: plain wait. That is no runtime, a current-thread runtime, a `LocalSet` driven by a thread with another
    name (the main thread) and its `spawn_local` tasks, `block_on`'s main future, `Handle::block_on`, `spawn_blocking`
    threads of runtimes that are not named like tokio's default. It is safe because the awaited future runs on the global
-   runtime, which is never the caller's runtime here, and (since #303) every pooled connection belongs to the global
+   runtime, which is never the caller's runtime here, and (since #303) every pooled connection belongs to s3dlio's I/O
    runtime too, so the wait can no longer stall on a connection the blocked caller's runtime opened.
 
 The Python store-cache lock (`lock_build`) uses the same helper.

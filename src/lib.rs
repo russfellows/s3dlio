@@ -262,7 +262,9 @@ pub use crate::s3_utils::{
 };
 
 // Re-export the multipart public types
-pub use crate::multipart::{MultipartCompleteInfo, MultipartUploadConfig, MultipartUploadSink};
+pub use crate::multipart::{
+    flush_pending_aborts, MultipartCompleteInfo, MultipartUploadConfig, MultipartUploadSink,
+};
 
 // types:
 pub use crate::config::ObjectType;

@@ -364,6 +364,16 @@ pub(crate) mod body_finished_hook {
 #[pyfunction]
 fn drain_async_deliveries_at_exit(py: Python<'_>) {
     let timeout = crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT;
+    // Unfinished multipart sinks that were dropped spawn their AbortMultipartUpload; give those
+    // requests a bounded moment (GIL released) before the interpreter finalizes (#303). They run
+    // on s3dlio's own runtimes and need neither the GIL nor the delivery gate below.
+    let pending = py.detach(|| crate::multipart::flush_pending_aborts(Duration::from_secs(2)));
+    if pending > 0 {
+        tracing::warn!(
+            pending,
+            "s3dlio: {pending} AbortMultipartUpload request(s) were still pending at interpreter exit"
+        );
+    }
     DELIVERIES.close();
     let drained = py.detach(|| DELIVERIES.wait_idle(timeout));
     // Close the buffer-export releaser's attach gate, wait (GIL detached) for any attach scope it

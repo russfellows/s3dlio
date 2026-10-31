@@ -69,6 +69,95 @@ fn start_emulator() -> u16 {
     rx.recv().unwrap()
 }
 
+/// A keep-alive emulator that CUTS the body of the first GET after 40 000 of its 100 000 bytes
+/// (the body stream fails, hyper aborts the connection) and answers every later GET fully,
+/// honouring `Range` (`206` with `Content-Range`, as the live media API does).
+fn start_cutting_emulator() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use futures::StreamExt;
+    use http_body_util::{BodyExt, StreamBody};
+    use hyper::body::Frame;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let count0 = Arc::new(AtomicUsize::new(0));
+    let count_for_server = count0.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tx.send(l.local_addr().unwrap().port()).unwrap();
+            let count = count_for_server;
+            loop {
+                let (sock, _) = l.accept().await.unwrap();
+                let count = count.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let count = count.clone();
+                        async move {
+                            let n = count.fetch_add(1, Ordering::SeqCst);
+                            let range = req
+                                .headers()
+                                .get("range")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string);
+                            let (start, end) =
+                                match range.as_deref().and_then(|v| v.strip_prefix("bytes=")) {
+                                    Some(spec) => {
+                                        let (a, b) = spec.split_once('-').unwrap();
+                                        let a: usize = a.parse().unwrap();
+                                        let b: usize = if b.is_empty() {
+                                            LEN - 1
+                                        } else {
+                                            b.parse::<usize>().unwrap().min(LEN - 1)
+                                        };
+                                        (a, b)
+                                    }
+                                    None => (0, LEN - 1),
+                                };
+                            let part = Bytes::from(body()[start..=end].to_vec());
+                            let mut b = Response::builder()
+                                .status(if range.is_some() { 206 } else { 200 })
+                                .header("content-type", "application/octet-stream")
+                                .header("content-length", part.len().to_string())
+                                .header("x-goog-generation", "7")
+                                .header("x-goog-stored-content-length", LEN.to_string());
+                            if range.is_some() {
+                                b = b.header("content-range", format!("bytes {start}-{end}/{LEN}"));
+                            }
+                            let body: http_body_util::combinators::BoxBody<Bytes, std::io::Error> =
+                                if n == 0 {
+                                    let first = part.slice(..40_000.min(part.len()));
+                                    let frames =
+                                        futures::stream::iter(vec![Ok(Frame::data(first))]).chain(
+                                            futures::stream::once(async {
+                                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                                Err(std::io::Error::new(
+                                                    std::io::ErrorKind::ConnectionReset,
+                                                    "emulator: connection cut",
+                                                ))
+                                            }),
+                                        );
+                                    BodyExt::boxed(StreamBody::new(frames))
+                                } else {
+                                    Full::new(part).map_err(|never| match never {}).boxed()
+                                };
+                            Ok::<_, std::convert::Infallible>(b.body(body).unwrap())
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(sock), svc)
+                        .await;
+                });
+            }
+        });
+    });
+    (rx.recv().unwrap(), count0)
+}
+
 fn run_child(case: &str, port: u16) -> (bool, Duration, String) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["child_entry", "--exact", "--nocapture", "--test-threads=1"])
@@ -125,6 +214,22 @@ macro_rules! cases {
             }
         )*
     };
+}
+
+#[test]
+fn gcs_cut_body_repair_connection_belongs_to_the_io_runtime() {
+    let (port, requests) = start_cutting_emulator();
+    let (ok, elapsed, out) = run_child("gcs_cut_body_repair", port);
+    // cut, repair, and the second runtime's read: the body really was cut and repaired
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the first body must have been cut and repaired by one new request"
+    );
+    assert!(
+        ok && elapsed < Duration::from_secs(8),
+        "regressed: ok={ok} elapsed={elapsed:?}\n{out}"
+    );
 }
 
 cases!(
@@ -193,6 +298,12 @@ fn child_entry() {
             m.block_on(get(&c));
         }
         "gcs_get_into_on_two_ct_runtimes" => {
+            a.block_on(read_into(&c));
+            b.block_on(read_into(&c));
+        }
+        // the first body is cut mid-stream; the receive loop repairs it with a NEW request (a
+        // new connection), then a second runtime reads again over that connection
+        "gcs_cut_body_repair" => {
             a.block_on(read_into(&c));
             b.block_on(read_into(&c));
         }

@@ -185,19 +185,19 @@ fn control_builder(
     }
 }
 
-/// Run a GCS operation with the GLOBAL runtime as the tokio context (#303).
+/// Run a GCS operation with the I/O-owner runtime as the tokio context (#303).
 ///
 /// The Google clients keep their own pooled HTTP/1.1 and HTTP/2 connections, tonic channel
 /// workers and background reader tasks, and they have no hook for choosing the runtime that
 /// owns them: they belong to the runtime whose context is entered when the call that creates
-/// them is polled. Polling every operation inside [`crate::s3_client::in_global_ctx`] makes that
+/// them is polled. Polling every operation inside [`crate::s3_client::in_io_ctx`] makes that
 /// the global runtime, which no caller can block. (The operation is still polled by the caller's
 /// task: no spawn, no extra hop; dropping the future cancels it as before.)
 async fn on_global<T, F>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
-    crate::s3_client::in_global_ctx(fut).await
+    crate::s3_client::in_io_ctx(fut).await
 }
 
 /// Exponential backoff delay for GCS full-read retry attempts.
@@ -506,7 +506,7 @@ impl GcsClient {
                     );
                 }
 
-                // Built on the global runtime: the gRPC channel's background tasks and its
+                // Built in the I/O runtime context: the gRPC channel's background tasks and its
                 // connections belong to the runtime that builds it (#303).
                 let ep = endpoint.clone();
                 let client = on_global(async move {
@@ -625,7 +625,7 @@ impl GcsClient {
         on_global(async move { this.detect_rapid_bucket_result_local(&bucket).await }).await
     }
 
-    /// The body of [`Self::detect_rapid_bucket_result`]; runs on the global runtime.
+    /// The body of [`Self::detect_rapid_bucket_result`]; runs with the I/O runtime as the context.
     async fn detect_rapid_bucket_result_local(&self, bucket: &str) -> Result<bool> {
         let layout_name = format!("projects/_/buckets/{}/storageLayout", bucket);
         let layout = self
@@ -661,7 +661,7 @@ impl GcsClient {
         on_global(async move { this.get_object_local(&bucket, &object).await }).await
     }
 
-    /// The body of [`Self::get_object`]; runs on the global runtime.
+    /// The body of [`Self::get_object`]; runs with the I/O runtime as the context.
     async fn get_object_local(&self, bucket: &str, object: &str) -> Result<Bytes> {
         let bucket_name = format_bucket_name(bucket);
         if self.is_rapid_bucket(bucket).await {
@@ -996,7 +996,7 @@ impl GcsClient {
         .await
     }
 
-    /// The body of [`Self::get_object_range`]; runs on the global runtime.
+    /// The body of [`Self::get_object_range`]; runs with the I/O runtime as the context.
     async fn get_object_range_local(
         &self,
         bucket: &str,
@@ -1053,7 +1053,7 @@ impl GcsClient {
         on_global(async move { this.put_object_local(&bucket, &object, data).await }).await
     }
 
-    /// The body of [`Self::put_object`]; runs on the global runtime.
+    /// The body of [`Self::put_object`]; runs with the I/O runtime as the context.
     async fn put_object_local(&self, bucket: &str, object: &str, data: Bytes) -> Result<()> {
         let is_rapid = self.is_rapid_bucket(bucket).await;
         let data_len = data.len();
@@ -1089,7 +1089,7 @@ impl GcsClient {
         on_global(async move { this.delete_object_local(&bucket, &object).await }).await
     }
 
-    /// The body of [`Self::delete_object`]; runs on the global runtime.
+    /// The body of [`Self::delete_object`]; runs with the I/O runtime as the context.
     async fn delete_object_local(&self, bucket: &str, object: &str) -> Result<()> {
         debug!(
             "GCS DELETE (official): bucket={}, object={}",
@@ -1126,7 +1126,7 @@ impl GcsClient {
         on_global(async move { this.get_object_metadata_local(&bucket, &object).await }).await
     }
 
-    /// The body of [`Self::get_object_metadata`]; runs on the global runtime.
+    /// The body of [`Self::get_object_metadata`]; runs with the I/O runtime as the context.
     async fn get_object_metadata_local(
         &self,
         bucket: &str,
@@ -1178,7 +1178,7 @@ impl GcsClient {
         on_global(async move { this.stat_object_local(&bucket, &object).await }).await
     }
 
-    /// The body of [`Self::stat_object`]; runs on the global runtime.
+    /// The body of [`Self::stat_object`]; runs with the I/O runtime as the context.
     async fn stat_object_local(&self, bucket: &str, object: &str) -> Result<GcsObjectMetadata> {
         if self.is_rapid_bucket(bucket).await {
             return self.stat_object_via_bidi_read(bucket, object).await;
@@ -1248,7 +1248,7 @@ impl GcsClient {
         .await
     }
 
-    /// The body of [`Self::list_objects`]; runs on the global runtime.
+    /// The body of [`Self::list_objects`]; runs with the I/O runtime as the context.
     async fn list_objects_local(
         &self,
         bucket: &str,
@@ -1319,8 +1319,8 @@ impl GcsClient {
         prefix: Option<&'a str>,
         recursive: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
-        // Every poll of the paginator runs with the GLOBAL runtime entered (#303).
-        Box::pin(crate::s3_client::in_global_ctx_stream(
+        // Every poll of the paginator runs with the I/O runtime entered (#303).
+        Box::pin(crate::s3_client::in_io_ctx_stream(
             self.list_objects_stream_local(bucket, prefix, recursive),
         ))
     }
@@ -1478,7 +1478,7 @@ impl GcsClient {
         on_global(async move { this.delete_bucket_local(&bucket).await }).await
     }
 
-    /// The body of [`Self::delete_bucket`]; runs on the global runtime.
+    /// The body of [`Self::delete_bucket`]; runs with the I/O runtime as the context.
     async fn delete_bucket_local(&self, bucket: &str) -> Result<()> {
         debug!("GCS DELETE BUCKET (official): bucket={}", bucket);
 
@@ -1509,7 +1509,7 @@ impl GcsClient {
         .await
     }
 
-    /// The body of [`Self::create_bucket`]; runs on the global runtime.
+    /// The body of [`Self::create_bucket`]; runs with the I/O runtime as the context.
     async fn create_bucket_local(&self, bucket: &str, _project_id: Option<&str>) -> Result<()> {
         debug!("GCS CREATE BUCKET (official): bucket={}", bucket);
 
@@ -1537,7 +1537,7 @@ impl GcsClient {
         on_global(async move { this.delete_objects_local(&bucket, objects).await }).await
     }
 
-    /// The body of [`Self::delete_objects`]; runs on the global runtime.
+    /// The body of [`Self::delete_objects`]; runs with the I/O runtime as the context.
     async fn delete_objects_local(&self, bucket: &str, objects: Vec<String>) -> Result<()> {
         if objects.is_empty() {
             return Ok(());
@@ -2716,7 +2716,7 @@ mod caller_buffer {
     #[async_trait]
     impl ChunkStream for HttpStream {
         async fn next_chunk(&mut self) -> Option<Result<Bytes, GaxError>> {
-            self.0.next().await
+            crate::s3_client::in_io_ctx(self.0.next()).await
         }
     }
 
@@ -2755,9 +2755,9 @@ mod caller_buffer {
                 }
                 (start, None) => builder = builder.set_read_range(ReadRange::offset(start)),
             }
-            // Only the opening request runs on the global runtime (#303); the body is polled by
+            // Only the opening request is bound to the I/O runtime (#303); the body is polled by
             // the caller's task and copied straight into `dst`, as before (Rule #1).
-            let response = crate::s3_client::in_global_ctx(builder.send()).await?;
+            let response = crate::s3_client::in_io_ctx(builder.send()).await?;
             let highlights = response.object();
             Ok(Opened {
                 facts: ObjectFacts {
@@ -2800,7 +2800,7 @@ mod caller_buffer {
     #[async_trait]
     impl ChunkStream for RapidStream {
         async fn next_chunk(&mut self) -> Option<Result<Bytes, GaxError>> {
-            let next = self.reader.next().await;
+            let next = crate::s3_client::in_io_ctx(self.reader.next()).await;
             if matches!(next, Some(Err(_))) {
                 trace!(
                     "GCS Rapid read failed; upload id {:?}",
@@ -2831,7 +2831,7 @@ mod caller_buffer {
                 (start, None) => ReadRange::offset(start),
             };
             let (descriptor, reader) =
-                crate::s3_client::in_global_ctx(builder.send_and_read(range)).await?;
+                crate::s3_client::in_io_ctx(builder.send_and_read(range)).await?;
             let object = descriptor.object();
             Ok(Opened {
                 facts: ObjectFacts {
@@ -2850,9 +2850,7 @@ mod caller_buffer {
             if let Some(generation) = generation {
                 builder = builder.set_generation(generation);
             }
-            Ok(crate::s3_client::in_global_ctx(builder.send())
-                .await?
-                .object())
+            Ok(crate::s3_client::in_io_ctx(builder.send()).await?.object())
         }
     }
 
@@ -3004,7 +3002,7 @@ mod caller_buffer {
             .await
         }
 
-        /// The body of [`Self::stat_object_with_generation`]; runs on the global runtime.
+        /// The body of [`Self::stat_object_with_generation`]; runs with the I/O runtime as the context.
         async fn stat_object_with_generation_local(
             &self,
             bucket: &str,

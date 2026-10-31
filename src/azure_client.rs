@@ -487,14 +487,14 @@ fn service_client_for_url(account_url: &str) -> Result<(Arc<BlobServiceClient>, 
     })
 }
 
-/// The Azure HTTP transport that runs every request with the GLOBAL runtime as the tokio context
+/// The Azure HTTP transport that runs every request with the I/O-owner runtime as the tokio context
 /// (#303).
 ///
 /// A pooled connection belongs to the runtime whose context is entered when it is created, and
 /// the service client (and the credential clients) are process-wide. The wrapped client is
 /// azure_core's own default (reqwest) client; `execute_request` is polled inside
-/// [`crate::s3_client::in_global_ctx`], so every socket, timer and connection task it creates
-/// belongs to the global runtime. The response body is still streamed to the caller's task (the
+/// [`crate::s3_client::in_io_ctx`], so every socket, timer and connection task it creates
+/// belongs to the I/O runtime. The response body is still streamed to the caller's task (the
 /// `get_into` paths copy chunks straight into the caller's buffer, no extra copy).
 #[derive(Debug)]
 pub(crate) struct GlobalRtHttpClient {
@@ -507,7 +507,7 @@ impl azure_core::http::HttpClient for GlobalRtHttpClient {
         &self,
         request: &azure_core::http::Request,
     ) -> azure_core::Result<azure_core::http::AsyncRawResponse> {
-        crate::s3_client::in_global_ctx(self.inner.execute_request(request)).await
+        crate::s3_client::in_io_ctx(self.inner.execute_request(request)).await
     }
 }
 

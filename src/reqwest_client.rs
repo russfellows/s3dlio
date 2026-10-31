@@ -388,12 +388,12 @@ impl HttpConnector for ReqwestHttpConnector {
 // Factory function
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Send `request` with the GLOBAL runtime as the tokio context (#303) and return reqwest's own
+/// Send `request` with the I/O-owner runtime as the tokio context (#303) and return reqwest's own
 /// result.
 ///
 /// The connection that serves a request is opened, and its driver task spawned, under the
-/// runtime context of the thread that polls `send()`; entering the global runtime's context makes
-/// that the global runtime every time (see [`crate::s3_client::in_global_ctx`]), so no pooled
+/// runtime context of the thread that polls `send()`; entering the I/O runtime's context makes
+/// that the I/O runtime every time (see [`crate::s3_client::in_io_ctx`]), so no pooled
 /// connection belongs to a caller's runtime that may be blocked. The future is still polled by
 /// the caller's task (no spawn, no thread hop), and the returned `Response`'s body is read on the
 /// caller's task as before, which keeps the zero-copy caller-buffer GET paths (`get_into`) free
@@ -401,7 +401,7 @@ impl HttpConnector for ReqwestHttpConnector {
 async fn send_on_global_rt(
     request: reqwest::RequestBuilder,
 ) -> Result<Result<reqwest::Response, reqwest::Error>, ConnectorError> {
-    Ok(crate::s3_client::in_global_ctx(request.send()).await)
+    Ok(crate::s3_client::in_io_ctx(request.send()).await)
 }
 
 /// Every data segment of `body`, as the very `Bytes` the body yields (no gather; trailers, if

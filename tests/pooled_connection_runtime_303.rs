@@ -48,9 +48,55 @@ const HARD_KILL: Duration = Duration::from_secs(40);
 struct Mock {
     port: u16,
     log: Arc<Mutex<Vec<String>>>,
+    /// Set for the https mock: the PEM file of its (self-signed) certificate.
+    ca: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// http, HTTP/1.1 and h2c prior knowledge
+    Auto,
+    /// http, HTTP/1.1 only (rejects an h2c prior-knowledge preface)
+    H1,
+    /// https with ALPN h2 / http/1.1
+    Tls,
 }
 
 fn start_mock() -> Mock {
+    start_mock_kind(Kind::Auto)
+}
+
+fn start_mock_kind(kind: Kind) -> Mock {
+    let ca_path = (kind == Kind::Tls).then(|| {
+        std::env::temp_dir().join(
+            format!(
+                "s3dlio303-ca-{}-{:?}.pem",
+                std::process::id(),
+                std::thread::current().id()
+            )
+            .replace(['(', ')'], ""),
+        )
+    });
+    let acceptor = ca_path.as_ref().map(|path| {
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        std::fs::write(path, cert.pem()).unwrap();
+        let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(cert.der().to_vec())],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                key_pair.serialize_der(),
+            )),
+        )
+        .unwrap();
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        tokio_rustls::TlsAcceptor::from(Arc::new(cfg))
+    });
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = std::sync::mpsc::channel();
     let log2 = log.clone();
@@ -66,14 +112,32 @@ fn start_mock() -> Mock {
             loop {
                 let (sock, _) = l.accept().await.unwrap();
                 let log = log2.clone();
+                let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
                         let log = log.clone();
                         async move { Ok::<_, std::convert::Infallible>(handle(req, log).await) }
                     });
-                    let _ = AutoBuilder::new(TokioExecutor::new())
-                        .serve_connection(TokioIo::new(sock), svc)
-                        .await;
+                    match (kind, acceptor) {
+                        (Kind::H1, _) => {
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(TokioIo::new(sock), svc)
+                                .await;
+                        }
+                        (_, Some(acc)) => {
+                            let Ok(tls) = acc.accept(sock).await else {
+                                return;
+                            };
+                            let _ = AutoBuilder::new(TokioExecutor::new())
+                                .serve_connection(TokioIo::new(tls), svc)
+                                .await;
+                        }
+                        _ => {
+                            let _ = AutoBuilder::new(TokioExecutor::new())
+                                .serve_connection(TokioIo::new(sock), svc)
+                                .await;
+                        }
+                    }
                 });
             }
         });
@@ -81,6 +145,7 @@ fn start_mock() -> Mock {
     Mock {
         port: rx.recv().unwrap(),
         log,
+        ca: ca_path,
     }
 }
 
@@ -118,6 +183,20 @@ async fn handle(
         _ => "OTHER",
     };
     log.lock().unwrap().push(format!("{tag} {path}?{q}"));
+    if tag == "HEAD" && path.contains("slow-403") {
+        // a long call that ends in an error that is NOT the operation timeout
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+    }
+    if tag == "ABORT" && path.contains("abort-fails") {
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+    }
     if tag == "ABORT" && path.contains("slow-abort") {
         // An AbortMultipartUpload that takes a while to answer: a Drop that waits for it is
         // visible whatever else is fixed.
@@ -171,18 +250,26 @@ fn run_child_with(case: &str, mock: &Mock, op_timeout_secs: u64) -> Outcome {
         .env(CASE_VAR, case)
         .env(
             "AWS_ENDPOINT_URL",
-            format!("http://127.0.0.1:{}", mock.port),
+            if mock.ca.is_some() {
+                format!("https://localhost:{}", mock.port)
+            } else {
+                format!("http://127.0.0.1:{}", mock.port)
+            },
         )
         .env("AWS_ACCESS_KEY_ID", "x")
         .env("AWS_SECRET_ACCESS_KEY", "y")
         .env("AWS_REGION", "us-east-1")
         .env("S3DLIO_OPERATION_TIMEOUT_SECS", op_timeout_secs.to_string())
         .env_remove("AWS_ENDPOINT_URL_S3")
+        .env_remove("AWS_CA_BUNDLE")
         .env_remove("S3DLIO_POOL_MAX_IDLE_PER_HOST")
         .env_remove("S3DLIO_POOL_IDLE_TIMEOUT_SECS")
         .env_remove("S3DLIO_H2C")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(ca) = &mock.ca {
+        cmd.env("AWS_CA_BUNDLE", ca);
+    }
     let t0 = Instant::now();
     let mut child = cmd.spawn().unwrap();
     let mut so = child.stdout.take().unwrap();
@@ -286,6 +373,83 @@ cases!(
     mt_async_then_sync,
 );
 
+macro_rules! kind_cases {
+    ($kind:expr => $($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                let mock = start_mock_kind($kind);
+                expect_fast(stringify!($name), &mock);
+            }
+        )*
+    };
+}
+
+// `S3DLIO_H2C=auto` against a server that only speaks HTTP/1.1: the first (h2c) attempt is
+// rejected and the request is RETRIED on the HTTP/1.1 client (`reqwest_client` fallback), which
+// opens its own connection: it must be owned by the I/O runtime too.
+kind_cases!(Kind::H1 => ct_async_then_sync_stat_h2c_auto_fallback_retry);
+// https with ALPN (h2) and a custom CA bundle, and the redirect-following wrapper over both
+kind_cases!(Kind::Tls => ct_async_then_sync_stat_https, ct_async_then_sync_stat_https_follow_redirects);
+kind_cases!(Kind::Auto => ct_async_then_sync_stat_follow_redirects, starve_global_workers_do_not_stall_async_io);
+
+/// `warmup_connection_pool` builds its own client and needs no caller runtime: driven by a
+/// runtime-less executor on a plain thread it must work (its sockets belong to the I/O
+/// runtime) and open every connection it was asked for.
+#[test]
+fn warmup_connection_pool_needs_no_caller_runtime() {
+    let mock = start_mock();
+    expect_fast("warmup_no_runtime", &mock);
+    let heads = mock
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.starts_with("HEAD"))
+        .count();
+    assert!(
+        heads >= 4,
+        "warmup sent {heads} HEAD requests, expected 4: {:?}",
+        mock.log.lock().unwrap()
+    );
+}
+
+/// A call that runs long and then fails for another reason must NOT be told that it blocked its
+/// runtime (the hint belongs to the operation-timeout error only).
+#[test]
+fn a_long_call_that_fails_for_another_reason_gets_no_hint() {
+    let mock = start_mock();
+    // timeout 3 s, failure at 2.5 s: inside the old "elapsed + 1 s >= timeout" window
+    let o = run_child_with("long_failure_no_hint", &mock, 3);
+    assert!(
+        o.ok && o.elapsed < Duration::from_secs(8),
+        "ok={} {:?}\n{}",
+        o.ok,
+        o.elapsed,
+        o.output
+    );
+}
+
+/// The reviewer's process-exit case: a sink dropped just before the process ends. The abort
+/// answers slowly (1.5 s); `flush_pending_aborts` is what keeps the process alive until it was
+/// delivered, so the mock has logged it by the time the child has exited.
+#[test]
+fn a_sink_dropped_before_exit_has_its_abort_delivered_by_flush_pending_aborts() {
+    let mock = start_mock();
+    let o = run_child_with("drop_then_exit_flush", &mock, OP_TIMEOUT_SECS);
+    assert!(o.ok, "{}", o.output);
+    // no waiting here: the child has exited
+    assert!(
+        mock.log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("ABORT")),
+        "the abort was not delivered before the process exited: {:?}",
+        mock.log.lock().unwrap()
+    );
+}
+
 #[test]
 fn drop_unfinished_sink_on_ct_returns_at_once_and_aborts() {
     let mock = start_mock();
@@ -312,6 +476,15 @@ fn a_self_deadlock_on_the_callers_runtime_is_reported_by_name() {
         o.elapsed,
         o.output
     );
+}
+
+/// `abort().await` is new API and reports the REAL outcome (unlike `abort_blocking`, whose locked
+/// contract is `Ok(())`): a failed AbortMultipartUpload is an `Err` that says the upload may
+/// still exist; a repeat is a no-op.
+#[test]
+fn abort_reports_a_failed_abort_request() {
+    let mock = start_mock();
+    expect_fast("abort_error_ct", &mock);
 }
 
 #[test]
@@ -368,6 +541,72 @@ fn child_entry() {
         "ct_async_then_sync_stat" => ct().block_on(async {
             check("async stat", stat_object_uri_async(URI).await);
             check("sync stat", stat_object_uri(URI));
+        }),
+        "ct_async_then_sync_stat_h2c_auto_fallback_retry" => {
+            std::env::set_var("S3DLIO_H2C", "auto");
+            ct().block_on(async {
+                check("async stat", stat_object_uri_async(URI).await);
+                check("sync stat", stat_object_uri(URI));
+                check("async stat again", stat_object_uri_async(URI).await);
+            })
+        }
+        "ct_async_then_sync_stat_follow_redirects"
+        | "ct_async_then_sync_stat_https_follow_redirects" => {
+            std::env::set_var("S3DLIO_FOLLOW_REDIRECTS", "1");
+            ct().block_on(async {
+                check("async stat", stat_object_uri_async(URI).await);
+                check("sync stat", stat_object_uri(URI));
+            })
+        }
+        "ct_async_then_sync_stat_https" => ct().block_on(async {
+            check("async stat", stat_object_uri_async(URI).await);
+            check("sync stat", stat_object_uri(URI));
+            check("async stat again", stat_object_uri_async(URI).await);
+        }),
+        // the global runtime's workers are all busy with blocking user work: async I/O of an
+        // independent runtime must not depend on them (the I/O-owner runtime does the I/O)
+        "starve_global_workers_do_not_stall_async_io" => {
+            std::env::set_var("S3DLIO_RT_THREADS", "2");
+            let a = mt(2);
+            a.block_on(async { check("warm", stat_object_uri_async(URI).await) });
+            for _ in 0..2 {
+                s3dlio::s3_client::spawn_on_global_rt(async {
+                    std::thread::sleep(Duration::from_secs(20));
+                });
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            let b = mt(2);
+            b.block_on(async {
+                check(
+                    "async stat while the global workers are blocked",
+                    stat_object_uri_async(URI).await,
+                )
+            });
+        }
+        "warmup_no_runtime" => {
+            // no tokio runtime on this thread at all
+            let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap();
+            futures::executor::block_on(s3dlio::reqwest_client::warmup_connection_pool(
+                &endpoint, 4,
+            ));
+        }
+        "long_failure_no_hint" => ct().block_on(async {
+            let e = stat_object_uri("s3://bkt/slow-403").expect_err("403");
+            let text = format!("{e:#}");
+            assert!(
+                !text.contains("blocked a thread that belongs to a tokio runtime"),
+                "a non-timeout failure got the self-deadlock hint: {text}"
+            );
+        }),
+        "drop_then_exit_flush" => ct().block_on(async {
+            let mut s = MultipartUploadSink::new_async("bkt", "slow-abort-key", cfg())
+                .await
+                .expect("new_async");
+            check("write", s.write(vec![7u8; 11 << 20]).await);
+            drop(s);
+            // the "exit path": wait for the spawned abort, as the CLI and the Python atexit hook do
+            let left = s3dlio::flush_pending_aborts(Duration::from_secs(5));
+            assert_eq!(left, 0, "{left} abort(s) still pending");
         }),
         "ct_async_then_sync_stat_h2c" => {
             std::env::set_var("S3DLIO_H2C", "1");
@@ -495,6 +734,20 @@ fn child_entry() {
                 text.contains("blocked a thread that belongs to a tokio runtime"),
                 "the error does not name the cause: {text}"
             );
+        }),
+        "abort_error_ct" => ct().block_on(async {
+            let mut s = MultipartUploadSink::new_async("bkt", "abort-fails-key", cfg())
+                .await
+                .expect("new_async");
+            check("write", s.write(vec![7u8; 11 << 20]).await);
+            let e = s.abort().await.expect_err("the abort request fails (500)");
+            let text = format!("{e:#}");
+            assert!(text.contains("may still exist on the server"), "{text}");
+            assert!(
+                text.contains("UP1"),
+                "the upload id is in the error: {text}"
+            );
+            check("second abort is a no-op", s.abort().await);
         }),
         "explicit_abort_ct" => ct().block_on(async {
             let mut s = MultipartUploadSink::new_async("bkt", "key", cfg())

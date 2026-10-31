@@ -759,13 +759,22 @@ fn main() -> std::process::ExitCode {
     // credentials in any `scheme://` URI of the cause chain (userinfo, signed queries) are
     // removed and control / bidi characters are escaped. Same `Error: ...` form as the
     // default `main` result printer, and the exit code stays non-zero.
-    match run() {
+    let code = match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {:?}", s3dlio::sanitized_error(&e));
             std::process::ExitCode::FAILURE
         }
+    };
+    // A command that ended early (an `?`) may have dropped an unfinished multipart sink: give
+    // its AbortMultipartUpload a bounded moment so the upload does not stay on the server (#303).
+    let pending = s3dlio::flush_pending_aborts(std::time::Duration::from_secs(2));
+    if pending > 0 {
+        eprintln!(
+            "warning: {pending} AbortMultipartUpload request(s) were not delivered before exit"
+        );
     }
+    code
 }
 
 fn run() -> Result<()> {
