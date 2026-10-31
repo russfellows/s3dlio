@@ -831,9 +831,9 @@ def _mock_s3(port, store):
                 parts[int(q["partNumber"][0])] = b
             else:
                 store[u.path] = b
-            self._send(
-                200, extra={"ETag": '"p{}"'.format(q.get("partNumber", ["0"])[0])}
-            )
+            # int(): the header never carries raw request text (no CR/LF injection)
+            part = int(q.get("partNumber", ["0"])[0])
+            self._send(200, extra={"ETag": f'"p{part}"'})
 
         def do_POST(self):
             u = urllib.parse.urlparse(self.path)
