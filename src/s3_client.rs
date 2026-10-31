@@ -486,7 +486,7 @@ fn get_runtime_threads() -> usize {
 ///    an unmarked runtime whose threads have custom names. `block_in_place` is never called
 ///    there: it panics inside a `LocalSet` that a non-worker thread drives (#300). `fut` runs on
 ///    the global runtime, which is never the caller's runtime here, and every pooled connection
-///    belongs to the I/O runtime (#303, [`in_io_ctx`]), so the wait cannot stall on a connection
+///    belongs to the I/O runtime (#303, `in_io_ctx`), so the wait cannot stall on a connection
 ///    the blocked caller's runtime opened.
 ///
 /// Recorded limits (see `runtime_support` for the details and the remedies):
