@@ -19,6 +19,7 @@ not) to the one known residual: pyo3's own reference-pool mutex.
 """
 
 import asyncio
+import contextlib
 import ctypes
 import json
 import os
@@ -34,7 +35,8 @@ import time
 import s3dlio
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 250
-BUSY = int(sys.argv[2]) if len(sys.argv) > 2 else 8  # S3DLIO_STRESS_NO_ASYNC=1: no async calls in the parent
+# S3DLIO_STRESS_NO_ASYNC=1: no async calls in the parent
+BUSY = int(sys.argv[2]) if len(sys.argv) > 2 else 8
 HANG_S = float(sys.argv[3]) if len(sys.argv) > 3 else 30.0
 PR_SET_PTRACER = 0x59616D61
 PR_SET_PTRACER_ANY = ctypes.c_ulong(-1).value
@@ -53,17 +55,22 @@ class S(socketserver.ThreadingMixIn, http.server.HTTPServer): daemon_threads = T
 S(("127.0.0.1", port), H).serve_forever()
 """
 import socket as _socket
+
 with _socket.socket() as _s:
     _s.bind(("127.0.0.1", 0))
     MOCK_PORT = _s.getsockname()[1]
 os.environ.update(
-    AWS_ENDPOINT_URL=f"http://127.0.0.1:{MOCK_PORT}", AWS_ACCESS_KEY_ID="t", AWS_SECRET_ACCESS_KEY="t",
-    AWS_REGION="us-east-1", AWS_EC2_METADATA_DISABLED="true",
+    AWS_ENDPOINT_URL=f"http://127.0.0.1:{MOCK_PORT}",
+    AWS_ACCESS_KEY_ID="t",
+    AWS_SECRET_ACCESS_KEY="t",
+    AWS_REGION="us-east-1",
+    AWS_EC2_METADATA_DISABLED="true",
 )
 D = tempfile.mkdtemp(prefix="stress297_")
 RELEASE = f"{D}/release"
 _mock = subprocess.Popen([sys.executable, "-c", MOCK, str(MOCK_PORT), RELEASE])
-for _ in range(200):  # wait until the mock accepts connections (a loaded host can be slow)
+# wait until the mock accepts connections (a loaded host can be slow)
+for _ in range(200):
     try:
         _socket.create_connection(("127.0.0.1", MOCK_PORT), timeout=0.2).close()
         break
@@ -94,7 +101,8 @@ def busy(k):
                 s3dlio.generate_data(2 << 20)
             elif m == 1:
                 if os.environ.get("S3DLIO_STRESS_NO_ASYNC") == "1":
-                    s3dlio.get(URI)  # the async delivery path is left out of the parent's load
+                    # the async delivery path is left out of the parent's load
+                    s3dlio.get(URI)
                 else:
                     asyncio.run(_ag())
             else:
@@ -107,10 +115,8 @@ def busy(k):
 
 
 def blocked_get():
-    try:
+    with contextlib.suppress(BaseException):
         s3dlio.get("s3://bkt/slow_get")
-    except BaseException:  # noqa: BLE001
-        pass
 
 
 ds = s3dlio.PyDataset.from_uris(["s3://bkt/slow_loader"])
@@ -119,10 +125,8 @@ SHARED_IT = iter(loader)
 
 
 def consumer():
-    try:
+    with contextlib.suppress(BaseException):
         next(SHARED_IT)
-    except BaseException:  # noqa: BLE001
-        pass
 
 
 threads = [threading.Thread(target=busy, args=(k,), daemon=True) for k in range(BUSY)]
@@ -132,14 +136,14 @@ for t in threads:
     t.start()
 time.sleep(1.5)
 if not all(t.is_alive() for t in threads[BUSY:]):
-    sys.exit("stress scenario failed: the parked threads are not parked (mock S3 not answering as designed)")
+    sys.exit(
+        "stress scenario failed: the parked threads are not parked (mock S3 not answering as designed)"
+    )
 
 
 def child_work(depth):
-    try:
+    with contextlib.suppress(Exception):
         ctypes.CDLL(None).prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
-    except Exception:  # noqa: BLE001
-        pass
     s3dlio.get(URI)
     asyncio.run(_ag())
     s3dlio.generate_data(2 << 20)
@@ -196,7 +200,10 @@ for i in range(N):
         if shutil.which("gdb"):
             bt = subprocess.run(
                 ["gdb", "-p", str(pid), "-batch", "-ex", "thread apply all bt 25"],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
             ).stdout
         path = f"{D}/hangs/hang_{i}_{pid}.txt"
         with open(path, "w") as f:
@@ -213,14 +220,22 @@ for i in range(N):
         res["OK"] += 1
     time.sleep(random.random() * 0.02)
 
-parked_alive = [t.is_alive() for t in threads[BUSY:]]  # the parked threads are still parked
+parked_alive = [
+    t.is_alive() for t in threads[BUSY:]
+]  # the parked threads are still parked
 stop.set()
 open(RELEASE, "w").close()  # release the parked threads
 time.sleep(0.5)
 _mock.kill()
 summary = {
-    "children": N, "busy_threads": BUSY, "seconds": round(time.time() - t_start, 1),
-    "parked_threads_alive_at_end": parked_alive, "results": res, "crashes": crashes, "hang_backtraces": hangs, "scratch": D,
+    "children": N,
+    "busy_threads": BUSY,
+    "seconds": round(time.time() - t_start, 1),
+    "parked_threads_alive_at_end": parked_alive,
+    "results": res,
+    "crashes": crashes,
+    "hang_backtraces": hangs,
+    "scratch": D,
 }
 print("SUMMARY " + json.dumps(summary), flush=True)
 os._exit(0 if res["CRASH"] == 0 and res["FAILED"] == 0 else 1)

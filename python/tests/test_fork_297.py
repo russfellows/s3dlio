@@ -98,8 +98,12 @@ def _harness_main(warm, hang_s, only=None):
         N["ldr"] = s3dlio.PyBytesAsyncDataLoader(N["ds"], {"batch_size": 1})
         N["it"] = iter(N["ldr"])
         next(N["it"])
-        N["vl"] = s3dlio.PyAsyncDataLoader(s3dlio.PyVecDataset(list(range(8))), {"batch_size": 2})
-        N["vit"] = N["vl"].__aiter__()  # an async iterator over a producer task of the parent
+        N["vl"] = s3dlio.PyAsyncDataLoader(
+            s3dlio.PyVecDataset(list(range(8))), {"batch_size": 2}
+        )
+        N["vit"] = N[
+            "vl"
+        ].__aiter__()  # an async iterator over a producer task of the parent
         N["wr"] = s3dlio.create_filesystem_writer(f"file://{D}/parent_writer.bin")
         N["wr"].write_chunk(b"w" * 10)  # an unfinalised writer
         N["gen"] = s3dlio.Generator(size=GEN_BYTES)
@@ -228,7 +232,9 @@ def _harness_main(warm, hang_s, only=None):
     def vec_loader_new():
         async def f():
             n = 0
-            async for _ in s3dlio.PyAsyncDataLoader(s3dlio.PyVecDataset(list(range(8))), {"batch_size": 2}):
+            async for _ in s3dlio.PyAsyncDataLoader(
+                s3dlio.PyVecDataset(list(range(8))), {"batch_size": 2}
+            ):
                 n += 1
             return n
 
@@ -319,7 +325,10 @@ def _harness_main(warm, hang_s, only=None):
     inherited("ckpt_inherited_save", lambda: N["ck"].save(5, 1, "pt", b"z"))
     inherited("ckpt_inherited_list", lambda: N["ck"].list_checkpoints())
     inherited("ckpt_inherited_writer", lambda: N["ck"].writer(1, 0))
-    inherited("ckpt_writer_inherited", lambda: N["ckw"].save_distributed_shard(6, 1, "pt", b"z"))
+    inherited(
+        "ckpt_writer_inherited",
+        lambda: N["ckw"].save_distributed_shard(6, 1, "pt", b"z"),
+    )
     inherited("ckpt_reader_inherited", lambda: N["ckr"].load_latest_manifest())
     inherited("ckpt_stream_inherited_write", lambda: N["cks"].write_chunk(b"zz"))
     inherited("ckpt_stream_inherited_cancel", lambda: N["cks"].cancel())
@@ -439,7 +448,8 @@ def _harness_main(warm, hang_s, only=None):
                 rec.update(json.loads(raw) if raw else {"res": "NO-RESULT"})
                 rec["exit"] = os.WEXITSTATUS(status)
         try:
-            rec["warns"] = open(errf).read().count(WARN_MARK)
+            with open(errf) as fh:
+                rec["warns"] = fh.read().count(WARN_MARK)
         except OSError:
             rec["warns"] = -1
         recs.append(rec)
@@ -461,7 +471,9 @@ def _run_harness(warm, env_extra=None, only=None):
     cmd = [sys.executable, os.path.abspath(__file__), "HARNESS", warm]
     if only:
         cmd += list(only)
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=1200, env=env)
+    p = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=1200, env=env, check=False
+    )
     recs = {}
     for line in p.stdout.splitlines():
         if line.startswith("RESULT "):
@@ -481,27 +493,62 @@ if pytest is not None:
     def _results(warm):
         if warm not in _CACHE:
             recs, p = _run_harness(warm)
-            assert recs, f"harness produced nothing:\n{p.stdout[-2000:]}\n{p.stderr[-2000:]}"
+            assert recs, (
+                f"harness produced nothing:\n{p.stdout[-2000:]}\n{p.stderr[-2000:]}"
+            )
             _CACHE[warm] = recs
         return _CACHE[warm]
 
     ALL_CASES = [
-        "get", "get_range", "put_bytes", "list", "stat", "delete", "get_many", "get_async",
-        "get_into_async", "head_async", "put_bytes_async", "multi_endpoint_new", "writer_fs",
-        "checkpoint_new", "loader_new", "bytes_loader_new", "vec_loader_new", "dataset_new",
-        "generate_data", "generate_data_with_threads", "generate_into_buffer", "generator_new",
-        "generate_npz_bytes", "oplog_init", "configure_then_get", "nested_fork",
+        "get",
+        "get_range",
+        "put_bytes",
+        "list",
+        "stat",
+        "delete",
+        "get_many",
+        "get_async",
+        "get_into_async",
+        "head_async",
+        "put_bytes_async",
+        "multi_endpoint_new",
+        "writer_fs",
+        "checkpoint_new",
+        "loader_new",
+        "bytes_loader_new",
+        "vec_loader_new",
+        "dataset_new",
+        "generate_data",
+        "generate_data_with_threads",
+        "generate_into_buffer",
+        "generator_new",
+        "generate_npz_bytes",
+        "oplog_init",
+        "configure_then_get",
+        "nested_fork",
         "exit_after_use",
     ]
     INHERITED_CASES = [
-        "ckpt_inherited_save", "ckpt_inherited_list", "ckpt_inherited_writer",
-        "ckpt_writer_inherited", "ckpt_reader_inherited", "ckpt_stream_inherited_write",
-        "ckpt_stream_inherited_cancel", "mep_inherited", "dataset_inherited", "loader_inherited",
-        "iterator_inherited", "async_iterator_inherited", "writer_inherited_write",
-        "writer_inherited_finalize", "generator_inherited",
+        "ckpt_inherited_save",
+        "ckpt_inherited_list",
+        "ckpt_inherited_writer",
+        "ckpt_writer_inherited",
+        "ckpt_reader_inherited",
+        "ckpt_stream_inherited_write",
+        "ckpt_stream_inherited_cancel",
+        "mep_inherited",
+        "dataset_inherited",
+        "loader_inherited",
+        "iterator_inherited",
+        "async_iterator_inherited",
+        "writer_inherited_write",
+        "writer_inherited_finalize",
+        "generator_inherited",
     ]
     DROP_CASES = [
-        "drop_inherited_objects", "exit_with_inherited_objects", "exit_after_del_inherited_ckpt",
+        "drop_inherited_objects",
+        "exit_with_inherited_objects",
+        "exit_after_del_inherited_ckpt",
     ]
 
     @pytest.mark.parametrize("warm", WARMS)
@@ -539,14 +586,22 @@ if pytest is not None:
         for case, rec in _results("none").items():
             assert rec["warns"] == 0, rec
         # parent used it: at most ONE line per child process, and the first use says it
-        for warm, case in (("sync", "get"), ("async", "get_async"), ("datagen", "generate_data")):
+        for warm, case in (
+            ("sync", "get"),
+            ("async", "get_async"),
+            ("datagen", "generate_data"),
+        ):
             assert _results(warm)[case]["warns"] == 1, _results(warm)[case]
         for warm in ("sync", "async", "datagen", "all"):
             for case, rec in _results(warm).items():
                 assert 0 <= rec["warns"] <= 1, rec
 
     def test_the_warning_can_be_silenced():
-        recs, _ = _run_harness("all", {"S3DLIO_FORK_WARN": "0"}, only=["get", "get_async", "generate_data", "nested_fork"])
+        recs, _ = _run_harness(
+            "all",
+            {"S3DLIO_FORK_WARN": "0"},
+            only=["get", "get_async", "generate_data", "nested_fork"],
+        )
         assert set(recs) == {"get", "get_async", "generate_data", "nested_fork"}
         for rec in recs.values():
             assert rec["res"] == "OK" and rec["warns"] == 0, rec
@@ -563,7 +618,14 @@ if pytest is not None:
 def _run_script(code, timeout=180, env_extra=None):
     env = dict(os.environ)
     env.update(env_extra or {})
-    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout, env=env)
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
 
 
 if pytest is not None:
@@ -696,7 +758,10 @@ else:
     print("MP OK")
 """
         p = _run_script(code, timeout=300)
-        assert ("TORCH OK" in p.stdout) or ("MP OK" in p.stdout), (p.stdout[-1500:], p.stderr[-1500:])
+        assert ("TORCH OK" in p.stdout) or ("MP OK" in p.stdout), (
+            p.stdout[-1500:],
+            p.stderr[-1500:],
+        )
 
 
 # =============================================================================================
@@ -766,7 +831,9 @@ def _mock_s3(port, store):
                 parts[int(q["partNumber"][0])] = b
             else:
                 store[u.path] = b
-            self._send(200, extra={"ETag": '"p%s"' % q.get("partNumber", ["0"])[0]})
+            self._send(
+                200, extra={"ETag": '"p{}"'.format(q.get("partNumber", ["0"])[0])}
+            )
 
         def do_POST(self):
             u = urllib.parse.urlparse(self.path)
@@ -774,12 +841,18 @@ def _mock_s3(port, store):
             b = self._body()
             log.append(("POST", self.path, self.client_address[1], len(b)))
             if "uploads" in q:
-                self._send(200, b"<?xml version='1.0'?><InitiateMultipartUploadResult><Bucket>bkt</Bucket>"
-                                b"<Key>k</Key><UploadId>UP1</UploadId></InitiateMultipartUploadResult>")
+                self._send(
+                    200,
+                    b"<?xml version='1.0'?><InitiateMultipartUploadResult><Bucket>bkt</Bucket>"
+                    b"<Key>k</Key><UploadId>UP1</UploadId></InitiateMultipartUploadResult>",
+                )
             else:
                 store[u.path] = b"".join(parts[k] for k in sorted(parts))
-                self._send(200, b"<?xml version='1.0'?><CompleteMultipartUploadResult><Location>x</Location>"
-                                b"<Bucket>bkt</Bucket><Key>k</Key><ETag>\"c\"</ETag></CompleteMultipartUploadResult>")
+                self._send(
+                    200,
+                    b"<?xml version='1.0'?><CompleteMultipartUploadResult><Location>x</Location>"
+                    b'<Bucket>bkt</Bucket><Key>k</Key><ETag>"c"</ETag></CompleteMultipartUploadResult>',
+                )
 
         def do_DELETE(self):
             log.append(("DELETE", self.path, self.client_address[1], 0))
@@ -816,7 +889,9 @@ if pytest is not None:
 
     def test_the_child_opens_its_own_connection_and_the_parent_keeps_its_own():
         port = _free_port()
-        store = {f"/bkt/{k}": b"hello" * 1000 for k in ("p1", "p2", "c1", "c2", "p3", "p4")}
+        store = {
+            f"/bkt/{k}": b"hello" * 1000 for k in ("p1", "p2", "c1", "c2", "p3", "p4")
+        }
         srv, log = _mock_s3(port, store)
         try:
             code = """
@@ -847,19 +922,21 @@ print("PARENT OK")
             ports = {}
             for cmd, path, cport, _n in log:
                 if cmd == "GET":
-                    ports.setdefault(path.split("?")[0].split("/")[-1], set()).add(cport)
+                    ports.setdefault(path.split("?")[0].split("/")[-1], set()).add(
+                        cport
+                    )
             assert all(len(v) == 1 for v in ports.values()), ports
             parent_ports = {next(iter(ports[k])) for k in ("p1", "p2", "p3", "p4")}
             child_ports = {next(iter(ports[k])) for k in ("c1", "c2")}
-            assert len(parent_ports) == 1, f"the parent's connection must survive the child: {ports}"
+            assert len(parent_ports) == 1, (
+                f"the parent's connection must survive the child: {ports}"
+            )
             assert len(child_ports) == 1, ports
             assert parent_ports.isdisjoint(child_ports), (
                 f"the child must open its own connection, not reuse the parent's: {ports}"
             )
         finally:
             srv.shutdown()
-
-
 
     def test_an_inherited_multipart_writer_is_refused_and_never_aborts_the_parents_upload():
         """The multipart writer's drop aborts its upload. In a fork child that would abort the
@@ -900,14 +977,19 @@ print("PARENT OK", meta["parts"])
 """
             p = _run_script(code, timeout=120, env_extra=_mock_env(port))
             assert "PARENT OK" in p.stdout, (p.stdout[-1500:], p.stderr[-1500:])
-            assert not [e for e in log if e[0] == "DELETE"], f"the parent's upload was aborted: {log}"
+            assert not [e for e in log if e[0] == "DELETE"], (
+                f"the parent's upload was aborted: {log}"
+            )
             assert len(store["/bkt/big.bin"]) == 6 << 20
         finally:
             srv.shutdown()
+
 
 # =============================================================================================
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "HARNESS":
         _harness_main(sys.argv[2], HANG_S, only=set(sys.argv[3:]) or None)
     else:
-        sys.exit("usage: test_fork_297.py HARNESS WARM [CASE ...]  (or run it with pytest)")
+        sys.exit(
+            "usage: test_fork_297.py HARNESS WARM [CASE ...]  (or run it with pytest)"
+        )

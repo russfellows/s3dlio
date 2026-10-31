@@ -16,8 +16,8 @@ Two kinds of check:
   file with it): in that build an off-GIL `Py` drop ABORTS the process, so any future regression
   fails these tests by crashing them.
 """
+
 import asyncio
-import os
 import tempfile
 import threading
 import time
@@ -39,11 +39,13 @@ def stats():
 
 
 def test_exact_bytes_puts_release_their_reference_through_the_queue(uri):
-    u, d = uri
+    _u, d = uri
     before = stats()["deferred_decrefs"]
     for i in range(50):
         s3dlio.put_bytes(f"file://{d}/p{i}.bin", bytes([i % 256]) * 4096)
-    assert stats()["deferred_decrefs"] > before, "the exact-bytes drop must go through the queue"
+    assert stats()["deferred_decrefs"] > before, (
+        "the exact-bytes drop must go through the queue"
+    )
     deadline = time.time() + 5
     while stats()["queued"] and time.time() < deadline:
         time.sleep(0.02)
@@ -52,7 +54,7 @@ def test_exact_bytes_puts_release_their_reference_through_the_queue(uri):
 
 
 def test_checkpoint_save_and_async_puts_do_not_drop_off_the_gil(uri):
-    u, d = uri
+    _u, d = uri
     st = s3dlio.PyCheckpointStore(f"file://{d}/ck")
     for i in range(20):
         st.save(i, 1, "pt", bytes([i]) * 1000)
@@ -66,7 +68,7 @@ def test_checkpoint_save_and_async_puts_do_not_drop_off_the_gil(uri):
 
 
 def test_the_async_bridge_never_falls_back_to_the_queue(uri):
-    u, d = uri
+    u, _d = uri
 
     async def run():
         for _ in range(100):
@@ -82,7 +84,7 @@ def test_the_async_bridge_never_falls_back_to_the_queue(uri):
                 pass
         # an error result
         for _ in range(20):
-            with pytest.raises(Exception):
+            with pytest.raises(Exception):  # noqa: B017 - any error; the test checks the counter
                 await s3dlio.get_async(u + ".missing")
 
     asyncio.run(run())

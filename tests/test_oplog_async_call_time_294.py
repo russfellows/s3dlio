@@ -69,7 +69,7 @@ def need_hook():
 # Common child code
 # ----------------------------------------------------------------------------
 
-PRELUDE = '''
+PRELUDE = """
     import asyncio, subprocess, shutil, inspect, threading, time
     T = os.path.realpath(sys.argv[1])
     HEADER = {header!r}
@@ -95,7 +95,7 @@ PRELUDE = '''
         assert not any("OLDTOK" in f for _, f in r2), ("the OLD call/object wrote into session 2", r2)
         if expect_rows:
             assert any("NEWTOK" in f for _, f in r2), ("the session-2 control was not logged", r2)
-'''
+"""
 
 
 def scenario(body, *args, env=None):
@@ -123,7 +123,7 @@ FILE_ENTRIES = {
     "get_into_async": "lambda p: s3dlio.get_into_async(u(p), bytearray(1), expected_len=1)",
 }
 
-HELD_BODY = '''
+HELD_BODY = """
     DIRECTION = sys.argv[2]
     CALL = eval(sys.argv[3])
     NEW_URI_BASE = sys.argv[4]          # "" for file:// (CALL takes a path), else a prefix
@@ -151,7 +151,7 @@ HELD_BODY = '''
     check(rows(S2), True)
     if DIRECTION == "created_in_session_1":
         assert not any("OLDTOK" in f for _, f in rows(S1)), "a finalized session gained a row"
-'''
+"""
 
 DIRECTIONS = ["created_in_session_1", "created_before_init"]
 
@@ -177,10 +177,18 @@ class DataMock(MockS3):
     gate_dir = None
 
     def respond(self, method, key, query, body_keys):
-        if method == "GET" and "list-type" not in query and self.gate_dir and "GATE" in key:
+        if (
+            method == "GET"
+            and "list-type" not in query
+            and self.gate_dir
+            and "GATE" in key
+        ):
             open(os.path.join(self.gate_dir, "seen"), "w").close()
             end = time.time() + 60
-            while not os.path.exists(os.path.join(self.gate_dir, "release")) and time.time() < end:
+            while (
+                not os.path.exists(os.path.join(self.gate_dir, "release"))
+                and time.time() < end
+            ):
                 time.sleep(0.02)
         if method in ("GET", "HEAD") and "list-type" not in query:
             with self.lock:
@@ -190,9 +198,15 @@ class DataMock(MockS3):
 
 
 KEYS = (
-    "OLDTOK", "NEWTOK", "mep/OLDTOK", "mep/NEWTOK",
-    "oldds/OLDTOK0", "newds/NEWTOK0",
-    "OLDTOK-GATE-a", "OLDTOK-GATE-b", "NEWTOK-sync",
+    "OLDTOK",
+    "NEWTOK",
+    "mep/OLDTOK",
+    "mep/NEWTOK",
+    "oldds/OLDTOK0",
+    "newds/NEWTOK0",
+    "OLDTOK-GATE-a",
+    "OLDTOK-GATE-b",
+    "NEWTOK-sync",
 )
 
 
@@ -222,16 +236,16 @@ S3_ENTRIES = {
 def test_s3_async_call_is_bound_to_the_session_active_when_it_was_made(
     tmp_path, mock, entry, direction
 ):
-    scenario(HELD_BODY, str(tmp_path), direction, S3_ENTRIES[entry], "s3", env=s3env(mock))
+    scenario(
+        HELD_BODY, str(tmp_path), direction, S3_ENTRIES[entry], "s3", env=s3env(mock)
+    )
 
 
 # ----------------------------------------------------------------------------
 # 3. Constructed objects: datasets, loaders and MultiEndpointStores capture the logger at CONSTRUCTION
 # ----------------------------------------------------------------------------
 # `build(uri)` constructs the object, `use(obj)` is an async function that fetches through it.
-MEP_BUILD = (
-    'lambda uri: (s3dlio.create_multi_endpoint_store(["s3://bkt/mep/"]), "OLDTOK" if "old" in uri else "NEWTOK")'
-)
+MEP_BUILD = 'lambda uri: (s3dlio.create_multi_endpoint_store(["s3://bkt/mep/"]), "OLDTOK" if "old" in uri else "NEWTOK")'
 
 OBJECTS = {
     "dataset_get_item": (
@@ -276,7 +290,7 @@ OBJECTS = {
     # iterator, so it cannot be iterated; create_async_loader is the supported route to S3BytesDataset.)
 }
 
-OBJECT_BODY = '''
+OBJECT_BODY = """
     DIRECTION = sys.argv[2]
     BUILD = eval(sys.argv[3])
     USE = sys.argv[4]
@@ -312,7 +326,7 @@ OBJECT_BODY = '''
     check(rows(S2), True)
     if DIRECTION == "built_in_session_1":
         assert not any("OLDTOK" in f for _, f in rows(S1)), "a finalized session gained a row"
-'''
+"""
 
 
 @pytest.mark.usefixtures("need_hook")
@@ -323,7 +337,13 @@ def test_constructed_dataset_or_loader_keeps_the_logger_it_was_built_with(
 ):
     build, use, hold = OBJECTS[obj]
     scenario(
-        OBJECT_BODY, str(tmp_path), direction, build, use, "1" if hold else "0", env=s3env(mock)
+        OBJECT_BODY,
+        str(tmp_path),
+        direction,
+        build,
+        use,
+        "1" if hold else "0",
+        env=s3env(mock),
     )
 
 
@@ -331,7 +351,7 @@ def test_constructed_dataset_or_loader_keeps_the_logger_it_was_built_with(
 # 4. Synchronous get_many on s3:// captures the logger once, at entry
 # ----------------------------------------------------------------------------
 
-SYNC_BODY = '''
+SYNC_BODY = """
     GATE = sys.argv[2]
     s3dlio.init_op_log(S1)
     uris = ["s3://bkt/OLDTOK-GATE-a", "s3://bkt/OLDTOK-GATE-b"]
@@ -354,7 +374,7 @@ SYNC_BODY = '''
     s3dlio.finalize_op_log()
     check(rows(S2), True)
     assert not any("OLDTOK" in f for _, f in rows(S1)), "a finalized session gained a row"
-'''
+"""
 
 
 def test_sync_get_many_s3_takes_the_logger_once_at_entry(tmp_path, mock):

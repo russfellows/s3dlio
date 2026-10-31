@@ -19,6 +19,7 @@ corrupts it (SIGSEGV/SIGABRT, "PyInterpreterState_Delete: remaining threads").  
 Do NOT rely on the "FATAL" check alone: release builds can abort silently inside pthread_exit;
 the exit code is the load-bearing assertion.
 """
+
 import os
 import subprocess
 import sys
@@ -28,7 +29,7 @@ import pytest
 
 NWORKERS = 8
 
-SCRIPT = textwrap.dedent('''
+SCRIPT = textwrap.dedent("""
     import asyncio, atexit, os, socket, sys, threading, time
     import s3dlio
 
@@ -231,10 +232,10 @@ SCRIPT = textwrap.dedent('''
         assert s3dlio.is_op_log_active()
     print("READY", len(started), completed[0], flush=True)
     # main returns here: interpreter finalization starts with the daemons inside s3dlio calls
-''')
+""")
 
 # Stand-in S3 service for the scenarios that need a completing S3 call (run as its own process).
-FAKE_S3 = textwrap.dedent('''
+FAKE_S3 = textwrap.dedent("""
     import http.server, os, socketserver, sys, threading
     DATA = os.urandom(1 << 20)
     LIST = ('<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
@@ -283,19 +284,42 @@ FAKE_S3 = textwrap.dedent('''
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     sys.stdin.read()          # parent gone (stdin closed): exit
     os._exit(0)
-''')
+""")
 
 # Attempts per scenario. A crash at exit is probabilistic (1/30 to 30/30 depending on the call), so CI
 # raises this with S3DLIO_EXIT_ATTEMPTS; the default keeps a local run short.
 ATTEMPTS = int(os.environ.get("S3DLIO_EXIT_ATTEMPTS", "3"))
 
 DAEMON_MODES = [
-    "get", "put_bytes", "list", "stat", "get_many", "get_range", "writer", "sync_blackhole",
-    "async_get", "async_put_bytes", "async_pending", "get_into_async",
-    "async_get_range", "async_get_many", "async_get_many_stats", "async_stat", "async_stat_many", "async_put",
-    "mes_get", "mes_get_range", "mes_get_from_endpoint", "ds_get_item", "async_loader",
-    "async_numeric_loader", "async_s3_loader",
-    "oplog_get", "oplog_put", "atexit_get", "atexit_oplog_finalize",
+    "get",
+    "put_bytes",
+    "list",
+    "stat",
+    "get_many",
+    "get_range",
+    "writer",
+    "sync_blackhole",
+    "async_get",
+    "async_put_bytes",
+    "async_pending",
+    "get_into_async",
+    "async_get_range",
+    "async_get_many",
+    "async_get_many_stats",
+    "async_stat",
+    "async_stat_many",
+    "async_put",
+    "mes_get",
+    "mes_get_range",
+    "mes_get_from_endpoint",
+    "ds_get_item",
+    "async_loader",
+    "async_numeric_loader",
+    "async_s3_loader",
+    "oplog_get",
+    "oplog_put",
+    "atexit_get",
+    "atexit_oplog_finalize",
 ]
 
 
@@ -303,7 +327,10 @@ def _run(mode, tmp_path):
     (tmp_path / "fake_s3.py").write_text(FAKE_S3)
     return subprocess.run(
         [sys.executable, "-c", SCRIPT, mode, str(tmp_path), str(NWORKERS)],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
 
 
@@ -311,26 +338,29 @@ def _run(mode, tmp_path):
 @pytest.mark.parametrize("mode", DAEMON_MODES)
 def test_exit_with_daemon_threads_in_s3dlio_calls(mode, attempt, tmp_path):
     r = _run(mode, tmp_path)
-    assert r.returncode == 0, "exit code %r\nstdout:\n%s\nstderr:\n%s" % (
-        r.returncode, r.stdout[-500:], r.stderr[-2000:])
+    assert r.returncode == 0, (
+        f"exit code {r.returncode!r}\nstdout:\n{r.stdout[-500:]}\nstderr:\n{r.stderr[-2000:]}"
+    )
     assert "FATAL" not in r.stderr, r.stderr[-2000:]
-    assert "READY" in r.stdout, "scenario was not exercised:\n%s\n%s" % (r.stdout[-500:], r.stderr[-1000:])
+    assert "READY" in r.stdout, (
+        f"scenario was not exercised:\n{r.stdout[-500:]}\n{r.stderr[-1000:]}"
+    )
 
 
 @pytest.mark.parametrize("attempt", range(ATTEMPTS))
 def test_exit_with_non_daemon_threads_still_waits_and_exits_cleanly(attempt, tmp_path):
     """Non-daemon threads are joined by Python before finalization: no abort, all work completes."""
     r = _run("nondaemon", tmp_path)
-    assert r.returncode == 0, "exit code %r\nstderr:\n%s" % (r.returncode, r.stderr[-2000:])
+    assert r.returncode == 0, f"exit code {r.returncode!r}\nstderr:\n{r.stderr[-2000:]}"
     assert "FATAL" not in r.stderr, r.stderr[-2000:]
-    assert "DONE %d" % NWORKERS in r.stdout, r.stdout[-500:]
+    assert f"DONE {NWORKERS}" in r.stdout, r.stdout[-500:]
 
 
 # Issue #304: once the exit gate has closed (the s3dlio atexit drain ran), an async entry point is
 # REFUSED with a catchable RuntimeError before it calls into Python, instead of entering Python while
 # the interpreter finalizes (an abort on CPython < 3.13.8). An atexit handler registered BEFORE
 # `import s3dlio` runs after the drain, so it sees the closed gate.
-REFUSAL_SCRIPT = textwrap.dedent('''
+REFUSAL_SCRIPT = textwrap.dedent("""
     import atexit, asyncio, os, sys, tempfile
     d = tempfile.mkdtemp()
     p = os.path.join(d, "o.bin")
@@ -361,16 +391,34 @@ REFUSAL_SCRIPT = textwrap.dedent('''
     atexit.register(late)           # BEFORE the import: runs after s3dlio's drain
     import s3dlio
     print("READY", flush=True)
-''')
+""")
 
 
 def test_async_calls_after_the_exit_gate_closed_raise_runtime_error():
-    r = subprocess.run([sys.executable, "-c", REFUSAL_SCRIPT], capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, "exit code %r\nstdout:\n%s\nstderr:\n%s" % (r.returncode, r.stdout, r.stderr[-2000:])
+    r = subprocess.run(
+        [sys.executable, "-c", REFUSAL_SCRIPT],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert r.returncode == 0, (
+        f"exit code {r.returncode!r}\nstdout:\n{r.stdout}\nstderr:\n{r.stderr[-2000:]}"
+    )
     assert "NOT-REFUSED" not in r.stdout, r.stdout
-    for name in ("get_async", "put_bytes_async", "put_bytes_async_bytearray", "get_into_async", "stat_async",
-                 "put_bytes_async_user_bytes"):
-        assert "REFUSED %s True" % name in r.stdout, (name, r.stdout, r.stderr[-1000:])
+    for name in (
+        "get_async",
+        "put_bytes_async",
+        "put_bytes_async_bytearray",
+        "get_into_async",
+        "stat_async",
+        "put_bytes_async_user_bytes",
+    ):
+        assert f"REFUSED {name} True" in r.stdout, (
+            name,
+            r.stdout,
+            r.stderr[-1000:],
+        )
 
 
 # Issue #304, round 2: ONE exit-gate scope covers a guarded entry point from its top to its end. If the
@@ -378,7 +426,7 @@ def test_async_calls_after_the_exit_gate_closed_raise_runtime_error():
 # which closes it right after the spawn), the rest of the start (guard construction, and the cancel of
 # every failure path) must NOT be refused: the call returns its awaitable. Before, `instantiate` was
 # refused, the cancel was skipped, and the call blocked in the export barrier and raised.
-CLOSE_AFTER_SPAWN_SCRIPT = textwrap.dedent('''
+CLOSE_AFTER_SPAWN_SCRIPT = textwrap.dedent("""
     import asyncio, os, tempfile, time
     import s3dlio
     d = tempfile.mkdtemp()
@@ -393,17 +441,32 @@ CLOSE_AFTER_SPAWN_SCRIPT = textwrap.dedent('''
 
     asyncio.run(go())
     print("DONE", flush=True)
-''')
+""")
 
 
 def test_gate_closing_after_the_spawn_does_not_refuse_the_rest_of_the_start():
     # The hook exists only in a wheel built with the `test-hooks` cargo feature (never in a release wheel).
-    probe = subprocess.run([sys.executable, "-c", "import s3dlio,sys; sys.exit(0 if getattr(s3dlio, '_test_close_exit_gate_after_next_spawn', None) else 3)"])
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import s3dlio,sys; sys.exit(0 if getattr(s3dlio, '_test_close_exit_gate_after_next_spawn', None) else 3)",
+        ],
+        check=False,
+    )
     if probe.returncode != 0:
         msg = "this wheel was built without the `test-hooks` cargo feature (no s3dlio._test_close_exit_gate_after_next_spawn)"
         if os.environ.get("S3DLIO_REQUIRE_TEST_HOOKS") == "1":
             pytest.fail(msg + "; S3DLIO_REQUIRE_TEST_HOOKS=1 forbids skipping")
         pytest.skip(msg)
-    r = subprocess.run([sys.executable, "-c", CLOSE_AFTER_SPAWN_SCRIPT], capture_output=True, text=True, timeout=120)
-    assert r.returncode == 0, "exit code %r\nstdout:\n%s\nstderr:\n%s" % (r.returncode, r.stdout, r.stderr[-2000:])
+    r = subprocess.run(
+        [sys.executable, "-c", CLOSE_AFTER_SPAWN_SCRIPT],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert r.returncode == 0, (
+        f"exit code {r.returncode!r}\nstdout:\n{r.stdout}\nstderr:\n{r.stderr[-2000:]}"
+    )
     assert "RETURNED" in r.stdout and "DONE" in r.stdout, (r.stdout, r.stderr[-2000:])

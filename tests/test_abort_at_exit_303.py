@@ -7,6 +7,7 @@ is garbage-collected, must have its AbortMultipartUpload DELIVERED before the pr
 (The sink's Drop spawns the abort and no longer blocks; the writer's Drop and the atexit hook wait
 for it, bounded.) A tiny keep-alive S3 mock in this process logs every request; a child
 interpreter makes the upload and ends without finish()."""
+
 import subprocess
 import sys
 import threading
@@ -54,10 +55,18 @@ class H(BaseHTTPRequestHandler):
         self._body()
         if "uploads" in q:
             LOG.append("CREATE")
-            self._send(200, b'<?xml version="1.0"?><InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><UploadId>UP1</UploadId></InitiateMultipartUploadResult>', {"Content-Type": "application/xml"})
+            self._send(
+                200,
+                b'<?xml version="1.0"?><InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><UploadId>UP1</UploadId></InitiateMultipartUploadResult>',
+                {"Content-Type": "application/xml"},
+            )
         else:
             LOG.append("COMPLETE")
-            self._send(200, b'<?xml version="1.0"?><CompleteMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><ETag>"e"</ETag></CompleteMultipartUploadResult>', {"Content-Type": "application/xml"})
+            self._send(
+                200,
+                b'<?xml version="1.0"?><CompleteMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><ETag>"e"</ETag></CompleteMultipartUploadResult>',
+                {"Content-Type": "application/xml"},
+            )
 
     def do_PUT(self):
         self._body()
@@ -66,7 +75,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         LOG.append("ABORT")
-        time.sleep(1.0)  # a slow abort: only a process that waits for the answer outlives it
+        # a slow abort: only a process that waits for the answer outlives it
+        time.sleep(1.0)
         self._send(204)
         ACKED.append(time.time())
 
@@ -105,7 +115,14 @@ def run(port, mode):
         "AWS_REGION": "us-east-1",
         "S3DLIO_OPERATION_TIMEOUT_SECS": "10",
     }
-    p = subprocess.run([sys.executable, "-c", CHILD, mode], env=env, capture_output=True, text=True, timeout=60)
+    p = subprocess.run(
+        [sys.executable, "-c", CHILD, mode],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
     assert "child-done" in p.stdout, p.stdout + p.stderr
     return p
 
@@ -120,4 +137,6 @@ def test_unfinished_writer_abort_is_delivered_before_the_process_exits(server, m
     assert "CREATE" in LOG
     assert "ABORT" in LOG, f"the upload leaked: {LOG}"
     assert "COMPLETE" not in LOG
-    assert ACKED and ACKED[0] <= ended + 0.05, "the process exited before the abort was answered"
+    assert ACKED and ACKED[0] <= ended + 0.05, (
+        "the process exited before the abort was answered"
+    )
