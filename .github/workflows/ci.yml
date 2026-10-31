@@ -232,7 +232,13 @@ jobs:
             *) echo "this interpreter has no shared libpython (LDLIBRARY=$LDLIB): cannot link the extension-module unit tests" >&2; exit 1 ;;
           esac
           export RUSTFLAGS="-C link-arg=-L$LIBDIR -C link-arg=-lpython$LDVER -C link-arg=-Wl,-rpath,$LIBDIR"
-          cargo test --lib --offline --features extension-module,backend-azure -- python_api::
+          # caller_buffer_tests need CPython >= 3.12 (PEP 688 `__buffer__`) and fail by design on
+          # 3.11: the 3.11 cells skip that one module.
+          SKIP=""
+          if [ "$(python -c 'import sys; print(sys.version_info >= (3, 12))')" = "False" ]; then
+            SKIP="--skip python_api::python_core_api::caller_buffer_tests"
+          fi
+          cargo test --lib --offline --features extension-module,backend-azure -- python_api:: $SKIP
 
   # Rust-only integration tests that do not depend on the Python version. They
   # run once per OS, in parallel with the `test` matrix, instead of six times
