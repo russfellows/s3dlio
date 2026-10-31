@@ -808,7 +808,7 @@ impl PyMultipartUploadWriter {
     /// `abort_blocking()` is infallible by contract (bug A3, this session):
     /// it always cancels the coordinator and always returns `Ok(())`, even
     /// when the underlying `AbortMultipartUpload` request itself fails.
-    /// That failure is not lost — `cancel_coordinator_and_maybe_abort`
+    /// That failure is not lost — `cancel_coordinator`
     /// (shared by `abort_blocking()` and `Drop`) emits a `tracing::warn!`
     /// naming the bucket/key/upload_id right where the failure occurs, so
     /// there is nothing left for `__exit__` to swallow. See

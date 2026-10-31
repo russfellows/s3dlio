@@ -279,7 +279,7 @@ pub struct MultipartUploadSink {
     /// Coordinator task handle; awaited in finish_blocking().
     coordinator: Option<JoinHandle<Result<MultipartCompleteInfo>>>,
     /// Signaled on Drop / abort() to stop the coordinator BEFORE it can
-    /// reach CompleteMultipartUpload. See `cancel_coordinator_and_maybe_abort`
+    /// reach CompleteMultipartUpload. See `cancel_coordinator`
     /// (audit #151 findings f11/f12 — issue #148 CLAUDE.md bug class:
     /// dropping `part_tx` alone is not enough, because dropping a
     /// `JoinHandle` detaches rather than cancels the task it points to).
@@ -326,7 +326,58 @@ impl Drop for MultipartUploadSink {
         // reach CompleteMultipartUpload for a sink that was dropped
         // without finish() (audit #151 f12 — locked contract, see
         // docs/implementation-plans/v0.9.109-audit-fix-plan.md bug A2).
-        self.cancel_coordinator_and_maybe_abort(self.cfg.abort_on_drop);
+        //
+        // The Abort is SPAWNED on the global runtime and Drop returns at once (#303): a Drop
+        // that waited for it blocked the dropping thread, and on a current-thread runtime (the
+        // only thread that could drive the connection) it stalled for the whole operation
+        // timeout and leaked the upload. The outcome is logged; if the process exits before the
+        // request is delivered the upload may remain on the server, so call `abort().await`
+        // (or `abort_blocking()`) when delivery must be certain.
+        if let Some(req) = self.cancel_coordinator(self.cfg.abort_on_drop) {
+            spawn_on_global_rt(async move {
+                let what = req.describe();
+                match req.send().await {
+                    Ok(()) => debug!("s3dlio MPU: dropped sink aborted {what}"),
+                    Err(e) => warn_abort_failed(&what, &e),
+                }
+            });
+        }
+    }
+}
+
+fn warn_abort_failed(what: &str, e: &anyhow::Error) {
+    warn!(
+        "s3dlio MPU: best-effort AbortMultipartUpload failed for {what}: {e} — \
+         the in-progress upload may need manual cleanup"
+    );
+}
+
+/// One best-effort `AbortMultipartUpload`, detached from the sink so it can run anywhere.
+struct AbortRequest {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+}
+
+impl AbortRequest {
+    fn describe(&self) -> String {
+        format!(
+            "s3://{}/{} upload_id={}",
+            self.bucket, self.key, self.upload_id
+        )
+    }
+
+    async fn send(&self) -> Result<()> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("AbortMultipartUpload failed: {e}"))
     }
 }
 
@@ -849,22 +900,66 @@ impl MultipartUploadSink {
     /// this is an explicit user action, so the S3-side Abort always
     /// fires regardless of `abort_on_drop` (that flag only gates
     /// *implicit* cleanup-on-drop).
+    ///
+    /// Blocks the calling thread until the Abort was attempted; use [`MultipartUploadSink::abort`]
+    /// from async code.
     pub fn abort_blocking(&mut self) -> Result<()> {
-        self.cancel_coordinator_and_maybe_abort(true);
+        if let Some(req) = self.cancel_coordinator(true) {
+            let outcome = run_on_global_rt(async move {
+                let what = req.describe();
+                Ok::<_, anyhow::Error>((what, req.send().await))
+            });
+            match outcome {
+                Ok((_, Ok(()))) => {}
+                Ok((what, Err(e))) => warn_abort_failed(&what, &e),
+                Err(e) => warn_abort_failed(
+                    &format!(
+                        "s3://{}/{} upload_id={}",
+                        self.bucket, self.key, self.upload_id
+                    ),
+                    &e,
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Explicitly abort the upload from async code (#303).
+    ///
+    /// Same contract as [`MultipartUploadSink::abort_blocking`]: the coordinator is cancelled
+    /// first (it can never reach CompleteMultipartUpload after this call), a best-effort
+    /// `AbortMultipartUpload` is awaited (it runs on s3dlio's own runtime, so it completes even
+    /// when the calling runtime is a current-thread one), a failure of that cleanup request is
+    /// only logged (`warn!`, with the upload id) and the call returns `Ok(())`. It fires
+    /// regardless of `abort_on_drop`. Calling it again, or after `finish()`, does nothing. If the
+    /// returned future is dropped before it completes, the Abort still runs: the cancellation has
+    /// already happened and the request is spawned.
+    pub async fn abort(&mut self) -> Result<()> {
+        if let Some(req) = self.cancel_coordinator(true) {
+            let what = req.describe();
+            // Spawned (not awaited inline) so that dropping this future cannot cancel the
+            // cleanup half-way and leak the upload.
+            let task = spawn_on_global_rt(async move { req.send().await });
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn_abort_failed(&what, &e),
+                Err(e) => warn_abort_failed(&what, &anyhow::anyhow!("abort task failed: {e}")),
+            }
+        }
         Ok(())
     }
 
     // ── internal ─────────────────────────────────────────────────────────────
 
-    /// Shared by `Drop::drop` and `abort_blocking()`: stop the coordinator
-    /// before it can reach Complete, then optionally fire a best-effort
-    /// `AbortMultipartUpload`. `fire_abort=false` is used only from Drop
-    /// when `abort_on_drop=false` — the operator explicitly opted into
-    /// leaving the upload dangling rather than paying for the extra
-    /// request, per the locked A2 contract.
-    fn cancel_coordinator_and_maybe_abort(&mut self, fire_abort: bool) {
+    /// Stop the coordinator before it can reach Complete (shared by `Drop::drop`,
+    /// `abort_blocking()` and `abort()`). Returns the best-effort `AbortMultipartUpload` request
+    /// to run, or `None` when none is wanted (`fire_abort == false`, or the sink is already
+    /// finished or aborted). `fire_abort=false` is used only from Drop when `abort_on_drop=false`
+    /// — the operator explicitly opted into leaving the upload dangling rather than paying for
+    /// the extra request, per the locked A2 contract.
+    fn cancel_coordinator(&mut self, fire_abort: bool) -> Option<AbortRequest> {
         if self.finished {
-            return;
+            return None;
         }
         self.finished = true;
 
@@ -876,34 +971,12 @@ impl MultipartUploadSink {
         // channel state.
         self.cancel.cancel();
 
-        if !fire_abort {
-            return;
-        }
-
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key = self.key.clone();
-        let upload_id = self.upload_id.clone();
-
-        let abort_result = run_on_global_rt(async move {
-            client
-                .abort_multipart_upload()
-                .bucket(&bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("AbortMultipartUpload failed: {e}"))
-        });
-
-        if let Err(e) = abort_result {
-            warn!(
-                "s3dlio MPU: best-effort AbortMultipartUpload failed for s3://{}/{} \
-                 upload_id={}: {e} — the in-progress upload may need manual cleanup",
-                self.bucket, self.key, self.upload_id
-            );
-        }
+        fire_abort.then(|| AbortRequest {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            upload_id: self.upload_id.clone(),
+        })
     }
 
     /// Enqueue a complete part for upload via the coordinator channel.

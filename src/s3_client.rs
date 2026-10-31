@@ -427,13 +427,15 @@ fn get_runtime_threads() -> usize {
 ///    (`run_until`, `block_on`, `spawn_local`), `Handle::block_on`, a `spawn_blocking` thread, and
 ///    an unmarked runtime whose threads have custom names. `block_in_place` is never called
 ///    there: it panics inside a `LocalSet` that a non-worker thread drives (#300). `fut` runs on
-///    the global runtime, which is never the caller's runtime here, so the wait cannot deadlock
-///    it.
+///    the global runtime, which is never the caller's runtime here, and every pooled connection
+///    belongs to the global runtime too (#303, [`in_global_ctx`]), so the wait cannot stall on a
+///    connection the blocked caller's runtime opened.
 ///
 /// Recorded limits (see `runtime_support` for the details and the remedies):
 /// (a) a worker of an unmarked runtime with CUSTOM thread names takes rule 4: no panic, but it gets
 /// no hand-off (every call parks a worker for its whole duration, and it HANGS if the awaited work
-/// needs that same runtime, such as an in-process server); call
+/// needs that same runtime, such as an in-process server: the error after the operation timeout
+/// names that cause, #303); call
 /// `Builder::on_thread_start(mark_tokio_worker_thread)`, or use the async API;
 /// (b) PANIC on any thread that carries the default tokio worker name or the s3dlio marker and
 /// drives a `LocalSet` with the call inside a task: a `spawn_blocking` thread (even without
@@ -461,8 +463,34 @@ where
     // Hand the worker's core off ONLY where `runtime_support` knows that is valid (a marked
     // worker of a multi-thread runtime, outside an `inline_blocking_io` scope); a plain
     // blocking wait everywhere else. No runtime state is probed by provoking a panic.
-    crate::runtime_support::blocking_wait(spawn_and_wait)
+    //
+    // A wait that ends in an error after (about) the whole operation timeout, on a thread that
+    // belongs to a tokio runtime, is named for what it can be (#303): the one way left for this
+    // wait to stall is awaited work that needs THIS runtime, such as an in-process server
+    // task, which cannot run while the thread is blocked here. (A pooled connection of the
+    // caller's runtime no longer can: all network I/O runs on the global runtime.)
+    let on_runtime_thread = tokio::runtime::Handle::try_current().is_ok();
+    let started = std::time::Instant::now();
+    let result = crate::runtime_support::blocking_wait(spawn_and_wait);
+    match result {
+        Err(e)
+            if on_runtime_thread
+                && started.elapsed() + Duration::from_secs(1) >= get_operation_timeout() =>
+        {
+            Err(e.context(BLOCKED_RUNTIME_HINT))
+        }
+        other => other,
+    }
 }
+
+/// Context added to a synchronous wrapper's error that took the whole operation timeout on a
+/// thread of a tokio runtime (see [`run_on_global_rt`]).
+const BLOCKED_RUNTIME_HINT: &str =
+    "this synchronous s3dlio call blocked a thread that belongs to a tokio runtime for the whole \
+operation timeout; if the endpoint is served by a task on that same runtime (an in-process \
+server), that task cannot run while this thread is blocked: use the async API, or call the \
+synchronous API from spawn_blocking or a plain thread (if the endpoint is not served by this \
+process, this is an ordinary network timeout)";
 
 /// Spawn a task on the global runtime without blocking (non-blocking spawn).
 /// Returns a JoinHandle immediately that can be awaited later.
@@ -475,6 +503,51 @@ where
     T: Send + 'static,
 {
     global_rt_handle().spawn(fut)
+}
+
+/// Poll `fut` with the GLOBAL runtime entered as the tokio context, from any runtime (#303).
+///
+/// A pooled HTTP connection belongs to the runtime that creates it: its socket is registered
+/// with that runtime's I/O driver, its timers with that runtime's time driver, and the task that
+/// drives it is spawned onto that runtime (`tokio::spawn` and every `Handle::current()` use the
+/// runtime context of the thread that polls the creating future). Created while a caller's
+/// current-thread runtime was polling, a connection stalled every later request that reused it
+/// for the whole operation timeout whenever that runtime was alive but blocked (a sync s3dlio
+/// call waiting on its only thread).
+///
+/// Entering the global runtime's context around every poll of the HTTP futures
+/// ([`tokio::runtime::Handle::enter`], documented for exactly this) makes every socket, timer and
+/// connection task they create belong to the global runtime, which no caller can block. The
+/// future itself keeps being polled by the caller's task: there is no spawn, no `'static` bound,
+/// no extra thread hop, and dropping the returned future drops `fut`, exactly as before. Buffers
+/// the future borrows (the caller-buffer `get_into` paths) are untouched, so Rule #1 (zero copy)
+/// holds with no change to those paths.
+///
+/// Anything `fut` spawns or registers while it is polled lands on the global runtime. Work done
+/// when a connection or body is DROPPED outside a poll is not covered (a drop only releases
+/// resources; it creates no connection and no connection task).
+pub(crate) async fn in_global_ctx<F: std::future::Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let handle = global_rt_handle();
+    std::future::poll_fn(move |cx| {
+        let _entered = handle.enter();
+        fut.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// [`in_global_ctx`] for a stream: every poll runs with the global runtime entered.
+#[cfg(feature = "backend-gcs")]
+pub(crate) fn in_global_ctx_stream<S>(stream: S) -> impl futures::Stream<Item = S::Item> + Unpin
+where
+    S: futures::Stream + Unpin,
+{
+    let handle = global_rt_handle();
+    let mut stream = stream;
+    futures::stream::poll_fn(move |cx| {
+        let _entered = handle.enter();
+        std::pin::Pin::new(&mut stream).poll_next(cx)
+    })
 }
 
 // -----------------------------------------------------------------------------

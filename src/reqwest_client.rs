@@ -247,7 +247,7 @@ impl HttpConnector for ReqwestHttpConnector {
             }
             builder = builder.body(req_body.to_reqwest());
 
-            let first_result = builder.send().await;
+            let first_result = send_on_global_rt(builder).await?;
 
             // ── Handle auto-probe outcome ─────────────────────────────────
             let resp = match first_result {
@@ -296,7 +296,7 @@ impl HttpConnector for ReqwestHttpConnector {
                         rb = rb.timeout(timeout);
                     }
                     rb = rb.body(req_body.to_reqwest());
-                    rb.send().await.map_err(|e| {
+                    send_on_global_rt(rb).await?.map_err(|e| {
                         if e.is_connect() || e.is_timeout() {
                             ConnectorError::timeout(e.into())
                         } else {
@@ -387,6 +387,22 @@ impl HttpConnector for ReqwestHttpConnector {
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory function
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Send `request` with the GLOBAL runtime as the tokio context (#303) and return reqwest's own
+/// result.
+///
+/// The connection that serves a request is opened, and its driver task spawned, under the
+/// runtime context of the thread that polls `send()`; entering the global runtime's context makes
+/// that the global runtime every time (see [`crate::s3_client::in_global_ctx`]), so no pooled
+/// connection belongs to a caller's runtime that may be blocked. The future is still polled by
+/// the caller's task (no spawn, no thread hop), and the returned `Response`'s body is read on the
+/// caller's task as before, which keeps the zero-copy caller-buffer GET paths (`get_into`) free
+/// of any extra copy or buffer hand-off.
+async fn send_on_global_rt(
+    request: reqwest::RequestBuilder,
+) -> Result<Result<reqwest::Response, reqwest::Error>, ConnectorError> {
+    Ok(crate::s3_client::in_global_ctx(request.send()).await)
+}
 
 /// Every data segment of `body`, as the very `Bytes` the body yields (no gather; trailers, if
 /// any, are dropped exactly as `collect().to_bytes()` dropped them).
@@ -886,7 +902,7 @@ pub async fn warmup_connection_pool(endpoint_url: &str, connections: usize) {
             async move {
                 // HEAD to the root path — we only care about establishing the TCP
                 // connection, not the response status.
-                let _ = c.head(&u).send().await;
+                let _ = send_on_global_rt(c.head(&u)).await;
             }
         })
         .collect();
