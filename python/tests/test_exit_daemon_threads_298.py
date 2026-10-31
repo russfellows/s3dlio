@@ -274,6 +274,10 @@ FAKE_S3 = textwrap.dedent('''
             self.wfile.write(body)
     class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True
+        # The default listen backlog is 5. 8 loops x 4 calls x 4 requests open about 100 connections at once;
+        # the overflow drops the final ACK and the client sits in SYN retransmit back-off (1, 2, 4, 8 s),
+        # which showed up as a 1-3% 'scenario not exercised' flake.
+        request_queue_size = 512
     srv = S(("127.0.0.1", 0), H)
     print(srv.server_address[1], flush=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -332,6 +336,10 @@ REFUSAL_SCRIPT = textwrap.dedent('''
     p = os.path.join(d, "o.bin")
     open(p, "wb").write(b"x" * 4096)
 
+    class UserBytes:                 # only __bytes__: the last-resort conversion runs the user's bytecode
+        def __bytes__(self):
+            return b"zz"
+
     def late():
         async def go():
             calls = {
@@ -340,6 +348,7 @@ REFUSAL_SCRIPT = textwrap.dedent('''
                 "put_bytes_async_bytearray": lambda: s3dlio.put_bytes_async("file://" + d + "/w2.bin", bytearray(1024)),
                 "get_into_async": lambda: s3dlio.get_into_async("file://" + p, bytearray(4096), expected_len=4096),
                 "stat_async": lambda: s3dlio.stat_async("file://" + p),
+                "put_bytes_async_user_bytes": lambda: s3dlio.put_bytes_async("file://" + d + "/w3.bin", UserBytes()),
             }
             for name, call in calls.items():
                 try:
@@ -359,5 +368,35 @@ def test_async_calls_after_the_exit_gate_closed_raise_runtime_error():
     r = subprocess.run([sys.executable, "-c", REFUSAL_SCRIPT], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, "exit code %r\nstdout:\n%s\nstderr:\n%s" % (r.returncode, r.stdout, r.stderr[-2000:])
     assert "NOT-REFUSED" not in r.stdout, r.stdout
-    for name in ("get_async", "put_bytes_async", "put_bytes_async_bytearray", "get_into_async", "stat_async"):
+    for name in ("get_async", "put_bytes_async", "put_bytes_async_bytearray", "get_into_async", "stat_async",
+                 "put_bytes_async_user_bytes"):
         assert "REFUSED %s True" % name in r.stdout, (name, r.stdout, r.stderr[-1000:])
+
+
+# Issue #304, round 2: ONE exit-gate scope covers a guarded entry point from its top to its end. If the
+# gate closes after the native put was spawned (hidden hook `_test_close_exit_gate_after_next_spawn`,
+# which closes it right after the spawn), the rest of the start (guard construction, and the cancel of
+# every failure path) must NOT be refused: the call returns its awaitable. Before, `instantiate` was
+# refused, the cancel was skipped, and the call blocked in the export barrier and raised.
+CLOSE_AFTER_SPAWN_SCRIPT = textwrap.dedent('''
+    import asyncio, os, tempfile, time
+    import s3dlio
+    d = tempfile.mkdtemp()
+
+    async def go():
+        buf = bytearray(1 << 20)               # a mutable buffer: borrowed, so the put is guarded
+        s3dlio._test_close_exit_gate_after_next_spawn()
+        t0 = time.time()
+        aw = s3dlio.put_bytes_async("file://" + d + "/w.bin", buf)
+        print("RETURNED %.2f" % (time.time() - t0), flush=True)
+        aw.cancel()
+
+    asyncio.run(go())
+    print("DONE", flush=True)
+''')
+
+
+def test_gate_closing_after_the_spawn_does_not_refuse_the_rest_of_the_start():
+    r = subprocess.run([sys.executable, "-c", CLOSE_AFTER_SPAWN_SCRIPT], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, "exit code %r\nstdout:\n%s\nstderr:\n%s" % (r.returncode, r.stdout, r.stderr[-2000:])
+    assert "RETURNED" in r.stdout and "DONE" in r.stdout, (r.stdout, r.stderr[-2000:])

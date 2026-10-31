@@ -275,7 +275,8 @@ finalization began is parked forever; it never runs again, so its remaining Pyth
   `put_bytes_async`). Wheels from before those fixes still have those two crashes. An async call made after s3dlio's exit
   drain (from an `atexit` handler registered before `import s3dlio`) raises `RuntimeError` ("the interpreter is exiting").
   A residual window remains (a call still starting when the 2 s drain timeout expires; Python code that Rust runs outside
-  the async machinery, such as a user-defined `__buffer__`); see the changelog entry for #304.
+  the async machinery, such as a user-defined `__bytes__` / `__buffer__`, argument extraction from user objects, `__del__`
+  of released user buffers); see the changelog entry for #304.
 - Non-daemon threads are unaffected: Python waits for them before finalizing.
 - Parking a thread is not a clean shutdown. Work a daemon thread had in flight is lost; stop and join your workers (and
   call `finalize_op_log()`) if you need it to complete.

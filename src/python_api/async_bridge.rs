@@ -128,10 +128,17 @@
 //!   (microseconds to a few milliseconds: creating a future, instantiating the guard) so this needs a
 //!   thread that is starved of the GIL for 2 s or a user event loop whose `create_future` blocks.
 //!   The timeout is logged by the drain.
-//! * Python code that Rust runs for other reasons than the awaitable machinery: the buffer
-//!   protocol of a user-defined object that implements `__buffer__` in Python (3.12+), `dict`
-//!   subclass options of the loaders, and in general any sync `#[pyfunction]` that calls back into
-//!   Python bytecode. They are not async entry points and are not gated.
+//! * Python code that Rust runs on the calling thread for other reasons than the awaitable
+//!   machinery, and that is therefore NOT gated (none of these is an `await` point, but all run
+//!   bytecode that can drop and re-take the GIL with Rust frames below):
+//!   - the user's own `__bytes__()` (`put_payload.rs`, the last-resort payload conversion; the call
+//!     itself IS under a scope, the bytecode of a slow user method can outlast the drain timeout);
+//!   - the buffer protocol of a user-defined object that implements `__buffer__` in Python (3.12+);
+//!   - extraction of arguments from user objects (`__index__`, `__len__`, `__iter__` and `__getitem__` of
+//!     user sequences and mappings passed as `uris` or loader options, `dict` subclasses);
+//!   - `__del__` and `__release_buffer__` of user objects that a Rust-side drop releases
+//!     (a buffer export released by the caller thread, a dropped payload);
+//!   - any synchronous `#[pyfunction]` that calls back into Python.
 //! * Calls made from an `atexit` handler registered BEFORE `import s3dlio` run after the drain
 //!   and are now refused with a `RuntimeError` (before: the awaitable never resolved). Handlers
 //!   registered after the import run before the drain and are unaffected.
@@ -360,8 +367,28 @@ impl ContextExt for S3dlioRuntime {
 /// out, so no thread is inside such a call when finalization starts, and a call that begins after
 /// the close is refused with a catchable `RuntimeError` instead of entering Python at all.
 /// See the module docs ("The residual window") for what remains.
+///
+/// Scopes NEST per thread: only the outermost one touches the gate (and can be refused); an
+/// inner one is a plain depth count that always succeeds. A guarded entry point therefore takes
+/// ONE scope at its top, and every later step (`prepare_guard`, the spawn, `instantiate`, the
+/// cancel calls of its failure paths) cannot be refused half-way: a refusal is only possible
+/// before anything was spawned. A scope is tied to its thread (`!Send`) and must be dropped
+/// before any long blocking wait (`py.detach` waits), so exit is never delayed by one.
 pub(crate) struct PythonCallScope {
-    _ticket: DeliveryTicket,
+    /// `None` for a nested scope.
+    _ticket: Option<DeliveryTicket>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+thread_local! {
+    /// How many [`PythonCallScope`]s the current thread holds.
+    static SCOPE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Drop for PythonCallScope {
+    fn drop(&mut self) {
+        let _ = SCOPE_DEPTH.try_with(|d| d.set(d.get().saturating_sub(1)));
+    }
 }
 
 /// Open a [`PythonCallScope`] on the process-wide gate, or raise `RuntimeError` when the
@@ -373,9 +400,36 @@ pub(crate) fn python_call_scope() -> PyResult<PythonCallScope> {
 
 /// [`python_call_scope`] on an explicit tracker (tests).
 fn scope_in(tracker: &'static DeliveryTracker) -> PyResult<PythonCallScope> {
-    match tracker.enter() {
-        Some(_ticket) => Ok(PythonCallScope { _ticket }),
-        None => Err(pyo3::exceptions::PyRuntimeError::new_err(EXITING_MESSAGE)),
+    let nested = SCOPE_DEPTH.with(|d| d.get()) > 0;
+    let ticket = if nested {
+        None
+    } else {
+        match tracker.enter() {
+            Some(t) => Some(t),
+            None => return Err(pyo3::exceptions::PyRuntimeError::new_err(EXITING_MESSAGE)),
+        }
+    };
+    SCOPE_DEPTH.with(|d| d.set(d.get() + 1));
+    Ok(PythonCallScope {
+        _ticket: ticket,
+        _not_send: std::marker::PhantomData,
+    })
+}
+
+/// Test hook (hidden `_test_close_exit_gate_after_next_spawn`): arm it, and the NEXT guarded
+/// entry point closes the exit gate right after it spawned its native work (see
+/// `guarded_put`). The gate never reopens; use it only in a throw-away process.
+static CLOSE_GATE_AFTER_NEXT_SPAWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn arm_close_gate_after_next_spawn() {
+    CLOSE_GATE_AFTER_NEXT_SPAWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Called by the guarded entry points right after the native work was spawned.
+pub(crate) fn after_spawn_hook() {
+    if CLOSE_GATE_AFTER_NEXT_SPAWN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        DELIVERIES.close();
     }
 }
 

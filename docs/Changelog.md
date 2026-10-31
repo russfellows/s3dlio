@@ -224,7 +224,10 @@ affected. No API change.
   park guard wraps only GIL re-acquisitions that Rust itself starts (`PyEval_RestoreThread`, `PyGILState_Ensure`).
 - **Fix.** The exit gate of #192 now also covers these calls. `future_into_py`, the guard preparation (`prepare_guard`,
   including its first-use module import), `PreparedGuard::instantiate` and the cancel calls of the failure paths each hold
-  a gate ticket for the duration of the Python call. The `atexit` drain closes the gate first, then releases the GIL and
+  a gate ticket for the duration of the Python call. A guarded entry point (the puts with a mutable buffer,
+  `get_into_async`, `head_async`) takes ONE scope at its top that covers everything up to its end (scopes nest per
+  thread, only the outermost can be refused), so a refusal can only happen before anything is spawned and the cancel of
+  a failure path is never skipped. The `atexit` drain closes the gate first, then releases the GIL and
   waits (bounded by `ASYNC_EXIT_DRAIN_TIMEOUT`, 2 s) for tickets already out, so no thread is inside such a call when
   finalization starts. A call that begins after the gate closed is **refused with a `RuntimeError`**
   ("s3dlio: the interpreter is exiting; the async call was refused") before it calls into Python, and before any native
@@ -234,12 +237,21 @@ affected. No API change.
   interpreter is not exiting.
 - **Remaining window.** (1) A call still inside its scope when the 2 s drain timeout expires (a thread starved of the GIL
   for 2 s, or a user event loop whose `create_future` blocks) can still be ended by `pthread_exit`; the drain logs the
-  timeout. (2) Python code that Rust runs outside the async machinery is not gated: the buffer protocol of a user-defined
-  object implementing `__buffer__` in Python (3.12+), `dict`-subclass loader options, any sync `#[pyfunction]` calling back
-  into Python. See the module docs of `src/python_api/async_bridge.rs`.
+  timeout. (2) Python code that Rust runs outside the async machinery is not gated: a user object's `__bytes__()` (the
+  call itself is under a scope, but a slow user method can outlast the drain timeout), the buffer protocol of a user-defined
+  object implementing `__buffer__` in Python (3.12+), extraction of arguments from user objects (`__index__`, `__len__`,
+  `__iter__`/`__getitem__` of user sequences and mappings, `dict` subclasses), `__del__` / `__release_buffer__` of user objects
+  released by a Rust-side drop, and any sync `#[pyfunction]` calling back into Python. See the module docs of
+  `src/python_api/async_bridge.rs`.
 - **Tests.** `python/tests/test_exit_daemon_threads_298.py` runs every async entry point's exit scenario (set the number of
-  attempts per scenario with `S3DLIO_EXIT_ATTEMPTS`, default 3; CI uses more) and a new test for the refusal; the
-  structural test `tests/python_future_bodies_no_attach_302.rs` now scans every production source file.
+  attempts per scenario with `S3DLIO_EXIT_ATTEMPTS`, default 3; CI uses more), a test for the refusal (including a user
+  `__bytes__` object) and a test that closes the gate right after the spawn (hidden hook
+  `_test_close_exit_gate_after_next_spawn`). The S3 stand-in server of the exit tests, and the other Python test servers,
+  listen with a backlog of 512 instead of the default 5 (a connection burst overflowing it showed up as a 1-3% flake).
+  The structural test `tests/python_future_bodies_no_attach_302.rs` scans every production source file for attaches
+  (including `use ..::attach`, turbofish and aliases), for formatting or unwrapping inside future bodies (a `PyErr`
+  Display/Debug attaches inside PyO3), and requires `python_call_scope()` before every Python call of the awaitable
+  machinery; each rule is mutation-checked. It is a lexical scan and says so; the exit scenarios are the behavioural barrier.
 
 ### Fixed — exit crash with async calls in flight on CPython 3.14 (#302)
 

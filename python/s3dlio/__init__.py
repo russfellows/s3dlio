@@ -73,6 +73,8 @@ _put_export_stats = _core._put_export_stats
 # Hidden test hooks of the barrier (used only by python/tests/test_put_release_barrier.py).
 _put_test_queue_export = _core._put_test_queue_export
 _put_test_retain_next_clone = _core._put_test_retain_next_clone
+# Hidden test hook (issue #304): the next guarded put closes the exit gate right after it spawned.
+_test_close_exit_gate_after_next_spawn = _core._test_close_exit_gate_after_next_spawn
 _put_test_retained = _core._put_test_retained
 _put_test_release_retained = _core._put_test_release_retained
 

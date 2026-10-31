@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use super::async_bridge::{future_into_py, python_call_scope};
+use super::async_bridge::{
+    after_spawn_hook, arm_close_gate_after_next_spawn, future_into_py, python_call_scope,
+    PythonCallScope,
+};
 use super::put_payload::{
     acquire_writable, deadline_warning_text, export_stats, hold_for_call, latch_ready,
     note_internal_error, put_payload, put_payload_in_batch, quiesce_async, quiesce_blocking,
@@ -1740,12 +1743,31 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = PyResult<Option<()>>> + Send + 'static,
 {
+    // ONE exit-gate scope for the whole start (#304): a refusal is only possible here, before the
+    // guard is prepared and before anything is spawned; every later step runs under this scope (the
+    // inner scopes of `prepare_guard`, `future_into_py`, `instantiate` and the cancel calls nest and
+    // cannot be refused), so the cancel of a failure path is never skipped.
+    let scope = match python_call_scope() {
+        Ok(scope) => scope,
+        Err(e) => {
+            drop(make); // nothing was prepared or spawned: release the (queued) exports
+            if let Some(latch) = &latch {
+                if quiesce_blocking(py, latch).is_err() {
+                    return Err(still_referenced_error(&format!(
+                        "the put could not be started: {e}"
+                    )));
+                }
+            }
+            return Err(e);
+        }
+    };
     let guard = match &latch {
         None => None,
         Some(latch) => match prepare_guard(py, latch.clone()) {
             Ok(g) => Some(g),
             Err(e) => {
                 drop(make); // nothing was spawned: this releases the (queued) exports...
+                drop(scope); // ...and the wait below must not hold the exit gate
                 if quiesce_blocking(py, latch).is_err() {
                     return Err(still_referenced_error(&format!(
                         "the put could not be started: {e}"
@@ -1757,6 +1779,7 @@ where
     };
 
     let inner = future_into_py(py, make());
+    after_spawn_hook();
     // On EVERY error path from here the barrier is kept: the blocking wait + drain below.
     let fail = |py: Python<'py>, latch: &Option<std::sync::Arc<Latch>>, e: PyErr| -> PyErr {
         if let Some(latch) = latch {
@@ -1768,10 +1791,13 @@ where
     };
     let inner = match inner {
         Ok(i) => i,
-        Err(e) => return Err(fail(py, &latch, e)),
+        Err(e) => {
+            drop(scope);
+            return Err(fail(py, &latch, e));
+        }
     };
     match (guard, &latch) {
-        (Some(g), Some(latch)) => wrap_in_guard(py, g, inner, latch),
+        (Some(g), Some(latch)) => wrap_in_guard(py, g, inner, latch, scope),
         _ => Ok(inner),
     }
 }
@@ -1792,11 +1818,13 @@ fn wrap_in_guard<'py>(
     guard: PreparedGuard<'py>,
     inner: Bound<'py, PyAny>,
     latch: &std::sync::Arc<Latch>,
+    scope: PythonCallScope,
 ) -> PyResult<Bound<'py, PyAny>> {
     match guard.instantiate(py, inner.clone()) {
         Ok(f) => Ok(f),
         Err(e) => {
             cancel_ignoring_errors(&inner);
+            drop(scope); // the blocking wait below must not hold the exit gate
             if quiesce_blocking(py, latch).is_err() {
                 return Err(still_referenced_error(&format!(
                     "the put could not be started: {e}"
@@ -2439,6 +2467,9 @@ fn get_into_with_store<'py, S: StartSeams>(
     expected_len: usize,
     latch: Arc<Latch>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // ONE exit-gate scope for the whole start (#304), refused only here, before anything is acquired or
+    // spawned; the inner scopes nest and cannot be refused, so no cancel below is ever skipped.
+    let _scope = python_call_scope()?;
     let guard = prepare_guard(py, latch.clone())?;
     let owner = acquire_writable(py, dst, expected_len, &latch)?;
 
@@ -2560,6 +2591,8 @@ fn head_with_store<'py, S: StartSeams>(
     uri: String,
     latch: Arc<Latch>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // ONE exit-gate scope for the whole start (#304); see `get_into_with_store`.
+    let _scope = python_call_scope()?;
     let guard = prepare_guard(py, latch.clone())?;
 
     let (tx, rx) = oneshot::channel::<()>();
@@ -2627,6 +2660,15 @@ fn object_capabilities_py<'py>(py: Python<'py>, uri: &str) -> PyResult<Bound<'py
     result.set_item("get_into", caps.get_into)?;
     result.set_item("head", caps.head)?;
     Ok(result)
+}
+
+/// Test hook (hidden): the NEXT guarded put closes the exit gate right after it spawned its native
+/// work, to prove the rest of the start cannot be refused half-way (#304). The gate never reopens:
+/// use it only in a throw-away process.
+#[pyfunction]
+#[pyo3(name = "_test_close_exit_gate_after_next_spawn")]
+fn test_close_exit_gate_after_next_spawn_py() {
+    arm_close_gate_after_next_spawn();
 }
 
 // ---------------------------------------------------------------------------
@@ -4650,6 +4692,10 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     // Caller-buffer GET, typed HEAD and pure capabilities (#264)
     m.add_function(wrap_pyfunction!(object_capabilities_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        test_close_exit_gate_after_next_spawn_py,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(get_into_async, m)?)?;
     m.add_function(wrap_pyfunction!(head_async, m)?)?;
     m.add_class::<PyHeadMetadata>()?;
@@ -5634,7 +5680,9 @@ mod borrowed_put_guard_tests {
             let latch = Latch::new();
             latch.mark_dropped();
             latch.mark_released(); // no native reader: the fallback wait returns at once
-            let err = wrap_in_guard(py, guard, inner.clone(), &latch).expect_err("must fail");
+            let scope = python_call_scope().expect("gate open");
+            let err =
+                wrap_in_guard(py, guard, inner.clone(), &latch, scope).expect_err("must fail");
             assert!(err.to_string().contains("boom"), "{err}");
             let cancelled: bool = inner.call_method0("cancelled").unwrap().extract().unwrap();
             assert!(cancelled, "the already-spawned put was not cancelled");
