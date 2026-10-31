@@ -31,6 +31,9 @@ import socket
 import textwrap
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+# The default listen backlog of these stand-in servers is 5; concurrent connects beyond it wait for a SYN
+# retransmit (1, 2, 4 s). A bigger backlog removes that source of flakiness (issue #304 round 2).
+ThreadingHTTPServer.request_queue_size = 512
 from urllib.parse import parse_qs, unquote, urlsplit
 from xml.sax.saxutils import escape, unescape
 

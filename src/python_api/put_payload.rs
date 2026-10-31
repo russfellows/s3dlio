@@ -915,6 +915,7 @@ impl ReleaseQueue {
                 continue; // a caller drained it during the grace period
             }
             park_releaser_for_test();
+            // exit-gate: allowed (the buffer-export releaser: its own attach gate is closed and drained at exit, #238)
             let attached = Python::try_attach(|py| {
                 self.attaches.fetch_add(1, Ordering::Relaxed);
                 self.drain(py);
@@ -1616,6 +1617,8 @@ fn payload_parts_in(
     // 5. Last resort: `__bytes__()` only; Python's fresh `bytes` is wrapped (one copy). There is
     //    NO `bytes(obj)` fallback (issue #261): it would turn an int or a bool into that many
     //    zero bytes and accept any iterable of ints, which every writer must refuse.
+    // The user's own bytecode, run from Rust: exit-gate scope (#304), refused before anything is spawned.
+    let _scope = super::async_bridge::python_call_scope()?;
     match data.call_method0("__bytes__") {
         Ok(bytes_obj) => match bytes_obj.cast_exact::<PyBytes>() {
             Ok(b) => Ok(plain(bytes_from_pybytes(b))),

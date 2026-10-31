@@ -65,7 +65,7 @@ pip install s3dlio
 ### Requirements
 
 - Python 3.11+ (release validation targets CPython 3.11–3.13). Exit with daemon threads inside s3dlio calls is
-  fixed since the PyO3 0.29.3 upgrade (#298), with one 3.14 async exception (#302); see
+  fixed since the PyO3 0.29.3 upgrade (#298) plus the #302 and #304 fixes for async calls; see
   [Interpreter exit with daemon threads](#interpreter-exit-with-daemon-threads-298)
 - Rust 1.94.1+ (for building from source)
 - Optional: PyTorch, JAX, or TensorFlow for ML integration
@@ -267,11 +267,16 @@ finalization began is parked forever; it never runs again, so its remaining Pyth
   (3.11, 3.12 and 3.13.0 to 3.13.7) this was a SIGABRT (exit code 134, often `FATAL: exception not rethrown`). Python
   3.13.8+ and 3.14 were never affected. Workarounds for such a wheel: use Python 3.13.8+, or signal your workers to stop
   and `join()` them (for example in a `try/finally` around `main()`) before the main thread returns.
-- **Now** (PyO3 0.29.3 or later 0.29.x): fixed for daemon threads in sync calls and in the async cases listed in the
-  changelog entry (`put_bytes_async`, `get_into_async`, a never-completing `get_async`), on Python 3.11 to 3.13 (all
-  patch levels) and 3.14. One exception: on Python 3.14 a daemon thread's asyncio loop with `get_async` calls in
-  flight at exit still crashes, identically before and after this fix; it is tracked as
-  [#302](https://github.com/russfellows/s3dlio/issues/302).
+- **Now** (PyO3 0.29.3 or later 0.29.x, with the #302 and #304 fixes): fixed for daemon threads in sync calls and in every
+  async call the changelog lists, on Python 3.11 to 3.13 (all patch levels) and 3.14. Two later fixes are part of that
+  claim: [#302](https://github.com/russfellows/s3dlio/issues/302) (CPython 3.14: a daemon loop with `get_async` and the
+  other awaitables in flight at exit crashed) and [#304](https://github.com/russfellows/s3dlio/issues/304) (Python before
+  3.13.8: an async call that was STARTING while the interpreter shut down aborted, about 3 to 6% of runs for
+  `put_bytes_async`). Wheels from before those fixes still have those two crashes. An async call made after s3dlio's exit
+  drain (from an `atexit` handler registered before `import s3dlio`) raises `RuntimeError` ("the interpreter is exiting").
+  A residual window remains (a call still starting when the 2 s drain timeout expires; Python code that Rust runs outside
+  the async machinery, such as a user-defined `__bytes__` / `__buffer__`, argument extraction from user objects, `__del__`
+  of released user buffers); see the changelog entry for #304.
 - Non-daemon threads are unaffected: Python waits for them before finalizing.
 - Parking a thread is not a clean shutdown. Work a daemon thread had in flight is lost; stop and join your workers (and
   call `finalize_op_log()`) if you need it to complete.

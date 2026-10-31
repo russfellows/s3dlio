@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use super::async_bridge::future_into_py;
+#[cfg(feature = "test-hooks")]
+use super::async_bridge::arm_close_gate_after_next_spawn;
+use super::async_bridge::{after_spawn_hook, future_into_py, python_call_scope, PythonCallScope};
 use super::put_payload::{
     acquire_writable, deadline_warning_text, export_stats, hold_for_call, latch_ready,
     note_internal_error, put_payload, put_payload_in_batch, quiesce_async, quiesce_blocking,
@@ -728,6 +730,7 @@ pub fn mp_get(
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    // exit-gate: allowed (sync pyfunction on the calling Python thread, already attached)
     Python::attach(|py| {
         // Parse S3 URI
         let (bucket, key_prefix) = parse_s3_uri_for_global_client(uri).map_err(py_err)?;
@@ -1253,7 +1256,9 @@ pub(crate) fn put_async_py<'p>(
         })
         .await
         .map_err(py_err)??;
-        Python::attach(|py| Ok(py.None()))
+        // Python `None`, converted inside the exit-safe delivery (issue #302): a tokio worker must
+        // never attach to Python itself.
+        Ok(None::<()>)
     })
 }
 
@@ -1395,10 +1400,8 @@ fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAn
 
     future_into_py(py, async move {
         let os = store.stat(&uri).await.map_err(py_err)?;
-        Python::attach(|py| {
-            let obj: Py<PyAny> = stat_to_pydict(py, os)?.unbind().into();
-            Ok::<Py<PyAny>, PyErr>(obj)
-        })
+        // The dict is built inside the exit-safe delivery (issue #302), not on this worker.
+        Ok(StatDict(os))
     })
 }
 
@@ -1406,15 +1409,25 @@ fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAn
 fn stat_many_async<'py>(py: Python<'py>, uris: Vec<String>) -> PyResult<pyo3::Bound<'py, PyAny>> {
     future_into_py(py, async move {
         let metas = stat_object_many_async(uris).await.map_err(py_err)?;
-        Python::attach(|py| {
-            let list = PyList::empty(py);
-            for os in metas {
-                // append accepts any IntoPyObject<'py>; Bound<'py, PyDict> works directly
-                list.append(stat_to_pydict(py, os)?)?;
-            }
-            Ok::<Py<PyAny>, PyErr>(list.unbind().into())
-        })
+        // The list of dicts is built inside the exit-safe delivery (issue #302).
+        Ok(metas.into_iter().map(StatDict).collect::<Vec<_>>())
     })
+}
+
+/// An object's metadata on its way to Python as a `dict`.
+///
+/// Lets the async stat futures return a plain Rust value: the `dict` is built by `IntoPyObject`
+/// inside the exit-safe result delivery (issue #302), never by a tokio worker attaching to Python.
+struct StatDict(crate::s3_utils::ObjectStat);
+
+impl<'py> IntoPyObject<'py> for StatDict {
+    type Target = PyDict;
+    type Output = Bound<'py, PyDict>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        stat_to_pydict(py, self.0)
+    }
 }
 
 /// Helper function to map Rust to Python for stat call
@@ -1734,12 +1747,31 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = PyResult<Option<()>>> + Send + 'static,
 {
+    // ONE exit-gate scope for the whole start (#304): a refusal is only possible here, before the
+    // guard is prepared and before anything is spawned; every later step runs under this scope (the
+    // inner scopes of `prepare_guard`, `future_into_py`, `instantiate` and the cancel calls nest and
+    // cannot be refused), so the cancel of a failure path is never skipped.
+    let scope = match python_call_scope() {
+        Ok(scope) => scope,
+        Err(e) => {
+            drop(make); // nothing was prepared or spawned: release the (queued) exports
+            if let Some(latch) = &latch {
+                if quiesce_blocking(py, latch).is_err() {
+                    return Err(still_referenced_error(&format!(
+                        "the put could not be started: {e}"
+                    )));
+                }
+            }
+            return Err(e);
+        }
+    };
     let guard = match &latch {
         None => None,
         Some(latch) => match prepare_guard(py, latch.clone()) {
             Ok(g) => Some(g),
             Err(e) => {
                 drop(make); // nothing was spawned: this releases the (queued) exports...
+                drop(scope); // ...and the wait below must not hold the exit gate
                 if quiesce_blocking(py, latch).is_err() {
                     return Err(still_referenced_error(&format!(
                         "the put could not be started: {e}"
@@ -1751,6 +1783,7 @@ where
     };
 
     let inner = future_into_py(py, make());
+    after_spawn_hook();
     // On EVERY error path from here the barrier is kept: the blocking wait + drain below.
     let fail = |py: Python<'py>, latch: &Option<std::sync::Arc<Latch>>, e: PyErr| -> PyErr {
         if let Some(latch) = latch {
@@ -1762,10 +1795,13 @@ where
     };
     let inner = match inner {
         Ok(i) => i,
-        Err(e) => return Err(fail(py, &latch, e)),
+        Err(e) => {
+            drop(scope);
+            return Err(fail(py, &latch, e));
+        }
     };
     match (guard, &latch) {
-        (Some(g), Some(latch)) => wrap_in_guard(py, g, inner, latch),
+        (Some(g), Some(latch)) => wrap_in_guard(py, g, inner, latch, scope),
         _ => Ok(inner),
     }
 }
@@ -1786,11 +1822,13 @@ fn wrap_in_guard<'py>(
     guard: PreparedGuard<'py>,
     inner: Bound<'py, PyAny>,
     latch: &std::sync::Arc<Latch>,
+    scope: PythonCallScope,
 ) -> PyResult<Bound<'py, PyAny>> {
     match guard.instantiate(py, inner.clone()) {
         Ok(f) => Ok(f),
         Err(e) => {
-            let _ = inner.call_method0("cancel");
+            cancel_ignoring_errors(&inner);
+            drop(scope); // the blocking wait below must not hold the exit gate
             if quiesce_blocking(py, latch).is_err() {
                 return Err(still_referenced_error(&format!(
                     "the put could not be started: {e}"
@@ -1952,6 +1990,8 @@ impl<'py> PreparedGuard<'py> {
     /// Wrap the `inner` put future (cannot fail for lack of resources prepared above).
     fn instantiate(self, py: Python<'py>, inner: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let _ = py;
+        // Runs the `GuardedFuture` constructor (Python bytecode) from Rust: exit-gate scope (#304).
+        let _scope = python_call_scope()?;
         self.class.call1((
             inner,
             self.latch_ready,
@@ -1967,6 +2007,9 @@ fn prepare_guard<'py>(
     py: Python<'py>,
     latch: std::sync::Arc<Latch>,
 ) -> PyResult<PreparedGuard<'py>> {
+    // The first call compiles and imports the guard module (`asyncio`, `warnings`: Python
+    // bytecode run from Rust): exit-gate scope (#304), refused once the interpreter is exiting.
+    let _scope = python_call_scope()?;
     static GUARD: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
     let class = match GUARD.get() {
         Some(g) => g.bind(py).clone(),
@@ -2334,6 +2377,15 @@ impl StartSeams for LiveSeams {
 /// paths of starting an awaitable, where the original error is what the caller must see and
 /// nothing may wait on the outcome of the cancellation.
 fn cancel_ignoring_errors(future: &Bound<'_, PyAny>) {
+    // `cancel()` schedules callbacks on the loop (Python bytecode run from Rust): exit-gate scope
+    // (#304). A refusal means the interpreter is exiting; there is nothing left to cancel for.
+    let _scope = match python_call_scope() {
+        Ok(scope) => scope,
+        Err(e) => {
+            debug!("s3dlio: not cancelling an awaitable: {e}");
+            return;
+        }
+    };
     if let Err(e) = future.call_method0("cancel") {
         debug!("s3dlio: ignoring an error cancelling an awaitable that failed to start: {e}");
     }
@@ -2419,6 +2471,9 @@ fn get_into_with_store<'py, S: StartSeams>(
     expected_len: usize,
     latch: Arc<Latch>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // ONE exit-gate scope for the whole start (#304), refused only here, before anything is acquired or
+    // spawned; the inner scopes nest and cannot be refused, so no cancel below is ever skipped.
+    let _scope = python_call_scope()?;
     let guard = prepare_guard(py, latch.clone())?;
     let owner = acquire_writable(py, dst, expected_len, &latch)?;
 
@@ -2540,6 +2595,8 @@ fn head_with_store<'py, S: StartSeams>(
     uri: String,
     latch: Arc<Latch>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // ONE exit-gate scope for the whole start (#304); see `get_into_with_store`.
+    let _scope = python_call_scope()?;
     let guard = prepare_guard(py, latch.clone())?;
 
     let (tx, rx) = oneshot::channel::<()>();
@@ -2607,6 +2664,16 @@ fn object_capabilities_py<'py>(py: Python<'py>, uri: &str) -> PyResult<Bound<'py
     result.set_item("get_into", caps.get_into)?;
     result.set_item("head", caps.head)?;
     Ok(result)
+}
+
+/// Test hook (hidden; registered only in a `test-hooks` build): the NEXT guarded put closes the exit gate right after it spawned its native
+/// work, to prove the rest of the start cannot be refused half-way (#304). The gate never reopens:
+/// use it only in a throw-away process.
+#[cfg(feature = "test-hooks")]
+#[pyfunction]
+#[pyo3(name = "_test_close_exit_gate_after_next_spawn")]
+fn test_close_exit_gate_after_next_spawn_py() {
+    arm_close_gate_after_next_spawn();
 }
 
 // ---------------------------------------------------------------------------
@@ -2707,7 +2774,8 @@ pub fn get_many_stats_async<'p>(
         .await
         .map_err(py_err)??;
 
-        Python::attach(|py| (count, total).into_py_any(py))
+        // A `(count, total)` tuple, converted inside the exit-safe delivery (issue #302).
+        Ok((count, total))
     })
 }
 
@@ -2730,13 +2798,12 @@ pub(crate) fn get_many_async_py<'p>(
         .await
         .map_err(py_err)??;
 
-        Python::attach(|_py| {
-            let out = pairs
-                .into_iter()
-                .map(|(u, b)| (u, PyBytesView::new(b)))
-                .collect::<Vec<_>>();
-            Ok(out)
-        })
+        // `PyBytesView` wraps the same `Bytes` (no copy); the Python objects are created inside the
+        // exit-safe delivery (issue #302), not on this worker.
+        Ok(pairs
+            .into_iter()
+            .map(|(u, b)| (u, PyBytesView::new(b)))
+            .collect::<Vec<_>>())
     })
 }
 
@@ -2805,7 +2872,9 @@ pub fn get_async_py<'p>(py: Python<'p>, uri: &str) -> PyResult<Bound<'p, PyAny>>
     future_into_py(py, async move {
         let store = get_or_create_store(&uri_owned, logger).map_err(py_err)?;
         let bytes = store.get(&uri_owned).await.map_err(py_err)?;
-        Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
+        // Zero-copy `BytesView` over the same `Bytes`; the Python object is created inside the
+        // exit-safe delivery (issue #302): this worker never attaches to Python.
+        Ok(PyBytesView::new(bytes))
     })
 }
 
@@ -2827,7 +2896,9 @@ pub fn get_range_async_py<'p>(
             .get_range(&uri_owned, offset, length)
             .await
             .map_err(py_err)?;
-        Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
+        // Zero-copy `BytesView` over the same `Bytes`; the Python object is created inside the
+        // exit-safe delivery (issue #302): this worker never attaches to Python.
+        Ok(PyBytesView::new(bytes))
     })
 }
 
@@ -4013,7 +4084,8 @@ impl PyMultiEndpointStore {
                 .await
                 .map_err(|e| py_err(e.context("Get failed")))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            // The `BytesView` is created inside the exit-safe delivery (issue #302).
+            Ok(PyBytesView::new(data))
         })
     }
 
@@ -4035,7 +4107,8 @@ impl PyMultiEndpointStore {
                 .await
                 .map_err(|e| py_err(e.context("Get range failed")))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            // The `BytesView` is created inside the exit-safe delivery (issue #302).
+            Ok(PyBytesView::new(data))
         })
     }
 
@@ -4155,7 +4228,8 @@ impl PyMultiEndpointStore {
                 .get_from_endpoint(index, &uri)
                 .await
                 .map_err(|e| py_err(e.context("Get from endpoint failed")))?;
-            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            // The `BytesView` is created inside the exit-safe delivery (issue #302).
+            Ok(PyBytesView::new(data))
         })
     }
 
@@ -4641,6 +4715,11 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     // Caller-buffer GET, typed HEAD and pure capabilities (#264)
     m.add_function(wrap_pyfunction!(object_capabilities_py, m)?)?;
+    #[cfg(feature = "test-hooks")]
+    m.add_function(wrap_pyfunction!(
+        test_close_exit_gate_after_next_spawn_py,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(get_into_async, m)?)?;
     m.add_function(wrap_pyfunction!(head_async, m)?)?;
     m.add_class::<PyHeadMetadata>()?;
@@ -5625,7 +5704,9 @@ mod borrowed_put_guard_tests {
             let latch = Latch::new();
             latch.mark_dropped();
             latch.mark_released(); // no native reader: the fallback wait returns at once
-            let err = wrap_in_guard(py, guard, inner.clone(), &latch).expect_err("must fail");
+            let scope = python_call_scope().expect("gate open");
+            let err =
+                wrap_in_guard(py, guard, inner.clone(), &latch, scope).expect_err("must fail");
             assert!(err.to_string().contains("boom"), "{err}");
             let cancelled: bool = inner.call_method0("cancelled").unwrap().extract().unwrap();
             assert!(cancelled, "the already-spawned put was not cancelled");

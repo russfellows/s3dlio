@@ -18,7 +18,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
-        python-version: ['3.11', '3.12', '3.13']
+        # 3.14 (#302): the cp314 wheel is built by the same `maturin build` step below (PyO3 0.29 supports it);
+        # the exit test file is what exercises the CPython 3.14 thread-state race. Written without being able
+        # to run GitHub Actions; the build and the exit file were run locally on CPython 3.14.10.
+        python-version: ['3.11', '3.12', '3.13', '3.14']
     
     steps:
       - uses: actions/checkout@v4
@@ -115,9 +118,9 @@ jobs:
       - name: Build (Python)
         run: |
           pip install maturin
-          # `test-hooks` adds the hidden s3dlio._hold_async_runtime() used by the deterministic op-log tests
-          # (#294). This wheel is a TEST wheel: it is not the one published (publish-pypi.yml builds without it
-          # and asserts the symbol is absent).
+          # `test-hooks` adds the hidden s3dlio._hold_async_runtime() (deterministic op-log tests, #294) and
+          # s3dlio._test_close_exit_gate_after_next_spawn() (#304 test). This wheel is a TEST wheel: it is not the one published (publish-pypi.yml builds without it
+          # and asserts both symbols are absent).
           maturin build --release --out dist --features extension-module,backend-azure,test-hooks
           pip install dist/*.whl
       
@@ -180,7 +183,13 @@ jobs:
       # Interpreter exit with daemon threads inside s3dlio calls (#298): every scenario runs in a
       # fresh subprocess and must exit 0 with no FATAL on stderr. RED on CPython < 3.13.8 (the 3.11
       # and 3.12 matrix cells) with PyO3 < 0.29.3; the `>=0.29.3, <0.30` requirement in Cargo.toml keeps it green.
-      - name: Test (Python - exit with daemon threads, #298)
+      # #302 (CPython 3.14: a Tokio worker attaching to Python) and #304 (Python < 3.13.8: an async call
+      # starting during shutdown) are probabilistic crashes (1/30 to 30/30 runs depending on the call), so
+      # this step repeats each scenario S3DLIO_EXIT_ATTEMPTS times instead of the local default of 3.
+      - name: Test (Python - exit with daemon threads, #298 #302 #304)
+        env:
+          S3DLIO_EXIT_ATTEMPTS: "8"
+          S3DLIO_REQUIRE_TEST_HOOKS: "1"   # the #304 close-after-spawn test FAILS, not skips, without the hook
         run: |
           pip install pytest
           python -m pytest -q -rs python/tests/test_exit_daemon_threads_298.py

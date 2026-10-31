@@ -46,7 +46,9 @@ pip install s3dlio
 > **Interpreter exit with daemon threads (#298).** Before this fix a process could die with SIGABRT (exit 134) when the
 > main thread returned while a daemon thread was inside an s3dlio call, on CPython before 3.13.8 (3.11, 3.12, 3.13.0 to
 > 3.13.7). It is fixed by the PyO3 0.29.3 upgrade: the process now exits with code 0. On an older wheel, use Python
-> 3.13.8+ or `join()` your worker threads before exit. See [docs/Changelog.md](docs/Changelog.md).
+> 3.13.8+ or `join()` your worker threads before exit. Two later fixes cover async calls on a daemon thread's event
+> loop: #302 (CPython 3.14, `get_async` and friends crashed at exit) and #304 (Python before 3.13.8, an async call starting
+> during shutdown aborted; such a call now raises `RuntimeError`). See [docs/Changelog.md](docs/Changelog.md).
 
 ### Python Backend Profiles (PyPI vs Full Build)
 
