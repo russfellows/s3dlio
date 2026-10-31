@@ -68,7 +68,12 @@
 //!    driven by a thread of any other name (the main thread: `rt.block_on(local.run_until(..))`,
 //!    `LocalSet::block_on`, and its `spawn_local` tasks), `block_on`'s main future, a thread of
 //!    an unmarked runtime that has custom thread names. Safe because the awaited future runs on
-//!    the global runtime, which is never the caller's runtime here (its threads are marked).
+//!    the global runtime, which is never the caller's runtime here (its threads are marked), and,
+//!    since #303, because every pooled HTTP connection belongs to s3dlio's separate I/O-owner
+//!    runtime (`s3_client::io_rt_handle`; all network I/O is polled with it as the tokio context,
+//!    `s3_client::in_io_ctx`), so the awaited work never needs a connection that the blocked
+//!    caller's runtime opened, and the I/O runtime never runs a work future that a blocked
+//!    global worker could be holding up.
 //!
 //! No panic is provoked and none is caught, so a `panic = "abort"` build behaves the same.
 //!
@@ -77,7 +82,10 @@
 //! * (a) an unmarked runtime with CUSTOM worker thread names (`Builder::thread_name`) gets NO
 //!   hand-off (rule 4): it cannot panic, but every sync-wrapper call parks a worker for its whole
 //!   duration (latency and capacity), and it HANGS if the awaited work needs that same runtime
-//!   (an in-process server on it with every worker parked). Remedy, one
+//!   (an in-process server on it with every worker parked; since #303 the error returned after
+//!   the operation timeout names that cause). The second hang this case used to have, a request
+//!   stalling on a connection that this runtime had opened for an earlier async s3dlio call, is
+//!   fixed by #303 (connections belong to the I/O runtime). Remedy, one
 //!   line: `Builder::on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)`, or use
 //!   the async API.
 //! * (b) PANIC, on ANY thread that carries the default tokio worker name or the s3dlio marker and

@@ -486,8 +486,23 @@ drives a `LocalSet` needs `inline_blocking_io()`; details in `s3dlio::runtime_su
 `panic = "abort"` too; they used to panic. They hand the worker off (`block_in_place`) on s3dlio's own runtimes and on an
 embedder's runtime whose workers have tokio's default thread name, and wait plainly elsewhere. If your runtime sets custom
 thread names, add `.on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)` so a worker is never parked without
-a hand-off; a `spawn_blocking` closure (or a thread hand-named like tokio's default worker) that drives a `LocalSet` with the call inside needs `inline_blocking_io()`, else it panics; a runtime with custom thread names and no marker gets no hand-off (a hang if the awaited work needs that same runtime). `MultipartUploadSink`'s blocking
+a hand-off; a `spawn_blocking` closure (or a thread hand-named like tokio's default worker) that drives a `LocalSet` with the call inside needs `inline_blocking_io()`, else it panics; a runtime with custom thread names and no marker gets no hand-off (a hang if the awaited work needs that same runtime, such as an in-process server; the timeout error names the cause since #303). `MultipartUploadSink`'s blocking
 methods are a separate bug (#301), not covered. Details in `s3dlio::runtime_support` and `docs/Changelog.md`.
+
+**Connections belong to s3dlio's own I/O runtime (#303):** every HTTP request, for S3, Azure and GCS, is polled with s3dlio's
+small I/O-owner runtime as the tokio context, so a pooled connection never belongs to YOUR runtime and never depends on the
+global runtime's workers being free. Before, a connection opened while a current-thread runtime was polling stalled every later
+request that reused it, for the whole operation timeout (60 s) and then failed with "check network connectivity", as soon as
+that runtime was blocked: any async s3dlio call followed by any sync one (`stat_object_uri`, `MultipartUploadSink::new`, ...) on a
+current-thread runtime or in a `LocalSet`, two live current-thread runtimes, and the custom-named unmarked runtime of #300. No
+change is needed in your code, and the async paths cost nothing measurable (no extra thread hop, no copy; `get_into` still writes
+straight into your buffer; `S3DLIO_IO_THREADS` sizes the I/O runtime). A `MultipartUploadSink` dropped unfinished no longer
+blocks: `Drop` spawns the `AbortMultipartUpload` and returns; call `sink.abort().await` (new, returns the real error) when the
+abort must be delivered before you continue, and `s3dlio::flush_pending_aborts(Duration)` once before the process exits (the CLI
+and the Python `atexit` hook do), or an abort that is still in flight when the process ends leaves the upload on the server.
+`spawn_on_global_rt` must not be given blocking work: sync wrappers share the global workers. A sync wrapper that blocks the
+thread of a runtime serving its own endpoint (an in-process server) still cannot finish; its operation-timeout error now names
+that cause. Details in `docs/Changelog.md`.
 
 **Writes borrow your buffer (v0.10.0):** async writes read your buffer in place until the `await` finishes; pass
 `borrow=False` for a copy.

@@ -271,7 +271,8 @@ async fn probe_and_record_cert_with_roots(
     );
 
     let connector = tokio_rustls::TlsConnector::from(config);
-    let tcp = tokio::net::TcpStream::connect(&host_port)
+    // The probe's socket is registered with the I/O-owner runtime like every other (#303).
+    let tcp = crate::s3_client::in_io_ctx(tokio::net::TcpStream::connect(&host_port))
         .await
         .map_err(|e| {
             ConnectorError::other(
@@ -291,14 +292,16 @@ async fn probe_and_record_cert_with_roots(
         )
     })?;
 
-    connector.connect(server_name, tcp).await.map_err(|e| {
-        ConnectorError::other(
-            boxed_str_error(format!(
-                "TLS cert probe: TLS handshake with \"{host_port}\" failed: {e}"
-            )),
-            None,
-        )
-    })?;
+    crate::s3_client::in_io_ctx(connector.connect(server_name, tcp))
+        .await
+        .map_err(|e| {
+            ConnectorError::other(
+                boxed_str_error(format!(
+                    "TLS cert probe: TLS handshake with \"{host_port}\" failed: {e}"
+                )),
+                None,
+            )
+        })?;
 
     // Handshake complete — RecordingVerifier has stored the cert. Drop the connection.
     Ok(())
@@ -1647,6 +1650,35 @@ mod tests {
             recorded, cert_der,
             "recorded cert bytes must be identical to the certificate the server presented"
         );
+    }
+
+    /// #303 round 1: the probe's socket belongs to the I/O-owner runtime, not to whichever
+    /// runtime polls it: driven by an executor with NO tokio runtime at all (a plain thread) it
+    /// must work, where a `TcpStream::connect` in the caller's context panics ("no reactor").
+    #[tokio::test]
+    async fn probe_needs_no_caller_runtime() {
+        let (port, cert_der) = spawn_tls_test_server().await;
+        let store = CertVerifyStore::new();
+        let roots = test_root_store(&cert_der);
+        let store2 = store.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            // a fresh std thread: no tokio context
+            std::thread::spawn(move || {
+                futures::executor::block_on(probe_and_record_cert_with_roots(
+                    "localhost",
+                    port,
+                    &store2,
+                    roots,
+                ))
+                .map_err(|e| e.to_string())
+            })
+            .join()
+            .expect("the probe must not panic without a runtime")
+        })
+        .await
+        .unwrap();
+        outcome.expect("probe");
+        assert!(store.get(&format!("localhost:{port}")).is_some());
     }
 
     /// The probe must NOT record a cert when WebPKI validation fails.

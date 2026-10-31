@@ -312,8 +312,20 @@ pub struct PyMultipartUploadWriter {
 }
 
 impl Drop for PyMultipartUploadWriter {
+    /// A writer that is garbage-collected (or still alive at interpreter shutdown) with an
+    /// unfinished upload drops its sink, which SPAWNS the abort (#303). Wait for it here, bounded,
+    /// so the abort is delivered before the object (or the process) goes away, as it was when
+    /// the sink's `Drop` blocked. The abort needs neither this thread nor the GIL. A writer
+    /// inherited by a fork child is leaked instead (#297): its sink belongs to the parent.
     fn drop(&mut self) {
-        self.stamp.leak_on_drop(self.inner.take());
+        if let Some(sink) = self.inner.take() {
+            if self.stamp.is_inherited() {
+                std::mem::forget(sink);
+            } else {
+                drop(sink);
+                crate::multipart::flush_pending_aborts(std::time::Duration::from_secs(2));
+            }
+        }
     }
 }
 
@@ -825,7 +837,7 @@ impl PyMultipartUploadWriter {
     /// `abort_blocking()` is infallible by contract (bug A3, this session):
     /// it always cancels the coordinator and always returns `Ok(())`, even
     /// when the underlying `AbortMultipartUpload` request itself fails.
-    /// That failure is not lost — `cancel_coordinator_and_maybe_abort`
+    /// That failure is not lost — `cancel_coordinator`
     /// (shared by `abort_blocking()` and `Drop`) emits a `tracing::warn!`
     /// naming the bucket/key/upload_id right where the failure occurs, so
     /// there is nothing left for `__exit__` to swallow. See
