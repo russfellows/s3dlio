@@ -1,201 +1,6 @@
 # s3dlio Changelog
 
-## Unreleased — Op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267); exit abort with daemon threads (#298); sync wrappers inside a tokio `LocalSet` (#300); fork safety (#297); requests stalled on a blocked runtime (#303); exit crash with async calls on CPython 3.14 (#302); exit abort when an async call starts during shutdown on Python < 3.13.8 (#304)
-
-### Fixed — requests stalled on a blocked runtime's pooled connection (#303)
-
-Every pooled HTTP connection belongs to the tokio runtime that opened it: its socket is registered with that runtime's I/O
-driver and the task that drives it is spawned onto that runtime. The process-wide S3 client (and the Azure and GCS
-clients) kept their connections in one pool shared by every runtime in the process. When the runtime that had opened a
-connection was alive but BLOCKED, any later request that reused the connection stalled for the whole operation timeout
-(60 s) and failed with "request timed out ... check network connectivity". The usual way to hit it was a Rust program on a
-current-thread runtime that made any async s3dlio call and then any sync one (`stat_object_uri`, `get_object_uri`,
-`delete_objects`, `MultipartUploadSink::new`, ...): the sync wrapper blocks the runtime's only thread while the global
-runtime tries to reuse the connection. Also affected: a `LocalSet` on a current-thread runtime, two live current-thread
-runtimes (async on A, then async on B), current-thread then multi-thread, and an unmarked runtime with custom thread names
-that had made an earlier async s3dlio call (the #300 residual). An unfinished `MultipartUploadSink` dropped on a
-current-thread runtime stalled 60 s and then LEAKED the upload on the server. Python was not affected.
-
-Fix: every pooled connection now belongs to s3dlio's own small I/O-owner runtime (`s3_client::io_rt_handle`, 2 threads,
-`S3DLIO_IO_THREADS` overrides), a runtime that exists only to own sockets, timers and connection tasks and never
-runs s3dlio work futures, `spawn_on_global_rt` tasks, sync-wrapper waits or user code. No caller can block it, and blocking
-every worker of the global runtime cannot stall it either (an earlier design that used the global runtime itself did, and an
-async-only application with its own runtime then timed out). The HTTP futures are still polled by the caller's task, but with
-the I/O runtime entered as the tokio context (`s3_client::in_io_ctx`, `Handle::enter`, per poll), so every socket, timer
-and connection task they create is registered with, and spawned onto, the I/O runtime. There is no spawn, no `'static`
-bound, no thread hop and no extra copy: the caller-buffer `get_into` paths keep writing straight into the caller's buffer
-(Rule #1), and dropping a future still cancels the request exactly as before. The caller's own runtime still needs its time
-driver (the SDK's timeouts run there). Where it is applied:
-
-| Backend | Chokepoint | Covers |
-|---|---|---|
-| S3 | `reqwest_client::ReqwestHttpConnector::call` (`send_on_global_rt`, both attempts of the h2c-auto fallback) and `warmup_connection_pool`; the TLS certificate probe of the redirect wrapper | every request of the aws-sdk client: every async fn of `s3_utils`, the S3 `ObjectStore`, `get_into`/head/range engines, list streams, multipart (`new_async`, coordinator, abort), delete batches, per-endpoint clients, credential providers, https/ALPN, h2c |
-| Azure | `azure_client::GlobalRtHttpClient` (the transport of the service client and of the credential clients) | every blob and credential request |
-| GCS | `google_gcs_client::on_global` around every `GcsClient` operation, the client build, the storage-layout probe, the opener `open`/`describe` AND every chunk poll of the `get_into` readers, and the list stream | HTTP/1.1 and HTTP/2 connections, tonic channel workers, background readers |
-
-`MultipartUploadSink`:
-- `Drop` no longer waits for `AbortMultipartUpload`: it SPAWNS the abort on the global runtime and returns at once (the
-  outcome is logged, `debug!` on success and `warn!` with the upload id on failure) and counts it as pending. New
-  `s3dlio::flush_pending_aborts(timeout) -> usize` waits (bounded) for the aborts that dropped sinks spawned and returns how
-  many are still pending. A program that may end with an unfinished sink (an early `?` out of `main`) should call it once
-  before exiting, otherwise the process can end before the request is sent and the upload stays on the server. The s3dlio
-  CLI calls it (2 s) when a command ends, the Python `atexit` hook calls it (2 s, GIL released, before the exit gate
-  closes), and the Python `MultipartUploadWriter` waits (2 s) when it is dropped with an unfinished upload.
-- New `pub async fn abort(&mut self) -> Result<()>`, the async twin of `abort_blocking`: cancels the coordinator first, then
-  awaits `AbortMultipartUpload` and returns its REAL outcome (`Err`, naming the upload id, when the request failed; the sink
-  is cancelled either way), fires regardless of `abort_on_drop`, and does nothing when called again or after `finish()`.
-  (`abort_blocking` keeps its locked contract: always `Ok(())`, failure only logged.) The abort runs on s3dlio's runtimes, so
-  it completes on a current-thread runtime.
-
-Sizing: the global runtime keeps at least 2 workers when MPI-aware sizing would compute 1 (one blocking task would
-otherwise starve everything else; an explicit `S3DLIO_RT_THREADS` is still honoured as given). `spawn_on_global_rt`
-must be given futures that do not block a thread: a blocking task occupies a global worker, and the sync wrappers (and the
-tasks they run) share those workers.
-
-Hang diagnostics: one way remains for a synchronous wrapper to wait for ever: the awaited work needs the very runtime whose
-thread the wrapper blocks (an in-process server task on a current-thread runtime). No connection ownership can fix that. A
-wrapper that ends in the SDK's operation-timeout error ("request timed out after ...") within a window around the timeout
-(never when the timeout is 0) on a thread that belongs to a tokio runtime now says so: the error carries "this synchronous
-s3dlio call blocked a thread that belongs to a tokio runtime for the whole operation timeout; if the endpoint is served by a
-task on that same runtime ... use the async API, or call the synchronous API from spawn_blocking or a plain thread". Any
-other error of a long call gets no such text.
-
-Overhead (Loki-4, loopback keep-alive mock, 9 interleaved rounds, medians; see docs in the build report): multi-thread callers unchanged within noise (sequential HEAD median 225 us vs 219 base, GET 1 KiB 225 vs 229, 64-way HEAD 20.4k vs 20.5k req/s, 256 MiB `get_object_uri_async` 1.6 vs 1.6 GB/s, 256 MiB caller-buffer `get_into` 5.6 vs 5.2 GB/s); a current-thread caller pays roughly 50 to 90 us more per small request (the connection task now runs on another thread instead of the caller's, GET 1 KiB 238 vs 146 us, HEAD 196 vs 164 us), a sync wrapper called alone is faster (223-263 vs 440 us, fewer threads to wake); the earlier design that used the global runtime for connections was +90 us on current-thread GETs too and slower for sync calls (418-457 us). The round-0 per-request `spawn_on_global_rt` hop was +80..110 us for everyone and -20 % on `get_into`
-
-Tests: `tests/pooled_connection_runtime_303.rs` (every case in its own child process against an in-process keep-alive
-mock with `S3DLIO_OPERATION_TIMEOUT_SECS=5`: current-thread async then sync stat/get/delete/`MultipartUploadSink::new`, a
-`LocalSet`, two current-thread runtimes, current-thread then multi-thread, the unmarked one-worker custom-named runtime,
-h2c, `S3DLIO_H2C=auto` against an HTTP/1.1-only server (the fallback retry), https with ALPN and a CA bundle, the
-redirect-following wrapper, `warmup_connection_pool` without a runtime, a whole multipart upload, the unfinished-sink Drop
-against a slow abort, a sink dropped right before exit plus `flush_pending_aborts`, `abort()` and its real error, every
-global worker blocked, the sync-then-async and multi-thread controls, the self-deadlock error text and its absence on other
-errors), plus `tests/pooled_connection_runtime_303_azure.rs` and `tests/pooled_connection_runtime_303_gcs.rs` (including a
-body cut mid-stream and repaired) with `--features backend-azure` / `backend-gcs`.
-
-### Fixed — sync wrappers inside a tokio `LocalSet` (#300)
-
-`run_on_global_rt` and every synchronous wrapper built on it (for example `s3_utils::stat_object_uri`) panicked with "can call blocking
-only when running on the multi-threaded runtime" when called inside a `tokio::task::LocalSet` that a non-worker thread
-drives, the usual `rt.block_on(local.run_until(..))` on the main thread (also `LocalSet::block_on` and `spawn_local`
-tasks), on a multi-thread runtime. Cause: they always called `tokio::task::block_in_place` on a multi-thread runtime,
-and tokio refuses that off a worker thread inside a `LocalSet`. They now work there, and under `panic = "abort"`.
-
-The wait for the global runtime hands the worker off with `block_in_place` where that is valid and waits plainly
-elsewhere, decided in this order (`runtime_support::blocking_wait`; no panic is provoked or caught):
-
-1. inside an `inline_blocking_io()` scope: plain wait;
-2. the thread carries the worker marker (all of s3dlio's runtimes, any runtime built with
-   `on_thread_start(mark_tokio_worker_thread)`) on a multi-thread runtime: hand off, exactly as before (#173);
-3. not marked, multi-thread runtime, inside a task and the thread has tokio's default worker thread name: hand off. This
-   keeps `#[tokio::main]` and `#[tokio::test(flavor = "multi_thread")]` runtimes working when the awaited work (for
-   example an in-process mock server) needs that same runtime;
-4. everything else: plain wait. That is no runtime, a current-thread runtime, a `LocalSet` driven by a thread with another
-   name (the main thread) and its `spawn_local` tasks, `block_on`'s main future, `Handle::block_on`, `spawn_blocking`
-   threads of runtimes that are not named like tokio's default. It is safe because the awaited future runs on the global
-   runtime, which is never the caller's runtime here, and (since #303) every pooled connection belongs to s3dlio's I/O
-   runtime too, so the wait can no longer stall on a connection the blocked caller's runtime opened.
-
-The Python store-cache lock (`lock_build`) uses the same helper.
-
-Known residuals:
-- An unmarked runtime with CUSTOM thread names (`Builder::thread_name`) gets no hand-off (rule 4): no panic, but every
-  call parks a worker for its whole duration (latency), and it HANGS if the awaited work needs that same runtime (an
-  in-process server on it; since #303 the error after the operation timeout names that cause). (The other hang this
-  case had, a request stalling on a connection that runtime had opened earlier with an async s3dlio call, is fixed by
-  #303.) Remedy, one line:
-  `Builder::on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)`, or call the async API.
-- PANIC (it panicked before this fix too) on any thread that carries the default tokio worker name or the s3dlio
-  marker and drives a `LocalSet` with the call inside a task: a `spawn_blocking` thread running
-  `handle.block_on(local.run_until(..))` (even without `spawn_local`: the blocking task's id persists inside
-  `Handle::block_on`) and a thread hand-named like tokio's default. Tokio gives no way to tell them from a worker. Remedy:
-  wrap the closure in `runtime_support::inline_blocking_io()`.
-- `MultipartUploadSink::write_blocking`, `enqueue_part` and `finish_blocking` (`blocking_send`) panic in any tokio context.
-  That is a separate bug (#301), NOT fixed here.
-
-Tests: `tests/run_on_global_rt_contexts_300.rs` (a context matrix with 12 s row timeouts that stops at the first hang, a
-per-process hang test for an unmarked runtime that serves its own endpoint with 1, 2 and 4 workers, a latency test and
-hand-off accounting) and `scripts/test_panic_abort_300.sh` (a `panic = "abort"` build); both run in CI next to the #295 ones.
-
-### Fixed — fork safety (#297)
-
-A child made by `fork()` (`os.fork`, `multiprocessing` with the fork start method, PyTorch `DataLoader(num_workers>0)`,
-which forks by default) hung on its first s3dlio call whenever the parent had used s3dlio: `fork` copies only the
-calling thread, so the child owned the parent's Tokio runtimes, rayon pool and connection pools without any of the
-threads that make them work. The same hang hit `generate_data*` and `generate_npz_bytes` even when the parent never did
-any I/O (the rayon pool was built at import), and deleting an inherited `PyCheckpointStore` (or exiting with one) hung
-in `Runtime::drop`.
-
-- **Every s3dlio entry point now works in a fork child.** The child detects the fork (a `pthread_atfork` child handler
-  that only increments an atomic: async-signal-safe, same house style as the #294 op-log handlers) and rebuilds its
-  process-global state lazily, on first use: the global Tokio runtime, the decode/async-API runtime, the rayon pool,
-  the store cache, the S3 / Azure / GCS clients and credentials, the `direct://` bounce pool, the put-payload release
-  queue, the async delivery tracker and attach gate, and the global metrics collector. Nothing inherited is ever
-  used, locked or dropped in the child (the parent's runtimes and pools are leaked in the child, never joined), so
-  the child never reuses the parent's connections, TLS sessions or HTTP/2 streams, and the parent is unaffected.
-- **One warning line on stderr per forked process**, the first time inherited state is abandoned:
-  `s3dlio: this process was forked after s3dlio had already been used; ...`. Silence it with `S3DLIO_FORK_WARN=0`.
-  A child whose parent never used s3dlio prints nothing. `spawn` and `forkserver` never inherit anything and never print it.
-- **Objects created before the fork raise a catchable `RuntimeError` in the child**, never a `PanicException`, a hang
-  or a crash: `PyCheckpointStore` / `PyCheckpointWriter` / `PyCheckpointReader` / `PyCheckpointStream`, object writers
-  (`create_*_writer`), `MultipartUploadWriter`, `MultiEndpointStore`, datasets and loaders and their iterators,
-  `ParquetStream*`, and `Generator`. They own a runtime and/or connections of the parent that cannot be rebuilt
-  transparently. The message is "this s3dlio object was created before fork() ...; create it in the child process".
-  Create the object in the child instead. `del`, garbage collection and interpreter exit of an inherited object are safe: its state is
-  leaked, not dropped (dropping a runtime joins threads that do not exist; dropping a multipart writer would abort the
-  PARENT's upload).
-- **No thread pool is built at import any more.** The rayon pool s3dlio used to build with `build_global` at import is
-  now s3dlio's own pool (not rayon's global one), built on the first parallel call, and every parallel iterator in
-  s3dlio (`generate_data`, `generate_data_with_threads`, `generate_into_buffer`, `generate_npz_bytes`, the in-place
-  fill, one-shot generation in `data_gen_alt`) runs inside it. `configure_tokio_threads(n)` still sets the sizes; it
-  builds nothing. BEHAVIOUR CHANGE: s3dlio no longer pre-sizes rayon's GLOBAL pool at import. A Rust caller of
-  `configure_thread_pools(n)` who relied on that and uses rayon itself now gets rayon's defaults (`RAYON_NUM_THREADS`), and
-  `ThreadPoolBuilder::build_global()` after the import now succeeds (it used to return `Err`: the pool already existed); `s3dlio::s3_client::rayon_pool_threads()` reports the size of
-  s3dlio's own pool.
-- **tokio's `parking_lot` feature is removed** (`tokio` is now built without `full`), and the `parking_lot` dependency
-  is gone; the sync loader iterators use `std::sync::Mutex`. A thread parked in parking_lot leaves an entry in a
-  process-global table that points into its stack; a fork child's own parking_lot use then follows dangling
-  pointers: with the feature on, 10 to 37% of children aborted (SIGABRT) in the investigation. A CI guard
-  (`scripts/check_fork_safety_deps.sh`) fails if the feature returns or if any crate other than `dashmap` uses
-  `parking_lot_core`. Throughput of dropping the feature (release builds, identical sources, 8 interleaved rounds on a
-  busy shared host, Python `get` on tmpfs, medians): 16 MiB +2 to +8% (1, 8 and 32 threads), 1 MiB +1% at 8 threads and
-  +73% at 32 threads, 4 KiB +10% at 8 threads and +87% at 32 threads; `get_into_local_bench` `file://` variants within
-  the noise (-1% to +22%, 3 rounds). No slowdown was measured. The explanation (tokio's inject queue and park/unpark mutexes under 32-way contention are cheaper as std futex mutexes than through parking_lot's hash table) is INFERRED, not profiled.
-- **No Python reference is ever dropped without the GIL, and the op-log lock is fork-safe.** The first release candidate
-  still hung 1 to 9% of children when the parent had busy threads: not a pyo3 limit but s3dlio's own off-GIL drops.
-  pyo3 registers a `Py<..>` dropped on a thread without the GIL in a process-global mutex, and a parent thread holding it
-  at the fork left the child's first Python call waiting for ever. The sources (found by instrumenting pyo3,
-  3295 samples) were (a) the `bytes` of an exact-`bytes` put dying on a Tokio worker or inside `py.detach`
-  (`put_bytes`, async puts, checkpoint saves) and (b) pyo3-async-runtimes dropping a spare reference per awaitable on a
-  Tokio worker. (a) now queues the reference for a thread that holds the GIL; (b) is replaced by an s3dlio-owned
-  `future_into_py` whose references are consumed under the GIL. Independently, `global_logger()` (taken on every store
-  lookup) locks the op-log state, and the #294 fork handlers that hold that lock across a fork were registered only
-  by `init_op_logger`: a parent that never used the op-log left it locked in the child. They are now registered by
-  `global_logger()` too. CI builds a wheel with `--cfg pyo3_disable_reference_pool` (an off-GIL drop aborts) and runs the
-  fork, async-exit and put-release tests with it; released wheels keep the default pool.
-- **No blocking work under the op-log lifecycle lock (#297).** Registering the fork handlers in `global_logger()` made
-  every `fork()` of a process that touched a store wait for the lifecycle lock, so an `init_op_logger` blocked opening
-  its file (a FIFO without a reader, a dead NFS server) would have stalled every fork: a hang. The file is now opened,
-  checked and truncated and the writer started outside the lock, under a `Starting` state that other inits wait on;
-  a failed creation leaves the op-log as it was; `finalize` already joined after releasing the lock, and the Active-init
-  path comparison now `stat`s outside it. #294 semantics (restart after finalize, stale handles rejected, one file wins)
-  are unchanged. Test: `tests/fork_oplog_fifo_297.rs` (a thread blocked on a FIFO does not stall a concurrent fork or
-  a child's op-log calls; RED before, GREEN after). A `finalize_op_logger()` that races an init still creating its file
-  waits for it and finishes the session that was published (it is not lost; `tests/fork_oplog_edges_297.rs`).
-- **The lock rule.** Every process-global lock of s3dlio lives in a `ForkCell`, except `OP_LOG_STATE` (and the client-id
-  lock), which the #294 atfork handlers hold across the fork.
-- **Known limits (none observed as a hang).** (1) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware
-  rayon pool: a streaming `Generator`/`ObjectGen` created in a child whose ancestor already created one is limited to
-  one thread (correct, slower) until dgen-data is fork-aware. (2) `OnceLock`/`Lazy` initialisation that is in progress on
-  another parent thread at the fork (a one-time, microseconds-wide window at first use), dashmap's parking_lot table and
-  tracing's callsite registry (third party). (3) Rust callers that fork must not use a store, writer or generator
-  created before the fork. (4) std's environment lock: only `configure_s3` calls `set_var`, with the GIL held, which the
-  forking thread holds; the warning line reads `S3DLIO_FORK_WARN` with `getenv`.
-- Tests: `python/tests/test_fork_297.py` (parent states x child entry points, inherited objects, drop/exit, warnings,
-  fork while parent threads run s3dlio calls, nested fork, `multiprocessing` fork Pool, DataLoader, exec, a mock S3
-  server proving the child opens its own connection, a mock multipart upload the child must not abort),
-  `python/tests/stress_fork_297.py`, the `fork_guard` unit tests (rebuild in the child, claim takeover, a panic in
-  `init` releases the claim, recursive init is detected, the no-drop rule) and `tests/fork_globals_297.rs` (runtime,
-  rayon pool and data generation in a fork child).
+## Version 0.10.1 — Bug fixes: op-log restart after `finalize_op_log()` (#294); caller-buffer GET (`get_into`) and typed HEAD (`head`) for `file://` and `direct://` (#295, #267); fork safety (#297); exit abort with daemon threads, Python < 3.13.8 (#298); sync wrappers inside a tokio `LocalSet` (#300); exit crash with async calls on CPython 3.14 (#302); requests stalled on a blocked runtime's pooled connection (#303); exit abort when an async call starts during shutdown, Python < 3.13.8 (#304)
 
 ### Fixed — Op-log can be restarted after `finalize_op_log()` (#294)
 
@@ -421,6 +226,274 @@ faulting fresh pages in. Into a freshly allocated buffer `get_into` runs at abou
 these runs: it does the same work, plus faulting the pages in). The bounce copy costs about 35% against a reused
 aligned destination, and a reused unaligned destination is still about 8% faster than `get`.
 
+### Fixed — fork safety (#297)
+
+A child made by `fork()` (`os.fork`, `multiprocessing` with the fork start method, PyTorch `DataLoader(num_workers>0)`,
+which forks by default) hung on its first s3dlio call whenever the parent had used s3dlio: `fork` copies only the
+calling thread, so the child owned the parent's Tokio runtimes, rayon pool and connection pools without any of the
+threads that make them work. The same hang hit `generate_data*` and `generate_npz_bytes` even when the parent never did
+any I/O (the rayon pool was built at import), and deleting an inherited `PyCheckpointStore` (or exiting with one) hung
+in `Runtime::drop`.
+
+- **Every s3dlio entry point now works in a fork child.** The child detects the fork (a `pthread_atfork` child handler
+  that only increments an atomic: async-signal-safe, same house style as the #294 op-log handlers) and rebuilds its
+  process-global state lazily, on first use: the global Tokio runtime, the decode/async-API runtime, the rayon pool,
+  the store cache, the S3 / Azure / GCS clients and credentials, the `direct://` bounce pool, the put-payload release
+  queue, the async delivery tracker and attach gate, and the global metrics collector. Nothing inherited is ever
+  used, locked or dropped in the child (the parent's runtimes and pools are leaked in the child, never joined), so
+  the child never reuses the parent's connections, TLS sessions or HTTP/2 streams, and the parent is unaffected.
+- **One warning line on stderr per forked process**, the first time inherited state is abandoned:
+  `s3dlio: this process was forked after s3dlio had already been used; ...`. Silence it with `S3DLIO_FORK_WARN=0`.
+  A child whose parent never used s3dlio prints nothing. `spawn` and `forkserver` never inherit anything and never print it.
+- **Objects created before the fork raise a catchable `RuntimeError` in the child**, never a `PanicException`, a hang
+  or a crash: `PyCheckpointStore` / `PyCheckpointWriter` / `PyCheckpointReader` / `PyCheckpointStream`, object writers
+  (`create_*_writer`), `MultipartUploadWriter`, `MultiEndpointStore`, datasets and loaders and their iterators,
+  `ParquetStream*`, and `Generator`. They own a runtime and/or connections of the parent that cannot be rebuilt
+  transparently. The message is "this s3dlio object was created before fork() ...; create it in the child process".
+  Create the object in the child instead. `del`, garbage collection and interpreter exit of an inherited object are safe: its state is
+  leaked, not dropped (dropping a runtime joins threads that do not exist; dropping a multipart writer would abort the
+  PARENT's upload).
+- **No thread pool is built at import any more.** The rayon pool s3dlio used to build with `build_global` at import is
+  now s3dlio's own pool (not rayon's global one), built on the first parallel call, and every parallel iterator in
+  s3dlio (`generate_data`, `generate_data_with_threads`, `generate_into_buffer`, `generate_npz_bytes`, the in-place
+  fill, one-shot generation in `data_gen_alt`) runs inside it. `configure_tokio_threads(n)` still sets the sizes; it
+  builds nothing. BEHAVIOUR CHANGE: s3dlio no longer pre-sizes rayon's GLOBAL pool at import. A Rust caller of
+  `configure_thread_pools(n)` who relied on that and uses rayon itself now gets rayon's defaults (`RAYON_NUM_THREADS`), and
+  `ThreadPoolBuilder::build_global()` after the import now succeeds (it used to return `Err`: the pool already existed); `s3dlio::s3_client::rayon_pool_threads()` reports the size of
+  s3dlio's own pool.
+- **tokio's `parking_lot` feature is removed** (`tokio` is now built without `full`), and the `parking_lot` dependency
+  is gone; the sync loader iterators use `std::sync::Mutex`. A thread parked in parking_lot leaves an entry in a
+  process-global table that points into its stack; a fork child's own parking_lot use then follows dangling
+  pointers: with the feature on, 10 to 37% of children aborted (SIGABRT) in the investigation. A CI guard
+  (`scripts/check_fork_safety_deps.sh`) fails if the feature returns or if any crate other than `dashmap` uses
+  `parking_lot_core`. Throughput of dropping the feature (release builds, identical sources, 8 interleaved rounds on a
+  busy shared host, Python `get` on tmpfs, medians): 16 MiB +2 to +8% (1, 8 and 32 threads), 1 MiB +1% at 8 threads and
+  +73% at 32 threads, 4 KiB +10% at 8 threads and +87% at 32 threads; `get_into_local_bench` `file://` variants within
+  the noise (-1% to +22%, 3 rounds). No slowdown was measured. The explanation (tokio's inject queue and park/unpark mutexes under 32-way contention are cheaper as std futex mutexes than through parking_lot's hash table) is INFERRED, not profiled.
+- **No Python reference is ever dropped without the GIL, and the op-log lock is fork-safe.** The first release candidate
+  still hung 1 to 9% of children when the parent had busy threads: not a pyo3 limit but s3dlio's own off-GIL drops.
+  pyo3 registers a `Py<..>` dropped on a thread without the GIL in a process-global mutex, and a parent thread holding it
+  at the fork left the child's first Python call waiting for ever. The sources (found by instrumenting pyo3,
+  3295 samples) were (a) the `bytes` of an exact-`bytes` put dying on a Tokio worker or inside `py.detach`
+  (`put_bytes`, async puts, checkpoint saves) and (b) pyo3-async-runtimes dropping a spare reference per awaitable on a
+  Tokio worker. (a) now queues the reference for a thread that holds the GIL; (b) is replaced by an s3dlio-owned
+  `future_into_py` whose references are consumed under the GIL. Independently, `global_logger()` (taken on every store
+  lookup) locks the op-log state, and the #294 fork handlers that hold that lock across a fork were registered only
+  by `init_op_logger`: a parent that never used the op-log left it locked in the child. They are now registered by
+  `global_logger()` too. CI builds a wheel with `--cfg pyo3_disable_reference_pool` (an off-GIL drop aborts) and runs the
+  fork, async-exit and put-release tests with it; released wheels keep the default pool.
+- **No blocking work under the op-log lifecycle lock (#297).** Registering the fork handlers in `global_logger()` made
+  every `fork()` of a process that touched a store wait for the lifecycle lock, so an `init_op_logger` blocked opening
+  its file (a FIFO without a reader, a dead NFS server) would have stalled every fork: a hang. The file is now opened,
+  checked and truncated and the writer started outside the lock, under a `Starting` state that other inits wait on;
+  a failed creation leaves the op-log as it was; `finalize` already joined after releasing the lock, and the Active-init
+  path comparison now `stat`s outside it. #294 semantics (restart after finalize, stale handles rejected, one file wins)
+  are unchanged. Test: `tests/fork_oplog_fifo_297.rs` (a thread blocked on a FIFO does not stall a concurrent fork or
+  a child's op-log calls; RED before, GREEN after). A `finalize_op_logger()` that races an init still creating its file
+  waits for it and finishes the session that was published (it is not lost; `tests/fork_oplog_edges_297.rs`).
+- **The lock rule.** Every process-global lock of s3dlio lives in a `ForkCell`, except `OP_LOG_STATE` (and the client-id
+  lock), which the #294 atfork handlers hold across the fork.
+- **Known limits (none observed as a hang).** (1) dgen-data's streaming `DataGenerator` keeps its own, not fork-aware
+  rayon pool: a streaming `Generator`/`ObjectGen` created in a child whose ancestor already created one is limited to
+  one thread (correct, slower) until dgen-data is fork-aware. (2) `OnceLock`/`Lazy` initialisation that is in progress on
+  another parent thread at the fork (a one-time, microseconds-wide window at first use), dashmap's parking_lot table and
+  tracing's callsite registry (third party). (3) Rust callers that fork must not use a store, writer or generator
+  created before the fork. (4) std's environment lock: only `configure_s3` calls `set_var`, with the GIL held, which the
+  forking thread holds; the warning line reads `S3DLIO_FORK_WARN` with `getenv`.
+- Tests: `python/tests/test_fork_297.py` (parent states x child entry points, inherited objects, drop/exit, warnings,
+  fork while parent threads run s3dlio calls, nested fork, `multiprocessing` fork Pool, DataLoader, exec, a mock S3
+  server proving the child opens its own connection, a mock multipart upload the child must not abort),
+  `python/tests/stress_fork_297.py`, the `fork_guard` unit tests (rebuild in the child, claim takeover, a panic in
+  `init` releases the claim, recursive init is detected, the no-drop rule) and `tests/fork_globals_297.rs` (runtime,
+  rayon pool and data generation in a fork child).
+
+### Fixed — exit abort with daemon threads (#298)
+
+On CPython **before 3.13.8** (every 3.11 and 3.12, and 3.13.0 to 3.13.7), a process died with SIGABRT (exit code 134,
+often `FATAL: exception not rethrown` on stderr) when the main thread returned while a daemon thread was inside an
+s3dlio call (sync `get`, `put_bytes`, `list`, `stat`, `get_many`, `get_range`, streaming writers, `get_into_async` on the
+thread's event loop, and so on; the async calls that were still in the middle of STARTING an awaitable are #304, below). Remaining `atexit` handlers, buffered output and final log flushes were lost, and a
+scheduler or CI system saw a crash. It was not specific to s3dlio (a trivial PyO3 0.27 module that only sleeps with the
+GIL released aborts the same way) and not specific to 3.12 as first reported: CPython 3.13.8 and 3.14 no longer end such
+a thread with `pthread_exit`, 3.11 and 3.12 still do.
+
+- **Fix:** PyO3, `numpy` and `pyo3-async-runtimes` are upgraded from 0.27 to 0.29. PyO3 0.29 wraps the GIL re-acquire in
+  a guard that parks the thread instead of letting the forced unwind cross Rust frames. That guard covers a GIL
+  re-acquire that RUST starts (after `py.detach`, or a `Python::attach`). It does not cover one that happens inside a
+  Python call made from Rust (`loop.create_future()` inside an async entry point); that path is closed by the exit
+  gate of #304. `pyo3` must be
+  **0.29.3 or later in the 0.29 series (`>=0.29.3, <0.30`)**: 0.29.0 to 0.29.2 lack the follow-up fix (PyO3 #6404), so the
+  lower bound must not be lowered. `Cargo.lock` resolves 0.29.3.
+- **Behaviour now:** the process exits with code 0 and runs its `atexit` handlers; the daemon threads are simply
+  abandoned, as on 3.13.8+ and 3.14. Non-daemon threads are unaffected (Python waits for them). Python 3.13.8+ and 3.14
+  were never affected. No API change. The `#[pyclass]` types that Python code passes back by value
+  (`PyDataset`, `PyBytesAsyncDataLoader`, `PyLoaderOptions`, `PyVecDataset`, `PyS3Dataset`, `PyS3DatasetCompat`,
+  `ObjectMetadata`) keep their by-value extraction (`#[pyclass(from_py_object)]`, the PyO3 0.28 opt-in), and the module
+  declares `#[pymodule(gil_used = true)]`, which keeps the PyO3 0.27 behaviour on free-threaded CPython (the GIL is
+  re-enabled on import); it has no effect on regular CPython.
+- **One user-visible side effect:** PyO3 0.29 no longer rewrites argument-extraction `TypeError`s. For example
+  `s3dlio.get(123)` still raises `TypeError`, but the message changes from "argument 'uri': 'int' object cannot be cast
+  as 'str'" to "'int' object is not an instance of 'str'"; the argument name moves to the exception's `__notes__`.
+  Code that matches on the old message text must be updated; the exception type is unchanged.
+- **Not covered:** a thread parked at exit keeps whatever Rust state it holds above the call (it never runs
+  its destructors); that is the same as 3.13.8+. Other extensions (NumPy C code, torch) that release the GIL are not
+  changed by this fix. Do not build s3dlio with `panic = "abort"` for release: the guard needs unwinding.
+- **Two async exceptions came after this entry and are fixed in the entries above it: #302 (CPython 3.14, a Tokio worker
+  attaching to Python) and #304 (Python < 3.13.8, an async call starting while the interpreter shuts down).**
+- **Tests:** `python/tests/test_exit_daemon_threads_298.py` runs each scenario in a fresh subprocess with a timeout:
+  sync `get`, `put_bytes`, `list`, `stat`, `get_many`, `get_range`, a streaming writer, a call blocked on an unresponsive
+  endpoint, async calls (including `get_into_async`, a never-completing one and every #302 entry point) on a daemon
+  thread's event loop, op-log
+  active at exit, `atexit` handlers that call s3dlio while daemon threads are busy, and a non-daemon-thread case. CI's
+  Python job runs it.
+- **Workarounds on a wheel without #302 / #304:** use Python 3.13.8 or later, or stop and `join()` worker threads before the main
+  thread returns.
+
+### Fixed — sync wrappers inside a tokio `LocalSet` (#300)
+
+`run_on_global_rt` and every synchronous wrapper built on it (for example `s3_utils::stat_object_uri`) panicked with "can call blocking
+only when running on the multi-threaded runtime" when called inside a `tokio::task::LocalSet` that a non-worker thread
+drives, the usual `rt.block_on(local.run_until(..))` on the main thread (also `LocalSet::block_on` and `spawn_local`
+tasks), on a multi-thread runtime. Cause: they always called `tokio::task::block_in_place` on a multi-thread runtime,
+and tokio refuses that off a worker thread inside a `LocalSet`. They now work there, and under `panic = "abort"`.
+
+The wait for the global runtime hands the worker off with `block_in_place` where that is valid and waits plainly
+elsewhere, decided in this order (`runtime_support::blocking_wait`; no panic is provoked or caught):
+
+1. inside an `inline_blocking_io()` scope: plain wait;
+2. the thread carries the worker marker (all of s3dlio's runtimes, any runtime built with
+   `on_thread_start(mark_tokio_worker_thread)`) on a multi-thread runtime: hand off, exactly as before (#173);
+3. not marked, multi-thread runtime, inside a task and the thread has tokio's default worker thread name: hand off. This
+   keeps `#[tokio::main]` and `#[tokio::test(flavor = "multi_thread")]` runtimes working when the awaited work (for
+   example an in-process mock server) needs that same runtime;
+4. everything else: plain wait. That is no runtime, a current-thread runtime, a `LocalSet` driven by a thread with another
+   name (the main thread) and its `spawn_local` tasks, `block_on`'s main future, `Handle::block_on`, `spawn_blocking`
+   threads of runtimes that are not named like tokio's default. It is safe because the awaited future runs on the global
+   runtime, which is never the caller's runtime here, and (since #303) every pooled connection belongs to s3dlio's I/O
+   runtime too, so the wait can no longer stall on a connection the blocked caller's runtime opened.
+
+The Python store-cache lock (`lock_build`) uses the same helper.
+
+Known residuals:
+- An unmarked runtime with CUSTOM thread names (`Builder::thread_name`) gets no hand-off (rule 4): no panic, but every
+  call parks a worker for its whole duration (latency), and it HANGS if the awaited work needs that same runtime (an
+  in-process server on it; since #303 the error after the operation timeout names that cause). (The other hang this
+  case had, a request stalling on a connection that runtime had opened earlier with an async s3dlio call, is fixed by
+  #303.) Remedy, one line:
+  `Builder::on_thread_start(s3dlio::runtime_support::mark_tokio_worker_thread)`, or call the async API.
+- PANIC (it panicked before this fix too) on any thread that carries the default tokio worker name or the s3dlio
+  marker and drives a `LocalSet` with the call inside a task: a `spawn_blocking` thread running
+  `handle.block_on(local.run_until(..))` (even without `spawn_local`: the blocking task's id persists inside
+  `Handle::block_on`) and a thread hand-named like tokio's default. Tokio gives no way to tell them from a worker. Remedy:
+  wrap the closure in `runtime_support::inline_blocking_io()`.
+- `MultipartUploadSink::write_blocking`, `enqueue_part` and `finish_blocking` (`blocking_send`) panic in any tokio context.
+  That is a separate bug (#301), NOT fixed here.
+
+Tests: `tests/run_on_global_rt_contexts_300.rs` (a context matrix with 12 s row timeouts that stops at the first hang, a
+per-process hang test for an unmarked runtime that serves its own endpoint with 1, 2 and 4 workers, a latency test and
+hand-off accounting) and `scripts/test_panic_abort_300.sh` (a `panic = "abort"` build); both run in CI next to the #295 ones.
+
+### Fixed — exit crash with async calls in flight on CPython 3.14 (#302)
+
+On CPython 3.14, a process crashed at exit (`Fatal Python error: PyInterpreterState_Delete: remaining threads`,
+`double free or corruption`, exit 139 or 134) when the main thread returned while a daemon thread's asyncio loop had an
+s3dlio async call in flight. 28 of 30 runs of `get_async` crashed on 3.14.10, identically with PyO3 0.27.2 and 0.29.3;
+Python 3.11 to 3.13 (all patch levels) were never affected. No API change.
+
+- **Root cause.** Every affected `async` entry point finished its future with a bare `Python::attach` on a Tokio
+  worker thread (to build the `BytesView`, dict or list the caller awaits). A thread that is not a Python thread gets a
+  brand-new thread state from `PyGILState_Ensure` on every attach. CPython 3.14 does not refuse to create one while
+  the interpreter is finalizing, and (unlike 3.13) it parks only the thread states that existed when finalization
+  started, so a worker that attached late ran against a half-torn-down interpreter and corrupted it (a use after free of
+  its thread state, or a thread state left behind for `PyInterpreterState_Delete`). PyO3's own "is the interpreter
+  finalizing" check does not help: `Python::attach` consults `Py_IsInitialized()` first, CPython clears that as soon as
+  finalization begins, and `attach` then attaches anyway. The #192 exit gate only covered the result delivery, not
+  these attaches.
+- **Fix.** These futures now return plain Rust values (`BytesView` wrapping the same `Bytes`, a `(count, total)` tuple,
+  a stat wrapper, `Vec<BytesView>`, `Option<()>`) and the Python object is built by PyO3's `IntoPyObject` inside the
+  exit-safe delivery (the gated `spawn_blocking` of #192), which the exit drain waits for and which is refused once
+  the gate has closed. No Tokio worker attaches to Python on its own any more. Zero-copy is unchanged (the same `Bytes`,
+  no copy), and one `Python::attach` per call is saved. Affected: `get_async`, `get_range_async`, `get_many_async`,
+  `get_many_stats_async`, `stat_async`, `stat_many_async`, `put_async`, `MultiEndpointStore.get`, `.get_range`,
+  `.get_from_endpoint`, `PyDataset.get_item`, and the async data-loader iterators (`create_async_loader`,
+  `PyS3AsyncDataLoader`, the bytes and numeric loaders).
+- **Tests.** `python/tests/test_exit_daemon_threads_298.py` loses its 3.14 `xfail` and gains a scenario for each entry
+  point above (`async_get_range`, `async_get_many`, `async_get_many_stats`, `async_stat`, `async_stat_many`, `async_put`,
+  `mes_get`, `mes_get_range`, `mes_get_from_endpoint`, `ds_get_item`, `async_loader`, `async_numeric_loader`,
+  `async_s3_loader`). `tests/python_future_bodies_no_attach_302.rs` (std only) fails if ANY production source file
+  attaches to Python, re-takes the GIL through raw FFI, aliases `Python`, or builds an awaitable without the bridge,
+  outside an allow-list of marked sites (`// exit-gate: allowed (reason)`); the exit scenarios are the behavioural barrier.
+
+### Fixed — requests stalled on a blocked runtime's pooled connection (#303)
+
+Every pooled HTTP connection belongs to the tokio runtime that opened it: its socket is registered with that runtime's I/O
+driver and the task that drives it is spawned onto that runtime. The process-wide S3 client (and the Azure and GCS
+clients) kept their connections in one pool shared by every runtime in the process. When the runtime that had opened a
+connection was alive but BLOCKED, any later request that reused the connection stalled for the whole operation timeout
+(60 s) and failed with "request timed out ... check network connectivity". The usual way to hit it was a Rust program on a
+current-thread runtime that made any async s3dlio call and then any sync one (`stat_object_uri`, `get_object_uri`,
+`delete_objects`, `MultipartUploadSink::new`, ...): the sync wrapper blocks the runtime's only thread while the global
+runtime tries to reuse the connection. Also affected: a `LocalSet` on a current-thread runtime, two live current-thread
+runtimes (async on A, then async on B), current-thread then multi-thread, and an unmarked runtime with custom thread names
+that had made an earlier async s3dlio call (the #300 residual). An unfinished `MultipartUploadSink` dropped on a
+current-thread runtime stalled 60 s and then LEAKED the upload on the server. Python was not affected.
+
+Fix: every pooled connection now belongs to s3dlio's own small I/O-owner runtime (`s3_client::io_rt_handle`, 2 threads,
+`S3DLIO_IO_THREADS` overrides), a runtime that exists only to own sockets, timers and connection tasks and never
+runs s3dlio work futures, `spawn_on_global_rt` tasks, sync-wrapper waits or user code. No caller can block it, and blocking
+every worker of the global runtime cannot stall it either (an earlier design that used the global runtime itself did, and an
+async-only application with its own runtime then timed out). The HTTP futures are still polled by the caller's task, but with
+the I/O runtime entered as the tokio context (`s3_client::in_io_ctx`, `Handle::enter`, per poll), so every socket, timer
+and connection task they create is registered with, and spawned onto, the I/O runtime. There is no spawn, no `'static`
+bound, no thread hop and no extra copy: the caller-buffer `get_into` paths keep writing straight into the caller's buffer
+(Rule #1), and dropping a future still cancels the request exactly as before. The caller's own runtime still needs its time
+driver (the SDK's timeouts run there). Where it is applied:
+
+| Backend | Chokepoint | Covers |
+|---|---|---|
+| S3 | `reqwest_client::ReqwestHttpConnector::call` (`send_on_global_rt`, both attempts of the h2c-auto fallback) and `warmup_connection_pool`; the TLS certificate probe of the redirect wrapper | every request of the aws-sdk client: every async fn of `s3_utils`, the S3 `ObjectStore`, `get_into`/head/range engines, list streams, multipart (`new_async`, coordinator, abort), delete batches, per-endpoint clients, credential providers, https/ALPN, h2c |
+| Azure | `azure_client::GlobalRtHttpClient` (the transport of the service client and of the credential clients) | every blob and credential request |
+| GCS | `google_gcs_client::on_global` around every `GcsClient` operation, the client build, the storage-layout probe, the opener `open`/`describe` AND every chunk poll of the `get_into` readers, and the list stream | HTTP/1.1 and HTTP/2 connections, tonic channel workers, background readers |
+
+`MultipartUploadSink`:
+- `Drop` no longer waits for `AbortMultipartUpload`: it SPAWNS the abort on the global runtime and returns at once (the
+  outcome is logged, `debug!` on success and `warn!` with the upload id on failure) and counts it as pending. New
+  `s3dlio::flush_pending_aborts(timeout) -> usize` waits (bounded) for the aborts that dropped sinks spawned and returns how
+  many are still pending. A program that may end with an unfinished sink (an early `?` out of `main`) should call it once
+  before exiting, otherwise the process can end before the request is sent and the upload stays on the server. The s3dlio
+  CLI calls it (2 s) when a command ends, the Python `atexit` hook calls it (2 s, GIL released, before the exit gate
+  closes), and the Python `MultipartUploadWriter` waits (2 s) when it is dropped with an unfinished upload.
+- New `pub async fn abort(&mut self) -> Result<()>`, the async twin of `abort_blocking`: cancels the coordinator first, then
+  awaits `AbortMultipartUpload` and returns its REAL outcome (`Err`, naming the upload id, when the request failed; the sink
+  is cancelled either way), fires regardless of `abort_on_drop`, and does nothing when called again or after `finish()`.
+  (`abort_blocking` keeps its locked contract: always `Ok(())`, failure only logged.) The abort runs on s3dlio's runtimes, so
+  it completes on a current-thread runtime.
+
+Sizing: the global runtime keeps at least 2 workers when MPI-aware sizing would compute 1 (one blocking task would
+otherwise starve everything else; an explicit `S3DLIO_RT_THREADS` is still honoured as given). `spawn_on_global_rt`
+must be given futures that do not block a thread: a blocking task occupies a global worker, and the sync wrappers (and the
+tasks they run) share those workers.
+
+Hang diagnostics: one way remains for a synchronous wrapper to wait for ever: the awaited work needs the very runtime whose
+thread the wrapper blocks (an in-process server task on a current-thread runtime). No connection ownership can fix that. A
+wrapper that ends in the SDK's operation-timeout error ("request timed out after ...") within a window around the timeout
+(never when the timeout is 0) on a thread that belongs to a tokio runtime now says so: the error carries "this synchronous
+s3dlio call blocked a thread that belongs to a tokio runtime for the whole operation timeout; if the endpoint is served by a
+task on that same runtime ... use the async API, or call the synchronous API from spawn_blocking or a plain thread". Any
+other error of a long call gets no such text.
+
+Overhead (Loki-4, loopback keep-alive mock, 9 interleaved rounds, medians; see docs in the build report): multi-thread callers unchanged within noise (sequential HEAD median 225 us vs 219 base, GET 1 KiB 225 vs 229, 64-way HEAD 20.4k vs 20.5k req/s, 256 MiB `get_object_uri_async` 1.6 vs 1.6 GB/s, 256 MiB caller-buffer `get_into` 5.6 vs 5.2 GB/s); a current-thread caller pays roughly 50 to 90 us more per small request (the connection task now runs on another thread instead of the caller's, GET 1 KiB 238 vs 146 us, HEAD 196 vs 164 us), a sync wrapper called alone is faster (223-263 vs 440 us, fewer threads to wake); the earlier design that used the global runtime for connections was +90 us on current-thread GETs too and slower for sync calls (418-457 us). The round-0 per-request `spawn_on_global_rt` hop was +80..110 us for everyone and -20 % on `get_into`
+
+Tests: `tests/pooled_connection_runtime_303.rs` (every case in its own child process against an in-process keep-alive
+mock with `S3DLIO_OPERATION_TIMEOUT_SECS=5`: current-thread async then sync stat/get/delete/`MultipartUploadSink::new`, a
+`LocalSet`, two current-thread runtimes, current-thread then multi-thread, the unmarked one-worker custom-named runtime,
+h2c, `S3DLIO_H2C=auto` against an HTTP/1.1-only server (the fallback retry), https with ALPN and a CA bundle, the
+redirect-following wrapper, `warmup_connection_pool` without a runtime, a whole multipart upload, the unfinished-sink Drop
+against a slow abort, a sink dropped right before exit plus `flush_pending_aborts`, `abort()` and its real error, every
+global worker blocked, the sync-then-async and multi-thread controls, the self-deadlock error text and its absence on other
+errors), plus `tests/pooled_connection_runtime_303_azure.rs` and `tests/pooled_connection_runtime_303_gcs.rs` (including a
+body cut mid-stream and repaired) with `--features backend-azure` / `backend-gcs`.
+
 ### Fixed — exit abort when an async call starts during shutdown, Python < 3.13.8 (#304)
 
 On Python **3.11, 3.12 and 3.13.0 to 3.13.7**, the process aborted (SIGABRT, exit code 134, no message) in a few percent of
@@ -465,79 +538,6 @@ affected. No API change.
   (including `use ..::attach`, turbofish and aliases), for formatting or unwrapping inside future bodies (a `PyErr`
   Display/Debug attaches inside PyO3), and requires `python_call_scope()` before every Python call of the awaitable
   machinery; each rule is mutation-checked. It is a lexical scan and says so; the exit scenarios are the behavioural barrier.
-
-### Fixed — exit crash with async calls in flight on CPython 3.14 (#302)
-
-On CPython 3.14, a process crashed at exit (`Fatal Python error: PyInterpreterState_Delete: remaining threads`,
-`double free or corruption`, exit 139 or 134) when the main thread returned while a daemon thread's asyncio loop had an
-s3dlio async call in flight. 28 of 30 runs of `get_async` crashed on 3.14.10, identically with PyO3 0.27.2 and 0.29.3;
-Python 3.11 to 3.13 (all patch levels) were never affected. No API change.
-
-- **Root cause.** Every affected `async` entry point finished its future with a bare `Python::attach` on a Tokio
-  worker thread (to build the `BytesView`, dict or list the caller awaits). A thread that is not a Python thread gets a
-  brand-new thread state from `PyGILState_Ensure` on every attach. CPython 3.14 does not refuse to create one while
-  the interpreter is finalizing, and (unlike 3.13) it parks only the thread states that existed when finalization
-  started, so a worker that attached late ran against a half-torn-down interpreter and corrupted it (a use after free of
-  its thread state, or a thread state left behind for `PyInterpreterState_Delete`). PyO3's own "is the interpreter
-  finalizing" check does not help: `Python::attach` consults `Py_IsInitialized()` first, CPython clears that as soon as
-  finalization begins, and `attach` then attaches anyway. The #192 exit gate only covered the result delivery, not
-  these attaches.
-- **Fix.** These futures now return plain Rust values (`BytesView` wrapping the same `Bytes`, a `(count, total)` tuple,
-  a stat wrapper, `Vec<BytesView>`, `Option<()>`) and the Python object is built by PyO3's `IntoPyObject` inside the
-  exit-safe delivery (the gated `spawn_blocking` of #192), which the exit drain waits for and which is refused once
-  the gate has closed. No Tokio worker attaches to Python on its own any more. Zero-copy is unchanged (the same `Bytes`,
-  no copy), and one `Python::attach` per call is saved. Affected: `get_async`, `get_range_async`, `get_many_async`,
-  `get_many_stats_async`, `stat_async`, `stat_many_async`, `put_async`, `MultiEndpointStore.get`, `.get_range`,
-  `.get_from_endpoint`, `PyDataset.get_item`, and the async data-loader iterators (`create_async_loader`,
-  `PyS3AsyncDataLoader`, the bytes and numeric loaders).
-- **Tests.** `python/tests/test_exit_daemon_threads_298.py` loses its 3.14 `xfail` and gains a scenario for each entry
-  point above (`async_get_range`, `async_get_many`, `async_get_many_stats`, `async_stat`, `async_stat_many`, `async_put`,
-  `mes_get`, `mes_get_range`, `mes_get_from_endpoint`, `ds_get_item`, `async_loader`, `async_numeric_loader`,
-  `async_s3_loader`). `tests/python_future_bodies_no_attach_302.rs` (std only) fails if ANY production source file
-  attaches to Python, re-takes the GIL through raw FFI, aliases `Python`, or builds an awaitable without the bridge,
-  outside an allow-list of marked sites (`// exit-gate: allowed (reason)`); the exit scenarios are the behavioural barrier.
-
-### Fixed — exit abort with daemon threads (#298)
-
-On CPython **before 3.13.8** (every 3.11 and 3.12, and 3.13.0 to 3.13.7), a process died with SIGABRT (exit code 134,
-often `FATAL: exception not rethrown` on stderr) when the main thread returned while a daemon thread was inside an
-s3dlio call (sync `get`, `put_bytes`, `list`, `stat`, `get_many`, `get_range`, streaming writers, `get_into_async` on the
-thread's event loop, and so on; the async calls that were still in the middle of STARTING an awaitable are #304, below). Remaining `atexit` handlers, buffered output and final log flushes were lost, and a
-scheduler or CI system saw a crash. It was not specific to s3dlio (a trivial PyO3 0.27 module that only sleeps with the
-GIL released aborts the same way) and not specific to 3.12 as first reported: CPython 3.13.8 and 3.14 no longer end such
-a thread with `pthread_exit`, 3.11 and 3.12 still do.
-
-- **Fix:** PyO3, `numpy` and `pyo3-async-runtimes` are upgraded from 0.27 to 0.29. PyO3 0.29 wraps the GIL re-acquire in
-  a guard that parks the thread instead of letting the forced unwind cross Rust frames. That guard covers a GIL
-  re-acquire that RUST starts (after `py.detach`, or a `Python::attach`). It does not cover one that happens inside a
-  Python call made from Rust (`loop.create_future()` inside an async entry point); that path is closed by the exit
-  gate of #304. `pyo3` must be
-  **0.29.3 or later in the 0.29 series (`>=0.29.3, <0.30`)**: 0.29.0 to 0.29.2 lack the follow-up fix (PyO3 #6404), so the
-  lower bound must not be lowered. `Cargo.lock` resolves 0.29.3.
-- **Behaviour now:** the process exits with code 0 and runs its `atexit` handlers; the daemon threads are simply
-  abandoned, as on 3.13.8+ and 3.14. Non-daemon threads are unaffected (Python waits for them). Python 3.13.8+ and 3.14
-  were never affected. No API change. The `#[pyclass]` types that Python code passes back by value
-  (`PyDataset`, `PyBytesAsyncDataLoader`, `PyLoaderOptions`, `PyVecDataset`, `PyS3Dataset`, `PyS3DatasetCompat`,
-  `ObjectMetadata`) keep their by-value extraction (`#[pyclass(from_py_object)]`, the PyO3 0.28 opt-in), and the module
-  declares `#[pymodule(gil_used = true)]`, which keeps the PyO3 0.27 behaviour on free-threaded CPython (the GIL is
-  re-enabled on import); it has no effect on regular CPython.
-- **One user-visible side effect:** PyO3 0.29 no longer rewrites argument-extraction `TypeError`s. For example
-  `s3dlio.get(123)` still raises `TypeError`, but the message changes from "argument 'uri': 'int' object cannot be cast
-  as 'str'" to "'int' object is not an instance of 'str'"; the argument name moves to the exception's `__notes__`.
-  Code that matches on the old message text must be updated; the exception type is unchanged.
-- **Not covered:** a thread parked at exit keeps whatever Rust state it holds above the call (it never runs
-  its destructors); that is the same as 3.13.8+. Other extensions (NumPy C code, torch) that release the GIL are not
-  changed by this fix. Do not build s3dlio with `panic = "abort"` for release: the guard needs unwinding.
-- **Two async exceptions came after this entry and are fixed in the entries above it: #302 (CPython 3.14, a Tokio worker
-  attaching to Python) and #304 (Python < 3.13.8, an async call starting while the interpreter shuts down).**
-- **Tests:** `python/tests/test_exit_daemon_threads_298.py` runs each scenario in a fresh subprocess with a timeout:
-  sync `get`, `put_bytes`, `list`, `stat`, `get_many`, `get_range`, a streaming writer, a call blocked on an unresponsive
-  endpoint, async calls (including `get_into_async`, a never-completing one and every #302 entry point) on a daemon
-  thread's event loop, op-log
-  active at exit, `atexit` handlers that call s3dlio while daemon threads are busy, and a non-daemon-thread case. CI's
-  Python job runs it.
-- **Workarounds on a wheel without #302 / #304:** use Python 3.13.8 or later, or stop and `join()` worker threads before the main
-  thread returns.
 
 ## Version 0.10.0 — Caller-buffer GET (`get_into_async`), typed HEAD (`head_async`) and `object_capabilities` for S3, Azure and GCS; zero copy everywhere (Rule #1); stricter payloads and URI validation, download layout kept, checkpoint integrity, Python 3.11 fixes
 
